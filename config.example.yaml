@@ -1,0 +1,20 @@
+# 复制此文件为 config.yaml，填入真实 API key 后使用
+# cp config.example.yaml config.yaml
+
+# 使用 Anthropic Claude
+# protocol: anthropic
+# model: claude-sonnet-4-6
+# base_url: https://api.anthropic.com
+# api_key: sk-ant-...
+
+# 使用 OpenAI
+# protocol: openai
+# model: gpt-4o
+# base_url: https://api.openai.com/v1
+# api_key: sk-...
+
+# 使用 DeepSeek
+protocol: deepseek
+model: deepseek-chat
+base_url: https://api.deepseek.com
+api_key: YOUR_API_KEY

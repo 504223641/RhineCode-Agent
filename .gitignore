@@ -1,0 +1,21 @@
+# 配置文件（含 API key，禁止提交）
+config.yaml
+
+# Python 构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Claude Code 本地设置（含个人配置，不纳入版本管理）
+.claude
+CLAUDE.md
+
+# 开发文档
+/docs
