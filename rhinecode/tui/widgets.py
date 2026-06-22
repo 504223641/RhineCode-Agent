@@ -1,8 +1,9 @@
 """
-TUI 组件模块，定义三个自定义 Textual Widget。
+TUI 组件模块，定义四个自定义 Textual Widget。
 
 组件职责：
 - HistoryView：对话历史展示区，支持流式逐块更新和滚动
+- CommandPanel：斜杠命令提示面板，输入 "/" 时弹出，支持键盘上下选择
 - InputBar：用户输入框，拦截回车事件并发出自定义消息
 - StatusBar：底部状态栏，展示当前 Provider、模型和思考模式状态
 
@@ -14,7 +15,8 @@ TUI 组件模块，定义三个自定义 Textual Widget。
 """
 
 from textual.app import ComposeResult
-from textual.widgets import Static, Input
+from textual.widgets import Static, Input, OptionList
+from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
@@ -99,6 +101,54 @@ class HistoryView(ScrollableContainer):
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
         self.query_one("#history-messages", Vertical).remove_children()
+
+
+class CommandPanel(OptionList):
+    """
+    斜杠命令提示面板。
+
+    继承自 Textual OptionList，内置 Up/Down 键盘导航和 Enter 选中能力。
+    默认 display:none 不占布局空间；当用户输入以 "/" 开头时由 App 层调用
+    show_for() 使其出现，并根据已输入内容进行前缀过滤。
+
+    选中某条命令后，App 层监听 OptionList.OptionSelected 事件，
+    将命令文本填入 InputBar 并自动提交。
+
+    COMMANDS 是所有内置命令的注册表，新增命令只需在此列表追加即可，
+    无需修改其他代码。
+    """
+
+    # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
+    DEFAULT_CSS = "CommandPanel { display: none; }"
+
+    # 命令注册表：(命令文本, 简要描述)
+    COMMANDS: list[tuple[str, str]] = [
+        ("/think", "切换 Extended Thinking 开启/关闭（仅 Anthropic 支持）"),
+        ("/clear", "清空当前对话历史"),
+        ("/exit",  "退出 RhineCode"),
+    ]
+
+    def show_for(self, prefix: str) -> None:
+        """
+        根据用户已输入的前缀过滤命令并刷新 OptionList，有匹配则显示面板，无匹配则隐藏。
+
+        每次调用会先清空现有选项再重新填充，避免残留上次的过滤结果。
+        Option 的 id 设置为命令文本本身，方便 OptionSelected 事件中直接取用。
+
+        :param prefix: 用户当前输入内容（如 "/"、"/th"、"/clear"）
+        """
+        matched = [(cmd, desc) for cmd, desc in self.COMMANDS if cmd.startswith(prefix)]
+        self.clear_options()
+        if not matched:
+            self.display = False
+            return
+        for cmd, desc in matched:
+            self.add_option(Option(f"{cmd}  [dim]{desc}[/dim]", id=cmd))
+        self.display = True
+
+    def hide(self) -> None:
+        """隐藏面板并收回布局空间。"""
+        self.display = False
 
 
 class InputBar(Input):

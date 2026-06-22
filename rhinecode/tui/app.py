@@ -2,10 +2,11 @@
 Textual App 主类模块。
 
 RhineApp 是 TUI 层的核心，负责：
-1. 组合三个面板（HistoryView / InputBar / StatusBar）
+1. 组合四个面板（HistoryView / CommandPanel / InputBar / StatusBar）
 2. 监听用户输入事件，调用 ConversationManager 处理
 3. 将流式 StreamChunk 通过 Worker + call_from_thread 安全地渲染到 UI
 4. 响应斜杠命令结果（状态栏刷新、历史区清空、程序退出）
+5. 管理命令提示面板的显示/隐藏和键盘导航（焦点始终保持在 InputBar）
 
 线程模型：
   Textual 的事件循环运行在主线程，UI 操作必须在主线程执行。
@@ -16,12 +17,13 @@ RhineApp 是 TUI 层的核心，负责：
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static
+from textual.events import Key
+from textual.widgets import Static, Input
 
 from rhinecode.config import Config
 from rhinecode.conversation import ConversationManager
 from rhinecode.provider.base import StreamChunk
-from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar
+from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar, CommandPanel
 
 
 class RhineApp(App):
@@ -29,12 +31,12 @@ class RhineApp(App):
     RhineCode 的 Textual 应用主类。
 
     布局（从上到下）：
-    - HistoryView：占据除底部两行外的全部高度（height: 1fr），可滚动
+    - HistoryView：占据除底部区域外的全部高度（height: 1fr），可滚动
+    - CommandPanel：斜杠命令提示面板，默认隐藏，输入 "/" 时弹出
     - InputBar：固定 3 行高（含边框），用户在此输入
-    - StatusBar：固定 1 行，展示当前 Provider / 模型 / 思考状态
+    - StatusBar：固定 1 行，右对齐展示当前 Provider / 模型 / 思考状态
     """
 
-    # Textual CSS：定义三个面板的布局和样式
     CSS = """
     Screen {
         layout: vertical;
@@ -43,6 +45,20 @@ class RhineApp(App):
         height: 1fr;
         border: solid $accent;
         padding: 0 1;
+    }
+    /* 内容容器随消息增长，超出 HistoryView 高度时触发父容器滚动 */
+    HistoryView > Vertical {
+        height: auto;
+    }
+    CommandPanel {
+        height: auto;
+        max-height: 6;
+        display: none;
+        /* 清除 OptionList 自带全方向边框，统一用顶部分隔线与主题色对齐 */
+        border: none;
+        border-top: tall $accent;
+        padding: 0 1;
+        background: $boost;
     }
     InputBar {
         height: 3;
@@ -53,7 +69,7 @@ class RhineApp(App):
         height: 1;
         background: $accent-darken-2;
         color: $text;
-        text-align: left;
+        text-align: right;
     }
     """
 
@@ -72,9 +88,10 @@ class RhineApp(App):
         self._config = config
 
     def compose(self) -> ComposeResult:
-        """按从上到下的顺序挂载三个面板。"""
+        """按从上到下的顺序挂载四个面板。"""
         yield HistoryView()
-        yield InputBar(placeholder="输入消息，/think 切换思考模式，/clear 清空，/exit 退出")
+        yield CommandPanel()
+        yield InputBar(placeholder="输入消息，/ 查看命令，Ctrl+C 退出")
         yield StatusBar()
 
     def on_mount(self) -> None:
@@ -96,20 +113,73 @@ class RhineApp(App):
             self._manager.thinking_enabled,
         )
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """
+        监听输入框内容变化，控制命令提示面板的显示与过滤。
+
+        当输入以 "/" 开头时调用 CommandPanel.show_for() 过滤并显示面板；
+        其他情况隐藏面板。每次内容变化都重新过滤，实现实时匹配效果。
+
+        :param event: Textual Input 的 Changed 事件，含当前输入框完整内容
+        """
+        panel = self.query_one(CommandPanel)
+        if event.value.startswith("/"):
+            panel.show_for(event.value)
+        else:
+            panel.hide()
+
+    def on_key(self, event: Key) -> None:
+        """
+        拦截命令面板可见时的特殊按键，焦点始终保持在 InputBar。
+
+        设计原则：焦点永远不离开 InputBar。
+        - Up/Down：仅移动面板的高亮光标，不转移焦点，用户可继续输入字符过滤命令
+        - Escape：隐藏面板，恢复正常输入状态
+        - Enter 在面板有高亮时的处理见 on_input_bar_input_submitted（在那里读取高亮项）
+
+        :param event: Textual Key 事件，此时事件已经过 InputBar 处理（bubble 阶段）
+        """
+        panel = self.query_one(CommandPanel)
+
+        if not panel.display:
+            return  # 面板不可见时不拦截任何按键，保持原有行为
+
+        if event.key == "up":
+            event.stop()
+            panel.action_cursor_up()    # 移动高亮，不转移焦点
+
+        elif event.key == "down":
+            event.stop()
+            panel.action_cursor_down()  # 移动高亮，不转移焦点
+
+        elif event.key == "escape":
+            event.stop()
+            panel.hide()                # 焦点本就在 InputBar，无需重新 focus()
+
     def on_input_bar_input_submitted(self, event: InputBar.InputSubmitted) -> None:
         """
         处理用户提交输入的事件（InputBar 发出 InputSubmitted 时触发）。
 
         执行步骤：
-        1. 将用户输入显示到历史区
-        2. 调用 ConversationManager.handle_input() 分发处理
-        3. 根据返回值类型决定后续行为：
+        1. 若命令面板可见且有高亮条目，用高亮命令替换输入框文本（Enter 确认逻辑）
+        2. 隐藏命令提示面板
+        3. 将最终文本显示到历史区
+        4. 调用 ConversationManager.handle_input() 分发处理
+        5. 根据返回值类型决定后续行为：
            - str：斜杠命令反馈，直接显示；/clear 还需清空历史区；/think 还需刷新状态栏
            - Iterator：流式生成器，启动 Worker 在后台消费并渲染
 
-        :param event: 包含用户输入文本的事件对象
+        :param event: 包含用户输入文本的事件对象（可能被高亮命令覆盖）
         """
-        text = event.text
+        panel = self.query_one(CommandPanel)
+
+        # 若面板有高亮条目，Enter 确认该命令，忽略输入框中的前缀文本（如 "/th"）
+        if panel.display and panel.highlighted is not None:
+            text = panel.get_option_at_index(panel.highlighted).id
+        else:
+            text = event.text
+
+        panel.hide()
         history_view = self.query_one(HistoryView)
 
         # 先将用户消息显示到历史区，给用户即时反馈
