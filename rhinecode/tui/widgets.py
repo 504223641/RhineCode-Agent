@@ -123,7 +123,7 @@ class CommandPanel(OptionList):
 
     # 命令注册表：(命令文本, 简要描述)
     COMMANDS: list[tuple[str, str]] = [
-        ("/think", "切换 Extended Thinking 开启/关闭（仅 Anthropic 支持）"),
+        ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
@@ -195,13 +195,14 @@ class StatusBar(Static):
     每次 /think 命令执行后，App 层会调用 update_status() 刷新显示。
     """
 
-    def update_status(self, provider: str, model: str, thinking: bool) -> None:
+    def update_status(self, provider: str, model: str, thinking_effort: str) -> None:
         """
         刷新状态栏显示内容。
 
         :param provider: Provider 协议名（anthropic / openai / deepseek）
         :param model: 当前使用的模型名称
-        :param thinking: Extended Thinking 是否开启
+        :param thinking_effort: 思考模式强度（off / high / max）
         """
-        state = "开启" if thinking else "关闭"
+        _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
+        state = _LABEL.get(thinking_effort, thinking_effort)
         self.update(f" [{provider}] {model} | 思考模式：{state} ")

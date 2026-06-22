@@ -110,7 +110,7 @@ class RhineApp(App):
         self.query_one(StatusBar).update_status(
             self._config.protocol,
             self._config.model,
-            self._manager.thinking_enabled,
+            self._manager.thinking_effort,
         )
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -166,7 +166,7 @@ class RhineApp(App):
         3. 将最终文本显示到历史区
         4. 调用 ConversationManager.handle_input() 分发处理
         5. 根据返回值类型决定后续行为：
-           - str：斜杠命令反馈，直接显示；/clear 还需清空历史区；/think 还需刷新状态栏
+           - str：斜杠命令反馈，直接显示；/clear 还需清空历史区；/think 还需刷新状态栏（三态循环）
            - Iterator：流式生成器，启动 Worker 在后台消费并渲染
 
         :param event: 包含用户输入文本的事件对象（可能被高亮命令覆盖）

@@ -38,7 +38,7 @@ class OpenAIProvider(BaseProvider):
     def stream_chat(
         self,
         messages: list[Message],
-        thinking: bool = False,
+        thinking_effort: str = "off",
     ) -> Iterator[StreamChunk]:
         """
         向 OpenAI API 发起流式对话请求，逐块产出 StreamChunk。
@@ -51,7 +51,7 @@ class OpenAIProvider(BaseProvider):
         5. 任何异常均捕获并以 type="error" 块返回
 
         :param messages: 完整对话历史（含本轮用户消息）
-        :param thinking: OpenAI 协议不支持此参数，传入后直接忽略
+        :param thinking_effort: OpenAI 协议不支持思考模式，传入后直接忽略
         :returns: StreamChunk 迭代器
 
         副作用：发起 HTTPS 请求，消耗 OpenAI token 配额。

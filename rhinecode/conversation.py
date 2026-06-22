@@ -4,7 +4,7 @@
 ConversationManager 是 TUI 层与 Provider 层之间的协调者，职责包括：
 - 维护多轮对话的完整消息历史（history）
 - 解析并执行斜杠命令（/think、/clear、/exit）
-- 管理 Extended Thinking 的开关状态
+- 管理思考模式的三档强度（off / high / max）
 - 在流式回复完成后，将 AI 回复追加到历史记录
 
 TUI 层调用 handle_input() 获取结果，结果类型决定 TUI 的后续行为：
@@ -25,18 +25,24 @@ class ConversationManager:
     TUI 层不直接调用 Provider，所有请求均通过此类中转。
     """
 
+    # /think 命令的三态循环顺序：关闭 → 高效 → 最强 → 关闭
+    _EFFORT_CYCLE = {"off": "high", "high": "max", "max": "off"}
+    # 各档位对应的中文显示名称
+    _EFFORT_LABEL = {"off": "关闭", "high": "高效（high）", "max": "最强（max）"}
+
     def __init__(self, provider: BaseProvider, provider_protocol: str):
         """
         初始化对话管理器。
 
         :param provider: 已实例化的 Provider，负责实际的 API 调用
         :param provider_protocol: Provider 的协议名（如 "anthropic"），
-                                  用于判断是否支持 Extended Thinking
+                                  用于判断是否支持思考模式
         """
         self._provider = provider
         self._protocol = provider_protocol
         self.history: list[Message] = []
-        self.thinking_enabled: bool = False
+        # 思考模式强度：off（关闭）/ high（高效）/ max（最强）
+        self.thinking_effort: str = "off"
 
     def clear(self) -> None:
         """
@@ -53,7 +59,8 @@ class ConversationManager:
         处理规则：
         - "/exit"  → 抛出 SystemExit，由 TUI 层捕获后调用 app.exit()
         - "/clear" → 清空 history，返回确认文本
-        - "/think" → 切换 thinking_enabled 状态；非 Anthropic 协议时返回不支持提示
+        - "/think" → 三态循环切换 thinking_effort（off→high→max→off）；
+                     OpenAI 原生协议不支持，返回提示文本
         - 其他     → 追加用户消息到 history，调用 Provider 流式接口，返回生成器
 
         :param text: 用户原始输入（含前后空白）
@@ -62,7 +69,7 @@ class ConversationManager:
 
         副作用：
         - "/clear" 会清空 self.history
-        - "/think" 会修改 self.thinking_enabled
+        - "/think" 会修改 self.thinking_effort
         - 普通消息会向 self.history 追加用户消息（AI 回复在流结束后由 _stream 追加）
         """
         text = text.strip()
@@ -75,12 +82,13 @@ class ConversationManager:
             return "对话历史已清空"
 
         if text == "/think":
-            # Extended Thinking 仅 Anthropic 协议支持，其他 Provider 忽略此参数
-            if self._protocol != "anthropic":
-                return "当前 Provider 不支持 Extended Thinking"
-            self.thinking_enabled = not self.thinking_enabled
-            state = "开启" if self.thinking_enabled else "关闭"
-            return f"思考模式：{state}"
+            # Anthropic 和 DeepSeek 均支持思考模式，OpenAI 原生协议不支持
+            if self._protocol not in ("anthropic", "deepseek"):
+                return "当前 Provider 不支持思考模式"
+            # 循环切换到下一档位
+            self.thinking_effort = self._EFFORT_CYCLE[self.thinking_effort]
+            label = self._EFFORT_LABEL[self.thinking_effort]
+            return f"思考模式：{label}"
 
         # 普通消息：先追加到历史，再发起流式请求
         # 注意：此时传给 Provider 的是追加用户消息后的完整历史快照
@@ -103,7 +111,7 @@ class ConversationManager:
         """
         full_response: list[str] = []
 
-        for chunk in self._provider.stream_chat(messages, self.thinking_enabled):
+        for chunk in self._provider.stream_chat(messages, self.thinking_effort):
             if chunk.type == "text":
                 # 积累文本块，用于流结束后构造完整的 assistant 消息
                 full_response.append(chunk.content)

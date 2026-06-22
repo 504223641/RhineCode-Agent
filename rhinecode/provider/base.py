@@ -55,13 +55,15 @@ class BaseProvider(ABC):
     def stream_chat(
         self,
         messages: list[Message],
-        thinking: bool = False,
+        thinking_effort: str = "off",
     ) -> Iterator[StreamChunk]:
         """
         以流式方式发起对话请求，逐块产出响应内容。
 
         :param messages: 完整对话历史，含本轮用户消息，按时间顺序排列
-        :param thinking: 是否启用 Extended Thinking（仅 Anthropic 生效，其他 Provider 忽略）
+        :param thinking_effort: 思考模式强度，取值 "off"（关闭）/ "high"（高效）/ "max"（最强）
+                                Anthropic 中 high/max 均映射为开启，DeepSeek 直接传给 reasoning_effort，
+                                OpenAI 协议忽略此参数
         :returns: StreamChunk 迭代器，调用方逐块消费，最后一块 type 为 "done" 或 "error"
 
         副作用：向远端 API 发起网络请求，消耗 token 配额。

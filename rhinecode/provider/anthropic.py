@@ -37,7 +37,7 @@ class AnthropicProvider(BaseProvider):
     def stream_chat(
         self,
         messages: list[Message],
-        thinking: bool = False,
+        thinking_effort: str = "off",
     ) -> Iterator[StreamChunk]:
         """
         向 Anthropic API 发起流式对话请求，逐块产出 StreamChunk。
@@ -52,7 +52,7 @@ class AnthropicProvider(BaseProvider):
         6. 任何异常均捕获并以 type="error" 块返回，保证调用方不因网络错误崩溃
 
         :param messages: 完整对话历史（含本轮用户消息）
-        :param thinking: True 时启用 Extended Thinking，thinking 块会以 type="thinking" 产出
+        :param thinking_effort: "off" 关闭，"high"/"max" 均映射为开启（Anthropic 无力度区分）
         :returns: StreamChunk 迭代器
 
         副作用：发起 HTTPS 请求，消耗 Anthropic token 配额。
@@ -66,7 +66,8 @@ class AnthropicProvider(BaseProvider):
             "messages": sdk_messages,
         }
 
-        if thinking:
+        # Anthropic 无 high/max 区分，只要不是 "off" 就开启 Extended Thinking
+        if thinking_effort != "off":
             # budget_tokens 控制思考过程最多消耗的 token 数量
             # temperature 必须设为 1，这是 Anthropic Extended Thinking 的硬性要求
             params["thinking"] = {"type": "enabled", "budget_tokens": 10000}
