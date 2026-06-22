@@ -43,7 +43,7 @@ class RhineApp(App):
     }
     HistoryView {
         height: 1fr;
-        border: solid $accent;
+        border: solid #7AEEFF 60%;
         padding: 0 1;
     }
     /* 内容容器随消息增长，超出 HistoryView 高度时触发父容器滚动 */
@@ -56,18 +56,18 @@ class RhineApp(App):
         display: none;
         /* 清除 OptionList 自带全方向边框，统一用顶部分隔线与主题色对齐 */
         border: none;
-        border-top: tall $accent;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
         background: $boost;
     }
     InputBar {
         height: 3;
-        border: solid $accent;
+        border: solid #7AEEFF 60%;
         margin-top: 0;
     }
     StatusBar {
         height: 1;
-        background: $accent-darken-2;
+        background: #7AEEFF 20%;
         color: $text;
         text-align: right;
     }
