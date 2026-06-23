@@ -52,8 +52,8 @@ class HistoryView(ScrollableContainer):
         return widget
 
     def append_user(self, text: str) -> None:
-        """追加一条用户消息，以青色粗体 "You:" 为前缀。"""
-        self._add_widget(f"[bold cyan]You:[/bold cyan] {text}")
+        """追加一条用户消息，以青色粗体 "◈" 为前缀。"""
+        self._add_widget(f"[bold #99FFFF]◈[/bold #99FFFF] {text}")
 
     def begin_assistant_turn(self) -> Static:
         """
@@ -64,7 +64,7 @@ class HistoryView(ScrollableContainer):
 
         :returns: 新建的 Static 组件，内容初始为带前缀的空字符串
         """
-        return self._add_widget("[bold green]AI:[/bold green] ")
+        return self._add_widget("[bold #CCFF99]Rhine[/bold #CCFF99] ")
 
     def begin_thinking_turn(self) -> Static:
         """

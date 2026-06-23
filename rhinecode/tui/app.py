@@ -254,7 +254,7 @@ class RhineApp(App):
                 self.call_from_thread(
                     history_view.update_widget,
                     response_widget,
-                    f"[bold green]AI:[/bold green] {''.join(response_chunks)}",
+                    f"[bold #CCFF99]Rhine[/bold #CCFF99] {''.join(response_chunks)}",
                 )
 
             elif chunk.type == "error":
