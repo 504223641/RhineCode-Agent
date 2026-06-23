@@ -25,7 +25,7 @@ from textual.widgets import Static, Input
 from rhinecode.config import Config
 from rhinecode.conversation import ConversationManager
 from rhinecode.provider.base import StreamChunk
-from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar, CommandPanel, ConfirmScreen
+from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel
 
 
 class RhineApp(App):
@@ -35,6 +35,7 @@ class RhineApp(App):
     布局（从上到下）：
     - HistoryView：占据除底部区域外的全部高度（height: 1fr），可滚动
     - CommandPanel：斜杠命令提示面板，默认隐藏，输入 "/" 时弹出
+    - ConfirmPanel：工具执行前的内联确认面板，默认隐藏，有副作用工具执行前弹出
     - InputBar：固定 3 行高（含边框），用户在此输入
     - StatusBar：固定 1 行，右对齐展示当前 Provider / 模型 / 思考状态
     """
@@ -59,6 +60,16 @@ class RhineApp(App):
         /* 清除 OptionList 自带全方向边框，统一用顶部分隔线与主题色对齐 */
         border: none;
         border-top: tall #7AEEFF 60%;
+        padding: 0 1;
+        background: $boost;
+    }
+    /* 工具确认面板：与 CommandPanel 同款内联布局，但用橘色分隔线警示有副作用 */
+    ConfirmPanel {
+        height: auto;
+        max-height: 6;
+        display: none;
+        border: none;
+        border-top: tall #FFA500 80%;
         padding: 0 1;
         background: $boost;
     }
@@ -88,11 +99,16 @@ class RhineApp(App):
         super().__init__()
         self._manager = manager
         self._config = config
+        # 待决的工具确认：None 表示当前无确认在进行；
+        # 进行中时为 {"event": threading.Event, "result": bool}，由 _confirm_tool 在
+        # Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
+        self._pending_confirm: dict | None = None
 
     def compose(self) -> ComposeResult:
-        """按从上到下的顺序挂载四个面板。"""
+        """按从上到下的顺序挂载五个面板。"""
         yield HistoryView()
         yield CommandPanel()
+        yield ConfirmPanel()
         yield InputBar(placeholder="输入消息，/ 查看命令，Ctrl+C 退出")
         yield StatusBar()
 
@@ -127,6 +143,9 @@ class RhineApp(App):
 
         :param event: Textual Input 的 Changed 事件，含当前输入框完整内容
         """
+        # 工具确认进行中：焦点在确认面板，不处理命令面板逻辑
+        if self._pending_confirm is not None:
+            return
         panel = self.query_one(CommandPanel)
         if event.value.startswith("/"):
             panel.show_for(event.value)
@@ -176,6 +195,9 @@ class RhineApp(App):
 
         :param event: 包含用户输入文本的事件对象（可能被高亮命令覆盖）
         """
+        # 工具确认进行中：忽略普通输入提交（确认通过面板自身的选择/取消完成）
+        if self._pending_confirm is not None:
+            return
         panel = self.query_one(CommandPanel)
 
         # 若面板有高亮条目，Enter 确认该命令，忽略输入框中的前缀文本（如 "/th"）
@@ -319,29 +341,74 @@ class RhineApp(App):
         协调层执行有副作用工具前的确认回调（在 Worker 线程被调用）。
 
         实现要点（保证 N7 不死锁）：
-        - 用 call_from_thread 在主线程 push_screen 弹出 ConfirmScreen，并传入回调收集结果
+        - 用 call_from_thread 在主线程弹出内联 ConfirmPanel 并把焦点移到它
         - 用 threading.Event 阻塞当前 Worker 线程，直到用户在主线程做出选择
         - 主线程事件循环不被阻塞，UI（含其它工具行的计时）照常刷新
 
-        采用 push_screen + 回调 + Event 而非 push_screen_wait，是因为 push_screen_wait
-        需在 worker 协程上下文中 await，而此处是线程 Worker，用 Event 同步更稳妥。
+        结果由主线程的选择/取消处理（on_option_list_option_selected /
+        on_confirm_panel_cancelled → _resolve_confirm）写入 self._pending_confirm
+        并 set() 唤醒本线程。
 
         :param tool_call: provider.base.ToolCall
         :param tool: tools.base.Tool
         :returns: True 用户允许执行 / False 用户拒绝
 
-        副作用：在主线程弹出模态屏并等待用户交互。
+        副作用：在主线程弹出内联确认面板并等待用户交互。
         """
-        done = threading.Event()
-        # 用单元素列表在闭包中回传结果（默认 False，异常或未选时按拒绝处理）
-        outcome = [False]
+        box = {"event": threading.Event(), "result": False}
+        self._pending_confirm = box
+        # 在主线程显示面板并移焦；Worker 随后阻塞等待用户选择
+        self.call_from_thread(self._show_confirm_panel, tool_call, tool)
+        box["event"].wait()
+        return box["result"]
 
-        def on_dismiss(approved: bool) -> None:
-            outcome[0] = bool(approved)
-            done.set()
+    def _show_confirm_panel(self, tool_call, tool) -> None:
+        """
+        在主线程显示内联确认面板并把焦点移到它。
 
-        # 在主线程推送模态屏；dismiss 时回调 on_dismiss 收集结果
-        self.call_from_thread(self.push_screen, ConfirmScreen(tool_call, tool), on_dismiss)
-        # 阻塞 Worker 线程直到用户选择完成（主线程不受影响）
-        done.wait()
-        return outcome[0]
+        先隐藏命令面板避免叠加；填充确认面板后聚焦，使其原生的上/下/回车选择生效。
+
+        :param tool_call: provider.base.ToolCall
+        :param tool: tools.base.Tool
+        """
+        self.query_one(CommandPanel).hide()
+        panel = self.query_one(ConfirmPanel)
+        panel.show_for(tool_call, tool)
+        panel.focus()
+
+    def _resolve_confirm(self, approved: bool) -> None:
+        """
+        在主线程结算一次工具确认：隐藏面板、还焦输入框、唤醒被阻塞的 Worker。
+
+        幂等：无待决确认时直接返回，避免重复结算（如选择后又收到取消消息）。
+
+        :param approved: True 放行执行 / False 拒绝
+
+        副作用：隐藏确认面板、改变焦点、set() 唤醒 Worker 线程。
+        """
+        box = self._pending_confirm
+        if box is None:
+            return
+        self._pending_confirm = None
+        self.query_one(ConfirmPanel).hide()
+        # 焦点还给输入框，恢复正常输入状态
+        self.query_one(InputBar).focus()
+        box["result"] = approved
+        box["event"].set()
+
+    def on_option_list_option_selected(self, event) -> None:
+        """
+        处理确认面板的选择（回车/点击「执行」或「取消」）。
+
+        仅当事件来自 ConfirmPanel 且有待决确认时才处理：依据 option.id 解析为放行/拒绝。
+        命令面板从不取得焦点、不会触发此消息，故无需额外区分。
+
+        :param event: OptionList.OptionSelected，event.option.id 为 "yes"/"no"
+        """
+        if isinstance(event.option_list, ConfirmPanel) and self._pending_confirm is not None:
+            event.stop()
+            self._resolve_confirm(event.option.id == "yes")
+
+    def on_confirm_panel_cancelled(self, event: ConfirmPanel.Cancelled) -> None:
+        """处理确认面板的 Esc 取消：等价于拒绝执行。"""
+        self._resolve_confirm(False)

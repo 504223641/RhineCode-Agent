@@ -21,8 +21,7 @@ from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.screen import ModalScreen
-from textual.widgets import Static, Input, OptionList, Button, Label
+from textual.widgets import Static, Input, OptionList
 from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
@@ -343,88 +342,72 @@ class StatusBar(Static):
         self.update(f" [{provider}] {model} | 思考模式：{state} ")
 
 
-class ConfirmScreen(ModalScreen[bool]):
+class ConfirmPanel(OptionList):
     """
-    工具执行前的 Yes/No 确认模态屏。
+    工具执行前的内联确认面板（取代旧的模态弹窗 ConfirmScreen）。
 
-    用于写文件、改文件、执行命令等有副作用工具：展示工具名与关键参数摘要，
-    让用户决定是否放行。`dismiss(True/False)` 返回结果，供协调层据此执行或拒绝。
+    交互体验与斜杠命令面板 CommandPanel 一致：出现在输入框上方，用方向键在
+    「执行 / 取消」间选择，回车确认，Esc 取消，不遮挡历史区。
 
-    操作方式：
-    - 点击「执行」按钮 / 按 y / 按 Enter → dismiss(True)
-    - 点击「取消」按钮 / 按 n / 按 Esc   → dismiss(False)
+    用于写文件、改文件、执行命令等有副作用工具：顶部以橘色表头展示工具名与关键参数摘要
+    （仅展示、不可选），下方两个可选项分别对应放行与拒绝。
 
-    ModalScreen[bool] 的类型参数表明 dismiss 返回布尔值。
+    结果如何回传：面板本身不持有协调层状态。用户选择「执行/取消」时由 OptionList 原生发出
+    OptionList.OptionSelected（App 据 option.id 解析为 True/False）；按 Esc 时发出本类的
+    Cancelled 消息（App 视为拒绝）。App 再唤醒被阻塞的 Worker 线程（见 RhineApp._confirm_tool）。
+
+    设计取舍：确认期间 App 会把焦点临时移到本面板，从而直接复用 OptionList 原生的
+    上/下/回车 选择能力（输入框为空时回车不会触发自定义提交消息，移焦到面板最稳健）。
     """
 
-    DEFAULT_CSS = """
-    ConfirmScreen {
-        align: center middle;
-    }
-    ConfirmScreen > Vertical {
-        width: 70;
-        height: auto;
-        max-height: 20;
-        border: thick #FFA500 80%;
-        background: $surface;
-        padding: 1 2;
-    }
-    ConfirmScreen #confirm-title {
-        text-style: bold;
-        color: #FFA500;
-        margin-bottom: 1;
-    }
-    ConfirmScreen #confirm-detail {
-        margin-bottom: 1;
-    }
-    ConfirmScreen #confirm-buttons {
-        height: auto;
-        align: right middle;
-    }
-    ConfirmScreen Button {
-        margin-left: 2;
-    }
-    """
+    # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
+    DEFAULT_CSS = "ConfirmPanel { display: none; }"
+
+    # 表头与两个可选项在 OptionList 中的索引（表头 disabled 不可选）
+    _HEADER_INDEX = 0
+    _YES_INDEX = 1  # 「执行」：默认高亮项，回车即执行
+
+    class Cancelled(TextualMessage):
+        """用户按 Esc 取消确认时发出，由 App 视为拒绝执行。"""
+        pass
 
     BINDINGS = [
-        # 键盘快捷确认/取消，无需移动焦点到按钮
-        Binding("y", "approve", "执行", show=False),
-        Binding("enter", "approve", "执行", show=False),
-        Binding("n", "reject", "取消", show=False),
-        Binding("escape", "reject", "取消", show=False),
+        # Esc 取消：发出 Cancelled 消息交给 App 处理（等价于选择「取消」）
+        Binding("escape", "cancel", "取消", show=False),
     ]
 
-    def __init__(self, tool_call, tool) -> None:
+    def show_for(self, tool_call, tool) -> None:
         """
+        为一次工具调用填充并显示确认面板。
+
+        每次调用先清空旧选项再重建，避免残留上一次确认的内容。
+        表头（disabled）展示工具名与参数摘要供用户判断；其后是「执行」「取消」两个可选项，
+        默认高亮「执行」（_YES_INDEX），用户直接回车即放行。
+
         :param tool_call: provider.base.ToolCall，提供工具名与参数
-        :param tool: tools.base.Tool，提供面向用户的工具描述
+        :param tool: tools.base.Tool（暂用于潜在扩展，如展示描述）
+
+        副作用：修改 OptionList 选项并使面板可见。
         """
-        super().__init__()
-        self._tool_name = tool_call.name
-        self._tool_desc = getattr(tool, "description", "")
-        self._args_summary = summarize_args(tool_call.arguments, max_len=200)
-
-    def compose(self) -> ComposeResult:
-        """构建确认对话框：标题、工具与参数详情、执行/取消按钮。"""
-        with Vertical():
-            yield Label("⚠ 需要确认：该工具有副作用", id="confirm-title")
-            yield Static(
-                f"工具：{self._tool_name}\n参数：{self._args_summary}",
-                id="confirm-detail",
-                markup=False,
+        args_summary = summarize_args(tool_call.arguments, max_len=200)
+        self.clear_options()
+        # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航
+        self.add_option(
+            Option(
+                f"[#FFA500]⚠ 确认执行：{tool_call.name}({args_summary})[/#FFA500]",
+                disabled=True,
             )
-            with Vertical(id="confirm-buttons"):
-                yield Button("执行 (Y)", variant="warning", id="confirm-yes")
-                yield Button("取消 (N)", variant="default", id="confirm-no")
+        )
+        self.add_option(Option("✅ 执行  [dim]立即执行该工具[/dim]", id="yes"))
+        self.add_option(Option("❌ 取消  [dim]拒绝并让模型据此调整[/dim]", id="no"))
+        self.display = True
+        # 默认高亮「执行」，回车即执行（与 / 命令面板一致的顺手体验）
+        self.highlighted = self._YES_INDEX
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        """按钮点击：依据按钮 id 决定放行或拒绝。"""
-        self.dismiss(event.button.id == "confirm-yes")
+    def hide(self) -> None:
+        """隐藏面板并收回布局空间。"""
+        self.display = False
 
-    def action_approve(self) -> None:
-        """键盘放行（y/Enter）。"""
-        self.dismiss(True)
-
-    def action_reject(self) -> None:
-        """键盘拒绝（n/Esc）。"""
-        self.dismiss(False)
+    def action_cancel(self) -> None:
+        """Esc 绑定：发出 Cancelled 消息，由 App 解释为拒绝执行。"""
+        self.post_message(self.Cancelled())
