@@ -2,8 +2,45 @@
 
 我正在构建一个终端 AI 编程助手（类似 Claude Code），项目名叫 RhineCode，使用 Python 实现。
 
+终端启动后进入 Textual TUI 多面板界面，支持与 Anthropic Claude、OpenAI、DeepSeek 进行多轮流式对话。当前处于 MVP 阶段（纯对话，工具调用尚未实现）。
+
 ## 语言
 中文回答
+
+## 技术栈
+
+- Python 3.11+
+- [Textual](https://textual.textualize.io/) — TUI 框架（流式渲染基于 Worker + `call_from_thread`）
+- `anthropic` / `openai` SDK，`pyyaml` 配置
+- 依赖与入口定义在 `pyproject.toml`，控制台脚本 `rhinecode`
+
+## 架构
+
+分三层，上层不感知下层具体实现，通过抽象接口解耦：
+
+- **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费流式 chunk 并逐块渲染；`widgets.py` 提供 HistoryView / InputBar / StatusBar。
+- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Provider 之间的唯一中转点，维护对话历史、解析斜杠命令、管理思考模式三档强度（off/high/max）。
+- **Provider 层**（`rhinecode/provider/`）— `base.py` 定义 `BaseProvider`/`Message`/`StreamChunk` 抽象；`anthropic.py`、`openai.py`、`deepseek.py` 为具体实现；`factory.py` 的 `create_provider` 按 `protocol` 分发。
+
+新增 Provider：在 `provider/` 下继承 `BaseProvider` 实现 `stream_chat`，再到 `factory.py` 添加 `elif` 分支，配置中 `protocol` 改为新值即可。
+
+## 常用命令
+
+```bash
+pip install -e .                          # 安装（开发模式）
+cp config.example.yaml config.yaml        # 创建配置后填入真实 api_key
+python -m rhinecode --config config.yaml  # 启动
+```
+
+运行时斜杠命令：`/think`（切换思考模式，仅 anthropic/deepseek 生效）、`/clear`（清空历史）、`/exit`（退出）。
+
+## 配置
+
+`config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。
+
+## Spec 驱动开发
+
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前章节为 `docs/c2/`。
 
 ## 测试
 
@@ -12,7 +49,7 @@
 1. 在 tmux 中启动 RhineCode
 2. 输入一段真实的对话请求
 3. 观察 RhineCode 是否正确调用工具、生成回复
-4. 对照 checklist.md 逐项验收
+4. 对照对应章节的 `checklist.md` 逐项验收
 
 ## 代码注释规范
 
@@ -85,3 +122,43 @@
 
 ## 文档搜索
 在参考任何文档之前请确保文档是否是最新版本
+
+## 学习与解释要求
+
+我是第一次独立完成这类项目，可能对项目中的部分技术概念、架构设计、工具链、代码写法或最佳实践不熟悉。
+
+在协助我开发时，请遵守以下要求：
+
+1. **不要默认我已经理解相关技术背景**
+
+   * 如果涉及新的技术概念、框架、库、设计模式或工程实践，请先用清楚、通俗的中文解释它是什么、为什么要用、解决了什么问题。
+
+2. **解释代码修改的原因**
+
+   * 不只是直接给出代码，还需要说明为什么要这样改。
+   * 如果有多种实现方式，请简单说明当前方案的优点，以及为什么更适合这个项目。
+
+3. **使用适合初学者理解的说明方式**
+
+   * 解释时尽量避免只堆砌专业术语。
+   * 必要时可以使用类比、步骤拆解或简单示例帮助理解。
+   * 专业关键词可以保留英文，但需要配合中文解释。
+
+4. **指出我需要重点理解的知识点**
+
+   * 如果某段代码或某个设计背后涉及重要知识点，请明确指出。
+   * 例如：异步处理、事件循环、状态管理、配置加载、异常处理、UI 渲染、Provider 抽象等。
+
+5. **避免只给结论**
+
+   * 对于关键修改，请说明：
+
+     * 问题是什么
+     * 为什么会出现这个问题
+     * 应该如何解决
+     * 修改后会带来什么效果
+
+6. **保持教学式协作**
+
+   * 这个项目不仅是为了完成代码，也是为了让我理解项目是如何搭建和演进的。
+   * 因此，请在保证代码质量的同时，帮助我逐步建立对项目结构、技术选型和实现细节的理解。
