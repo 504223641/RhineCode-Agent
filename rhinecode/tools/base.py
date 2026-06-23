@@ -13,6 +13,23 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 
+def human_size(n_bytes: int) -> str:
+    """
+    把字节数格式化为便于人读的体量字符串。
+
+    规则：<1024 用 B；<1MiB 用 K（保留一位小数）；其余用 M（保留一位小数）。
+    供 read_file / write_file 等工具构造 output 头部与 summary 复用。
+
+    :param n_bytes: 字节数（非负）
+    :returns: 如 "340 B" / "4.2K" / "1.3M"
+    """
+    if n_bytes < 1024:
+        return f"{n_bytes} B"
+    if n_bytes < 1024 * 1024:
+        return f"{n_bytes / 1024:.1f}K"
+    return f"{n_bytes / (1024 * 1024):.1f}M"
+
+
 @dataclass
 class ToolResult:
     """
@@ -22,10 +39,14 @@ class ToolResult:
 
     :param ok: 执行是否成功。True → TUI 以绿色展示；False → 红色展示
     :param output: 回灌给模型的文本。成功时为工具产出内容（如文件内容、命令输出）；
-                   失败时为对模型可读的错误描述，模型可据此调整重试
+                   失败时为对模型可读的错误描述，模型可据此调整重试。面向「模型」。
+    :param summary: 面向「TUI 单行展示」的简短摘要（如「读取 152 行 · 4.2K」）。
+                    与 output 解耦：output 给模型看完整内容，summary 给人看量级与状态。
+                    为空时 TUI 回退到取 output 首行（见 RhineApp._summarize_result）。
     """
     ok: bool
     output: str
+    summary: str = ""
 
 
 class Tool(ABC):

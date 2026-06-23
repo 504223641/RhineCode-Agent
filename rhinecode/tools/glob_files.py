@@ -50,7 +50,7 @@ class GlobTool(Tool):
         try:
             pattern = args.get("pattern")
             if not pattern:
-                return ToolResult(ok=False, output="缺少必填参数 pattern")
+                return ToolResult(ok=False, output="缺少必填参数 pattern", summary="缺少参数 pattern")
 
             base = Path.cwd()
             # 仅保留文件、排除目录；转为相对工作目录的路径，便于模型理解与后续操作
@@ -60,14 +60,19 @@ class GlobTool(Tool):
                 if p.is_file()
             ]
 
-            if not matches:
-                return ToolResult(ok=True, output=f"无匹配文件（模式: {pattern}）")
+            total = len(matches)
+            if total == 0:
+                return ToolResult(ok=True, output=f"无匹配文件（模式: {pattern}）", summary="无匹配")
 
-            truncated = matches[:MAX_RESULTS]
-            output = "\n".join(truncated)
-            if len(matches) > MAX_RESULTS:
-                output += f"\n…（共 {len(matches)} 个，仅显示前 {MAX_RESULTS} 个）"
-            return ToolResult(ok=True, output=output)
+            shown = matches[:MAX_RESULTS]
+            # 顶部计数头 + 路径列表
+            output = f"找到 {total} 个文件：\n" + "\n".join(shown)
+            if total > MAX_RESULTS:
+                output += f"\n…（共 {total} 个，仅显示前 {MAX_RESULTS} 个）"
+                summary = f"找到 {total} 个（显示前 {MAX_RESULTS}）"
+            else:
+                summary = f"找到 {total} 个文件"
+            return ToolResult(ok=True, output=output, summary=summary)
 
         except Exception as e:
-            return ToolResult(ok=False, output=f"查找文件失败: {e}")
+            return ToolResult(ok=False, output=f"查找文件失败: {e}", summary="查找失败")

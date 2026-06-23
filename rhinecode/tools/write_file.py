@@ -7,7 +7,7 @@
 
 import os
 
-from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.base import Tool, ToolResult, human_size
 
 
 class WriteFileTool(Tool):
@@ -40,11 +40,12 @@ class WriteFileTool(Tool):
 
         执行步骤：
         1. 取出 path 与 content，解析绝对路径
-        2. 父目录不存在则递归创建
-        3. 以 UTF-8 覆盖写入，返回写入字节数摘要
+        2. 写前判断文件是否已存在（用于区分「新建」与「覆盖」）
+        3. 父目录不存在则递归创建
+        4. 以 UTF-8 写入，返回含新建/覆盖、行数、字节数的摘要
 
         :param args: 含 "path" 与 "content" 键
-        :returns: 成功时 output 说明写入路径与字节数；异常时 ok=False
+        :returns: 成功时 output 说明写入路径、新建/覆盖、行数与字节数；异常时 ok=False
 
         副作用：创建/覆盖文件系统中的文件，可能创建父目录。
         """
@@ -52,11 +53,14 @@ class WriteFileTool(Tool):
             path = args.get("path")
             content = args.get("content")
             if not path:
-                return ToolResult(ok=False, output="缺少必填参数 path")
+                return ToolResult(ok=False, output="缺少必填参数 path", summary="缺少参数 path")
             if content is None:
-                return ToolResult(ok=False, output="缺少必填参数 content")
+                return ToolResult(ok=False, output="缺少必填参数 content", summary="缺少参数 content")
 
             abs_path = os.path.abspath(path)
+
+            # 写入前判断，区分新建/覆盖（写入后再判断就分不清了）
+            existed = os.path.exists(abs_path)
 
             # 父目录缺失时递归创建，避免因目录不存在导致写入失败
             parent = os.path.dirname(abs_path)
@@ -67,7 +71,15 @@ class WriteFileTool(Tool):
                 f.write(content)
 
             byte_len = len(content.encode("utf-8"))
-            return ToolResult(ok=True, output=f"已写入 {path}（{byte_len} 字节）")
+            # 空内容算 0 行；否则行数 = 换行数 + 1（末尾无换行也算最后一行）
+            line_count = 0 if content == "" else content.count("\n") + 1
+            action = "覆盖" if existed else "新建"
+
+            return ToolResult(
+                ok=True,
+                output=f"已写入 {path}（{action}，{line_count} 行，{byte_len} 字节）",
+                summary=f"{action} · {line_count} 行 · {human_size(byte_len)}",
+            )
 
         except Exception as e:
-            return ToolResult(ok=False, output=f"写入文件失败: {e}")
+            return ToolResult(ok=False, output=f"写入文件失败: {e}", summary="写入失败")

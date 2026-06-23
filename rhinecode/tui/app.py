@@ -323,11 +323,15 @@ class RhineApp(App):
         """
         把工具结果压缩为单行摘要，用于工具行的终态展示。
 
-        取结果文本首个非空行并限制长度，避免长输出（如整文件内容）撑爆单行。
+        优先使用工具自带的 summary（贴合各工具语义，如「读取 152 行 · 4.2K」）；
+        工具未提供 summary 时，回退到取 output 首个非空行并截断，避免长输出撑爆单行。
 
         :param res: tools.base.ToolResult
         :returns: 单行摘要
         """
+        # 工具提供了专用摘要则直接采用（与回灌给模型的 output 解耦）
+        if getattr(res, "summary", ""):
+            return res.summary
         text = (res.output or "").strip()
         if not text:
             return "（无输出）" if res.ok else "（无错误信息）"

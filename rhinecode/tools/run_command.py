@@ -16,6 +16,30 @@ from rhinecode.tools.base import Tool, ToolResult
 # 定义为模块常量，便于后续统一调整；本章不暴露为 YAML 配置项。
 DEFAULT_TIMEOUT = 30
 
+# 输出截断保护：单路输出（stdout/stderr）行数超过 RUN_HEAD+RUN_TAIL 时，
+# 只保留前 RUN_HEAD 行与后 RUN_TAIL 行，中间以省略提示替代，避免长输出爆 token。
+RUN_HEAD = 30
+RUN_TAIL = 10
+
+
+def _clip(text: str) -> str:
+    """
+    对多行文本做「头+尾」截断保护。
+
+    行数不超过 RUN_HEAD+RUN_TAIL 时原样返回；否则取前 RUN_HEAD 行 +
+    省略中间行数的提示 + 后 RUN_TAIL 行。
+
+    :param text: 原始文本（如命令的 stdout）
+    :returns: 截断后的文本（必要时含「…（省略中间 k 行）…」提示）
+    """
+    lines = text.splitlines()
+    if len(lines) <= RUN_HEAD + RUN_TAIL:
+        return text
+    omitted = len(lines) - RUN_HEAD - RUN_TAIL
+    head = lines[:RUN_HEAD]
+    tail = lines[-RUN_TAIL:]
+    return "\n".join(head + [f"…（省略中间 {omitted} 行）…"] + tail)
+
 
 class RunCommandTool(Tool):
     """在项目工作目录下执行 shell 命令并返回输出。"""
@@ -60,7 +84,7 @@ class RunCommandTool(Tool):
         try:
             command = args.get("command")
             if not command:
-                return ToolResult(ok=False, output="缺少必填参数 command")
+                return ToolResult(ok=False, output="缺少必填参数 command", summary="缺少参数 command")
 
             timeout = args.get("timeout") or DEFAULT_TIMEOUT
 
@@ -73,21 +97,36 @@ class RunCommandTool(Tool):
                 timeout=timeout,
             )
 
-            # 把退出码与两路输出拼成对模型可读的结构化文本
-            parts = [f"退出码: {proc.returncode}"]
-            if proc.stdout:
-                parts.append(f"stdout:\n{proc.stdout}")
-            if proc.stderr:
-                parts.append(f"stderr:\n{proc.stderr}")
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            out_lines = len(stdout.splitlines())
+            err_lines = len(stderr.splitlines())
+
+            # 回显命令 + 退出码 + 截断保护后的两路输出，便于模型阅读且不爆 token
+            parts = [f"$ {command}", f"退出码: {proc.returncode}"]
+            if stdout:
+                parts.append(f"stdout（{out_lines} 行）:\n{_clip(stdout)}")
+            if stderr:
+                parts.append(f"stderr（{err_lines} 行）:\n{_clip(stderr)}")
             output = "\n".join(parts)
 
+            ok = proc.returncode == 0
+            if ok:
+                summary = f"退出码 0 · 输出 {out_lines} 行"
+            else:
+                # 失败时摘要带上首行 stderr，方便用户一眼看到原因
+                first_err = stderr.splitlines()[0] if stderr else ""
+                summary = f"退出码 {proc.returncode}" + (f" · {first_err}" if first_err else "")
+
             # 退出码非 0 视为命令失败（ok=False），但仍把完整输出回灌供模型判断
-            return ToolResult(ok=(proc.returncode == 0), output=output)
+            return ToolResult(ok=ok, output=output, summary=summary)
 
         except subprocess.TimeoutExpired:
+            t = args.get("timeout") or DEFAULT_TIMEOUT
             return ToolResult(
                 ok=False,
-                output=f"命令执行超时（超过 {args.get('timeout') or DEFAULT_TIMEOUT} 秒）已被终止。",
+                output=f"命令执行超时（超过 {t} 秒）已被终止。",
+                summary=f"超时（{t}s）",
             )
         except Exception as e:
-            return ToolResult(ok=False, output=f"命令执行失败: {e}")
+            return ToolResult(ok=False, output=f"命令执行失败: {e}", summary="执行失败")

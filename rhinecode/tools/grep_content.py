@@ -60,16 +60,16 @@ class GrepTool(Tool):
         try:
             pattern = args.get("pattern")
             if not pattern:
-                return ToolResult(ok=False, output="缺少必填参数 pattern")
+                return ToolResult(ok=False, output="缺少必填参数 pattern", summary="缺少参数 pattern")
 
             try:
                 regex = re.compile(pattern)
             except re.error as e:
-                return ToolResult(ok=False, output=f"正则表达式非法: {e}")
+                return ToolResult(ok=False, output=f"正则表达式非法: {e}", summary="正则非法")
 
             target = Path(os.path.abspath(args.get("path") or "."))
             if not target.exists():
-                return ToolResult(ok=False, output=f"路径不存在: {args.get('path')}")
+                return ToolResult(ok=False, output=f"路径不存在: {args.get('path')}", summary="路径不存在")
 
             base = Path.cwd()
             # 统一收集待搜索文件列表：文件直接加入，目录递归收集
@@ -83,7 +83,8 @@ class GrepTool(Tool):
                     for fn in filenames:
                         files.append(Path(root) / fn)
 
-            matches: list[str] = []
+            # 收集 (相对路径, 行号, 行内容) 三元组，保持遍历顺序，便于后续按文件分组
+            matches: list[tuple[str, int, str]] = []
             for fp in files:
                 if len(matches) >= MAX_MATCHES:
                     break
@@ -92,23 +93,37 @@ class GrepTool(Tool):
                         for lineno, line in enumerate(f, start=1):
                             if regex.search(line):
                                 try:
-                                    rel = fp.relative_to(base)
+                                    rel = str(fp.relative_to(base))
                                 except ValueError:
-                                    rel = fp
-                                matches.append(f"{rel}:{lineno}:{line.rstrip()}")
+                                    rel = str(fp)
+                                matches.append((rel, lineno, line.rstrip()))
                                 if len(matches) >= MAX_MATCHES:
                                     break
                 except (UnicodeDecodeError, OSError):
                     # 二进制文件、无权限文件等静默跳过，不影响整体搜索
                     continue
 
-            if not matches:
-                return ToolResult(ok=True, output=f"无匹配内容（模式: {pattern}）")
+            total = len(matches)
+            if total == 0:
+                return ToolResult(ok=True, output=f"无匹配内容（模式: {pattern}）", summary="无匹配")
 
-            output = "\n".join(matches)
-            if len(matches) >= MAX_MATCHES:
-                output += f"\n…（已达上限 {MAX_MATCHES} 条，可能还有更多）"
-            return ToolResult(ok=True, output=output)
+            file_count = len({rel for rel, _, _ in matches})
+            capped = total >= MAX_MATCHES
+
+            # 按文件分组输出：文件名独占一行，其下命中行以「行号│ 内容」缩进展示
+            lines_out: list[str] = [f"{total} 处匹配 · {file_count} 个文件"]
+            current = None
+            for rel, lineno, line in matches:
+                if rel != current:
+                    lines_out.append(rel)
+                    current = rel
+                lines_out.append(f"  {lineno}│ {line}")
+            if capped:
+                lines_out.append(f"…（已达上限 {MAX_MATCHES} 条，可能还有更多）")
+            output = "\n".join(lines_out)
+
+            summary = f"≥{MAX_MATCHES} 处（已截断）" if capped else f"{total} 处匹配 · {file_count} 个文件"
+            return ToolResult(ok=True, output=output, summary=summary)
 
         except Exception as e:
-            return ToolResult(ok=False, output=f"搜索内容失败: {e}")
+            return ToolResult(ok=False, output=f"搜索内容失败: {e}", summary="搜索失败")
