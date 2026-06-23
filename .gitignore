@@ -12,10 +12,3 @@ build/
 .venv/
 venv/
 env/
-
-# Claude Code 本地设置（含个人配置，不纳入版本管理）
-.claude
-CLAUDE.md
-
-# 开发文档
-/docs
