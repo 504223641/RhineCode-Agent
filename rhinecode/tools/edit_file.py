@@ -11,9 +11,8 @@ new_string，但要求 old_string 在文件中恰好出现一次。属于有副�
 两种情况都返回带出现次数的清晰错误，让模型补充更多上下文后重试（spec F4）。
 """
 
-import os
-
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
 
 # 成功后回显「变更附近」片段的最大行数，超过则截断，避免大段替换刷屏。
 EDIT_CONTEXT_MAX = 14
@@ -77,10 +76,10 @@ class EditFileTool(Tool):
             if new_string is None:
                 return ToolResult(ok=False, output="缺少必填参数 new_string", summary="缺少参数 new_string")
 
-            abs_path = os.path.abspath(path)
-            if not os.path.exists(abs_path):
+            abs_path = resolve_in_workspace(path)
+            if not abs_path.exists():
                 return ToolResult(ok=False, output=f"文件不存在: {path}", summary="文件不存在")
-            if os.path.isdir(abs_path):
+            if abs_path.is_dir():
                 return ToolResult(ok=False, output=f"路径是目录而非文件: {path}", summary="不是文件")
 
             with open(abs_path, "r", encoding="utf-8") as f:
@@ -120,6 +119,8 @@ class EditFileTool(Tool):
                 output=f"文件无法以 UTF-8 文本解码（可能是二进制文件）: {args.get('path')}",
                 summary="非文本文件",
             )
+        except PathGuardError as e:
+            return ToolResult(ok=False, output=str(e), summary="路径越界")
         except Exception as e:
             return ToolResult(ok=False, output=f"编辑文件失败: {e}", summary="编辑失败")
 

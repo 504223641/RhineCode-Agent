@@ -197,7 +197,7 @@ yield done
 
 **确认交互（满足 N7 不死锁）**：`_execute` 在 Worker 线程调用 `confirm_callback`；TUI 的 `_confirm_tool` 用 `self.call_from_thread(self.push_screen_wait, ConfirmScreen(tc, tool))` 把模态推到主线程并阻塞 Worker 直到用户选择，返回 True/False。主线程事件循环照常运行，不死锁。
 
-**实时计时（满足 F14/N3）**：计时不依赖 Worker。`tool_start` 时新建 `ToolCallWidget` 并在其 `on_mount` 用 `set_interval(1, self._tick)` 启动**主线程**秒级定时器，每秒刷新"执行中… Ns"（橘色）；Worker 此刻可能阻塞在工具执行/并发等待中，互不影响。`tool_result` 时调 `widget.finish(ok, summary)` 停止定时器并定色（成功绿 `✓`/失败红 `✗`），附最终耗时与结果摘要。工具行用 `tool_call.id` 关联，支持并发时多行各自计时。
+**实时计时（满足 F14/N3）**：计时不依赖 Worker。`tool_start` 时新建 `ToolCallWidget` 并在其 `on_mount` 用 `set_interval(1, self._tick)` 启动**主线程**秒级定时器，每秒刷新"执行中… Ns"（橘色）；Worker 此刻可能阻塞在工具执行/并发等待中，互不影响。`tool_result` 时调 `widget.finish(ok, summary)` 停止定时器并定色（成功绿 `●`/失败红 `●`），附最终耗时与结果摘要。工具行用 `tool_call.id` 关联，支持并发时多行各自计时。
 
 **TUI 组件新增（`tui/widgets.py`）**：
 - `ToolCallWidget(Static)`：自管理计时器的工具行；方法 `finish(ok, summary)`；橘色执行中 / 绿成功 / 红失败三态。

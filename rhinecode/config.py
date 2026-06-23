@@ -49,6 +49,11 @@ def load(path: str) -> Config:
             data = yaml.safe_load(f)
     except FileNotFoundError:
         raise FileNotFoundError(f"{path} 配置文件不存在")
+    except yaml.YAMLError as e:
+        raise ValueError(f"配置文件 YAML 解析失败 {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("顶层必须是 YAML 对象，且包含 protocol/model/base_url/api_key")
 
     # 逐字段校验，确保错误信息精确到具体缺失的字段，方便用户定位问题
     for field in ("protocol", "model", "base_url", "api_key"):

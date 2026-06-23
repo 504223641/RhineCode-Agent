@@ -58,8 +58,8 @@ class ToolCallWidget(Static):
 
     三种视觉状态：
     - 执行中：橘色，显示 "🔧 工具名(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
-    - 成功：绿色 "✓ 工具名(参数摘要) 完成 (Ns) — 结果摘要"
-    - 失败：红色 "✗ 工具名(参数摘要) 失败 (Ns) — 错误摘要"
+    - 成功：绿色 "● 工具名(参数摘要) 完成 (Ns) — 结果摘要"
+    - 失败：红色 "● 工具名(参数摘要) 失败 (Ns) — 错误摘要"
 
     计时不依赖 Worker 线程：on_mount 中用 set_interval 在主线程每秒触发 _tick，
     因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
@@ -112,7 +112,7 @@ class ToolCallWidget(Static):
             self._timer.stop()
         elapsed = self._elapsed()
         color = self._COLOR_OK if ok else self._COLOR_FAIL
-        icon = "✓" if ok else "✗"
+        icon = "●" if ok else "●"
         self.update(
             f"[{color}]{icon} {self._name}({self._args_summary}) "
             f"{'完成' if ok else '失败'} ({elapsed}s) — {summary}[/]"
@@ -230,7 +230,7 @@ class HistoryView(ScrollableContainer):
 
     def append_error(self, text: str) -> None:
         """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
-        self._add_widget(f"[bold red]✗ 错误：{text}[/bold red]")
+        self._add_widget(f"[bold red]● 错误：{text}[/bold red]")
 
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""

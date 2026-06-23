@@ -103,6 +103,8 @@ class RhineApp(App):
         # 进行中时为 {"event": threading.Event, "result": bool}，由 _confirm_tool 在
         # Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
         self._pending_confirm: dict | None = None
+        # 单轮流式锁：避免多个 Worker 同时修改同一份 conversation history。
+        self._stream_active = False
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载五个面板。"""
@@ -198,6 +200,8 @@ class RhineApp(App):
         # 工具确认进行中：忽略普通输入提交（确认通过面板自身的选择/取消完成）
         if self._pending_confirm is not None:
             return
+        if self._stream_active:
+            return
         panel = self.query_one(CommandPanel)
 
         # 若面板有高亮条目，Enter 确认该命令，忽略输入框中的前缀文本（如 "/th"）
@@ -229,12 +233,25 @@ class RhineApp(App):
                 self._refresh_status()
         else:
             # 普通消息：在独立线程中消费流式生成器，避免阻塞 UI 主线程
-            # exclusive=False 允许多个 Worker 并发（极少出现，但保持健壮性）
+            # 同一时间只允许一轮对话，避免多个 Worker 并发写入共享 history。
+            self._set_streaming(True)
             self.run_worker(
                 lambda: self._do_stream(result),
                 thread=True,
-                exclusive=False,
+                exclusive=True,
             )
+
+    def _set_streaming(self, active: bool) -> None:
+        """
+        切换流式回复忙碌状态。
+
+        忙碌期间禁用输入框，防止用户提交第二轮请求导致共享 history 与确认弹窗状态交错。
+        """
+        self._stream_active = active
+        input_bar = self.query_one(InputBar)
+        input_bar.disabled = active
+        if not active:
+            input_bar.focus()
 
     def _do_stream(self, gen) -> None:
         """
@@ -262,61 +279,64 @@ class RhineApp(App):
         # 工具行按 tool_call.id 关联：tool_start 创建、tool_result 终结同一行
         tool_widgets: dict = {}
 
-        for chunk in gen:
-            if chunk.type == "thinking":
-                # 首个思考块到来时，在主线程创建占位组件并获取其引用
-                if thinking_widget is None:
-                    thinking_widget = self.call_from_thread(history_view.begin_thinking_turn)
-                thinking_chunks.append(chunk.content)
-                # 每次以完整内容更新组件（而非追加），保证渲染正确
-                self.call_from_thread(
-                    history_view.update_widget,
-                    thinking_widget,
-                    f"[dim italic]💭 {''.join(thinking_chunks)}[/dim italic]",
-                )
+        try:
+            for chunk in gen:
+                if chunk.type == "thinking":
+                    # 首个思考块到来时，在主线程创建占位组件并获取其引用
+                    if thinking_widget is None:
+                        thinking_widget = self.call_from_thread(history_view.begin_thinking_turn)
+                    thinking_chunks.append(chunk.content)
+                    # 每次以完整内容更新组件（而非追加），保证渲染正确
+                    self.call_from_thread(
+                        history_view.update_widget,
+                        thinking_widget,
+                        f"[dim italic]💭 {''.join(thinking_chunks)}[/dim italic]",
+                    )
 
-            elif chunk.type == "text":
-                # 首个文本块到来时，创建 AI 回复占位组件
-                if response_widget is None:
-                    response_widget = self.call_from_thread(history_view.begin_assistant_turn)
-                response_chunks.append(chunk.content)
-                # 使用 update_ai_widget 渲染 Markdown，支持代码块、标题、列表等格式
-                self.call_from_thread(
-                    history_view.update_ai_widget,
-                    response_widget,
-                    ''.join(response_chunks),
-                )
+                elif chunk.type == "text":
+                    # 首个文本块到来时，创建 AI 回复占位组件
+                    if response_widget is None:
+                        response_widget = self.call_from_thread(history_view.begin_assistant_turn)
+                    response_chunks.append(chunk.content)
+                    # 使用 update_ai_widget 渲染 Markdown，支持代码块、标题、列表等格式
+                    self.call_from_thread(
+                        history_view.update_ai_widget,
+                        response_widget,
+                        ''.join(response_chunks),
+                    )
 
-            elif chunk.type == "tool_start":
-                # 工具开始执行：新建橘色工具行并自动开始计时。
-                # 同时重置正文/思考占位组件，使后续（第二轮）文本另起新组件、
-                # 排在工具行之后，避免把第二轮回答并入第一轮的前言组件。
-                response_widget = None
-                response_chunks = []
-                thinking_widget = None
-                thinking_chunks = []
-                tc = chunk.tool_call
-                widget = self.call_from_thread(history_view.add_tool_widget, tc)
-                tool_widgets[tc.id] = widget
-
-            elif chunk.type == "tool_result":
-                # 工具执行完成：停止计时并将工具行定色（绿/红）+ 结果摘要。
-                tc = chunk.tool_call
-                res = chunk.tool_result
-                widget = tool_widgets.get(tc.id)
-                # 拒绝执行等情况只发 tool_result（无 tool_start），此时补建一行再终结
-                if widget is None:
+                elif chunk.type == "tool_start":
+                    # 工具开始执行：新建橘色工具行并自动开始计时。
+                    # 同时重置正文/思考占位组件，使后续（第二轮）文本另起新组件、
+                    # 排在工具行之后，避免把第二轮回答并入第一轮的前言组件。
+                    response_widget = None
+                    response_chunks = []
+                    thinking_widget = None
+                    thinking_chunks = []
+                    tc = chunk.tool_call
                     widget = self.call_from_thread(history_view.add_tool_widget, tc)
                     tool_widgets[tc.id] = widget
-                self.call_from_thread(widget.finish, res.ok, self._summarize_result(res))
 
-            elif chunk.type == "error":
-                # API 错误或网络异常，以红色显示，程序继续运行
-                self.call_from_thread(history_view.append_error, chunk.content)
+                elif chunk.type == "tool_result":
+                    # 工具执行完成：停止计时并将工具行定色（绿/红）+ 结果摘要。
+                    tc = chunk.tool_call
+                    res = chunk.tool_result
+                    widget = tool_widgets.get(tc.id)
+                    # 拒绝执行等情况只发 tool_result（无 tool_start），此时补建一行再终结
+                    if widget is None:
+                        widget = self.call_from_thread(history_view.add_tool_widget, tc)
+                        tool_widgets[tc.id] = widget
+                    self.call_from_thread(widget.finish, res.ok, self._summarize_result(res))
 
-            elif chunk.type == "done":
-                # 流正常结束，ConversationManager 已在 _stream() 中将回复追加到 history
-                pass
+                elif chunk.type == "error":
+                    # API 错误或网络异常，以红色显示，程序继续运行
+                    self.call_from_thread(history_view.append_error, chunk.content)
+
+                elif chunk.type == "done":
+                    # 流正常结束，ConversationManager 已在 _stream() 中将回复追加到 history
+                    pass
+        finally:
+            self.call_from_thread(self._set_streaming, False)
 
     @staticmethod
     def _summarize_result(res) -> str:

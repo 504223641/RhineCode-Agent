@@ -192,6 +192,7 @@ class ConversationManager:
                 pass
             elif chunk.type == "error":
                 yield chunk
+                return
             elif chunk.type == "done":
                 pass
 
@@ -325,10 +326,14 @@ class ConversationManager:
             yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
             return
 
-        # 执行前确认；回调缺省（None）时默认放行（TUI 始终会注入回调）
-        approved = True
-        if self.confirm_callback is not None:
-            approved = self.confirm_callback(tc, tool)
+        # 执行前确认采用 fail-closed：没有确认回调时绝不执行有副作用工具。
+        if self.confirm_callback is None:
+            res = ToolResult(ok=False, output="缺少执行前确认回调，已拒绝执行该工具。", summary="未确认，已拒绝")
+            results[tc.id] = res
+            yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
+            return
+
+        approved = self.confirm_callback(tc, tool)
 
         if not approved:
             # 用户拒绝：不执行，回灌结构化结果让模型据此回答；只展示结果行（无执行中）

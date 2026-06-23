@@ -5,9 +5,8 @@
 执行前不需用户确认，且可与其他只读工具并发执行。
 """
 
-import os
-
 from rhinecode.tools.base import Tool, ToolResult, human_size
+from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
 
 
 class ReadFileTool(Tool):
@@ -53,12 +52,12 @@ class ReadFileTool(Tool):
             if not path:
                 return ToolResult(ok=False, output="缺少必填参数 path", summary="缺少参数 path")
 
-            # 相对路径以当前工作目录为基准，保证与命令执行、glob/grep 一致
-            abs_path = os.path.abspath(path)
+            # 只读工具不经过确认，因此必须先把路径钉死在项目工作目录内。
+            abs_path = resolve_in_workspace(path)
 
-            if not os.path.exists(abs_path):
+            if not abs_path.exists():
                 return ToolResult(ok=False, output=f"文件不存在: {path}", summary="文件不存在")
-            if os.path.isdir(abs_path):
+            if abs_path.is_dir():
                 return ToolResult(ok=False, output=f"路径是目录而非文件: {path}", summary="不是文件")
 
             with open(abs_path, "r", encoding="utf-8") as f:
@@ -88,6 +87,8 @@ class ReadFileTool(Tool):
                 output=f"文件无法以 UTF-8 文本解码（可能是二进制文件）: {args.get('path')}",
                 summary="非文本文件",
             )
+        except PathGuardError as e:
+            return ToolResult(ok=False, output=str(e), summary="路径越界")
         except Exception as e:
             # 兜底：权限不足等其他异常统一转结构化错误，绝不向上抛出
             return ToolResult(ok=False, output=f"读取文件失败: {e}", summary="读取失败")

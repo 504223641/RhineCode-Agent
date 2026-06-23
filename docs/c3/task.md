@@ -96,7 +96,7 @@
 ## T9: TUI 工具组件
 **文件：** `rhinecode/tui/widgets.py` | **依赖：** T1
 **步骤：**
-1. `ToolCallWidget(Static)`：保存 tool_call、`on_mount` 起 `set_interval(1, self._tick)` 显示橘色"执行中… Ns"；`finish(ok, summary)` 停 timer、定色（绿✓/红✗）+ 耗时+摘要。
+1. `ToolCallWidget(Static)`：保存 tool_call、`on_mount` 起 `set_interval(1, self._tick)` 显示橘色"执行中… Ns"；`finish(ok, summary)` 停 timer、定色（绿●/红●）+ 耗时+摘要。
 2. `HistoryView.add_tool_widget(tool_call)`：挂载并返回 `ToolCallWidget`。
 3. `ConfirmScreen(ModalScreen[bool])`：展示工具名+关键参数；`y/enter`→`dismiss(True)`，`n/escape`→`dismiss(False)`。
 

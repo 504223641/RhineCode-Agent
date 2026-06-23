@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace, workspace_root
 
 # 返回的最大命中行数，避免超长结果。
 MAX_MATCHES = 200
@@ -67,21 +68,35 @@ class GrepTool(Tool):
             except re.error as e:
                 return ToolResult(ok=False, output=f"正则表达式非法: {e}", summary="正则非法")
 
-            target = Path(os.path.abspath(args.get("path") or "."))
+            target = resolve_in_workspace(args.get("path") or ".")
             if not target.exists():
                 return ToolResult(ok=False, output=f"路径不存在: {args.get('path')}", summary="路径不存在")
 
-            base = Path.cwd()
+            base = workspace_root()
             # 统一收集待搜索文件列表：文件直接加入，目录递归收集
             files: list[Path] = []
             if target.is_file():
                 files = [target]
             else:
                 for root, dirs, filenames in os.walk(target):
-                    # 原地修改 dirs 以阻止 os.walk 进入被跳过的目录
-                    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                    # 原地修改 dirs：跳过噪声目录，并防止符号链接或异常路径越过工作区。
+                    safe_dirs = []
+                    for d in dirs:
+                        if d in SKIP_DIRS:
+                            continue
+                        child = Path(root) / d
+                        try:
+                            resolve_in_workspace(str(child))
+                        except PathGuardError:
+                            continue
+                        safe_dirs.append(d)
+                    dirs[:] = safe_dirs
                     for fn in filenames:
-                        files.append(Path(root) / fn)
+                        fp = Path(root) / fn
+                        try:
+                            files.append(resolve_in_workspace(str(fp)))
+                        except PathGuardError:
+                            continue
 
             # 收集 (相对路径, 行号, 行内容) 三元组，保持遍历顺序，便于后续按文件分组
             matches: list[tuple[str, int, str]] = []
@@ -125,5 +140,7 @@ class GrepTool(Tool):
             summary = f"≥{MAX_MATCHES} 处（已截断）" if capped else f"{total} 处匹配 · {file_count} 个文件"
             return ToolResult(ok=True, output=output, summary=summary)
 
+        except PathGuardError as e:
+            return ToolResult(ok=False, output=str(e), summary="路径越界")
         except Exception as e:
             return ToolResult(ok=False, output=f"搜索内容失败: {e}", summary="搜索失败")

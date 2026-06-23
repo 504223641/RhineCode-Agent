@@ -5,9 +5,8 @@
 （read_only=False），执行前需用户确认，且不与其他工具并发执行（串行）。
 """
 
-import os
-
 from rhinecode.tools.base import Tool, ToolResult, human_size
+from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
 
 
 class WriteFileTool(Tool):
@@ -57,15 +56,13 @@ class WriteFileTool(Tool):
             if content is None:
                 return ToolResult(ok=False, output="缺少必填参数 content", summary="缺少参数 content")
 
-            abs_path = os.path.abspath(path)
+            abs_path = resolve_in_workspace(path)
 
             # 写入前判断，区分新建/覆盖（写入后再判断就分不清了）
-            existed = os.path.exists(abs_path)
+            existed = abs_path.exists()
 
             # 父目录缺失时递归创建，避免因目录不存在导致写入失败
-            parent = os.path.dirname(abs_path)
-            if parent and not os.path.exists(parent):
-                os.makedirs(parent, exist_ok=True)
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -81,5 +78,7 @@ class WriteFileTool(Tool):
                 summary=f"{action} · {line_count} 行 · {human_size(byte_len)}",
             )
 
+        except PathGuardError as e:
+            return ToolResult(ok=False, output=str(e), summary="路径越界")
         except Exception as e:
             return ToolResult(ok=False, output=f"写入文件失败: {e}", summary="写入失败")

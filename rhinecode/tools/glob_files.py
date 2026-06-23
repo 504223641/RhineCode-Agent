@@ -5,9 +5,13 @@
 （read_only=True），不需确认且可并发执行。
 """
 
-from pathlib import Path
-
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.path_guard import (
+    PathGuardError,
+    resolve_in_workspace,
+    validate_glob_pattern,
+    workspace_root,
+)
 
 # 返回的最大匹配文件数，避免在大型仓库中产出超长结果撑爆上下文。
 MAX_RESULTS = 200
@@ -52,13 +56,18 @@ class GlobTool(Tool):
             if not pattern:
                 return ToolResult(ok=False, output="缺少必填参数 pattern", summary="缺少参数 pattern")
 
-            base = Path.cwd()
+            validate_glob_pattern(pattern)
+            base = workspace_root()
             # 仅保留文件、排除目录；转为相对工作目录的路径，便于模型理解与后续操作
-            matches = [
-                str(p.relative_to(base))
-                for p in sorted(base.glob(pattern))
-                if p.is_file()
-            ]
+            matches = []
+            for p in sorted(base.glob(pattern)):
+                if not p.is_file():
+                    continue
+                try:
+                    resolve_in_workspace(str(p))
+                except PathGuardError:
+                    continue
+                matches.append(str(p.relative_to(base)))
 
             total = len(matches)
             if total == 0:
@@ -74,5 +83,7 @@ class GlobTool(Tool):
                 summary = f"找到 {total} 个文件"
             return ToolResult(ok=True, output=output, summary=summary)
 
+        except PathGuardError as e:
+            return ToolResult(ok=False, output=str(e), summary="路径越界")
         except Exception as e:
             return ToolResult(ok=False, output=f"查找文件失败: {e}", summary="查找失败")
