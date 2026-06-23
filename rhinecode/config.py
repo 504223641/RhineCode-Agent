@@ -48,12 +48,12 @@ def load(path: str) -> Config:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except FileNotFoundError:
-        raise FileNotFoundError(f"配置文件不存在：{path}")
+        raise FileNotFoundError(f"{path} 配置文件不存在")
 
     # 逐字段校验，确保错误信息精确到具体缺失的字段，方便用户定位问题
     for field in ("protocol", "model", "base_url", "api_key"):
         if not data.get(field):
-            raise ValueError(f"配置文件缺少必填字段：{field}")
+            raise ValueError(f"配置文件缺少必填字段 {field}")
 
     return Config(
         protocol=data["protocol"],

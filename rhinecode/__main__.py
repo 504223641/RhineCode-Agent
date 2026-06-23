@@ -33,7 +33,7 @@ def main() -> None:
 
     异常处理：
     - FileNotFoundError：配置文件路径不存在
-    - ValueError：配置文件缺少必填字段
+    - ValueError：配置文件缺少必填字段，或 Provider 配置无效
     两种情况均打印可读错误信息后 sys.exit(1)，不向用户暴露堆栈。
     """
     parser = argparse.ArgumentParser(description="RhineCode - 终端 AI 编程助手")
@@ -47,8 +47,14 @@ def main() -> None:
         print(f"配置错误：{e}", file=sys.stderr)
         sys.exit(1)
 
+    # 根据配置创建模型 Provider。
+    try:
+        provider = create_provider(cfg)
+    except ValueError as e:
+        print(f"Provider 初始化错误：{e}", file=sys.stderr)
+        sys.exit(1)
+
     # 依次构建各层组件，层间通过依赖注入解耦
-    provider = create_provider(cfg)
     manager = ConversationManager(provider, cfg.protocol)
     app = RhineApp(manager, cfg)
     app.run()

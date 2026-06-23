@@ -33,4 +33,4 @@ def create_provider(config: Config) -> BaseProvider:
         # DeepSeek 与 OpenAI API 完全兼容，通过 base_url 区分请求目标
         return DeepSeekProvider(config)
     else:
-        raise ValueError(f"不支持的 protocol：{config.protocol}，支持的值：anthropic / openai / deepseek")
+        raise ValueError(f"无效供应商 {config.protocol}，目前仅支持 anthropic / openai / deepseek")
