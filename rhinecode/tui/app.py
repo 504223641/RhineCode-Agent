@@ -15,6 +15,8 @@ RhineApp 是 TUI 层的核心，负责：
   调度回主线程，保证线程安全。
 """
 
+import threading
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import Key
@@ -23,7 +25,7 @@ from textual.widgets import Static, Input
 from rhinecode.config import Config
 from rhinecode.conversation import ConversationManager
 from rhinecode.provider.base import StreamChunk
-from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar, CommandPanel
+from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar, CommandPanel, ConfirmScreen
 
 
 class RhineApp(App):
@@ -102,6 +104,9 @@ class RhineApp(App):
         query_one() 可以安全地查找到子组件。
         """
         self._refresh_status()
+        # 注入执行前确认回调：协调层在执行有副作用工具前会调用它弹出确认框。
+        # 此处把 TUI 的 _confirm_tool 绑定给协调层，使协调层不感知 Textual 细节。
+        self._manager.confirm_callback = self._confirm_tool
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
 
@@ -232,6 +237,8 @@ class RhineApp(App):
         thinking_chunks: list[str] = []
         response_widget: Static | None = None
         response_chunks: list[str] = []
+        # 工具行按 tool_call.id 关联：tool_start 创建、tool_result 终结同一行
+        tool_widgets: dict = {}
 
         for chunk in gen:
             if chunk.type == "thinking":
@@ -258,6 +265,29 @@ class RhineApp(App):
                     ''.join(response_chunks),
                 )
 
+            elif chunk.type == "tool_start":
+                # 工具开始执行：新建橘色工具行并自动开始计时。
+                # 同时重置正文/思考占位组件，使后续（第二轮）文本另起新组件、
+                # 排在工具行之后，避免把第二轮回答并入第一轮的前言组件。
+                response_widget = None
+                response_chunks = []
+                thinking_widget = None
+                thinking_chunks = []
+                tc = chunk.tool_call
+                widget = self.call_from_thread(history_view.add_tool_widget, tc)
+                tool_widgets[tc.id] = widget
+
+            elif chunk.type == "tool_result":
+                # 工具执行完成：停止计时并将工具行定色（绿/红）+ 结果摘要。
+                tc = chunk.tool_call
+                res = chunk.tool_result
+                widget = tool_widgets.get(tc.id)
+                # 拒绝执行等情况只发 tool_result（无 tool_start），此时补建一行再终结
+                if widget is None:
+                    widget = self.call_from_thread(history_view.add_tool_widget, tc)
+                    tool_widgets[tc.id] = widget
+                self.call_from_thread(widget.finish, res.ok, self._summarize_result(res))
+
             elif chunk.type == "error":
                 # API 错误或网络异常，以红色显示，程序继续运行
                 self.call_from_thread(history_view.append_error, chunk.content)
@@ -265,3 +295,53 @@ class RhineApp(App):
             elif chunk.type == "done":
                 # 流正常结束，ConversationManager 已在 _stream() 中将回复追加到 history
                 pass
+
+    @staticmethod
+    def _summarize_result(res) -> str:
+        """
+        把工具结果压缩为单行摘要，用于工具行的终态展示。
+
+        取结果文本首个非空行并限制长度，避免长输出（如整文件内容）撑爆单行。
+
+        :param res: tools.base.ToolResult
+        :returns: 单行摘要
+        """
+        text = (res.output or "").strip()
+        if not text:
+            return "（无输出）" if res.ok else "（无错误信息）"
+        first_line = text.splitlines()[0]
+        if len(first_line) > 80:
+            first_line = first_line[:80] + "…"
+        return first_line
+
+    def _confirm_tool(self, tool_call, tool) -> bool:
+        """
+        协调层执行有副作用工具前的确认回调（在 Worker 线程被调用）。
+
+        实现要点（保证 N7 不死锁）：
+        - 用 call_from_thread 在主线程 push_screen 弹出 ConfirmScreen，并传入回调收集结果
+        - 用 threading.Event 阻塞当前 Worker 线程，直到用户在主线程做出选择
+        - 主线程事件循环不被阻塞，UI（含其它工具行的计时）照常刷新
+
+        采用 push_screen + 回调 + Event 而非 push_screen_wait，是因为 push_screen_wait
+        需在 worker 协程上下文中 await，而此处是线程 Worker，用 Event 同步更稳妥。
+
+        :param tool_call: provider.base.ToolCall
+        :param tool: tools.base.Tool
+        :returns: True 用户允许执行 / False 用户拒绝
+
+        副作用：在主线程弹出模态屏并等待用户交互。
+        """
+        done = threading.Event()
+        # 用单元素列表在闭包中回传结果（默认 False，异常或未选时按拒绝处理）
+        outcome = [False]
+
+        def on_dismiss(approved: bool) -> None:
+            outcome[0] = bool(approved)
+            done.set()
+
+        # 在主线程推送模态屏；dismiss 时回调 on_dismiss 收集结果
+        self.call_from_thread(self.push_screen, ConfirmScreen(tool_call, tool), on_dismiss)
+        # 阻塞 Worker 线程直到用户选择完成（主线程不受影响）
+        done.wait()
+        return outcome[0]

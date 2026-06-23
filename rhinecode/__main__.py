@@ -18,6 +18,7 @@ import sys
 from rhinecode.config import load
 from rhinecode.provider.factory import create_provider
 from rhinecode.conversation import ConversationManager
+from rhinecode.tools.registry import ToolRegistry
 from rhinecode.tui.app import RhineApp
 
 
@@ -54,8 +55,12 @@ def main() -> None:
         print(f"Provider 初始化错误：{e}", file=sys.stderr)
         sys.exit(1)
 
+    # 构建工具注册中心（含 6 个核心工具），注入协调层以启用工具能力。
+    # 工具仅在 DeepSeek 协议下实际生效，其余协议下协调层会自动忽略（见 ConversationManager）。
+    registry = ToolRegistry.default()
+
     # 依次构建各层组件，层间通过依赖注入解耦
-    manager = ConversationManager(provider, cfg.protocol)
+    manager = ConversationManager(provider, cfg.protocol, registry)
     app = RhineApp(manager, cfg)
     app.run()
 

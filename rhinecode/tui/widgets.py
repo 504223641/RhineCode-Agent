@@ -14,14 +14,110 @@ TUI 组件模块，定义四个自定义 Textual Widget。
   配合 call_from_thread 即可实现从 Worker 线程安全地驱动 UI 更新。
 """
 
+from time import monotonic
+
 from rich.console import Group as RichGroup
 from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text as RichText
 from textual.app import ComposeResult
-from textual.widgets import Static, Input, OptionList
+from textual.binding import Binding
+from textual.screen import ModalScreen
+from textual.widgets import Static, Input, OptionList, Button, Label
 from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
+
+
+def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
+    """
+    把工具调用参数压缩成单行摘要，用于工具行与确认框展示。
+
+    取每个参数 "键=值" 拼接，值过长则截断，整体再做长度上限截断，
+    目的是让用户一眼看清工具将操作什么（如 path=...），而非展示完整内容。
+
+    :param arguments: 解析后的参数字典；None（解析失败）时返回占位提示
+    :param max_len: 摘要最大长度，超出截断
+    :returns: 单行参数摘要字符串
+    """
+    if arguments is None:
+        return "<参数解析失败>"
+    parts = []
+    for key, value in arguments.items():
+        text = str(value).replace("\n", " ")
+        if len(text) > 30:
+            text = text[:30] + "…"
+        parts.append(f"{key}={text}")
+    summary = ", ".join(parts)
+    if len(summary) > max_len:
+        summary = summary[:max_len] + "…"
+    return summary
+
+
+class ToolCallWidget(Static):
+    """
+    单个工具调用的展示行，自管理执行计时。
+
+    三种视觉状态：
+    - 执行中：橘色，显示 "🔧 工具名(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
+    - 成功：绿色 "✓ 工具名(参数摘要) 完成 (Ns) — 结果摘要"
+    - 失败：红色 "✗ 工具名(参数摘要) 失败 (Ns) — 错误摘要"
+
+    计时不依赖 Worker 线程：on_mount 中用 set_interval 在主线程每秒触发 _tick，
+    因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
+    """
+
+    # 执行中橘色 / 成功绿色 / 失败红色
+    _COLOR_RUNNING = "#FFA500"
+    _COLOR_OK = "#5FD75F"
+    _COLOR_FAIL = "#FF5F5F"
+
+    def __init__(self, tool_call) -> None:
+        """
+        :param tool_call: provider.base.ToolCall，提供工具名与参数用于展示
+        """
+        super().__init__(markup=True)
+        self._name = tool_call.name
+        self._args_summary = summarize_args(tool_call.arguments)
+        self._start = 0.0
+        self._timer = None  # set_interval 返回的定时器，finish 时停止
+
+    def on_mount(self) -> None:
+        """挂载后记录起始时刻、立即渲染 0s，并启动每秒刷新的主线程定时器。"""
+        self._start = monotonic()
+        self._render_running()
+        # 每秒刷新一次耗时显示；定时器运行在主线程事件循环，不占用 Worker
+        self._timer = self.set_interval(1.0, self._render_running)
+
+    def _elapsed(self) -> int:
+        """返回从开始执行到现在的整数秒数。"""
+        return int(monotonic() - self._start)
+
+    def _render_running(self) -> None:
+        """以橘色渲染执行中状态，显示当前已耗时。"""
+        self.update(
+            f"[{self._COLOR_RUNNING}]🔧 {self._name}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
+        )
+
+    def finish(self, ok: bool, summary: str) -> None:
+        """
+        结束计时并切换到成功/失败终态。
+
+        由 TUI 的 Worker 通过 call_from_thread 在主线程调用，线程安全。
+
+        :param ok: 工具是否成功（决定绿/红与图标）
+        :param summary: 结果摘要文本（已由调用方取首行/截断）
+
+        副作用：停止计时定时器，原地更新本行内容。
+        """
+        if self._timer is not None:
+            self._timer.stop()
+        elapsed = self._elapsed()
+        color = self._COLOR_OK if ok else self._COLOR_FAIL
+        icon = "✓" if ok else "✗"
+        self.update(
+            f"[{color}]{icon} {self._name}({self._args_summary}) "
+            f"{'完成' if ok else '失败'} ({elapsed}s) — {summary}[/]"
+        )
 
 
 class HistoryView(ScrollableContainer):
@@ -112,6 +208,22 @@ class HistoryView(ScrollableContainer):
         # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable
         widget.update(RichGroup(label, body))
         self.scroll_end(animate=False)
+
+    def add_tool_widget(self, tool_call) -> "ToolCallWidget":
+        """
+        在历史区末尾挂载一个工具调用展示行（ToolCallWidget），返回其引用。
+
+        Worker 线程在收到 tool_start 时通过 call_from_thread 调用本方法创建工具行
+        （此时即开始橘色计时）；收到 tool_result 时再对返回的引用调用 finish() 定色。
+
+        :param tool_call: provider.base.ToolCall，用于初始化展示内容
+        :returns: 新建的 ToolCallWidget，供后续 finish() 更新
+        """
+        container = self.query_one("#history-messages", Vertical)
+        widget = ToolCallWidget(tool_call)
+        container.mount(widget)
+        self.scroll_end(animate=False)
+        return widget
 
     def append_system(self, text: str) -> None:
         """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
@@ -229,3 +341,90 @@ class StatusBar(Static):
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
         self.update(f" [{provider}] {model} | 思考模式：{state} ")
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """
+    工具执行前的 Yes/No 确认模态屏。
+
+    用于写文件、改文件、执行命令等有副作用工具：展示工具名与关键参数摘要，
+    让用户决定是否放行。`dismiss(True/False)` 返回结果，供协调层据此执行或拒绝。
+
+    操作方式：
+    - 点击「执行」按钮 / 按 y / 按 Enter → dismiss(True)
+    - 点击「取消」按钮 / 按 n / 按 Esc   → dismiss(False)
+
+    ModalScreen[bool] 的类型参数表明 dismiss 返回布尔值。
+    """
+
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen > Vertical {
+        width: 70;
+        height: auto;
+        max-height: 20;
+        border: thick #FFA500 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    ConfirmScreen #confirm-title {
+        text-style: bold;
+        color: #FFA500;
+        margin-bottom: 1;
+    }
+    ConfirmScreen #confirm-detail {
+        margin-bottom: 1;
+    }
+    ConfirmScreen #confirm-buttons {
+        height: auto;
+        align: right middle;
+    }
+    ConfirmScreen Button {
+        margin-left: 2;
+    }
+    """
+
+    BINDINGS = [
+        # 键盘快捷确认/取消，无需移动焦点到按钮
+        Binding("y", "approve", "执行", show=False),
+        Binding("enter", "approve", "执行", show=False),
+        Binding("n", "reject", "取消", show=False),
+        Binding("escape", "reject", "取消", show=False),
+    ]
+
+    def __init__(self, tool_call, tool) -> None:
+        """
+        :param tool_call: provider.base.ToolCall，提供工具名与参数
+        :param tool: tools.base.Tool，提供面向用户的工具描述
+        """
+        super().__init__()
+        self._tool_name = tool_call.name
+        self._tool_desc = getattr(tool, "description", "")
+        self._args_summary = summarize_args(tool_call.arguments, max_len=200)
+
+    def compose(self) -> ComposeResult:
+        """构建确认对话框：标题、工具与参数详情、执行/取消按钮。"""
+        with Vertical():
+            yield Label("⚠ 需要确认：该工具有副作用", id="confirm-title")
+            yield Static(
+                f"工具：{self._tool_name}\n参数：{self._args_summary}",
+                id="confirm-detail",
+                markup=False,
+            )
+            with Vertical(id="confirm-buttons"):
+                yield Button("执行 (Y)", variant="warning", id="confirm-yes")
+                yield Button("取消 (N)", variant="default", id="confirm-no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """按钮点击：依据按钮 id 决定放行或拒绝。"""
+        self.dismiss(event.button.id == "confirm-yes")
+
+    def action_approve(self) -> None:
+        """键盘放行（y/Enter）。"""
+        self.dismiss(True)
+
+    def action_reject(self) -> None:
+        """键盘拒绝（n/Esc）。"""
+        self.dismiss(False)

@@ -7,7 +7,7 @@ OpenAI Provider 实现。
 依赖：openai>=1.50.0（在 pyproject.toml 中声明）
 """
 
-from typing import Iterator
+from typing import Iterator, Optional
 import openai
 
 from rhinecode.config import Config
@@ -39,6 +39,7 @@ class OpenAIProvider(BaseProvider):
         self,
         messages: list[Message],
         thinking_effort: str = "off",
+        tools: Optional[list[dict]] = None,
     ) -> Iterator[StreamChunk]:
         """
         向 OpenAI API 发起流式对话请求，逐块产出 StreamChunk。
@@ -52,6 +53,8 @@ class OpenAIProvider(BaseProvider):
 
         :param messages: 完整对话历史（含本轮用户消息）
         :param thinking_effort: OpenAI 协议不支持思考模式，传入后直接忽略
+        :param tools: 工具描述列表；本章不为 OpenAI 实现工具调用，传入后直接忽略
+                      （保留参数仅为与 BaseProvider 接口一致）
         :returns: StreamChunk 迭代器
 
         副作用：发起 HTTPS 请求，消耗 OpenAI token 配额。
