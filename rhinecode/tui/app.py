@@ -251,10 +251,11 @@ class RhineApp(App):
                 if response_widget is None:
                     response_widget = self.call_from_thread(history_view.begin_assistant_turn)
                 response_chunks.append(chunk.content)
+                # 使用 update_ai_widget 渲染 Markdown，支持代码块、标题、列表等格式
                 self.call_from_thread(
-                    history_view.update_widget,
+                    history_view.update_ai_widget,
                     response_widget,
-                    f"[bold #CCFF99]Rhine[/bold #CCFF99] {''.join(response_chunks)}",
+                    ''.join(response_chunks),
                 )
 
             elif chunk.type == "error":

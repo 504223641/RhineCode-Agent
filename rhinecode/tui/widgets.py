@@ -14,6 +14,9 @@ TUI 组件模块，定义四个自定义 Textual Widget。
   配合 call_from_thread 即可实现从 Worker 线程安全地驱动 UI 更新。
 """
 
+from rich.console import Group as RichGroup
+from rich.markdown import Markdown as RichMarkdown
+from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.widgets import Static, Input, OptionList
 from textual.widgets.option_list import Option
@@ -88,6 +91,26 @@ class HistoryView(ScrollableContainer):
         :param markup: 新的 Rich markup 内容（完整替换，非追加）
         """
         widget.update(markup)
+        self.scroll_end(animate=False)
+
+    def update_ai_widget(self, widget: Static, content: str) -> None:
+        """
+        原地更新 AI 回复组件，将 content 作为 Markdown 渲染并滚动到底部。
+
+        与 update_widget() 不同，此方法使用 Rich Markdown 渲染器，
+        支持代码块语法高亮、标题、粗体、斜体、列表、表格等 Markdown 格式。
+        "Rhine" 前缀以青绿色粗体单独渲染，正文内容整体作为 Markdown 文档渲染，
+        两者通过 RichGroup 纵向组合后传给 Static.update()。
+
+        此方法在 Worker 线程中通过 call_from_thread 调用，是线程安全的。
+
+        :param widget: begin_assistant_turn() 返回的占位 Static 组件
+        :param content: AI 回复的完整累积文本（原始 Markdown 格式，非 markup）
+        """
+        label = RichText("Rhine ", style="bold #CCFF99")
+        body = RichMarkdown(content)
+        # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable
+        widget.update(RichGroup(label, body))
         self.scroll_end(animate=False)
 
     def append_system(self, text: str) -> None:
