@@ -42,7 +42,7 @@ class RhineApp(App):
     - ConfirmPanel：有副作用工具执行前确认 / 计划执行审批的内联面板，默认隐藏
     - ClarifyPanel：Plan Mode 需求澄清的内联面板，默认隐藏
     - InputBar：固定 3 行高（含边框），用户在此输入
-    - StatusBar：固定 1 行，展示 Provider / 模型 / 思考模式 / 计划模式 / 累计 Tokens
+    - StatusBar：固定 1 行，展示 Provider / 模型 / 思考模式 / 计划模式
     """
 
     CSS = """
@@ -122,8 +122,6 @@ class RhineApp(App):
         self._clarify_options: list = []
         # 单轮运行锁：避免多个 Worker 同时修改同一份 conversation history。
         self._stream_active = False
-        # 本会话累计消耗的 token，用于状态栏展示（USAGE 事件累加）
-        self._usage_total = 0
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板。"""
@@ -149,13 +147,12 @@ class RhineApp(App):
         self.query_one(InputBar).focus()
 
     def _refresh_status(self) -> None:
-        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式与累计用量。"""
+        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式。"""
         self.query_one(StatusBar).update_status(
             self._config.protocol,
             self._config.model,
             self._manager.thinking_effort,
             self._manager.plan_mode,
-            self._usage_total,
         )
 
     # ------------------------------------------------------------------ #
@@ -282,7 +279,6 @@ class RhineApp(App):
         - THINKING / TEXT：增量更新对应占位组件（思考灰色斜体、正文 Markdown）
         - TOOL_START：新建橘色工具行并计时；同时重置正文/思考占位（工具后的文本另起块）
         - TOOL_RESULT：工具行定色（绿/红）+ 摘要
-        - USAGE：累加 token 并刷新状态栏
         - FINISHED：按结束原因追加系统行（自然完成不打扰）
         - ERROR：红色错误行
 
@@ -351,11 +347,6 @@ class RhineApp(App):
                         widget = self.call_from_thread(history_view.add_tool_widget, tc)
                         tool_widgets[tc.id] = widget
                     self.call_from_thread(widget.finish, res.ok, self._summarize_result(res))
-
-                elif etype == AgentEventType.USAGE:
-                    if event.usage is not None:
-                        self._usage_total += event.usage.total_tokens
-                        self.call_from_thread(self._refresh_status)
 
                 elif etype == AgentEventType.FINISHED:
                     line = self._finish_line(event.stop_reason, event.message)
@@ -463,8 +454,15 @@ class RhineApp(App):
         panel.focus()
 
     def _show_clarify_panel(self, question, options) -> None:
-        """在主线程展示需求澄清面板并移焦。"""
+        """
+        在主线程展示需求澄清面板并移焦。
+
+        与确认/审批不同：Plan Mode 澄清要求用户「只能在候选项间选择，不能输入文本」，
+        因此这里禁用输入框（disabled=True），阻止用户点击输入框继续打字；
+        结算交互时（_resolve_interaction）再恢复。其它交互（confirm/approve）不做此限制。
+        """
         self.query_one(CommandPanel).hide()
+        self.query_one(InputBar).disabled = True
         panel = self.query_one(ClarifyPanel)
         panel.show_for(question, options)
         panel.focus()
@@ -493,6 +491,8 @@ class RhineApp(App):
         self._pending_interaction = None
         self.query_one(ConfirmPanel).hide()
         self.query_one(ClarifyPanel).hide()
+        # 恢复输入框：澄清面板期间被禁用（见 _show_clarify_panel），结算后统一解禁并还焦
+        self.query_one(InputBar).disabled = False
         self.query_one(InputBar).focus()
         box["result"] = result
         box["event"].set()

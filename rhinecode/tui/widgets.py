@@ -328,8 +328,8 @@ class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | Tokens: N
-    /think、/plan 命令执行后，以及循环产出用量事件时，App 层会调用 update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关
+    /think、/plan 命令执行后，App 层会调用 update_status() 刷新显示。
     """
 
     def update_status(
@@ -338,7 +338,6 @@ class StatusBar(Static):
         model: str,
         thinking_effort: str,
         plan_mode: bool = False,
-        usage_total: int = 0,
     ) -> None:
         """
         刷新状态栏显示内容。
@@ -347,14 +346,11 @@ class StatusBar(Static):
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
         :param plan_mode: 是否处于 Plan Mode（c4 新增，显示「计划模式：开/关」）
-        :param usage_total: 本次会话累计消耗的 token 数（c4 新增；大于 0 时才显示）
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
         plan_state = "开" if plan_mode else "关"
         text = f" [{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
-        if usage_total > 0:
-            text += f" | Tokens: {usage_total}"
         self.update(text + " ")
 
 
@@ -466,7 +462,7 @@ class ClarifyPanel(OptionList):
     - 实现方式：每个候选项渲染为「可选的概述行」+ 紧随其后的「disabled 详情行」。
       OptionList 的上下导航会自动跳过 disabled 项，从而做到「导航只在概述之间移动」，
       同时详情仍然可见，帮助用户判断（对应需求：上下移动只在概述间移动、每个选择下有详细描述）。
-    - 最推荐的候选项排在第一位（由模型保证），其概述前加「⭐ 推荐」标记。
+    - 最推荐的候选项排在第一位（由模型保证），概述文本自身已含推荐信息，不再额外加标记。
 
     结果如何回传：用户选中某概述行时由 OptionList 原生发出 OptionList.OptionSelected
     （option.id 为该候选项在 options 中的下标字符串，App 据此取回所选概述）；按 Esc 发出
@@ -494,7 +490,7 @@ class ClarifyPanel(OptionList):
         - 对每个候选项：一个可选概述行（id=下标字符串）+ 一个 disabled 详情行（若有 detail）
 
         :param question: 模型要澄清的问题
-        :param options: 候选项列表；第一个为最推荐项，会被标注「⭐ 推荐」
+        :param options: 候选项列表；第一个为最推荐项（概述文本自身已含推荐信息）
 
         副作用：修改 OptionList 选项并使面板可见。
         """
@@ -504,15 +500,17 @@ class ClarifyPanel(OptionList):
 
         first_selectable: int | None = None
         for idx, opt in enumerate(options):
-            # 概述行：可选，id 为该候选项下标（字符串），首项加推荐标记
-            prefix = "⭐ 推荐 " if idx == 0 else ""
+            # 概述行：可选，id 为该候选项下标（字符串）
+            # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
+            #     故不再额外加「⭐ 推荐」前缀，避免重复提示。
             option_index = self.option_count  # 加入前的位置即本概述行的索引
-            self.add_option(Option(f"{prefix}{opt.summary}", id=str(idx)))
+            self.add_option(Option(opt.summary, id=str(idx)))
             if first_selectable is None:
                 first_selectable = option_index
             # 详情行：disabled，仅展示，导航会跳过
+            # 不缩进，使详情与上方概述行左边缘对齐
             if opt.detail:
-                self.add_option(Option(f"    [dim]{opt.detail}[/dim]", disabled=True))
+                self.add_option(Option(f"[dim]{opt.detail}[/dim]", disabled=True))
 
         self.display = True
         # 默认高亮第一个可选概述行
