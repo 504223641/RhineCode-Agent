@@ -389,6 +389,8 @@ class RhineApp(App):
             return ""
         if stop_reason == StopReason.USER_CANCELLED:
             return "⏹ 已取消"
+        if stop_reason == StopReason.PLAN_REJECTED:
+            return "⏹ 计划未执行"
         if stop_reason == StopReason.MAX_ITERATIONS:
             return "⚠ " + (message or "已达迭代上限，自动停止")
         if stop_reason == StopReason.UNKNOWN_TOOL:
@@ -489,11 +491,11 @@ class RhineApp(App):
         """在主线程展示计划审批面板（复用 ConfirmPanel 的通用是/否）并移焦。"""
         self.query_one(CommandPanel).hide()
         panel = self.query_one(ConfirmPanel)
-        # 计划全文可能很长，表头只放简短提示；计划内容已在 present_plan 工具行中呈现
+        # 计划全文可能很长，已作为聊天记录中的普通助手消息展示；这里仅询问是否进入执行阶段。
         panel.show_prompt(
             "📋 计划已就绪，是否开始执行？",
-            "✅ 开始执行  [dim]放开全部工具并自动执行[/dim]",
-            "❌ 暂不执行  [dim]返回继续规划[/dim]",
+            "✅ 开始执行  [dim]写文件/改文件/运行命令仍会逐个确认[/dim]",
+            "❌ 暂不执行  [dim]停止本次执行[/dim]",
         )
         panel.focus()
 

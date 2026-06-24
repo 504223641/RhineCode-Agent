@@ -47,6 +47,7 @@ class StopReason(str, Enum):
     COMPLETED = "completed"            # 模型本轮不再发起工具调用，自然完成
     MAX_ITERATIONS = "max_iterations"  # 达到迭代上限（兜底安全网）
     USER_CANCELLED = "user_cancelled"  # 用户主动取消
+    PLAN_REJECTED = "plan_rejected"    # 用户拒绝执行计划
     UNKNOWN_TOOL = "unknown_tool"      # 连续调用未知工具达到阈值
     STREAM_ERROR = "stream_error"      # 底层流出错
 

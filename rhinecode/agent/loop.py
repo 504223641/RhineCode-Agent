@@ -16,6 +16,7 @@ Agent Loop（ReAct 自主循环）引擎，c4 的核心（spec F1/F2/F4/F5/F11/F
 Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_phase：
 - 规划阶段（plan_mode 且未获批）：只暴露只读工具 + ask_user/present_plan 两个特殊工具。
 - 用户通过 present_plan 批准后，execution_phase 置真，本轮后续迭代放开全部工具开始执行；
+  但写文件、改文件、运行命令等副作用工具仍逐个确认，除非用户选择本会话免确认。
   Plan Mode 开关本身仍由上层维持（下一条用户消息会重新从规划阶段开始）。
 """
 
@@ -57,6 +58,7 @@ class _RoundContext:
 
     :param cancelled: 本轮交互中用户取消（如澄清面板按 Esc）
     :param approved: 本轮 present_plan 获得用户批准（据此切换到执行阶段）
+    :param plan_rejected: 本轮 present_plan 被用户拒绝，主循环应立即停止
     :param known_count: 本轮命中的已知工具（含特殊工具）数量
     :param unknown_count: 本轮命中的未知工具数量
     """
@@ -64,6 +66,7 @@ class _RoundContext:
     def __init__(self) -> None:
         self.cancelled: bool = False
         self.approved: bool = False
+        self.plan_rejected: bool = False
         self.known_count: int = 0
         self.unknown_count: int = 0
 
@@ -189,7 +192,7 @@ class Agent:
             yield from self._execute(
                 tool_calls, results, ctx,
                 confirm, clarify, approve_plan,
-                execution_phase, cancel_event,
+                cancel_event,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -201,6 +204,11 @@ class Agent:
             # 计划获批 → 本轮后续迭代进入执行阶段
             if ctx.approved:
                 execution_phase = True
+
+            # 计划被拒绝 → 终止当前 Agent 回合，不再把结果交回模型继续下一轮
+            if ctx.plan_rejected:
+                yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.PLAN_REJECTED)
+                return
 
             # 停止条件：澄清面板被用户取消
             if ctx.cancelled:
@@ -243,7 +251,6 @@ class Agent:
         confirm: ConfirmFn,
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
-        execution_phase: bool,
         cancel_event: threading.Event,
     ) -> Iterator[AgentEvent]:
         """
@@ -260,7 +267,7 @@ class Agent:
         :param results: 输出参数，写入 id → ToolResult
         :param ctx: 本轮上下文，记录 cancelled/approved/known/unknown
         :param confirm/clarify/approve_plan: 三类交互回调
-        :param execution_phase: Plan Mode 是否已获批执行（执行阶段跳过逐工具确认，F13）
+        :param execution_phase: Plan Mode 是否已获批执行（仅影响本轮可用工具集合）
         :param cancel_event: 取消信号，串行执行前检查
 
         副作用：实际执行工具（可能读写文件、跑命令）；通过回调与用户交互。
@@ -296,13 +303,17 @@ class Agent:
                 ctx.cancelled = True
                 break
             yield from self._run_special(tc, results, ctx, clarify, approve_plan)
+            if ctx.cancelled or ctx.plan_rejected:
+                break
 
         # 有副作用 / 未知工具：串行
         for tc, tool in side_effect:
+            if ctx.cancelled or ctx.plan_rejected:
+                break
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_one_serial(tc, tool, results, confirm, execution_phase)
+            yield from self._run_one_serial(tc, tool, results, confirm)
 
     def _run_special(
         self,
@@ -349,14 +360,17 @@ class Agent:
                 res = ToolResult(ok=False, output="当前不支持计划审批（缺少审批回调）。")
             else:
                 plan = str(tc.arguments.get("plan", "")).strip()
+                if plan:
+                    yield AgentEvent(type=AgentEventType.TEXT, text=plan)
                 approved = approve_plan(plan)
                 if approved:
                     ctx.approved = True
                     res = ToolResult(ok=True, output="用户已批准计划，开始执行。", summary="已批准，开始执行")
                 else:
+                    ctx.plan_rejected = True
                     res = ToolResult(
                         ok=True,
-                        output="用户暂未批准，请根据反馈调整计划后再次提交。",
+                        output="用户暂未批准计划，已停止本次执行。",
                         summary="未批准",
                     )
 
@@ -427,14 +441,12 @@ class Agent:
         tool: Optional[Tool],
         results: dict[str, ToolResult],
         confirm: ConfirmFn,
-        execution_phase: bool,
     ) -> Iterator[AgentEvent]:
         """
         串行执行单个有副作用工具（或处理未知工具 / 参数错误），迁移自 c3 并适配 c4。
 
-        与 c3 的差异：
-        - Plan Mode 执行阶段（execution_phase=True）：跳过逐工具确认，直接执行（计划审批即放行，F13）。
-        - 非执行阶段：调 confirm（已封装三态 + 会话免确认）决定是否执行；拒绝则回灌「用户拒绝执行」。
+        已知的有副作用工具始终调 confirm（已封装三态 + 会话免确认）决定是否执行；
+        只有用户明确选择「本会话不再询问」后，上层 confirm 闭包才会自动放行。
         """
         # 未知工具：结构化错误
         if tool is None:
@@ -452,14 +464,13 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
-        # 执行阶段跳过确认；否则走确认回调
-        if not execution_phase:
-            approved = confirm(tc, tool)
-            if not approved:
-                res = ToolResult(ok=False, output="用户拒绝执行该工具。")
-                results[tc.id] = res
-                yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
-                return
+        # 计划审批只开放执行阶段，不等于免确认；副作用工具仍逐个走确认回调。
+        approved = confirm(tc, tool)
+        if not approved:
+            res = ToolResult(ok=False, output="用户拒绝执行该工具。")
+            results[tc.id] = res
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
+            return
 
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
         try:
