@@ -1,42 +1,47 @@
 """
 对话管理模块。
 
-ConversationManager 是 TUI 层与 Provider 层之间的协调者，职责包括：
+ConversationManager 是 TUI 层与下层之间的唯一协调者，职责包括：
 - 维护多轮对话的完整消息历史（history）
-- 解析并执行斜杠命令（/think、/clear、/exit）
-- 管理思考模式的三档强度（off / high / max）
-- 在流式回复完成后，将 AI 回复追加到历史记录
-- 工具编排（本章新增）：把模型发起的工具调用执行并回灌，自动触发一次最终回答
+- 解析并执行斜杠命令（/think、/clear、/exit、/plan）
+- 管理思考模式三档强度（off / high / max）
+- 管理 Plan Mode 开关与会话级「免确认」标志、当前运行的取消信号
+- 把每条普通消息委托给 Agent（ReAct 循环引擎）执行，并把其事件流交给 TUI
 
-TUI 层调用 handle_input() 获取结果，结果类型决定 TUI 的后续行为：
+c4 变化：c3 的工具编排（写死的单轮往返 _stream/_execute 等）已整体迁入 agent.loop.Agent。
+本类不再亲自跑循环，只负责「协调 + 状态」：每条普通消息构造一次 Agent 运行，把回调与策略
+以参数/闭包注入 Agent，返回 Agent 产出的 AgentEvent 事件流。
+
+TUI 层调用 handle_input() 获取结果，结果类型决定后续行为：
 - str：斜杠命令的反馈文本，直接作为系统提示显示
-- Iterator[StreamChunk]：流式回复生成器，由 TUI 的 Worker 消费并逐块渲染
-
-工具编排的单轮往返（仅 DeepSeek 且注入了 registry 时启用）：
-  用户消息 → 第一轮请求(带 tools) → 模型可能发起工具调用
-  → 执行工具(只读并发 / 有副作用串行 + 执行前确认) → 结果回灌 history
-  → 第二轮请求 → 模型基于结果产出最终文本回答 → 停（不做跨轮循环）
+- Iterator[AgentEvent]：Agent 循环的事件流，由 TUI 的 Worker 消费并逐个渲染
 """
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import Callable, Iterator, Optional
 
-from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
-from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.provider.base import BaseProvider, Message, ToolCall
+from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
+from rhinecode.agent.loop import Agent
+from rhinecode.agent.prompt import build_plan_prompt
+from rhinecode.agent.events import AgentEvent, ClarifyOption, ConfirmDecision
 
-# 执行前确认回调类型：给定工具调用与工具实例，返回 True(允许)/False(拒绝)。
-# 由 TUI 层实现（弹出确认框），协调层只调用、不感知 TUI 细节。
-ConfirmCallback = Callable[[ToolCall, Tool], bool]
+# 执行前确认回调类型：给定工具调用与工具实例，返回三态决定（执行/不再询问/拒绝）。
+# 由 TUI 层实现（弹确认面板），协调层只调用、不感知 TUI 细节。
+ConfirmCallback = Callable[[ToolCall, Tool], ConfirmDecision]
+# 需求澄清回调：给定问题与候选项，返回用户所选概述；返回 None 表示用户取消。
+ClarifyCallback = Callable[[str, list[ClarifyOption]], Optional[str]]
+# 计划审批回调：给定计划文本，返回用户是否批准开始执行。
+ApprovePlanCallback = Callable[[str], bool]
 
 
 class ConversationManager:
     """
     多轮对话管理器。
 
-    持有对话历史、思考模式状态、工具注册中心与确认回调，
-    是 TUI 与 Provider 之间的唯一协调点。TUI 层不直接调用 Provider，
-    所有请求均通过此类中转。
+    持有对话历史、思考模式、Plan Mode 与会话级免确认等状态，以及三类交互回调，
+    是 TUI 与下层之间的唯一协调点。TUI 层不直接调用 Provider / Agent，全部通过此类中转。
     """
 
     # /think 命令的三态循环顺序：关闭 → 高效 → 最强 → 关闭
@@ -55,7 +60,7 @@ class ConversationManager:
 
         :param provider: 已实例化的 Provider，负责实际的 API 调用
         :param provider_protocol: Provider 的协议名（如 "anthropic"），
-                                  用于判断是否支持思考模式与工具调用
+                                  用于判断是否支持思考模式与工具/循环能力
         :param registry: 工具注册中心；为 None 时不启用工具能力
         """
         self._provider = provider
@@ -64,10 +69,22 @@ class ConversationManager:
         self.history: list[Message] = []
         # 思考模式强度：off（关闭）/ high（高效）/ max（最强）
         self.thinking_effort: str = "off"
-        # 执行前确认回调，由 TUI 层在挂载后注入；为 None 时有副作用工具默认放行
+        # Plan Mode 开关：开启时循环只放只读工具并注入引导提示（仅工具可用 Provider 生效）
+        self.plan_mode: bool = False
+        # 会话级「免确认」：用户在确认面板选过「不再询问」后置真，本会话后续有副作用工具自动执行
+        self._always_allow: bool = False
+        # 当前运行的取消信号；每次运行重建，置位即让循环尽快停止
+        self._cancel_event: threading.Event = threading.Event()
+
+        # 三类交互回调，由 TUI 层在挂载后注入；为 None 时各自走 fail-closed/降级处理
         self.confirm_callback: Optional[ConfirmCallback] = None
-        # 工具能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
+        self.clarify_callback: Optional[ClarifyCallback] = None
+        self.approve_plan_callback: Optional[ApprovePlanCallback] = None
+
+        # 工具/循环能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
         self._tools_enabled = (provider_protocol == "deepseek" and registry is not None)
+        # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
+        self._agent = Agent(provider, registry)
 
     def clear(self) -> None:
         """
@@ -77,25 +94,35 @@ class ConversationManager:
         """
         self.history = []
 
-    def handle_input(self, text: str) -> "str | Iterator[StreamChunk]":
+    def request_cancel(self) -> None:
+        """
+        请求取消当前正在运行的 Agent 循环。
+
+        由 TUI 在用户按取消键时调用：置位当前运行的取消信号，循环会在安全点检测并尽快停止
+        （spec F9）。无运行时调用也安全（仅置位一个会在下次运行被重建的 Event）。
+        """
+        self._cancel_event.set()
+
+    def handle_input(self, text: str) -> "str | Iterator[AgentEvent]":
         """
         处理用户输入，根据内容类型分发到不同处理路径。
 
         处理规则：
         - "/exit"  → 抛出 SystemExit，由 TUI 层捕获后调用 app.exit()
         - "/clear" → 清空 history，返回确认文本
-        - "/think" → 三态循环切换 thinking_effort（off→high→max→off）；
-                     OpenAI 原生协议不支持，返回提示文本
-        - 其他     → 追加用户消息到 history，调用工具编排流程，返回生成器
+        - "/think" → 三态循环切换 thinking_effort（off→high→max→off）；不支持的 Provider 返回提示
+        - "/plan"  → 切换 Plan Mode；仅工具可用 Provider 生效，否则返回不支持提示
+        - 其他     → 追加用户消息到 history，委托 Agent 跑循环，返回事件流
 
         :param text: 用户原始输入（含前后空白）
-        :returns: str（斜杠命令反馈）或 Iterator[StreamChunk]（流式回复）
+        :returns: str（斜杠命令反馈）或 Iterator[AgentEvent]（循环事件流）
         :raises SystemExit: 用户输入 "/exit" 时抛出
 
         副作用：
         - "/clear" 会清空 self.history
         - "/think" 会修改 self.thinking_effort
-        - 普通消息会向 self.history 追加用户消息（AI 回复在流结束后由 _stream 追加）
+        - "/plan" 会修改 self.plan_mode
+        - 普通消息会向 self.history 追加用户消息（assistant/tool 消息由 Agent 在循环中追加）
         """
         text = text.strip()
 
@@ -110,243 +137,64 @@ class ConversationManager:
             # Anthropic 和 DeepSeek 均支持思考模式，OpenAI 原生协议不支持
             if self._protocol not in ("anthropic", "deepseek"):
                 return "当前 Provider 不支持思考模式"
-            # 循环切换到下一档位
             self.thinking_effort = self._EFFORT_CYCLE[self.thinking_effort]
             label = self._EFFORT_LABEL[self.thinking_effort]
             return f"思考模式：{label}"
 
-        # 普通消息：先追加到历史，再发起工具编排流程
-        msg = Message(role="user", content=text)
-        self.history.append(msg)
-        return self._stream(list(self.history))
+        if text == "/plan":
+            # Plan Mode 依赖工具能力，仅在工具可用的 Provider（DeepSeek + 注册中心）下生效
+            if not self._tools_enabled:
+                return "当前 Provider 不支持计划模式"
+            self.plan_mode = not self.plan_mode
+            return "计划模式：开启" if self.plan_mode else "计划模式：关闭"
 
-    def _stream(self, messages: list[Message]) -> Iterator[StreamChunk]:
+        # 普通消息：先追加到历史，再委托 Agent 跑循环
+        self.history.append(Message(role="user", content=text))
+        return self._run()
+
+    def _run(self) -> Iterator[AgentEvent]:
         """
-        工具编排主流程：第一轮请求 →（如有工具调用）执行并回灌 → 第二轮最终回答。
+        构造一次 Agent 运行并返回其事件流。
 
-        本方法是生成器：把面向 TUI 的 StreamChunk 逐个 yield 出去，同时在内部维护
-        对话历史。未启用工具或模型未发起工具调用时，行为与纯对话一致。
+        步骤：
+        1. 重建取消信号（每次运行独立，避免上次的取消影响本次）。
+        2. Plan Mode 时构造引导 system prompt（仅注入本次请求，不写入持久历史）。
+        3. 构造 confirm 闭包：把 TUI 的三态确认回调 + 会话级免确认，封装成循环只需的 bool 接口。
+        4. 调用 Agent.run，把历史、思考模式、Plan Mode、提示、三类回调与取消信号注入。
 
-        :param messages: 本轮请求携带的完整历史快照（含刚追加的用户消息）
-        :returns: 透传/产出供 TUI 渲染的 StreamChunk
+        :returns: Agent 产出的 AgentEvent 事件流
 
-        副作用：向 self.history 追加 assistant 文本、assistant(tool_calls)、tool 结果消息。
+        副作用：重建 self._cancel_event；可能在执行中置位 self._always_allow。
         """
-        tools = self._registry.schemas() if self._tools_enabled else None
+        self._cancel_event = threading.Event()
+        system_prompt = build_plan_prompt() if self.plan_mode else None
 
-        # ---------- 第一轮：带 tools 请求，收集文本与工具调用 ----------
-        text_buf: list[str] = []
-        tool_calls: list[ToolCall] = []
+        def confirm(tool_call: ToolCall, tool: Tool) -> bool:
+            """
+            有副作用工具执行前确认（供循环调用，返回是否执行）。
 
-        for chunk in self._provider.stream_chat(messages, self.thinking_effort, tools=tools):
-            if chunk.type == "text":
-                text_buf.append(chunk.content)
-                yield chunk
-            elif chunk.type == "thinking":
-                yield chunk
-            elif chunk.type == "tool_call":
-                # 工具调用由协调层内部收集，不直接渲染（执行时再以 tool_start 呈现）
-                if chunk.tool_call is not None:
-                    tool_calls.append(chunk.tool_call)
-            elif chunk.type == "error":
-                # API/网络错误：透传给 TUI 显示，终止本轮（不追加历史）
-                yield chunk
-                return
-            elif chunk.type == "done":
-                # 第一轮的 done 不直接透传，待后续决定是否进入第二轮
-                pass
+            - 会话级免确认已开启 → 直接放行
+            - 否则调用 TUI 三态确认回调：
+              ALLOW_ALWAYS → 置位会话级免确认并放行；ALLOW → 放行；DENY → 拒绝
+            - 无确认回调（理论上不该发生）→ fail-closed 拒绝，绝不擅自执行有副作用工具
+            """
+            if self._always_allow:
+                return True
+            if self.confirm_callback is None:
+                return False
+            decision = self.confirm_callback(tool_call, tool)
+            if decision == ConfirmDecision.ALLOW_ALWAYS:
+                self._always_allow = True
+                return True
+            return decision == ConfirmDecision.ALLOW
 
-        # 模型未发起工具调用：与纯对话行为一致
-        if not tool_calls:
-            if text_buf:
-                self.history.append(Message(role="assistant", content="".join(text_buf)))
-            yield StreamChunk(type="done", content="")
-            return
-
-        # ---------- 有工具调用：追加 assistant(tool_calls) 到历史 ----------
-        self.history.append(
-            Message(role="assistant", content="".join(text_buf), tool_calls=tool_calls)
+        return self._agent.run(
+            self.history,
+            self.thinking_effort,
+            self.plan_mode,
+            system_prompt,
+            confirm,
+            self.clarify_callback,
+            self.approve_plan_callback,
+            self._cancel_event,
         )
-
-        # ---------- 执行工具：只读并发 / 有副作用串行，结果写入 results ----------
-        results: dict[str, ToolResult] = {}
-        yield from self._execute(tool_calls, results)
-
-        # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
-        for tc in tool_calls:
-            res = results.get(tc.id)
-            output = res.output if res is not None else "工具未产生结果"
-            self.history.append(Message(role="tool", tool_call_id=tc.id, content=output))
-
-        # ---------- 第二轮：自动再请求，产出最终文本回答 ----------
-        # 仍携带 tools，但忽略模型此轮再次发起的 tool_call（不做跨轮循环）
-        text2: list[str] = []
-        for chunk in self._provider.stream_chat(list(self.history), self.thinking_effort, tools=tools):
-            if chunk.type == "text":
-                text2.append(chunk.content)
-                yield chunk
-            elif chunk.type == "thinking":
-                yield chunk
-            elif chunk.type == "tool_call":
-                # 单轮边界：第二轮的工具调用不执行，直接忽略
-                pass
-            elif chunk.type == "error":
-                yield chunk
-                return
-            elif chunk.type == "done":
-                pass
-
-        if text2:
-            self.history.append(Message(role="assistant", content="".join(text2)))
-        yield StreamChunk(type="done", content="")
-
-    def _execute(
-        self,
-        tool_calls: list[ToolCall],
-        results: dict[str, ToolResult],
-    ) -> Iterator[StreamChunk]:
-        """
-        执行一批工具调用，按只读/有副作用分组：只读并发、有副作用串行。
-
-        为每个工具在开始执行时产出 tool_start、完成时产出 tool_result（携带结果），
-        供 TUI 起橘色计时行并最终转绿/红。所有结果按 tool_call.id 写入 results 供回灌。
-
-        分组与执行规则：
-        - 只读工具（read_only=True）：并发执行（ThreadPoolExecutor），互不冲突
-        - 有副作用工具（read_only=False）/ 未知工具：串行执行，执行前调确认回调
-        - 参数解析失败（arguments is None）：不执行，直接结构化错误
-        - 未知工具名：不执行，结构化错误
-
-        :param tool_calls: 第一轮解析出的工具调用列表
-        :param results: 输出参数，函数把 id → ToolResult 写入其中
-        :returns: 产出 tool_start / tool_result 类型的 StreamChunk
-
-        副作用：实际执行工具（可能写文件、跑命令）；通过确认回调与用户交互。
-        """
-        readonly: list[tuple[ToolCall, Tool]] = []
-        side_effect: list[tuple[ToolCall, Optional[Tool]]] = []
-
-        # 按 read_only 分组；未知工具(tool=None)归入串行组以走统一的错误处理
-        for tc in tool_calls:
-            tool = self._registry.get(tc.name) if self._registry else None
-            if tool is not None and tool.read_only:
-                readonly.append((tc, tool))
-            else:
-                side_effect.append((tc, tool))
-
-        # 只读组并发执行
-        if readonly:
-            yield from self._run_readonly_concurrent(readonly, results)
-
-        # 有副作用组（含未知工具）串行执行
-        for tc, tool in side_effect:
-            yield from self._run_one_serial(tc, tool, results)
-
-    def _run_readonly_concurrent(
-        self,
-        items: list[tuple[ToolCall, Tool]],
-        results: dict[str, ToolResult],
-    ) -> Iterator[StreamChunk]:
-        """
-        并发执行一组只读工具。
-
-        先为每个调用产出 tool_start（TUI 起橘色计时行），再用线程池并发执行，
-        每个完成即产出对应 tool_result。参数解析失败的调用不进线程池，直接报错。
-
-        :param items: (ToolCall, Tool) 列表，均为只读工具
-        :param results: 输出参数，写入 id → ToolResult
-        :returns: tool_start / tool_result 流
-
-        副作用：并发读取文件系统等（只读，无写入）。
-        """
-        for tc, _tool in items:
-            yield StreamChunk(type="tool_start", tool_call=tc)
-
-        # 参数解析失败的调用：不执行，直接结构化错误
-        for tc, _tool in items:
-            if tc.arguments is None:
-                res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查参数格式后重试。")
-                results[tc.id] = res
-                yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
-
-        valid = [(tc, tool) for tc, tool in items if tc.arguments is not None]
-        if not valid:
-            return
-
-        # 线程池并发执行：as_completed 谁先完成先产出结果
-        with ThreadPoolExecutor(max_workers=len(valid)) as executor:
-            future_to_tc = {
-                executor.submit(tool.execute, tc.arguments): tc
-                for tc, tool in valid
-            }
-            for future in as_completed(future_to_tc):
-                tc = future_to_tc[future]
-                try:
-                    res = future.result()
-                except Exception as e:
-                    # execute 内部应已兜底；此处再兜一层防止线程异常逃逸
-                    res = ToolResult(ok=False, output=f"工具执行异常: {e}")
-                results[tc.id] = res
-                yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
-
-    def _run_one_serial(
-        self,
-        tc: ToolCall,
-        tool: Optional[Tool],
-        results: dict[str, ToolResult],
-    ) -> Iterator[StreamChunk]:
-        """
-        串行执行单个有副作用工具（或处理未知工具/参数错误）。
-
-        处理顺序：
-        1. 未知工具 → 结构化错误
-        2. 参数解析失败 → 结构化错误
-        3. 否则调确认回调：拒绝 → "用户拒绝执行" 结果；允许 → 执行
-
-        :param tc: 工具调用
-        :param tool: 对应工具实例；未知工具时为 None
-        :param results: 输出参数，写入 id → ToolResult
-        :returns: tool_start / tool_result 流
-
-        副作用：可能写文件、执行命令；通过 confirm_callback 与用户交互。
-        """
-        # 未知工具：展示一行并返回结构化错误
-        if tool is None:
-            yield StreamChunk(type="tool_start", tool_call=tc)
-            res = ToolResult(ok=False, output=f"未知工具: {tc.name}")
-            results[tc.id] = res
-            yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
-            return
-
-        # 参数解析失败
-        if tc.arguments is None:
-            yield StreamChunk(type="tool_start", tool_call=tc)
-            res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查参数格式后重试。")
-            results[tc.id] = res
-            yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
-            return
-
-        # 执行前确认采用 fail-closed：没有确认回调时绝不执行有副作用工具。
-        if self.confirm_callback is None:
-            res = ToolResult(ok=False, output="缺少执行前确认回调，已拒绝执行该工具。", summary="未确认，已拒绝")
-            results[tc.id] = res
-            yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
-            return
-
-        approved = self.confirm_callback(tc, tool)
-
-        if not approved:
-            # 用户拒绝：不执行，回灌结构化结果让模型据此回答；只展示结果行（无执行中）
-            res = ToolResult(ok=False, output="用户拒绝执行该工具。")
-            results[tc.id] = res
-            yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)
-            return
-
-        # 确认通过后才展示执行中行并实际执行
-        yield StreamChunk(type="tool_start", tool_call=tc)
-        try:
-            res = tool.execute(tc.arguments)
-        except Exception as e:
-            res = ToolResult(ok=False, output=f"工具执行异常: {e}")
-        results[tc.id] = res
-        yield StreamChunk(type="tool_result", tool_call=tc, tool_result=res)

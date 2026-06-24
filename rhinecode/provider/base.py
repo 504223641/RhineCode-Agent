@@ -68,17 +68,22 @@ class StreamChunk:
                     载荷在 tool_call 字段
     - "tool_result"：协调层在某工具执行完成时产出，TUI 据此把工具行转绿/红并展示摘要；
                      载荷在 tool_call（哪个调用）与 tool_result（执行结果）字段
+    - "usage"：本轮请求的 token 用量（c4 新增）。OpenAI 兼容协议在开启 include_usage 后，
+               流末尾会额外返回一块携带 usage 统计；Provider 据此产出本类型，载荷在 usage 字段
 
     :param type: 块类型，取值见上方说明
     :param content: 文本类块的内容；非文本类块为空字符串
     :param tool_call: tool_call / tool_start / tool_result 类型携带的工具调用信息
     :param tool_result: tool_result 类型携带的执行结果（类型为 tools.base.ToolResult，
                         此处标注为 Any 以避免 provider 包反向依赖 tools 包形成循环导入）
+    :param usage: usage 类型携带的 token 用量（provider SDK 原生 usage 对象或字典，
+                  标注为 Any 以免 provider 反向依赖 agent 包；由上层 collector 转成 Usage）
     """
     type: str
     content: str = ""
     tool_call: Optional[ToolCall] = None
     tool_result: Any = None
+    usage: Any = None
 
 
 class BaseProvider(ABC):

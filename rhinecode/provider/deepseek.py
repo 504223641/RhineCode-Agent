@@ -136,12 +136,15 @@ class DeepSeekProvider(BaseProvider):
         else:
             extra_body = {"thinking": {"type": "enabled"}, "reasoning_effort": thinking_effort}
 
-        # 仅在有工具时附加 tools 参数，保持纯对话请求不变
+        # 仅在有工具时附加 tools 参数，保持纯对话请求不变。
+        # stream_options.include_usage：OpenAI 兼容协议下开启后，流式响应会在最后额外
+        # 多发一块「usage 块」（该块 choices 为空、仅含 usage 统计），用于汇报 token 用量。
         create_kwargs: dict = {
             "model": self._model,
             "messages": sdk_messages,
             "stream": True,
             "extra_body": extra_body,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             create_kwargs["tools"] = tools
@@ -154,6 +157,12 @@ class DeepSeekProvider(BaseProvider):
             tool_buffers: dict[int, dict] = {}
 
             for chunk in stream:
+                # usage 块通常在流末尾、choices 为空，必须在「无 delta 就 continue」之前处理，
+                # 否则会被下面的 continue 吞掉。每块都尝试读取，最后一块才会真正带 usage。
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    yield StreamChunk(type="usage", usage=usage)
+
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if not delta:
                     continue

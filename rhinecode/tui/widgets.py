@@ -26,6 +26,8 @@ from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
+from rhinecode.agent.events import ClarifyOption
+
 
 def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     """
@@ -258,6 +260,7 @@ class CommandPanel(OptionList):
     # 命令注册表：(命令文本, 简要描述)
     COMMANDS: list[tuple[str, str]] = [
         ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
+        ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
@@ -325,21 +328,34 @@ class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：开启/关闭
-    每次 /think 命令执行后，App 层会调用 update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | Tokens: N
+    /think、/plan 命令执行后，以及循环产出用量事件时，App 层会调用 update_status() 刷新显示。
     """
 
-    def update_status(self, provider: str, model: str, thinking_effort: str) -> None:
+    def update_status(
+        self,
+        provider: str,
+        model: str,
+        thinking_effort: str,
+        plan_mode: bool = False,
+        usage_total: int = 0,
+    ) -> None:
         """
         刷新状态栏显示内容。
 
         :param provider: Provider 协议名（anthropic / openai / deepseek）
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
+        :param plan_mode: 是否处于 Plan Mode（c4 新增，显示「计划模式：开/关」）
+        :param usage_total: 本次会话累计消耗的 token 数（c4 新增；大于 0 时才显示）
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
-        self.update(f" [{provider}] {model} | 思考模式：{state} ")
+        plan_state = "开" if plan_mode else "关"
+        text = f" [{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
+        if usage_total > 0:
+            text += f" | Tokens: {usage_total}"
+        self.update(text + " ")
 
 
 class ConfirmPanel(OptionList):
@@ -350,11 +366,16 @@ class ConfirmPanel(OptionList):
     「执行 / 取消」间选择，回车确认，Esc 取消，不遮挡历史区。
 
     用于写文件、改文件、执行命令等有副作用工具：顶部以橘色表头展示工具名与关键参数摘要
-    （仅展示、不可选），下方两个可选项分别对应放行与拒绝。
+    （仅展示、不可选），下方三个可选项分别对应「执行 / 执行且本会话不再询问 / 取消」。
 
-    结果如何回传：面板本身不持有协调层状态。用户选择「执行/取消」时由 OptionList 原生发出
-    OptionList.OptionSelected（App 据 option.id 解析为 True/False）；按 Esc 时发出本类的
+    结果如何回传：面板本身不持有协调层状态。用户选择某项时由 OptionList 原生发出
+    OptionList.OptionSelected（App 据 option.id 解析为 ConfirmDecision）；按 Esc 时发出本类的
     Cancelled 消息（App 视为拒绝）。App 再唤醒被阻塞的 Worker 线程（见 RhineApp._confirm_tool）。
+
+    三个可选项的 option.id 约定：
+    - "yes"        → 仅放行本次（ConfirmDecision.ALLOW）
+    - "yes_always" → 放行且本会话不再询问（ConfirmDecision.ALLOW_ALWAYS）
+    - "no"         → 拒绝（ConfirmDecision.DENY）
 
     设计取舍：确认期间 App 会把焦点临时移到本面板，从而直接复用 OptionList 原生的
     上/下/回车 选择能力（输入框为空时回车不会触发自定义提交消息，移焦到面板最稳健）。
@@ -398,10 +419,31 @@ class ConfirmPanel(OptionList):
                 disabled=True,
             )
         )
-        self.add_option(Option("✅ 执行  [dim]立即执行该工具[/dim]", id="yes"))
+        self.add_option(Option("✅ 执行  [dim]仅执行本次[/dim]", id="yes"))
+        self.add_option(Option("⏩ 执行且不再询问  [dim]本会话后续有副作用工具自动执行[/dim]", id="yes_always"))
         self.add_option(Option("❌ 取消  [dim]拒绝并让模型据此调整[/dim]", id="no"))
         self.display = True
         # 默认高亮「执行」，回车即执行（与 / 命令面板一致的顺手体验）
+        self.highlighted = self._YES_INDEX
+
+    def show_prompt(self, title: str, yes_label: str, no_label: str) -> None:
+        """
+        以通用「是/否」提示复用本面板（c4 用于 Plan Mode 的「是否开始执行」审批）。
+
+        与 show_for 不同：不展示工具名/参数，而是展示一段自定义标题，下面给出两个选项
+        （id 固定为 "yes"/"no"，无第三项）。App 据 option.id=="yes" 判定是否批准。
+
+        :param title: 表头提示文本（单行，过长请由调用方先截断）
+        :param yes_label: 「是」选项的展示文本
+        :param no_label: 「否」选项的展示文本
+
+        副作用：修改 OptionList 选项并使面板可见。
+        """
+        self.clear_options()
+        self.add_option(Option(f"[#FFA500]{title}[/#FFA500]", disabled=True))
+        self.add_option(Option(yes_label, id="yes"))
+        self.add_option(Option(no_label, id="no"))
+        self.display = True
         self.highlighted = self._YES_INDEX
 
     def hide(self) -> None:
@@ -410,4 +452,77 @@ class ConfirmPanel(OptionList):
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为拒绝执行。"""
+        self.post_message(self.Cancelled())
+
+
+class ClarifyPanel(OptionList):
+    """
+    Plan Mode 需求澄清面板（spec F12）。
+
+    模型在规划阶段通过 ask_user 工具发起提问时，App 用本面板把问题与候选项呈现给用户：
+    出现在输入框上方，方向键上下选择，回车确认，Esc 取消，不遮挡历史区（与确认面板同款交互）。
+
+    每个候选项展示「概述 + 详细描述」，但只有概述可被选中：
+    - 实现方式：每个候选项渲染为「可选的概述行」+ 紧随其后的「disabled 详情行」。
+      OptionList 的上下导航会自动跳过 disabled 项，从而做到「导航只在概述之间移动」，
+      同时详情仍然可见，帮助用户判断（对应需求：上下移动只在概述间移动、每个选择下有详细描述）。
+    - 最推荐的候选项排在第一位（由模型保证），其概述前加「⭐ 推荐」标记。
+
+    结果如何回传：用户选中某概述行时由 OptionList 原生发出 OptionList.OptionSelected
+    （option.id 为该候选项在 options 中的下标字符串，App 据此取回所选概述）；按 Esc 发出
+    本类的 Cancelled 消息（App 视为用户取消澄清）。App 再唤醒被阻塞的 Worker（见 RhineApp._clarify）。
+    """
+
+    # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
+    DEFAULT_CSS = "ClarifyPanel { display: none; }"
+
+    class Cancelled(TextualMessage):
+        """用户按 Esc 取消澄清时发出，由 App 视为用户取消。"""
+        pass
+
+    BINDINGS = [
+        # Esc 取消：发出 Cancelled 消息交给 App 处理
+        Binding("escape", "cancel", "取消", show=False),
+    ]
+
+    def show_for(self, question: str, options: list[ClarifyOption]) -> None:
+        """
+        为一次澄清提问填充并显示面板。
+
+        先清空旧选项再重建，避免残留上一次提问内容。结构为：
+        - 一个 disabled 表头（展示问题 question，不可选）
+        - 对每个候选项：一个可选概述行（id=下标字符串）+ 一个 disabled 详情行（若有 detail）
+
+        :param question: 模型要澄清的问题
+        :param options: 候选项列表；第一个为最推荐项，会被标注「⭐ 推荐」
+
+        副作用：修改 OptionList 选项并使面板可见。
+        """
+        self.clear_options()
+        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过
+        self.add_option(Option(f"[#7AEEFF]❓ {question}[/#7AEEFF]", disabled=True))
+
+        first_selectable: int | None = None
+        for idx, opt in enumerate(options):
+            # 概述行：可选，id 为该候选项下标（字符串），首项加推荐标记
+            prefix = "⭐ 推荐 " if idx == 0 else ""
+            option_index = self.option_count  # 加入前的位置即本概述行的索引
+            self.add_option(Option(f"{prefix}{opt.summary}", id=str(idx)))
+            if first_selectable is None:
+                first_selectable = option_index
+            # 详情行：disabled，仅展示，导航会跳过
+            if opt.detail:
+                self.add_option(Option(f"    [dim]{opt.detail}[/dim]", disabled=True))
+
+        self.display = True
+        # 默认高亮第一个可选概述行
+        if first_selectable is not None:
+            self.highlighted = first_selectable
+
+    def hide(self) -> None:
+        """隐藏面板并收回布局空间。"""
+        self.display = False
+
+    def action_cancel(self) -> None:
+        """Esc 绑定：发出 Cancelled 消息，由 App 解释为用户取消澄清。"""
         self.post_message(self.Cancelled())
