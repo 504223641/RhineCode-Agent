@@ -12,5 +12,4 @@ build/
 .venv/
 venv/
 env/
-/tests
 TemText.txt
