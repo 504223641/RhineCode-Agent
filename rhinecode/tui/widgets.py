@@ -27,6 +27,7 @@ from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
 from rhinecode.agent.events import ClarifyOption
+from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 
 
 def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
@@ -54,23 +55,120 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     return summary
 
 
+# diff 块配色：删除红、新增绿、上下文与行号灰、分支与概要橘（与工具行橘色呼应）。
+_DIFF_REMOVE = "#FF5F5F"
+_DIFF_ADD = "#5FD75F"
+_DIFF_DIM = "#808080"
+_DIFF_BRANCH = "#FFA500"
+# 行号列宽度（右对齐），保证不同行的内容左缘对齐。
+_DIFF_NUM_WIDTH = 6
+
+
+def _count_phrase(added: int, removed: int) -> str:
+    """
+    把增删行数拼成自然语言概要，如 "Added 4 lines, removed 1 line"。
+
+    规则：有增才说 Added、有删才说 removed，单数用 line、复数用 lines；
+    句首词首字母大写（只删时即 "Removed 1 line"）；都为 0 时返回 "No changes"。
+
+    :param added: 新增行数
+    :param removed: 删除行数
+    :returns: 概要短语
+    """
+    parts = []
+    if added:
+        parts.append(f"Added {added} line{'s' if added != 1 else ''}")
+    if removed:
+        parts.append(f"removed {removed} line{'s' if removed != 1 else ''}")
+    if not parts:
+        return "No changes"
+    phrase = ", ".join(parts)
+    return phrase[0].upper() + phrase[1:]
+
+
+def render_diff_block(view) -> RichText:
+    """
+    把结构化差异 DiffView 渲染为带颜色、带行号的多行 Rich 文本，供工具行展示。
+
+    布局（缩进体现「隶属于上方状态行」的层级，类似树形分支）：
+        ⎿  Added 4 lines, removed 1 line
+            279     上下文行（灰）
+            282 -   删除行（红）
+            283 +   新增行（绿）
+            ⋮               （hunk 之间的省略）
+
+    行号取值：上下文/新增显示新文件行号，删除显示旧文件行号；
+    与 DiffView.to_text() 的取值规则一致，保证人看到的与回灌给模型的对得上。
+
+    :param view: tools.diff.DiffView
+    :returns: 已上色的 RichText（多行，行间以换行连接，无尾随空行）
+    """
+    lines: list[RichText] = []
+
+    # 概要分支行：增删行数的自然语言概要（如 "Added 4 lines, removed 1 line"）
+    # 用灰色，与其它工具的 "⎿ 摘要" 分支行保持一致的次级信息视觉层级
+    head = RichText("  ⎿  ", style=_DIFF_DIM)
+    head.append(_count_phrase(view.added, view.removed), style=_DIFF_DIM)
+    lines.append(head)
+
+    for row in view.rows:
+        if row.marker == MARK_GAP:
+            # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
+            lines.append(RichText("        ⋮", style=_DIFF_DIM))
+            continue
+
+        no = row.new_no if row.new_no is not None else row.old_no
+        num = f"    {no:>{_DIFF_NUM_WIDTH}} "  # 4 格缩进 + 右对齐行号
+        line = RichText(num, style=_DIFF_DIM)
+        if row.marker == MARK_REMOVE:
+            line.append(f"- {row.text}", style=_DIFF_REMOVE)
+        elif row.marker == MARK_ADD:
+            line.append(f"+ {row.text}", style=_DIFF_ADD)
+        else:  # MARK_CONTEXT
+            line.append(f"  {row.text}", style=_DIFF_DIM)
+        lines.append(line)
+
+    if view.truncated:
+        lines.append(RichText("        …（diff 已截断）", style=_DIFF_DIM))
+
+    # 以换行连接为单个 renderable，避免尾随空行影响布局
+    return RichText("\n").join(lines)
+
+
+# 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签，
+# 与改文件工具的 "Update"/"Write" 风格统一。这里是「展示层」的映射：
+# - 真实工具名仍是各工具的 name（API 用、注册中心用），此表只决定 UI 标题怎么写；
+# - 未登记的工具回退到原始名，保证新增工具即便忘了登记也不会显示异常。
+_TOOL_LABELS = {
+    "read_file": "Read",
+    "glob_files": "Glob",
+    "grep_content": "Grep",
+    "run_command": "Run",
+    "edit_file": "Update",
+    "write_file": "Write",
+}
+
+
 class ToolCallWidget(Static):
     """
     单个工具调用的展示行，自管理执行计时。
 
+    标题统一用展示标签（_TOOL_LABELS，如 Read/Grep/Update）而非内部工具名（snake_case）。
+
     三种视觉状态：
-    - 执行中：橘色，显示 "🔧 工具名(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
-    - 成功：绿色 "● 工具名(参数摘要) 完成 (Ns) — 结果摘要"
-    - 失败：红色 "● 工具名(参数摘要) 失败 (Ns) — 错误摘要"
+    - 执行中：橘色，显示 "● 标签(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
+    - 成功：绿色 "● 标签(参数摘要) 完成 (Ns)" + 下方 "⎿ 结果摘要"
+    - 失败：红色 "● 标签(参数摘要) 失败 (Ns)" + 下方 "⎿ 错误摘要"
 
     计时不依赖 Worker 线程：on_mount 中用 set_interval 在主线程每秒触发 _tick，
     因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
     """
 
-    # 执行中橘色 / 成功绿色 / 失败红色
+    # 执行中橘色 / 成功绿色 / 失败红色 / "⎿ 摘要" 分支行灰色（次级信息）
     _COLOR_RUNNING = "#FFA500"
     _COLOR_OK = "#5FD75F"
     _COLOR_FAIL = "#FF5F5F"
+    _COLOR_BRANCH = "#808080"
 
     def __init__(self, tool_call) -> None:
         """
@@ -78,6 +176,8 @@ class ToolCallWidget(Static):
         """
         super().__init__(markup=True)
         self._name = tool_call.name
+        # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
+        self._label = _TOOL_LABELS.get(self._name, self._name)
         self._args_summary = summarize_args(tool_call.arguments)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
@@ -96,10 +196,10 @@ class ToolCallWidget(Static):
     def _render_running(self) -> None:
         """以橘色渲染执行中状态，显示当前已耗时。"""
         self.update(
-            f"[{self._COLOR_RUNNING}]🔧 {self._name}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
+            f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
         )
 
-    def finish(self, ok: bool, summary: str) -> None:
+    def finish(self, ok: bool, summary: str, diff=None) -> None:
         """
         结束计时并切换到成功/失败终态。
 
@@ -107,6 +207,8 @@ class ToolCallWidget(Static):
 
         :param ok: 工具是否成功（决定绿/红与图标）
         :param summary: 结果摘要文本（已由调用方取首行/截断）
+        :param diff: 可选的 tools.diff.DiffView。改文件类工具会带上它，
+                     此时在状态行下方追加渲染一个彩色 diff 块；其它工具留空。
 
         副作用：停止计时定时器，原地更新本行内容。
         """
@@ -114,11 +216,19 @@ class ToolCallWidget(Static):
             self._timer.stop()
         elapsed = self._elapsed()
         color = self._COLOR_OK if ok else self._COLOR_FAIL
-        icon = "●" if ok else "●"
-        self.update(
-            f"[{color}]{icon} {self._name}({self._args_summary}) "
-            f"{'完成' if ok else '失败'} ({elapsed}s) — {summary}[/]"
-        )
+        result = "完成" if ok else "失败"
+        # 统一为两行式：第一行 "● 标题 完成/失败 (Ns)"，第二行起为 "⎿ ..." 分支。
+        if diff is not None and diff.rows:
+            # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要更贴近改动语义），
+            # 分支由 render_diff_block 产出（首行 "⎿ Added.../removed..." 概要 + 彩色 diff 行）。
+            header = f"[{color}]● {diff.op}({diff.path}) {result} ({elapsed}s)[/]"
+            self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
+        else:
+            # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
+            header = f"[{color}]● {self._label}({self._args_summary}) {result} ({elapsed}s)[/]"
+            branch = RichText("  ⎿  ", style=self._COLOR_BRANCH)
+            branch.append(summary, style=self._COLOR_BRANCH)
+            self.update(RichGroup(RichText.from_markup(header), branch))
 
 
 class HistoryView(ScrollableContainer):

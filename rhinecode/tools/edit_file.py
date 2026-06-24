@@ -12,12 +12,8 @@ new_string，但要求 old_string 在文件中恰好出现一次。属于有副�
 """
 
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.diff import build_diff
 from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
-
-# 成功后回显「变更附近」片段的最大行数，超过则截断，避免大段替换刷屏。
-EDIT_CONTEXT_MAX = 14
-# 变更区域上下各保留的上下文行数。
-EDIT_CONTEXT_PAD = 2
 
 
 class EditFileTool(Tool):
@@ -100,18 +96,24 @@ class EditFileTool(Tool):
                     summary=f"原文出现 {count} 次，需更精确",
                 )
 
-            # 记录替换位置（用于回显变更附近片段）后再替换写回
-            idx = content.index(old_string)
+            # 唯一匹配，执行替换并写回
             new_content = content.replace(old_string, new_string)
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
 
             # 净行数变化 = 新内容换行数 - 原内容换行数
             delta = new_content.count("\n") - content.count("\n")
-            snippet = self._context_snippet(content, new_content, idx, new_string)
+            # 基于整文件旧/新内容构造结构化差异：difflib 会自动只保留变更附近的 hunk。
+            # diff_view 同时服务两端——to_text() 回灌给模型，结构化数据交 TUI 渲染彩色 diff 块。
+            diff_view = build_diff("Update", path, content, new_content)
 
-            output = f"已替换 {path} 1 处（净 {delta:+d} 行）\n变更附近：\n{snippet}"
-            return ToolResult(ok=True, output=output, summary=f"替换 1 处 · 净 {delta:+d} 行")
+            output = f"已替换 {path} 1 处（净 {delta:+d} 行）\n{diff_view.to_text()}"
+            return ToolResult(
+                ok=True,
+                output=output,
+                summary=f"替换 1 处 · 净 {delta:+d} 行",
+                diff=diff_view,
+            )
 
         except UnicodeDecodeError:
             return ToolResult(
@@ -123,38 +125,3 @@ class EditFileTool(Tool):
             return ToolResult(ok=False, output=str(e), summary="路径越界")
         except Exception as e:
             return ToolResult(ok=False, output=f"编辑文件失败: {e}", summary="编辑失败")
-
-    @staticmethod
-    def _context_snippet(old_content: str, new_content: str, idx: int, new_string: str) -> str:
-        """
-        构造替换后「变更附近」的带行号片段，供模型确认改动结果而无需重新读文件。
-
-        :param old_content: 替换前的完整内容（用 idx 定位改动起始行）
-        :param new_content: 替换后的完整内容（片段行号取自此）
-        :param idx: old_string 在 old_content 中的起始字符下标
-        :param new_string: 替换进去的新文本（用于估算改动区域行数）
-        :returns: 形如 ' 10│ ...' 的多行片段；过长则截断并以 '…' 结尾
-
-        说明：以改动起始行为中心，上下各取 EDIT_CONTEXT_PAD 行；
-        若窗口超过 EDIT_CONTEXT_MAX 行则截断。
-        """
-        new_lines = new_content.splitlines()
-        total = len(new_lines)
-        # 改动起始行（1-based）= 改动前 idx 之前的换行数 + 1
-        start_line = old_content[:idx].count("\n") + 1
-        # 新区域行数 = 新文本换行数 + 1
-        region = new_string.count("\n") + 1
-        end_line = start_line + region - 1
-
-        s = max(1, start_line - EDIT_CONTEXT_PAD)
-        e = min(total, end_line + EDIT_CONTEXT_PAD)
-        truncated = False
-        if e - s + 1 > EDIT_CONTEXT_MAX:
-            e = s + EDIT_CONTEXT_MAX - 1
-            truncated = True
-
-        width = len(str(e))
-        rendered = "\n".join(f"{i:>{width}}│ {new_lines[i - 1]}" for i in range(s, e + 1))
-        if truncated:
-            rendered += "\n…"
-        return rendered

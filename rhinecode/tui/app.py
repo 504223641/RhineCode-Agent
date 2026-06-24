@@ -346,7 +346,10 @@ class RhineApp(App):
                     if widget is None:
                         widget = self.call_from_thread(history_view.add_tool_widget, tc)
                         tool_widgets[tc.id] = widget
-                    self.call_from_thread(widget.finish, res.ok, self._summarize_result(res))
+                    # 改文件类工具会在 res.diff 带上结构化差异，传给工具行渲染彩色 diff 块
+                    self.call_from_thread(
+                        widget.finish, res.ok, self._summarize_result(res), getattr(res, "diff", None)
+                    )
 
                 elif etype == AgentEventType.FINISHED:
                     line = self._finish_line(event.stop_reason, event.message)
