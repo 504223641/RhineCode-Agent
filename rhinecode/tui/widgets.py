@@ -16,8 +16,11 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 
 from time import monotonic
 
+from rich.cells import cell_len
 from rich.console import Group as RichGroup
 from rich.markdown import Markdown as RichMarkdown
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -55,11 +58,12 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     return summary
 
 
-# diff 块配色：删除红、新增绿、上下文与行号灰、分支与概要橘（与工具行橘色呼应）。
-_DIFF_REMOVE = "#FF5F5F"
-_DIFF_ADD = "#5FD75F"
-_DIFF_DIM = "#808080"
-_DIFF_BRANCH = "#FFA500"
+# diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
+# 上下文行、行号、概要统一用灰色前景。
+# Rich 的 "on <color>" 表示设置背景色；不写前景即沿用终端默认字色。
+_DIFF_REMOVE_BG = "on #5f1f1f"   # 删除行：暗红底
+_DIFF_ADD_BG = "on #1f4f1f"      # 新增行：暗绿底
+_DIFF_DIM = "#808080"            # 上下文/行号/概要：灰色前景
 # 行号列宽度（右对齐），保证不同行的内容左缘对齐。
 _DIFF_NUM_WIDTH = 6
 
@@ -86,53 +90,85 @@ def _count_phrase(added: int, removed: int) -> str:
     return phrase[0].upper() + phrase[1:]
 
 
-def render_diff_block(view) -> RichText:
+class _DiffBlock:
     """
-    把结构化差异 DiffView 渲染为带颜色、带行号的多行 Rich 文本，供工具行展示。
+    diff 块的自定义 Rich 渲染对象，供工具行展示。
 
     布局（缩进体现「隶属于上方状态行」的层级，类似树形分支）：
         ⎿  Added 4 lines, removed 1 line
             279     上下文行（灰）
-            282 -   删除行（红）
-            283 +   新增行（绿）
+            282 -   删除行（暗红底，整行高亮）
+            283 +   新增行（暗绿底，整行高亮）
             ⋮               （hunk 之间的省略）
+
+    为什么用自定义渲染对象而非现成的 RichText：
+      终端里背景色只覆盖字符本身，文本短于行宽时右侧不会着色，背景条会「断在文末」。
+      要做到「整行背景都是背景色」，必须把高亮行补足空格到**当前可用宽度**。
+      可用宽度只有在真正渲染时才知道（且会随终端 resize 变化），因此实现 __rich_console__，
+      从渲染参数 options.max_width 取得实时宽度再补空格——这样高亮条能铺满整行并自适应宽度。
 
     行号取值：上下文/新增显示新文件行号，删除显示旧文件行号；
     与 DiffView.to_text() 的取值规则一致，保证人看到的与回灌给模型的对得上。
+    """
+
+    def __init__(self, view) -> None:
+        """:param view: tools.diff.DiffView"""
+        self._view = view
+
+    def __rich_console__(self, console, options):
+        """
+        Rich 渲染协议：产出本块的 Segment 序列。
+
+        每行先组装出文本与样式，并标记是否需要「整行背景」。需要背景的行（删除/新增）
+        按 options.max_width 补足空格，使背景铺满整行；其余行（概要/上下文/省略）原样输出。
+        行间以换行分隔，末行不补换行，避免产生多余空行。
+        """
+        view = self._view
+        width = options.max_width
+        dim = Style.parse(_DIFF_DIM)
+        remove_bg = Style.parse(_DIFF_REMOVE_BG)
+        add_bg = Style.parse(_DIFF_ADD_BG)
+
+        # 先收集每行的 (文本, 样式, 是否整行铺背景)
+        rows_out: list[tuple[str, Style, bool]] = []
+        # 概要分支行（灰色，无背景）
+        rows_out.append((f"  ⎿  {_count_phrase(view.added, view.removed)}", dim, False))
+        for row in view.rows:
+            if row.marker == MARK_GAP:
+                # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
+                rows_out.append(("        ⋮", dim, False))
+                continue
+            no = row.new_no if row.new_no is not None else row.old_no
+            num = f"    {no:>{_DIFF_NUM_WIDTH}} "  # 4 格缩进 + 右对齐行号
+            if row.marker == MARK_REMOVE:
+                rows_out.append((f"{num}- {row.text}", remove_bg, True))
+            elif row.marker == MARK_ADD:
+                rows_out.append((f"{num}+ {row.text}", add_bg, True))
+            else:  # MARK_CONTEXT：无背景，灰色前景
+                rows_out.append((f"{num}  {row.text}", dim, False))
+        if view.truncated:
+            rows_out.append(("        …（diff 已截断）", dim, False))
+
+        last = len(rows_out) - 1
+        for idx, (text, style, fill) in enumerate(rows_out):
+            if fill:
+                # 补空格到整行宽度（cell_len 正确计算中文/全角宽度），使背景铺满整行
+                pad = max(0, width - cell_len(text))
+                yield Segment(text + " " * pad, style)
+            else:
+                yield Segment(text, style)
+            if idx != last:
+                yield Segment.line()
+
+
+def render_diff_block(view) -> "_DiffBlock":
+    """
+    构造 diff 块的可渲染对象（见 _DiffBlock）。保留函数形式，调用方无需感知具体类型。
 
     :param view: tools.diff.DiffView
-    :returns: 已上色的 RichText（多行，行间以换行连接，无尾随空行）
+    :returns: 一个 Rich 可渲染对象，删除/新增行整行背景高亮、自适应宽度
     """
-    lines: list[RichText] = []
-
-    # 概要分支行：增删行数的自然语言概要（如 "Added 4 lines, removed 1 line"）
-    # 用灰色，与其它工具的 "⎿ 摘要" 分支行保持一致的次级信息视觉层级
-    head = RichText("  ⎿  ", style=_DIFF_DIM)
-    head.append(_count_phrase(view.added, view.removed), style=_DIFF_DIM)
-    lines.append(head)
-
-    for row in view.rows:
-        if row.marker == MARK_GAP:
-            # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
-            lines.append(RichText("        ⋮", style=_DIFF_DIM))
-            continue
-
-        no = row.new_no if row.new_no is not None else row.old_no
-        num = f"    {no:>{_DIFF_NUM_WIDTH}} "  # 4 格缩进 + 右对齐行号
-        line = RichText(num, style=_DIFF_DIM)
-        if row.marker == MARK_REMOVE:
-            line.append(f"- {row.text}", style=_DIFF_REMOVE)
-        elif row.marker == MARK_ADD:
-            line.append(f"+ {row.text}", style=_DIFF_ADD)
-        else:  # MARK_CONTEXT
-            line.append(f"  {row.text}", style=_DIFF_DIM)
-        lines.append(line)
-
-    if view.truncated:
-        lines.append(RichText("        …（diff 已截断）", style=_DIFF_DIM))
-
-    # 以换行连接为单个 renderable，避免尾随空行影响布局
-    return RichText("\n").join(lines)
+    return _DiffBlock(view)
 
 
 # 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签，
