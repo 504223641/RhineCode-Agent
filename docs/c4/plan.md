@@ -10,7 +10,7 @@ c4 在现有三层（TUI / ConversationManager / Provider）之间，新增一�
 
 - **Provider 层（小改）** — `StreamChunk` 增加 `usage` 字段与 `"usage"` 类型；DeepSeek Provider 通过 `stream_options` 取回 token 用量，并把请求里的 `role="system"` 消息透传给 API（用于 Plan Mode 引导提示注入，F7/F11）。
 
-- **TUI 层（改造）** — Worker 改为消费 `AgentEvent`（而非裸 `StreamChunk`）；新增确认三态、澄清面板、计划审批、取消按键、`/plan` 命令与状态栏（Plan Mode + 累计用量）显示。
+- **TUI 层（改造）** — Worker 改为消费 `AgentEvent`（而非裸 `StreamChunk`）；新增确认三态、澄清面板、计划审批、取消按键、`/plan` 命令与状态栏 Plan Mode 显示。DeepSeek 用量已在事件层产出，当前 TUI 暂未把 Tokens 累计展示到状态栏。
 
 **事件 vs 回调的分工**：单向「展示用」信息（文本、工具进展、用量、进度、结束）走 `AgentEvent` 事件流，TUI 只读不回写；需要「用户做决定」的同步交互（有副作用工具确认、Plan Mode 需求澄清、计划执行审批）无法用单向事件承载往返，改用**阻塞回调**——循环在 Worker 线程调用回调，回调通过 `call_from_thread` 在主线程弹面板、用 `threading.Event` 阻塞等待用户选择后返回（沿用 c3 `_confirm_tool` 的不死锁模式，N2）。
 
@@ -32,6 +32,7 @@ c4 在现有三层（TUI / ConversationManager / Provider）之间，新增一�
 - `COMPLETED` — 模型本轮不再发起工具调用，自然完成
 - `MAX_ITERATIONS` — 达到迭代上限（兜底）
 - `USER_CANCELLED` — 用户取消
+- `PLAN_REJECTED` — 用户拒绝执行计划
 - `UNKNOWN_TOOL` — 连续调用未知工具达阈值
 - `STREAM_ERROR` — 底层流出错
 
@@ -121,19 +122,20 @@ Plan Mode 澄清面板的单个选项（落实 F12）：
    - 取 `text, tool_calls = collector.text, collector.tool_calls`。
    - **无工具调用** → 有文本则 `history.append(assistant(text))`，产出 `FINISHED(COMPLETED)` 返回（F2 自然完成 / F14 纯对话）。
    - **有工具调用** → `history.append(assistant(text, tool_calls))`；调用 `_execute(...)` 执行并回灌结果；按原始顺序把每个结果作为 `role="tool"` 追加 history（N5）。
-   - 根据 `_execute` 回写的轮次上下文更新：`consecutive_unknown`（本轮含未知工具则累加、含已知工具则清零）、`execution_phase`（present_plan 获批则置真）。
+   - 根据 `_execute` 回写的轮次上下文更新：`execution_phase`（present_plan 获批则置真），并在计划被拒绝时直接产出 `FINISHED(PLAN_REJECTED)` 返回，不再让模型继续下一轮。
+   - 更新 `consecutive_unknown`（本轮含未知工具且无已知工具则累加，否则清零）。
    - `consecutive_unknown >= MAX_CONSECUTIVE_UNKNOWN` → `FINISHED(UNKNOWN_TOOL)` 返回。
    - 安全点再查 `cancel_event`。
 3. 循环自然走完上限 → `FINISHED(MAX_ITERATIONS)`（F2 兜底 / N3）。
 
-**工具执行 `_execute(tool_calls, history-append via results, ctx, confirm, clarify, approve_plan, execution_phase, cancel_event) -> Iterator[AgentEvent]`：**
+**工具执行 `_execute(tool_calls, history-append via results, ctx, confirm, clarify, approve_plan, cancel_event) -> Iterator[AgentEvent]`：**
 - 先把 `tool_calls` 分流：
   - **特殊工具**（名为 `ask_user` / `present_plan`）→ 串行、走交互回调，不进 registry。
     - `ask_user`：解析 options → 调 `clarify(question, options)`；返回所选概述作为结果文本；返回 `None` → 置 `ctx.cancelled`（循环据此结束为 USER_CANCELLED）。
-    - `present_plan`：调 `approve_plan(plan)`；批准 → `ctx.approved = True`，结果文本「用户已批准，开始执行」；否则结果文本「用户暂未批准，请据反馈调整计划」。
+    - `present_plan`：先把 `plan` 作为 `AgentEvent(TEXT)` 产出，让完整计划进入聊天记录；再调 `approve_plan(plan)`；批准 → `ctx.approved = True`，结果文本「用户已批准，开始执行」；拒绝 → `ctx.plan_rejected = True`，结果文本「用户暂未批准计划，已停止本次执行」。
   - **普通只读工具** → 并发执行（沿用 c3 `ThreadPoolExecutor` 逻辑，F5）。
   - **普通有副作用工具 / 未知工具** → 串行执行（沿用 c3）。
-- 有副作用工具执行前是否确认：**`plan_mode 执行阶段（execution_phase=True）跳过确认**（计划审批即放行，F13）；否则调 `confirm(tool_call, tool)`（已封装三态+会话免确认，F6）。
+- 有副作用工具执行前是否确认：始终调 `confirm(tool_call, tool)`（已封装三态+会话免确认，F6）。Plan Mode 计划审批只开放执行阶段，不等于免确认；只有用户选择「本会话不再询问」后，`confirm` 闭包才会自动放行。
 - 未知工具：结构化错误结果，并在 `ctx` 记一次未知（用于连续未知统计）。
 - 每个工具开始/结束分别产出 `TOOL_START` / `TOOL_RESULT`；所有结果写入 `results` 供主循环回灌。
 - 全程异常兜底为 `ToolResult(ok=False)`（N1）。
@@ -159,7 +161,7 @@ Plan Mode 澄清面板的单个选项（落实 F12）：
 - `_to_sdk_messages` 已能透传 `role="system"`（走通用 else 分支），无需改动；确认其正确即可（用于 Plan Mode 引导提示）。
 
 ### 模块：tui/widgets.py（改造）
-- `StatusBar.update_status(...)`：新增 `plan_mode: bool` 与可选 `usage` 参数，显示 `… | 思考：X | 计划模式：开/关 | Tokens: N`。
+- `StatusBar.update_status(...)`：新增 `plan_mode: bool` 参数，显示 `… | 思考模式：X | 计划模式：开/关`。
 - `CommandPanel.COMMANDS`：新增 `("/plan", "切换计划模式：先规划并澄清需求，审批后再执行（DeepSeek）")`。
 - `ConfirmPanel.show_for`：选项由两项扩为三项——「执行」「执行且本会话不再询问」「取消」，`option.id` 分别为 `yes` / `yes_always` / `no`（F6）。
 - 新增 `ClarifyPanel(OptionList)`：`show_for(question, options)` 把每个选项渲染为「可选概述行 + 紧随其后的禁用详情行」，导航因 OptionList 跳过 disabled 项而只落在概述上；首个选项概述带「⭐ 推荐」标记（F12）。选中产出 `OptionSelected`（id=该选项索引），Esc 产出 `Cancelled`。
@@ -168,12 +170,12 @@ Plan Mode 澄清面板的单个选项（落实 F12）：
 **职责：** 消费 `AgentEvent`，实现三类交互回调与取消、`/plan` 与状态栏。
 **改动点：**
 - `on_mount`：注入 `manager.confirm_callback = self._confirm_tool`（返回 `ConfirmDecision`）、`manager.clarify_callback = self._clarify`、`manager.approve_plan_callback = self._approve_plan`。
-- `_do_stream`：改为按 `AgentEvent.type` 分发——`TEXT/THINKING` 同 c3 渲染；`TOOL_START/TOOL_RESULT` 同 c3 工具行；`USAGE` 累加并刷新状态栏；`PROGRESS` 刷新状态栏/瞬时行显示「第 N 轮」；`FINISHED` 按 `stop_reason` 追加系统行（完成 / 已达上限 / 已取消 / 连续未知工具停止）；`ERROR` 红色行。
+- `_do_stream`：改为按 `AgentEvent.type` 分发——`TEXT/THINKING` 同 c3 渲染；`TOOL_START/TOOL_RESULT` 同 c3 工具行；`PROGRESS` 第 2 轮起追加「第 N 轮」系统行；`FINISHED` 按 `stop_reason` 追加系统行（已达上限 / 已取消 / 计划未执行 / 连续未知工具停止 / 流错误等）；`ERROR` 红色行。`USAGE` 事件当前由 Agent 产出但 TUI 暂未展示。
 - `_confirm_tool`：复用 c3 阻塞模式，但读取三选项 → 返回 `ConfirmDecision`。
 - `_clarify(question, options)` / `_approve_plan(plan)`：同款阻塞模式，分别弹 `ClarifyPanel` / 复用 Yes-No 面板，返回所选概述 / bool；统一用 `self._pending_interaction` + `threading.Event` 管理（N2 不死锁）。
 - 取消：`on_key` 中当 `_stream_active` 且按下 `escape` → 调 `self._manager.request_cancel()`（F9）；输入框禁用期间该键仍可达 App 层。
 - `/plan`：`on_input_bar_input_submitted` 对 `/plan` 走 str 反馈分支并 `_refresh_status()` 同步状态栏（F10）。
-- `_refresh_status`：传入 `manager.plan_mode` 与累计用量。
+- `_refresh_status`：传入 `manager.plan_mode`。
 
 ### 模块：__main__.py
 - 基本不变（`Agent` 由 ConversationManager 内部构造）；如需可补注释。
@@ -199,10 +201,10 @@ PROGRESS ─▶ provider.stream_chat(req, tools) ─▶ StreamCollector.feed ─
        ├─ 无 tool_calls → FINISHED(COMPLETED)
        └─ 有 tool_calls → history.append(assistant) → _execute
              ├─ ask_user      → clarify() 回调（阻塞）→ TOOL_RESULT
-             ├─ present_plan   → approve_plan() 回调（阻塞）→ 置 execution_phase → TOOL_RESULT
+             ├─ present_plan   → TEXT(完整计划) → approve_plan() 回调（阻塞）→ 批准置 execution_phase / 拒绝置 plan_rejected → TOOL_RESULT
              ├─ 只读工具(并发) → TOOL_START/RESULT
-             └─ 副作用工具(串行) → [非执行阶段] confirm() 回调（阻塞）→ TOOL_START/RESULT
-        → history.append(tool 结果) → 更新 consecutive_unknown / execution_phase
+             └─ 副作用工具(串行) → confirm() 回调（阻塞，除非会话级免确认）→ TOOL_START/RESULT
+        → history.append(tool 结果) → 更新 execution_phase / plan_rejected / consecutive_unknown
         → 检查停止条件 → 下一轮 或 FINISHED(reason)
 ```
 
@@ -243,4 +245,4 @@ rhinecode/
 | 双路收集 | `StreamCollector.feed` 实时返回展示事件 + 内部累积完整响应 | 直接落实 F4，循环只管转发与判断 |
 | 澄清面板导航 | 概述为可选项、详情为紧随的 disabled 项 | OptionList 跳过 disabled，使导航只落概述、详情仍可见（F12） |
 | 迭代上限 / 未知阈值 | 模块常量（25 / 3） | spec 明确不做 YAML 配置 |
-| Plan 执行阶段确认 | 执行阶段（已审批）跳过逐工具确认 | 计划审批即整体放行（F13），避免重复打断 |
+| Plan 执行阶段确认 | 执行阶段仍逐个确认副作用工具 | 计划审批只确认“是否开始执行计划”，不等于允许任意写文件、改文件或运行命令；会话级免确认仍由 `ALLOW_ALWAYS` 控制 |

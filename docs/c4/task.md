@@ -29,7 +29,7 @@
 **步骤：**
 1. 新建空 `agent/__init__.py`（含一行包说明注释）。
 2. 在 `events.py` 定义枚举 `AgentEventType`（TEXT/THINKING/TOOL_START/TOOL_RESULT/USAGE/PROGRESS/FINISHED/ERROR，继承 `str, Enum`）。
-3. 定义枚举 `StopReason`（COMPLETED/MAX_ITERATIONS/USER_CANCELLED/UNKNOWN_TOOL/STREAM_ERROR）。
+3. 定义枚举 `StopReason`（COMPLETED/MAX_ITERATIONS/USER_CANCELLED/PLAN_REJECTED/UNKNOWN_TOOL/STREAM_ERROR）。
 4. 定义枚举 `ConfirmDecision`（ALLOW/ALLOW_ALWAYS/DENY）。
 5. 定义 `@dataclass Usage`（prompt_tokens/completion_tokens/total_tokens: int）。
 6. 定义 `@dataclass ClarifyOption`（summary: str、detail: str）。
@@ -144,12 +144,12 @@ python -c "from rhinecode.agent.plan_tools import plan_schemas, ASK_USER, PRESEN
 2. 定义 `Agent`：`__init__(self, provider, registry)` 保存依赖。
 3. 实现私有 `_schema_for(plan_mode, execution_phase) -> Optional[list[dict]]`：Plan Mode 且未获批 → 只读工具 schema + `plan_schemas()`；否则全部工具 schema（无 registry 时 None）。只读工具 schema 可通过遍历 `registry` 内工具按 `read_only` 过滤生成（必要时给 registry 加一个只读筛选 helper，或在 loop 内过滤 `tool.to_schema()`）。
 4. 实现 `run(history, thinking_effort, plan_mode, system_prompt, confirm, clarify, approve_plan, cancel_event) -> Iterator[AgentEvent]`，按 plan 的主循环逻辑：迭代上限 for 循环；每轮先查 cancel、产出 PROGRESS、算 tools、组装 `[system?]+history` 请求、用 `StreamCollector` 双路消费并转发事件、处理流错误、判断有无 tool_calls（无则 COMPLETED）、追加 assistant、调 `_execute`、回灌 tool 结果、更新 consecutive_unknown 与 execution_phase、检查停止条件；走完上限产出 FINISHED(MAX_ITERATIONS)。
-5. 实现 `_execute(tool_calls, results, ctx, confirm, clarify, approve_plan, execution_phase, cancel_event) -> Iterator[AgentEvent]`：
+5. 实现 `_execute(tool_calls, results, ctx, confirm, clarify, approve_plan, cancel_event) -> Iterator[AgentEvent]`：
    - 分流特殊工具 / 只读 / 副作用（含未知）。
    - `ask_user`：解析 options 为 `list[ClarifyOption]`，调 `clarify`；返回 None → `ctx["cancelled"]=True` 且结果文本「用户取消」；否则结果文本为所选概述。
-   - `present_plan`：调 `approve_plan(plan)`；批准 → `ctx["approved"]=True`，结果文本「用户已批准，开始执行」；否则「用户暂未批准，请据反馈调整」。
+   - `present_plan`：先产出 `AgentEvent(TEXT, text=plan)`，让计划全文进入聊天记录；再调 `approve_plan(plan)`；批准 → `ctx["approved"]=True`，结果文本「用户已批准，开始执行」；拒绝 → `ctx["plan_rejected"]=True`，结果文本「用户暂未批准计划，已停止本次执行」。
    - 只读工具并发执行（迁移 c3 `_run_readonly_concurrent` 逻辑，产出 AgentEvent.TOOL_START/RESULT）。
-   - 副作用/未知工具串行执行（迁移 c3 `_run_one_serial`）：未知工具记 `ctx["unknown"]+=1` 且结构化错误；副作用工具——`execution_phase=True` 时跳过确认直接执行，否则调 `confirm` 决定执行/拒绝。
+   - 副作用/未知工具串行执行（迁移 c3 `_run_one_serial`）：未知工具记 `ctx["unknown"]+=1` 且结构化错误；副作用工具始终调 `confirm` 决定执行/拒绝。计划审批只切换到执行阶段，不跳过逐工具确认；只有会话级 `ALLOW_ALWAYS` 会让 `confirm` 自动放行。
    - 已知工具被调用时 `ctx["had_known"]=True`（供主循环清零连续未知计数）。
 6. 全程 try/except 兜底为 `ToolResult(ok=False)`，事件类型用 AgentEvent。
 7. 充分中文注释（循环不变式、停止条件、安全点、特殊工具路由）。
@@ -209,7 +209,7 @@ print(m2.handle_input('/plan'))
 **文件：** `rhinecode/tui/widgets.py`
 **依赖：** T1
 **步骤：**
-1. `StatusBar.update_status`：增参 `plan_mode: bool = False`、`usage_total: int = 0`；显示串追加 `| 计划模式：开/关`，用量大于 0 时追加 `| Tokens: N`。
+1. `StatusBar.update_status`：增参 `plan_mode: bool = False`；显示串追加 `| 计划模式：开/关`。
 2. `CommandPanel.COMMANDS`：追加 `("/plan", "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）")`。
 3. `ConfirmPanel.show_for`：在「执行」「取消」之间或之后加入第三项「执行且本会话不再询问」，三项 `option.id` 为 `yes`/`yes_always`/`no`；调整默认高亮仍为「执行」。
 4. 新增 `ClarifyPanel(OptionList)`：`Cancelled` 内部消息类；`show_for(self, question, options: list[ClarifyOption])`——清空后加一个 disabled 表头（展示 question），再对每个 option 依次加「可选概述行（id=索引字符串）」+「disabled 详情行」，首个概述前缀「⭐ 推荐 」；`display=True`；默认高亮首个可选项。Esc 处理：参考 ConfirmPanel 发 `Cancelled`（具体键绑定在 app 层或本类 on_key）。
@@ -230,15 +230,15 @@ python -c "from rhinecode.tui.widgets import StatusBar, ClarifyPanel, ConfirmPan
 **步骤：**
 1. 导入 `AgentEvent, AgentEventType, StopReason, ConfirmDecision, ClarifyOption` 与 `ClarifyPanel`。
 2. `compose`：在 ConfirmPanel 之后挂载 `ClarifyPanel`。
-3. `on_mount`：注入 `self._manager.confirm_callback=self._confirm_tool`、`clarify_callback=self._clarify`、`approve_plan_callback=self._approve_plan`；新增累计用量状态 `self._usage_total=0`。
-4. 改造 `_do_stream(gen)`：按 `AgentEvent.type` 分发——TEXT/THINKING 沿用 c3 渲染（注意现在是 `event.text`）；TOOL_START/TOOL_RESULT 沿用 c3 工具行（`event.tool_call`/`event.tool_result`）；USAGE 累加 `self._usage_total += event.usage.total_tokens` 并 `call_from_thread(self._refresh_status)`；PROGRESS 刷新状态栏或追加/更新「第 N 轮」瞬时行；FINISHED 依 `stop_reason` 追加系统行（完成/已达上限/已取消/连续未知工具停止）；ERROR 红色行。
+3. `on_mount`：注入 `self._manager.confirm_callback=self._confirm_tool`、`clarify_callback=self._clarify`、`approve_plan_callback=self._approve_plan`。
+4. 改造 `_do_stream(gen)`：按 `AgentEvent.type` 分发——TEXT/THINKING 沿用 c3 渲染（注意现在是 `event.text`）；TOOL_START/TOOL_RESULT 沿用 c3 工具行（`event.tool_call`/`event.tool_result`）；PROGRESS 第 2 轮起追加「第 N 轮」系统行；FINISHED 依 `stop_reason` 追加系统行（已达上限/已取消/计划未执行/连续未知工具停止/流错误等）；ERROR 红色行。`USAGE` 事件当前由 Agent 产出但 TUI 暂未展示。
 5. `_confirm_tool` 返回 `ConfirmDecision`：复用 c3 阻塞模式，但读三选项 id 映射为枚举（yes→ALLOW, yes_always→ALLOW_ALWAYS, no→DENY）。
 6. 新增 `_clarify(question, options) -> Optional[str]`：阻塞模式弹 `ClarifyPanel`，返回所选概述；Esc/取消返回 None。
 7. 新增 `_approve_plan(plan) -> bool`：阻塞模式弹一个 Yes/No 面板（可复用 ConfirmPanel 或一个简单提示面板），展示计划摘要，返回是否批准。
 8. 统一交互结算：把 `_pending_confirm` 泛化为 `_pending_interaction`（保存 event + 结果），三类回调共用 `_resolve_*`；`on_option_list_option_selected` 按来源面板（ConfirmPanel / ClarifyPanel）分别结算。
 9. 取消键：`on_key` 中 `if self._stream_active and event.key=="escape": event.stop(); self._manager.request_cancel()`（不在交互面板等待时）。
 10. `/plan`：`on_input_bar_input_submitted` 的 str 分支中，`text=="/plan"` 时调用 `_refresh_status()`。
-11. `_refresh_status`：传入 `self._manager.plan_mode` 与 `self._usage_total`。
+11. `_refresh_status`：传入 `self._manager.plan_mode`。
 12. 充分中文注释。
 
 **验证：**
@@ -271,8 +271,8 @@ python -c "import rhinecode.__main__, rhinecode.tui.app, rhinecode.conversation,
 **依赖：** T11
 **步骤：**
 1. tmux 启动 `python -m rhinecode --config config.yaml`（DeepSeek 配置）。
-2. 提一个需多步工具的任务（如「读取 README 并统计行数后告诉我」），观察：进度推进、工具行、最终自动回答、状态栏 Tokens 累加。
-3. 输入 `/plan` 开启，提一个含模糊点的需求，观察：只读调研、`ask_user` 澄清面板（概述+详情、推荐首位）、`present_plan` 审批、批准后自动执行。
+2. 提一个需多步工具的任务（如「读取 README 并统计行数后告诉我」），观察：进度推进、工具行、最终自动回答。
+3. 输入 `/plan` 开启，提一个含模糊点的需求，观察：只读调研、`ask_user` 澄清面板（概述+详情、推荐首位）、`present_plan` 完整计划入聊天记录并弹审批；批准后进入执行阶段，副作用工具仍逐个确认；拒绝后提示计划未执行并停止本轮。
 4. 运行中按 Esc 测试取消。
 5. 对照 `checklist.md` 逐项验收。
 
