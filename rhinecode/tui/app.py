@@ -246,13 +246,28 @@ class RhineApp(App):
             if text in ("/think", "/plan"):
                 self._refresh_status()
         else:
-            # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history
+            # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history。
             self._set_streaming(True)
-            self.run_worker(
-                lambda: self._do_stream(result),
-                thread=True,
-                exclusive=True,
-            )
+            # 关键：先让刚挂载的用户消息完成本帧渲染，再启动后台 Worker。
+            # 否则 Textual 按帧合并重绘时，用户消息的挂载可能与「回复很快时的首块文本」落在同一帧，
+            # 观感上像「用户输入等到 AI 回复才一起出现」。call_after_refresh 把 Worker 的启动
+            # 推迟到下一次刷新之后，确保用户消息先单独绘制出来（spec：输入即时回显）。
+            self.call_after_refresh(self._start_stream_worker, result)
+
+    def _start_stream_worker(self, gen) -> None:
+        """
+        在用户消息完成渲染后，启动后台线程 Worker 消费 Agent 事件流。
+
+        由 on_input_bar_input_submitted 通过 call_after_refresh 调度，运行在主线程消息循环中，
+        因此可安全调用 run_worker。exclusive=True 保证同一时间只有一个流式 Worker。
+
+        :param gen: ConversationManager.handle_input 返回的 AgentEvent 生成器
+        """
+        self.run_worker(
+            lambda: self._do_stream(gen),
+            thread=True,
+            exclusive=True,
+        )
 
     def _set_streaming(self, active: bool) -> None:
         """
