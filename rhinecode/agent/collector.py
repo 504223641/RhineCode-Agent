@@ -97,4 +97,8 @@ class StreamCollector:
             prompt_tokens=pick("prompt_tokens"),
             completion_tokens=pick("completion_tokens"),
             total_tokens=pick("total_tokens"),
+            # DeepSeek 在 usage 中额外返回缓存命中/未命中字段；其他协议没有这两个键，
+            # pick 会按 0 返回，因此无需为 Provider 做特判（c5 F10 的上游采集）。
+            prompt_cache_hit_tokens=pick("prompt_cache_hit_tokens"),
+            prompt_cache_miss_tokens=pick("prompt_cache_miss_tokens"),
         )

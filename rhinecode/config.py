@@ -21,11 +21,16 @@ class Config:
     - model：模型名称，直接传给 API（例如 claude-sonnet-4-6、gpt-4o、deepseek-chat）
     - base_url：API 请求基础地址，支持自定义代理或私有部署
     - api_key：身份认证密钥，仅在运行时内存中使用，不打印到界面或日志
+    - debug_log：是否把每次请求的缓存命中/未命中 token 追加到 <项目根>/.rhinecode_debug.log，
+                 用于验证缓存策略是否生效（c5 F10）。可选字段，缺省为 True；每次请求仅写一行，
+                 IO 异常会静默降级，不影响对话。不想生成该文件时在配置里设为 false。
     """
     protocol: str
     model: str
     base_url: str
     api_key: str
+    # 调试日志开关：默认开启便于随时验证缓存；非必填字段，老配置不写也能正常加载。
+    debug_log: bool = True
 
 
 def load(path: str) -> Config:
@@ -60,9 +65,13 @@ def load(path: str) -> Config:
         if not data.get(field):
             raise ValueError(f"配置文件缺少必填字段 {field}")
 
+    # debug_log 为可选项：缺省或写成非布尔值时，统一按布尔语义取值，默认 True。
+    debug_log = data.get("debug_log", True)
+
     return Config(
         protocol=data["protocol"],
         model=data["model"],
         base_url=data["base_url"],
         api_key=data["api_key"],
+        debug_log=bool(debug_log),
     )

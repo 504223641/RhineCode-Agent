@@ -35,6 +35,8 @@ from rhinecode.agent.events import (
     StopReason,
 )
 from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
+from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
+from rhinecode.agent.cache_log import log_cache_usage
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
 MAX_ITERATIONS = 25
@@ -116,7 +118,10 @@ class Agent:
         history: list[Message],
         thinking_effort: str,
         plan_mode: bool,
-        system_prompt: Optional[str],
+        stable: str,
+        dynamic: str,
+        model: str,
+        debug_log_path: Optional[str],
         confirm: ConfirmFn,
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
@@ -128,14 +133,18 @@ class Agent:
         :param history: 对话历史（同一引用）；循环会向其追加 assistant 与 tool 结果消息（N5）
         :param thinking_effort: 思考模式强度（透传给 provider）
         :param plan_mode: 是否处于 Plan Mode
-        :param system_prompt: 需前置注入的 system 提示（Plan Mode 时非空），不写入持久 history
+        :param stable: 稳定系统提示（可缓存通道）；逐轮以 system 参数传给 provider，内容不变以命中缓存
+        :param dynamic: 动态内容（环境信息等）；每轮与会话级开关提醒合并进 <system-reminder> 注入
+        :param model: 当前模型名，仅用于缓存调试日志记录
+        :param debug_log_path: 缓存调试日志文件路径；为 None 表示关闭日志（c5 F10）
         :param confirm: 有副作用工具是否执行的回调（已解析三态/免确认，返回 bool）
         :param clarify: 需求澄清回调（ask_user 用），可为 None
         :param approve_plan: 计划审批回调（present_plan 用），可为 None
         :param cancel_event: 取消信号；循环在安全点轮询，置位即尽快停止
         :returns: AgentEvent 迭代器；末尾必为一个 FINISHED 事件
 
-        副作用：向 history 追加消息；通过 provider 发起多次网络请求；通过回调与用户交互。
+        副作用：向 history 追加消息；通过 provider 发起多次网络请求；通过回调与用户交互；
+                若 debug_log_path 非空，每轮把缓存用量追加写入该文件。
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
@@ -150,22 +159,37 @@ class Agent:
 
             tools = self._schema_for(plan_mode, execution_phase)
 
-            # 组装请求消息：Plan Mode 时把引导提示作为 system 消息前置（不入持久 history）
-            req_messages: list[Message] = []
-            if system_prompt:
-                req_messages.append(Message(role="system", content=system_prompt))
-            req_messages.extend(history)
+            # 组装请求消息（c5 分通道）：
+            # - 稳定系统提示走 stream_chat 的 system 参数（可缓存前缀），不进 messages；
+            # - 动态内容（dynamic 环境信息）+ 会话级开关（Plan Mode）按轮节奏的提醒，
+            #   合并进一条 <system-reminder> 系统消息，追加到历史「末尾」。
+            #   放末尾而非中间，是为了不破坏历史本身的前缀缓存——变化的提醒只成不缓存的尾巴。
+            # Plan Mode 提醒仅在「规划阶段」（plan_mode 且尚未获批执行）注入。
+            toggle = plan_toggle_instruction(
+                iteration, active=plan_mode and not execution_phase
+            )
+            reminder = build_system_reminder(dynamic, toggle)
+            req_messages: list[Message] = list(history)
+            if reminder:
+                req_messages.append(Message(role="system", content=reminder))
 
             # ---------- 双路收集本轮流式响应 ----------
             collector = StreamCollector()
             stream_error: Optional[str] = None
-            for chunk in self._provider.stream_chat(req_messages, thinking_effort, tools=tools):
+            for chunk in self._provider.stream_chat(
+                req_messages, thinking_effort, tools=tools, system=stable
+            ):
                 if chunk.type == "error":
                     stream_error = chunk.content
                     break
                 ev = collector.feed(chunk)
                 if ev is not None:
                     yield ev
+
+            # 缓存命中调试日志（c5 F10）：本轮拿到用量就记一行，用于验证稳定前缀是否命中缓存。
+            # 即使随后判定流出错也照常记录——usage 可能已先于错误到达，记录它有助于排查。
+            if debug_log_path and collector.usage is not None:
+                log_cache_usage(collector.usage, model, debug_log_path)
 
             # 停止条件：流出错
             if stream_error is not None:

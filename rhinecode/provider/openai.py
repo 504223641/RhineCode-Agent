@@ -40,6 +40,7 @@ class OpenAIProvider(BaseProvider):
         messages: list[Message],
         thinking_effort: str = "off",
         tools: Optional[list[dict]] = None,
+        system: Optional[str] = None,
     ) -> Iterator[StreamChunk]:
         """
         向 OpenAI API 发起流式对话请求，逐块产出 StreamChunk。
@@ -55,12 +56,18 @@ class OpenAIProvider(BaseProvider):
         :param thinking_effort: OpenAI 协议不支持思考模式，传入后直接忽略
         :param tools: 工具描述列表；本章不为 OpenAI 实现工具调用，传入后直接忽略
                       （保留参数仅为与 BaseProvider 接口一致）
+        :param system: 稳定系统提示（可缓存通道）；非空时前置为一条 system 消息，让纯对话也获得
+                       结构化全局提示。OpenAI 协议对前缀也有自动缓存，前置稳定内容同样有利于命中。
         :returns: StreamChunk 迭代器
 
         副作用：发起 HTTPS 请求，消耗 OpenAI token 配额。
         """
         # 将内部 Message 转换为 OpenAI SDK 接受的字典格式
         sdk_messages = [{"role": m.role, "content": m.content} for m in messages]
+
+        # 稳定系统提示置于消息序列最前（OpenAI 允许 role="system" 出现在消息列表中）。
+        if system:
+            sdk_messages = [{"role": "system", "content": system}] + sdk_messages
 
         try:
             stream = self._client.chat.completions.create(
