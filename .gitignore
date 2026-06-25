@@ -13,3 +13,6 @@ build/
 venv/
 env/
 TemText.txt
+
+# c5 缓存命中调试日志（运行时生成，用于验证缓存策略）
+.rhinecode_debug.log

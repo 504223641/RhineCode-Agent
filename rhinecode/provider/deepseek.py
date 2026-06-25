@@ -105,6 +105,7 @@ class DeepSeekProvider(BaseProvider):
         messages: list[Message],
         thinking_effort: str = "off",
         tools: Optional[list[dict]] = None,
+        system: Optional[str] = None,
     ) -> Iterator[StreamChunk]:
         """
         向 DeepSeek API 发起流式对话请求，支持 Thinking Mode 与工具调用。
@@ -124,11 +125,19 @@ class DeepSeekProvider(BaseProvider):
         :param messages: 完整对话历史（含本轮用户消息、可能的工具消息）
         :param thinking_effort: "off" 关闭，"high"/"max" 直接映射到 reasoning_effort
         :param tools: 工具描述列表（OpenAI function 格式），非空时启用工具调用
+        :param system: 稳定系统提示（可缓存通道）；非空时作为 SDK 消息序列的首条 system 消息。
+                       因其逐轮逐字节一致，会落在请求前缀，命中 DeepSeek 的自动前缀缓存（c5 F5）。
         :returns: StreamChunk 迭代器
 
         副作用：发起 HTTPS 请求，消耗 DeepSeek token 配额。
         """
         sdk_messages = self._to_sdk_messages(messages)
+
+        # 稳定系统提示置于消息序列最前：DeepSeek 按请求前缀自动缓存，前缀不变即命中缓存，
+        # 省去重复计费与计算。动态内容（环境信息/提醒）由上层以 <system-reminder> 放在历史末尾，
+        # 不在这条 system 之内，因此不会破坏该前缀的稳定性。
+        if system:
+            sdk_messages = [{"role": "system", "content": system}] + sdk_messages
 
         # DeepSeek 新版模型默认开启思考，必须显式传 "disabled" 才能关闭
         if thinking_effort == "off":

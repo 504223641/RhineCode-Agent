@@ -20,11 +20,13 @@ TUI 层调用 handle_input() 获取结果，结果类型决定后续行为：
 import threading
 from typing import Callable, Iterator, Optional
 
+from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
+from rhinecode.tools.path_guard import workspace_root
 from rhinecode.agent.loop import Agent
-from rhinecode.agent.prompt import build_plan_prompt
+from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import AgentEvent, ClarifyOption, ConfirmDecision
 
 # 执行前确认回调类型：给定工具调用与工具实例，返回三态决定（执行/不再询问/拒绝）。
@@ -52,19 +54,21 @@ class ConversationManager:
     def __init__(
         self,
         provider: BaseProvider,
-        provider_protocol: str,
+        config: Config,
         registry: Optional[ToolRegistry] = None,
     ):
         """
         初始化对话管理器。
 
         :param provider: 已实例化的 Provider，负责实际的 API 调用
-        :param provider_protocol: Provider 的协议名（如 "anthropic"），
-                                  用于判断是否支持思考模式与工具/循环能力
+        :param config: 运行配置；提供 protocol（判断思考/工具能力）、model 与 debug_log（c5）。
+                       构造结构化系统提示与环境信息、决定缓存调试日志是否开启时都要用到
         :param registry: 工具注册中心；为 None 时不启用工具能力
         """
         self._provider = provider
-        self._protocol = provider_protocol
+        self._config = config
+        # 协议名沿用配置里的 protocol，逻辑与此前一致（仅入参由字符串换成整份 config）。
+        self._protocol = config.protocol
         self._registry = registry
         self.history: list[Message] = []
         # 思考模式强度：off（关闭）/ high（高效）/ max（最强）
@@ -82,7 +86,7 @@ class ConversationManager:
         self.approve_plan_callback: Optional[ApprovePlanCallback] = None
 
         # 工具/循环能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
-        self._tools_enabled = (provider_protocol == "deepseek" and registry is not None)
+        self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
         self._agent = Agent(provider, registry)
 
@@ -158,16 +162,27 @@ class ConversationManager:
 
         步骤：
         1. 重建取消信号（每次运行独立，避免上次的取消影响本次）。
-        2. Plan Mode 时构造引导 system prompt（仅注入本次请求，不写入持久历史）。
-        3. 构造 confirm 闭包：把 TUI 的三态确认回调 + 会话级免确认，封装成循环只需的 bool 接口。
-        4. 调用 Agent.run，把历史、思考模式、Plan Mode、提示、三类回调与取消信号注入。
+        2. 采集环境信息并拼装结构化系统提示，分出 stable（可缓存）与 dynamic（动态）两段（c5）。
+        3. 计算缓存调试日志路径（debug_log 关闭时为 None）。
+        4. 构造 confirm 闭包：把 TUI 的三态确认回调 + 会话级免确认，封装成循环只需的 bool 接口。
+        5. 调用 Agent.run，把历史、思考模式、Plan Mode、系统提示两段、日志路径、三类回调与取消信号注入。
 
         :returns: Agent 产出的 AgentEvent 事件流
 
         副作用：重建 self._cancel_event；可能在执行中置位 self._always_allow。
         """
         self._cancel_event = threading.Event()
-        system_prompt = build_plan_prompt() if self.plan_mode else None
+
+        # 结构化系统提示（c5）：以项目根为工作目录采集环境信息，拼装出稳定/动态两段。
+        # stable 逐轮不变 → 走 system 参数命中缓存；dynamic（环境信息）由循环注入 <system-reminder>。
+        # Plan Mode 的引导不再在此构造，改由循环按轮节奏注入（见 loop.run / reminders）。
+        project_root = str(workspace_root())
+        env = collect_environment(self._config, project_root)
+        assembled = build_default_prompt(env)
+        # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
+        debug_log_path = (
+            str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
+        )
 
         def confirm(tool_call: ToolCall, tool: Tool) -> bool:
             """
@@ -192,7 +207,10 @@ class ConversationManager:
             self.history,
             self.thinking_effort,
             self.plan_mode,
-            system_prompt,
+            assembled.stable,
+            assembled.dynamic,
+            self._config.model,
+            debug_log_path,
             confirm,
             self.clarify_callback,
             self.approve_plan_callback,

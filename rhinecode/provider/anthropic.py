@@ -39,6 +39,7 @@ class AnthropicProvider(BaseProvider):
         messages: list[Message],
         thinking_effort: str = "off",
         tools: Optional[list[dict]] = None,
+        system: Optional[str] = None,
     ) -> Iterator[StreamChunk]:
         """
         向 Anthropic API 发起流式对话请求，逐块产出 StreamChunk。
@@ -56,18 +57,32 @@ class AnthropicProvider(BaseProvider):
         :param thinking_effort: "off" 关闭，"high"/"max" 均映射为开启（Anthropic 无力度区分）
         :param tools: 工具描述列表；本章不为 Anthropic 实现工具调用，传入后直接忽略
                       （保留参数仅为与 BaseProvider 接口一致）
+        :param system: 稳定系统提示（可缓存通道）；映射到 Anthropic SDK 的顶层 system 参数。
+                       将来可在此把 system 改成带 cache_control 断点的结构化形式以显式缓存（c5 F6）。
         :returns: StreamChunk 迭代器
 
         副作用：发起 HTTPS 请求，消耗 Anthropic token 配额。
         """
-        # 将内部 Message 转换为 Anthropic SDK 接受的字典格式
-        sdk_messages = [{"role": m.role, "content": m.content} for m in messages]
+        # Anthropic 的 messages 不接受 role="system"：上层循环为统一注入逻辑，会把动态提醒
+        # （<system-reminder>）作为 role="system" 消息追加到 messages 末尾。这里把所有 system
+        # 消息从 messages 中剥离，与传入的 system 参数一起合并到顶层 system，剩余消息照常下发。
+        system_parts: list[str] = [system] if system else []
+        sdk_messages: list[dict] = []
+        for m in messages:
+            if m.role == "system":
+                if m.content:
+                    system_parts.append(m.content)
+                continue
+            sdk_messages.append({"role": m.role, "content": m.content})
 
         params: dict = {
             "model": self._model,
             "max_tokens": 16000,
             "messages": sdk_messages,
         }
+        # 合并后的稳定系统提示 + 动态提醒，作为顶层 system 下发（空则不传）。
+        if system_parts:
+            params["system"] = "\n\n".join(system_parts)
 
         # Anthropic 无 high/max 区分，只要不是 "off" 就开启 Extended Thinking
         if thinking_effort != "off":

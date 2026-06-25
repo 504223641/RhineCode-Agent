@@ -33,7 +33,9 @@ class EditFileTool(Tool):
 
     name = "edit_file"
     description = (
-        "对文件做精确局部修改。两种用法二选一："
+        "对文件做精确局部修改。编辑前必须先用 read_file 读取该文件：未读取就直接编辑，"
+        "极易因不了解原文导致 old_string 匹配失败或改错位置。"
+        "两种用法二选一："
         "①单处：传 old_string 与 new_string；"
         "②批量：传 edits 数组，一次调用完成多处替换（推荐用于需要改动多个位置的场景，避免反复调用）。"
         "默认要求每个 old_string 在当前内容中唯一出现（包含足够上下文以保证唯一）；"

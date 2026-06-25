@@ -101,6 +101,7 @@ class BaseProvider(ABC):
         messages: list[Message],
         thinking_effort: str = "off",
         tools: Optional[list[dict]] = None,
+        system: Optional[str] = None,
     ) -> Iterator[StreamChunk]:
         """
         以流式方式发起对话请求，逐块产出响应内容。
@@ -112,6 +113,10 @@ class BaseProvider(ABC):
                                 OpenAI 协议忽略此参数
         :param tools: 工具描述列表（OpenAI function 格式）；非空时随请求发送以启用工具调用。
                       仅 DeepSeek 实现真正使用，OpenAI/Anthropic 实现忽略此参数（本章不支持工具）
+        :param system: 稳定系统提示，作为「可缓存通道」的抽象入口（c5）。内容逐轮逐字节一致，
+                       各 Provider 自行决定如何利用缓存：DeepSeek 把它作为消息序列首条 system 消息、
+                       依赖自动前缀缓存；Anthropic 映射到顶层 system 参数（将来可加 cache_control 断点）。
+                       与 messages 中带 <system-reminder> 标签的「动态」system 消息分属两条通道。
         :returns: StreamChunk 迭代器，调用方逐块消费，最后一块 type 为 "done" 或 "error"；
                   若模型发起工具调用，会在 done 之前产出若干 type="tool_call" 的块
 

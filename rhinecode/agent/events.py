@@ -76,11 +76,19 @@ class Usage:
     :param prompt_tokens: 输入（提示）消耗的 token 数
     :param completion_tokens: 输出（补全）消耗的 token 数
     :param total_tokens: 合计 token 数
+    :param prompt_cache_hit_tokens: 输入中命中前缀缓存的 token 数（DeepSeek 的
+                                    prompt_cache_hit_tokens 字段）；命中越多说明稳定系统
+                                    提示等前缀复用得越好，请求越省钱省时间（c5 F10）
+    :param prompt_cache_miss_tokens: 输入中未命中缓存、按全价计费的 token 数
+                                     （DeepSeek 的 prompt_cache_miss_tokens 字段）
     """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # 缓存命中/未命中字段：非 DeepSeek 协议通常不返回这两个字段，此时由 collector 填 0。
+    prompt_cache_hit_tokens: int = 0
+    prompt_cache_miss_tokens: int = 0
 
 
 @dataclass

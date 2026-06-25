@@ -14,6 +14,8 @@ from rhinecode.tools.read_file import ReadFileTool
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.tools.write_file import WriteFileTool
 
+from rhinecode.config import Config
+
 try:
     from rhinecode.config import load
 except ModuleNotFoundError:
@@ -119,6 +121,7 @@ class ToolCallingProvider(BaseProvider):
         messages: list[Message],
         thinking_effort: str = "off",
         tools: list[dict] | None = None,
+        system: str | None = None,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -149,6 +152,7 @@ class PlanProvider(BaseProvider):
         messages: list[Message],
         thinking_effort: str = "off",
         tools: list[dict] | None = None,
+        system: str | None = None,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -178,7 +182,15 @@ class PlanProvider(BaseProvider):
 def manager_with_tool(provider: BaseProvider, tool: RecordingTool) -> ConversationManager:
     registry = ToolRegistry()
     registry.register(tool)
-    return ConversationManager(provider, "deepseek", registry)
+    # c5：ConversationManager 改为接收整份 Config。测试里 debug_log=False，避免在临时工作区写日志文件。
+    config = Config(
+        protocol="deepseek",
+        model="test-model",
+        base_url="http://test",
+        api_key="test-key",
+        debug_log=False,
+    )
+    return ConversationManager(provider, config, registry)
 
 
 class ConversationManagerTests(unittest.TestCase):

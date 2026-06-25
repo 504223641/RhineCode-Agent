@@ -60,7 +60,7 @@ def main() -> None:
     registry = ToolRegistry.default()
 
     # 依次构建各层组件，层间通过依赖注入解耦
-    manager = ConversationManager(provider, cfg.protocol, registry)
+    manager = ConversationManager(provider, cfg, registry)
     app = RhineApp(manager, cfg)
     app.run()
 

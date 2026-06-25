@@ -2,7 +2,7 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C4 Agent Loop：模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
+当前版本以 DeepSeek Provider 为主实现了 C5 阶段能力：在 C4 Agent Loop 基础上加入结构化系统提示、动态 system-reminder 注入与缓存命中调试日志。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 功能
 
@@ -14,6 +14,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - **明确停止原因**：支持自然完成、迭代上限、用户取消、计划拒绝、连续未知工具、流错误等停止路径。
 - **路径安全边界**：文件类工具只能访问项目工作目录内路径，拒绝 `..`、越界绝对路径和指向项目外的符号链接。
 - **Textual TUI**：历史区、命令提示、工具行、彩色 diff、确认/澄清面板、输入框和状态栏组合成终端界面。
+- **结构化系统提示**：全局提示按身份、约束、任务模式、工具使用等模块拼装，稳定内容走可缓存通道，环境信息与 Plan Mode 提醒走 `<system-reminder>` 动态注入。
 
 > 工具调用与 Plan Mode 目前仅在 `protocol: deepseek` 且启用默认工具注册中心时可用。
 
@@ -52,6 +53,12 @@ api_key: YOUR_API_KEY
 | `model` | 模型名称 |
 | `base_url` | API 请求地址 |
 | `api_key` | 认证密钥 |
+
+可选字段：
+
+| 字段 | 说明 |
+|------|------|
+| `debug_log` | 是否把每次请求的缓存命中/未命中 token 追加到 `.rhinecode_debug.log`，默认开启 |
 
 ## 启动
 
@@ -125,7 +132,8 @@ rhinecode/
 │   ├── collector.py     # StreamCollector 双路收集
 │   ├── loop.py          # Agent Loop 核心
 │   ├── plan_tools.py    # ask_user / present_plan 特殊工具 schema
-│   └── prompt.py        # Plan Mode system prompt
+│   ├── cache_log.py     # 缓存命中调试日志
+│   └── prompt/          # 结构化系统提示模块、环境信息与 system-reminder 注入
 ├── provider/
 │   ├── base.py          # BaseProvider / Message / StreamChunk / ToolCall 抽象
 │   ├── anthropic.py     # Anthropic 纯对话实现
@@ -157,16 +165,26 @@ python -m unittest discover -s tests
 
 当前测试覆盖路径越界防护、确认回调、会话级免确认、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认等关键行为。
 
-## C4 文档
+## 当前阶段文档
 
-C4 的规格、实现计划、任务拆解和验收清单位于：
+C5 的规格、实现计划、任务拆解和验收清单位于：
 
-- `docs/c4/spec.md`
-- `docs/c4/plan.md`
-- `docs/c4/task.md`
-- `docs/c4/checklist.md`
+- `docs/c5/spec.md`
+- `docs/c5/plan.md`
+- `docs/c5/task.md`
+- `docs/c5/checklist.md`
 
-这些文档描述当前 Agent Loop 与 Plan Mode 的实际行为。
+这些文档描述当前结构化系统提示、缓存策略与 Agent Loop 接线的实际行为。C4 文档仍保留，用于追溯 Agent Loop 与 Plan Mode 的设计来源。
+
+## 后续补齐项
+
+以下问题已在工程审查中确认，但不属于当前阶段开发范围，后续章节再统一设计和实现：
+
+1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
+2. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。
+3. `write_file` / `edit_file` 的文件系统级原子写入。
+4. `run_command` 的权限策略、危险命令二次确认或更细粒度沙箱。
+5. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
 
 ## 扩展新 Provider
 
