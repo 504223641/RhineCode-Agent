@@ -14,6 +14,7 @@ import platform as _platform
 from dataclasses import dataclass
 
 from rhinecode.config import Config
+from rhinecode.agent.prompt.texts import ENVIRONMENT_TEMPLATE
 
 
 @dataclass
@@ -42,12 +43,13 @@ class EnvironmentInfo:
 
         副作用：无（纯字符串拼接）。
         """
-        return (
-            "运行环境：\n"
-            f"- 工作目录（项目根）：{self.working_dir}\n"
-            f"- 操作系统/平台：{self.platform}\n"
-            f"- 当前日期：{self.date}\n"
-            f"- 模型：{self.model}（protocol: {self.protocol}）"
+        # 文案模板在 texts/environment.py，这里只负责把字段值填进占位符。
+        return ENVIRONMENT_TEMPLATE.format(
+            working_dir=self.working_dir,
+            platform=self.platform,
+            date=self.date,
+            model=self.model,
+            protocol=self.protocol,
         )
 
 

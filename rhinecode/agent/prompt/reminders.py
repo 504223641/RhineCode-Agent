@@ -9,32 +9,19 @@
 为什么用 <system-reminder> 标签：它让这些指令既不进入可缓存的稳定前缀（不污染缓存），
 又能通过「系统约束」模块教会模型「带此标签的是系统补充上下文、不要当用户输入回复」（F8）。
 
-注意：旧 rhinecode/agent/prompt.py 的 build_plan_prompt() 文本已迁移到这里的
-PLAN_FULL_INSTRUCTION 常量，并新增了一句话的精简版 PLAN_BRIEF_INSTRUCTION。
+注意：Plan Mode 的两段文案已迁出到 texts/plan.py（PLAN_FULL / PLAN_BRIEF）。
+本模块只保留「按轮注入节奏」「<system-reminder> 包裹」的逻辑，并把文案重新绑定到
+对外公开的 PLAN_FULL_INSTRUCTION / PLAN_BRIEF_INSTRUCTION 名称（保持调用方与测试不变）。
 """
 
 from typing import Optional
 
-# Plan Mode 完整版指令：开关激活的首轮、以及之后每隔 3 轮重发一次，向模型完整交代规划流程。
-PLAN_FULL_INSTRUCTION = (
-    "你现在处于「计划模式（Plan Mode）」。在用户明确批准之前，你只能调研、不能执行任何"
-    "修改类操作（不要写文件、改文件或执行命令），当前也只为你开放了只读工具。\n"
-    "\n"
-    "请按以下流程工作：\n"
-    "1. 先用只读工具（读文件、查找文件、搜索代码等）充分调研，理解现状与需求。\n"
-    "2. 如果需求中存在不清楚、有歧义或需要用户拍板的细节，使用 ask_user 工具逐一向用户提问："
-    "每次提一个问题并给出若干候选项；每个候选项包含 summary（一句话概述）和 detail（详细说明与取舍）；"
-    "把你最推荐的候选项放在 options 列表的第一个。\n"
-    "3. 调研与澄清完成后，使用 present_plan 工具提交一份清晰的计划（plan 字段）等待用户审批。\n"
-    "4. 只有当用户通过 present_plan 批准后，才会为你开放全部工具，你才能开始执行计划。\n"
-    "\n"
-    "即使需求看起来已经很明确、无需澄清，也必须先用 present_plan 提交计划并取得批准，再执行。"
-)
+from rhinecode.agent.prompt.texts import PLAN_FULL, PLAN_BRIEF
 
-# Plan Mode 精简版提醒：中间轮次只用一句话「拍肩提醒」，避免每轮重复整段完整指令稀释注意力。
-PLAN_BRIEF_INSTRUCTION = (
-    "提醒：仍处于计划模式，未获批准前只调研、不修改；完成调研后用 present_plan 提交计划等待审批。"
-)
+# 对外仍以 *_INSTRUCTION 命名暴露（__init__ 导出、loop.py 与测试都引用这两个名字）；
+# 文案源是 texts/plan.py，这里做一次重绑定，避免文案与逻辑混在同一文件。
+PLAN_FULL_INSTRUCTION = PLAN_FULL
+PLAN_BRIEF_INSTRUCTION = PLAN_BRIEF
 
 
 def plan_toggle_instruction(iteration: int, active: bool) -> Optional[str]:
