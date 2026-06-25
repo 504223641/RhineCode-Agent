@@ -39,7 +39,7 @@ class BuilderTests(unittest.TestCase):
         stable = assembled.stable
         # 取每个模块文本的特征片段，断言它们按既定顺序出现
         markers = [
-            "你是 RhineCode",          # 身份
+            "你是 Rhine",              # 身份
             "<system-reminder>",        # 系统约束（讲到该标签）
             "调研 → 行动",              # 任务模式
             "有副作用的操作",           # 动作执行
@@ -77,14 +77,20 @@ class BuilderTests(unittest.TestCase):
 
 
 class EnvironmentTests(unittest.TestCase):
-    def test_render_contains_four_fields(self) -> None:
-        """AC2：环境信息 render 含工作目录、平台、日期、模型四项。"""
+    def test_render_contains_fields(self) -> None:
+        """AC2：环境信息 render 含工作目录、平台、日期、Git 分支、模型等字段。"""
         text = _env().render()
         self.assertIn("工作目录", text)
         self.assertIn("操作系统/平台", text)
         self.assertIn("当前日期", text)
+        self.assertIn("当前 Git 分支", text)
         self.assertIn("m-test", text)
         self.assertIn("deepseek", text)
+
+    def test_git_branch_absent_says_none(self) -> None:
+        """无分支信息时（_env 用不存在的 /proj/root，非 git 仓库）分支字段渲染为「无」。"""
+        text = _env().render()
+        self.assertIn("当前 Git 分支：无", text)
 
 
 class ReminderTests(unittest.TestCase):
