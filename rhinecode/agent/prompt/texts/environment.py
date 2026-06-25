@@ -11,7 +11,7 @@ rhinecode/agent/prompt/environment.py。
 # 环境信息模板：渲染成多行文本注入到 <system-reminder>，占位符与 EnvironmentInfo 字段一一对应。
 # git_branch 由采集逻辑填充：在 git 仓库内为当前分支名，非 git 仓库/获取失败时为「无」。
 ENVIRONMENT_TEMPLATE = (
-    "运行环境：\n"
+    "当前运行环境：\n"
     "- 工作目录（项目根）：{working_dir}\n"
     "- 操作系统/平台：{platform}\n"
     "- 当前日期：{date}\n"
