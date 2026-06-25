@@ -2,17 +2,19 @@
 Textual App 主类模块。
 
 RhineApp 是 TUI 层的核心，负责：
-1. 组合四个面板（HistoryView / CommandPanel / InputBar / StatusBar）
+1. 组合各面板（HistoryView / CommandPanel / ConfirmPanel / ClarifyPanel / InputBar / StatusBar）
 2. 监听用户输入事件，调用 ConversationManager 处理
-3. 将流式 StreamChunk 通过 Worker + call_from_thread 安全地渲染到 UI
-4. 响应斜杠命令结果（状态栏刷新、历史区清空、程序退出）
-5. 管理命令提示面板的显示/隐藏和键盘导航（焦点始终保持在 InputBar）
+3. 将 Agent 循环产出的 AgentEvent 通过 Worker + call_from_thread 安全地渲染到 UI
+4. 响应斜杠命令结果（状态栏刷新、历史区清空、程序退出、Plan Mode 切换）
+5. 提供三类用户交互回调（有副作用工具确认 / Plan Mode 需求澄清 / 计划执行审批）
+6. 提供运行中取消（按 Esc）
 
 线程模型：
   Textual 的事件循环运行在主线程，UI 操作必须在主线程执行。
-  流式 API 请求通过 run_worker(thread=True) 在独立线程中运行，
-  Worker 通过 call_from_thread() 将每个 StreamChunk 的渲染操作
-  调度回主线程，保证线程安全。
+  Agent 循环通过 run_worker(thread=True) 在独立线程中运行（消费 AgentEvent 生成器），
+  Worker 通过 call_from_thread() 把每个事件的渲染操作调度回主线程，保证线程安全。
+  需要用户决定的交互（确认/澄清/审批）由循环在 Worker 线程调用回调，回调内部用
+  call_from_thread 在主线程弹面板、用 threading.Event 阻塞 Worker 等待用户选择（不死锁，N2）。
 """
 
 import threading
@@ -24,8 +26,10 @@ from textual.widgets import Static, Input
 
 from rhinecode.config import Config
 from rhinecode.conversation import ConversationManager
-from rhinecode.provider.base import StreamChunk
-from rhinecode.tui.widgets import HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel
+from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
+from rhinecode.tui.widgets import (
+    HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
+)
 
 
 class RhineApp(App):
@@ -35,9 +39,10 @@ class RhineApp(App):
     布局（从上到下）：
     - HistoryView：占据除底部区域外的全部高度（height: 1fr），可滚动
     - CommandPanel：斜杠命令提示面板，默认隐藏，输入 "/" 时弹出
-    - ConfirmPanel：工具执行前的内联确认面板，默认隐藏，有副作用工具执行前弹出
+    - ConfirmPanel：有副作用工具执行前确认 / 计划执行审批的内联面板，默认隐藏
+    - ClarifyPanel：Plan Mode 需求澄清的内联面板，默认隐藏
     - InputBar：固定 3 行高（含边框），用户在此输入
-    - StatusBar：固定 1 行，右对齐展示当前 Provider / 模型 / 思考状态
+    - StatusBar：固定 1 行，展示 Provider / 模型 / 思考模式 / 计划模式
     """
 
     CSS = """
@@ -63,13 +68,23 @@ class RhineApp(App):
         padding: 0 1;
         background: $boost;
     }
-    /* 工具确认面板：与 CommandPanel 同款内联布局，但用橘色分隔线警示有副作用 */
+    /* 工具确认 / 计划审批面板：橘色分隔线警示「需要用户决定的操作」 */
     ConfirmPanel {
         height: auto;
-        max-height: 6;
+        max-height: 8;
         display: none;
         border: none;
         border-top: tall #FFA500 80%;
+        padding: 0 1;
+        background: $boost;
+    }
+    /* Plan Mode 需求澄清面板：青色分隔线，与确认区分 */
+    ClarifyPanel {
+        height: auto;
+        max-height: 12;
+        display: none;
+        border: none;
+        border-top: tall #7AEEFF 80%;
         padding: 0 1;
         background: $boost;
     }
@@ -93,60 +108,64 @@ class RhineApp(App):
 
     def __init__(self, manager: ConversationManager, config: Config):
         """
-        :param manager: 已初始化的对话管理器，持有 Provider 和对话历史
+        :param manager: 已初始化的对话管理器，持有 Provider / Agent 和对话历史
         :param config: 配置对象，用于在状态栏展示 Provider 和模型信息
         """
         super().__init__()
         self._manager = manager
         self._config = config
-        # 待决的工具确认：None 表示当前无确认在进行；
-        # 进行中时为 {"event": threading.Event, "result": bool}，由 _confirm_tool 在
-        # Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
-        self._pending_confirm: dict | None = None
-        # 单轮流式锁：避免多个 Worker 同时修改同一份 conversation history。
+        # 待决的用户交互（确认/澄清/审批）：None 表示当前无交互在进行；
+        # 进行中时为 {"event": threading.Event, "result": Any, "kind": str}，
+        # 由回调在 Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
+        self._pending_interaction: dict | None = None
+        # 当前澄清面板的候选项列表（用于把所选下标还原为概述文本）
+        self._clarify_options: list = []
+        # 单轮运行锁：避免多个 Worker 同时修改同一份 conversation history。
         self._stream_active = False
 
     def compose(self) -> ComposeResult:
-        """按从上到下的顺序挂载五个面板。"""
+        """按从上到下的顺序挂载各面板。"""
         yield HistoryView()
         yield CommandPanel()
         yield ConfirmPanel()
-        yield InputBar(placeholder="输入消息，/ 查看命令，Ctrl+C 退出")
+        yield ClarifyPanel()
+        yield InputBar(placeholder="输入消息，/ 查看命令，运行中按 Esc 取消，Ctrl+C 退出")
         yield StatusBar()
 
     def on_mount(self) -> None:
         """
         应用挂载完成后的初始化操作。
 
-        在此时机执行而非 __init__，是因为此时 DOM 已完全构建，
-        query_one() 可以安全地查找到子组件。
+        在此时机执行而非 __init__，是因为此时 DOM 已完全构建，query_one() 可安全查找子组件。
+        把三类交互回调注入协调层：协调层在循环中需要用户决定时调用它们，而不感知 Textual 细节。
         """
         self._refresh_status()
-        # 注入执行前确认回调：协调层在执行有副作用工具前会调用它弹出确认框。
-        # 此处把 TUI 的 _confirm_tool 绑定给协调层，使协调层不感知 Textual 细节。
         self._manager.confirm_callback = self._confirm_tool
+        self._manager.clarify_callback = self._clarify
+        self._manager.approve_plan_callback = self._approve_plan
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
 
     def _refresh_status(self) -> None:
-        """刷新状态栏，反映当前 Provider、模型和思考模式的最新状态。"""
+        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式。"""
         self.query_one(StatusBar).update_status(
             self._config.protocol,
             self._config.model,
             self._manager.thinking_effort,
+            self._manager.plan_mode,
         )
 
+    # ------------------------------------------------------------------ #
+    # 输入与命令面板
+    # ------------------------------------------------------------------ #
     def on_input_changed(self, event: Input.Changed) -> None:
         """
         监听输入框内容变化，控制命令提示面板的显示与过滤。
 
-        当输入以 "/" 开头时调用 CommandPanel.show_for() 过滤并显示面板；
-        其他情况隐藏面板。每次内容变化都重新过滤，实现实时匹配效果。
-
-        :param event: Textual Input 的 Changed 事件，含当前输入框完整内容
+        输入以 "/" 开头时显示并过滤命令面板，否则隐藏。交互进行中或流式运行中不处理，
+        避免与确认/澄清面板或运行状态交错。
         """
-        # 工具确认进行中：焦点在确认面板，不处理命令面板逻辑
-        if self._pending_confirm is not None:
+        if self._pending_interaction is not None or self._stream_active:
             return
         panel = self.query_one(CommandPanel)
         if event.value.startswith("/"):
@@ -156,55 +175,54 @@ class RhineApp(App):
 
     def on_key(self, event: Key) -> None:
         """
-        拦截命令面板可见时的特殊按键，焦点始终保持在 InputBar。
+        处理特殊按键：运行中取消、命令面板导航。
 
-        设计原则：焦点永远不离开 InputBar。
-        - Up/Down：仅移动面板的高亮光标，不转移焦点，用户可继续输入字符过滤命令
-        - Escape：隐藏面板，恢复正常输入状态
-        - Enter 在面板有高亮时的处理见 on_input_bar_input_submitted（在那里读取高亮项）
-
-        :param event: Textual Key 事件，此时事件已经过 InputBar 处理（bubble 阶段）
+        优先级：
+        1. 有交互待决（确认/澄清/审批）→ 交给被聚焦的面板自身的 Esc 绑定处理，这里不拦截。
+        2. 流式运行中 → Esc 触发取消当前 Agent 循环（spec F9）。
+        3. 命令面板可见 → Up/Down 移动高亮、Esc 隐藏（焦点始终保持在 InputBar）。
         """
+        # 1. 交互待决：让面板自己处理（它们各有 escape 绑定），不在此拦截
+        if self._pending_interaction is not None:
+            return
+
+        # 2. 运行中按 Esc 取消循环
+        if self._stream_active:
+            if event.key == "escape":
+                event.stop()
+                self._manager.request_cancel()
+            return
+
+        # 3. 命令面板导航
         panel = self.query_one(CommandPanel)
-
         if not panel.display:
-            return  # 面板不可见时不拦截任何按键，保持原有行为
-
+            return
         if event.key == "up":
             event.stop()
-            panel.action_cursor_up()    # 移动高亮，不转移焦点
-
+            panel.action_cursor_up()
         elif event.key == "down":
             event.stop()
-            panel.action_cursor_down()  # 移动高亮，不转移焦点
-
+            panel.action_cursor_down()
         elif event.key == "escape":
             event.stop()
-            panel.hide()                # 焦点本就在 InputBar，无需重新 focus()
+            panel.hide()
 
     def on_input_bar_input_submitted(self, event: InputBar.InputSubmitted) -> None:
         """
-        处理用户提交输入的事件（InputBar 发出 InputSubmitted 时触发）。
+        处理用户提交输入。
 
-        执行步骤：
-        1. 若命令面板可见且有高亮条目，用高亮命令替换输入框文本（Enter 确认逻辑）
-        2. 隐藏命令提示面板
-        3. 将最终文本显示到历史区
-        4. 调用 ConversationManager.handle_input() 分发处理
-        5. 根据返回值类型决定后续行为：
-           - str：斜杠命令反馈，直接显示；/clear 还需清空历史区；/think 还需刷新状态栏（三态循环）
-           - Iterator：流式生成器，启动 Worker 在后台消费并渲染
-
-        :param event: 包含用户输入文本的事件对象（可能被高亮命令覆盖）
+        步骤：
+        1. 若命令面板有高亮条目，用高亮命令替换文本（Enter 确认逻辑）。
+        2. 隐藏命令面板，显示用户消息到历史区。
+        3. 调用 ConversationManager.handle_input() 分发：
+           - str：斜杠命令反馈（/clear 清屏、/think 与 /plan 刷新状态栏）。
+           - Iterator：Agent 事件流，启动 Worker 在后台消费并渲染。
         """
-        # 工具确认进行中：忽略普通输入提交（确认通过面板自身的选择/取消完成）
-        if self._pending_confirm is not None:
-            return
-        if self._stream_active:
+        # 交互进行中 / 流式运行中：忽略普通输入提交
+        if self._pending_interaction is not None or self._stream_active:
             return
         panel = self.query_one(CommandPanel)
 
-        # 若面板有高亮条目，Enter 确认该命令，忽略输入框中的前缀文本（如 "/th"）
         if panel.display and panel.highlighted is not None:
             text = panel.get_option_at_index(panel.highlighted).id
         else:
@@ -212,144 +230,185 @@ class RhineApp(App):
 
         panel.hide()
         history_view = self.query_one(HistoryView)
-
-        # 先将用户消息显示到历史区，给用户即时反馈
         history_view.append_user(text)
 
         try:
             result = self._manager.handle_input(text)
         except SystemExit:
-            # /exit 命令：ConversationManager 抛出 SystemExit，此处捕获并正常退出
             self.exit()
             return
 
         if isinstance(result, str):
-            # 斜杠命令反馈：/clear 需要先清空历史区的 UI，再显示确认提示
             if text == "/clear":
                 history_view.clear_all()
             history_view.append_system(result)
-            # /think 切换了 thinking_enabled 状态，需要同步刷新状态栏
-            if text == "/think":
+            # /think 与 /plan 改变了状态，需要同步刷新状态栏
+            if text in ("/think", "/plan"):
                 self._refresh_status()
         else:
-            # 普通消息：在独立线程中消费流式生成器，避免阻塞 UI 主线程
-            # 同一时间只允许一轮对话，避免多个 Worker 并发写入共享 history。
+            # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history。
             self._set_streaming(True)
-            self.run_worker(
-                lambda: self._do_stream(result),
-                thread=True,
-                exclusive=True,
-            )
+            # 关键：先让刚挂载的用户消息完成本帧渲染，再启动后台 Worker。
+            # 否则 Textual 按帧合并重绘时，用户消息的挂载可能与「回复很快时的首块文本」落在同一帧，
+            # 观感上像「用户输入等到 AI 回复才一起出现」。call_after_refresh 把 Worker 的启动
+            # 推迟到下一次刷新之后，确保用户消息先单独绘制出来（spec：输入即时回显）。
+            self.call_after_refresh(self._start_stream_worker, result)
+
+    def _start_stream_worker(self, gen) -> None:
+        """
+        在用户消息完成渲染后，启动后台线程 Worker 消费 Agent 事件流。
+
+        由 on_input_bar_input_submitted 通过 call_after_refresh 调度，运行在主线程消息循环中，
+        因此可安全调用 run_worker。exclusive=True 保证同一时间只有一个流式 Worker。
+
+        :param gen: ConversationManager.handle_input 返回的 AgentEvent 生成器
+        """
+        self.run_worker(
+            lambda: self._do_stream(gen),
+            thread=True,
+            exclusive=True,
+        )
 
     def _set_streaming(self, active: bool) -> None:
         """
-        切换流式回复忙碌状态。
+        切换运行忙碌状态。
 
-        忙碌期间禁用输入框，防止用户提交第二轮请求导致共享 history 与确认弹窗状态交错。
+        与 c3 不同：忙碌期间不禁用输入框（保持焦点，使运行中 Esc 取消可靠路由到 on_key），
+        新一轮的并发提交由 on_input_bar_input_submitted 的 _stream_active 守卫拦截。
         """
         self._stream_active = active
-        input_bar = self.query_one(InputBar)
-        input_bar.disabled = active
         if not active:
-            input_bar.focus()
+            self.query_one(InputBar).focus()
 
+    # ------------------------------------------------------------------ #
+    # Agent 事件流消费
+    # ------------------------------------------------------------------ #
     def _do_stream(self, gen) -> None:
         """
-        在 Worker 线程中消费流式生成器，将每个 StreamChunk 渲染到 UI。
+        在 Worker 线程中消费 AgentEvent 生成器，把每个事件渲染到 UI。
 
-        此方法运行在独立线程，不能直接操作 UI 组件。
-        所有 UI 操作通过 call_from_thread() 调度到主线程执行，
-        call_from_thread 会阻塞当前 Worker 线程直到主线程执行完毕并返回结果。
+        本方法运行在独立线程，所有 UI 操作通过 call_from_thread() 调度到主线程。
 
         渲染策略：
-        - thinking chunk：首次到来时创建思考占位组件，后续增量更新同一组件
-        - text chunk：首次到来时创建 AI 回复占位组件，后续增量更新同一组件
-        - error chunk：在历史区追加红色错误提示
-        - done chunk：流正常结束，无需额外操作（history 已由 ConversationManager 更新）
+        - PROGRESS：进入新一轮——重置正文/思考占位组件，使新一轮文本另起新块；第 2 轮起追加一行提示
+        - THINKING / TEXT：增量更新对应占位组件（思考灰色斜体、正文 Markdown）
+        - TOOL_START：新建橘色工具行并计时；同时重置正文/思考占位（工具后的文本另起块）
+        - TOOL_RESULT：工具行定色（绿/红）+ 摘要
+        - FINISHED：按结束原因追加系统行（自然完成不打扰）
+        - ERROR：红色错误行
 
-        :param gen: ConversationManager._stream() 返回的 StreamChunk 生成器
+        :param gen: ConversationManager._run() 返回的 AgentEvent 生成器
         """
         history_view = self.query_one(HistoryView)
 
-        # 思考内容和正文各自维护独立的占位组件和内容缓冲区
         thinking_widget: Static | None = None
         thinking_chunks: list[str] = []
         response_widget: Static | None = None
         response_chunks: list[str] = []
-        # 工具行按 tool_call.id 关联：tool_start 创建、tool_result 终结同一行
         tool_widgets: dict = {}
 
+        def reset_text_widgets() -> None:
+            """重置正文/思考占位，使后续文本另起新组件（轮次切换或工具执行后调用）。"""
+            nonlocal thinking_widget, thinking_chunks, response_widget, response_chunks
+            thinking_widget = None
+            thinking_chunks = []
+            response_widget = None
+            response_chunks = []
+
         try:
-            for chunk in gen:
-                if chunk.type == "thinking":
-                    # 首个思考块到来时，在主线程创建占位组件并获取其引用
+            for event in gen:
+                etype = event.type
+
+                if etype == AgentEventType.PROGRESS:
+                    reset_text_widgets()
+                    # 第 2 轮起显示一行进度提示，标示循环在自主推进
+                    if event.iteration >= 2:
+                        self.call_from_thread(
+                            history_view.append_system, f"🔄 第 {event.iteration} 轮"
+                        )
+
+                elif etype == AgentEventType.THINKING:
                     if thinking_widget is None:
                         thinking_widget = self.call_from_thread(history_view.begin_thinking_turn)
-                    thinking_chunks.append(chunk.content)
-                    # 每次以完整内容更新组件（而非追加），保证渲染正确
+                    thinking_chunks.append(event.text)
                     self.call_from_thread(
                         history_view.update_widget,
                         thinking_widget,
                         f"[dim italic]💭 {''.join(thinking_chunks)}[/dim italic]",
                     )
 
-                elif chunk.type == "text":
-                    # 首个文本块到来时，创建 AI 回复占位组件
+                elif etype == AgentEventType.TEXT:
                     if response_widget is None:
                         response_widget = self.call_from_thread(history_view.begin_assistant_turn)
-                    response_chunks.append(chunk.content)
-                    # 使用 update_ai_widget 渲染 Markdown，支持代码块、标题、列表等格式
+                    response_chunks.append(event.text)
                     self.call_from_thread(
                         history_view.update_ai_widget,
                         response_widget,
                         ''.join(response_chunks),
                     )
 
-                elif chunk.type == "tool_start":
-                    # 工具开始执行：新建橘色工具行并自动开始计时。
-                    # 同时重置正文/思考占位组件，使后续（第二轮）文本另起新组件、
-                    # 排在工具行之后，避免把第二轮回答并入第一轮的前言组件。
-                    response_widget = None
-                    response_chunks = []
-                    thinking_widget = None
-                    thinking_chunks = []
-                    tc = chunk.tool_call
+                elif etype == AgentEventType.TOOL_START:
+                    # 工具开始：重置文本占位（工具后的文本另起块），新建橘色工具行
+                    reset_text_widgets()
+                    tc = event.tool_call
                     widget = self.call_from_thread(history_view.add_tool_widget, tc)
                     tool_widgets[tc.id] = widget
 
-                elif chunk.type == "tool_result":
-                    # 工具执行完成：停止计时并将工具行定色（绿/红）+ 结果摘要。
-                    tc = chunk.tool_call
-                    res = chunk.tool_result
+                elif etype == AgentEventType.TOOL_RESULT:
+                    tc = event.tool_call
+                    res = event.tool_result
                     widget = tool_widgets.get(tc.id)
-                    # 拒绝执行等情况只发 tool_result（无 tool_start），此时补建一行再终结
                     if widget is None:
                         widget = self.call_from_thread(history_view.add_tool_widget, tc)
                         tool_widgets[tc.id] = widget
-                    self.call_from_thread(widget.finish, res.ok, self._summarize_result(res))
+                    # 改文件类工具会在 res.diff 带上结构化差异，传给工具行渲染彩色 diff 块
+                    self.call_from_thread(
+                        widget.finish, res.ok, self._summarize_result(res), getattr(res, "diff", None)
+                    )
 
-                elif chunk.type == "error":
-                    # API 错误或网络异常，以红色显示，程序继续运行
-                    self.call_from_thread(history_view.append_error, chunk.content)
+                elif etype == AgentEventType.FINISHED:
+                    line = self._finish_line(event.stop_reason, event.message)
+                    if line:
+                        self.call_from_thread(history_view.append_system, line)
 
-                elif chunk.type == "done":
-                    # 流正常结束，ConversationManager 已在 _stream() 中将回复追加到 history
-                    pass
+                elif etype == AgentEventType.ERROR:
+                    self.call_from_thread(history_view.append_error, event.message)
         finally:
             self.call_from_thread(self._set_streaming, False)
+
+    @staticmethod
+    def _finish_line(stop_reason, message: str) -> str:
+        """
+        把循环结束原因转成一行系统提示（自然完成返回空串，不打扰用户）。
+
+        :param stop_reason: StopReason
+        :param message: 循环附带的补充说明（如有则优先使用）
+        :returns: 要展示的系统行；空串表示不展示
+        """
+        if stop_reason == StopReason.COMPLETED:
+            return ""
+        if stop_reason == StopReason.USER_CANCELLED:
+            return "⏹ 已取消"
+        if stop_reason == StopReason.PLAN_REJECTED:
+            return "⏹ 计划未执行"
+        if stop_reason == StopReason.MAX_ITERATIONS:
+            return "⚠ " + (message or "已达迭代上限，自动停止")
+        if stop_reason == StopReason.UNKNOWN_TOOL:
+            return "⚠ " + (message or "连续调用未知工具，已停止")
+        if stop_reason == StopReason.STREAM_ERROR:
+            return "⏹ 因流错误已停止"
+        return ""
 
     @staticmethod
     def _summarize_result(res) -> str:
         """
         把工具结果压缩为单行摘要，用于工具行的终态展示。
 
-        优先使用工具自带的 summary（贴合各工具语义，如「读取 152 行 · 4.2K」）；
-        工具未提供 summary 时，回退到取 output 首个非空行并截断，避免长输出撑爆单行。
+        优先使用工具自带的 summary；否则回退到取 output 首个非空行并截断。
 
         :param res: tools.base.ToolResult
         :returns: 单行摘要
         """
-        # 工具提供了专用摘要则直接采用（与回灌给模型的 output 解耦）
         if getattr(res, "summary", ""):
             return res.summary
         text = (res.output or "").strip()
@@ -360,79 +419,150 @@ class RhineApp(App):
             first_line = first_line[:80] + "…"
         return first_line
 
-    def _confirm_tool(self, tool_call, tool) -> bool:
+    # ------------------------------------------------------------------ #
+    # 三类用户交互回调（均在 Worker 线程被调用，阻塞等待主线程选择）
+    # ------------------------------------------------------------------ #
+    def _interact(self, kind: str, show_fn, default):
         """
-        协调层执行有副作用工具前的确认回调（在 Worker 线程被调用）。
+        统一的「阻塞式询问主线程」机制（确认/澄清/审批共用）。
 
-        实现要点（保证 N7 不死锁）：
-        - 用 call_from_thread 在主线程弹出内联 ConfirmPanel 并把焦点移到它
-        - 用 threading.Event 阻塞当前 Worker 线程，直到用户在主线程做出选择
-        - 主线程事件循环不被阻塞，UI（含其它工具行的计时）照常刷新
+        在 Worker 线程：登记一个待决交互盒（含 Event 与默认结果），用 call_from_thread 在主线程
+        弹出对应面板，然后阻塞等待，直到主线程的选择/取消处理写入结果并 set() 唤醒。
+        主线程事件循环不被阻塞，UI（含其它工具行计时）照常刷新（N2 不死锁）。
 
-        结果由主线程的选择/取消处理（on_option_list_option_selected /
-        on_confirm_panel_cancelled → _resolve_confirm）写入 self._pending_confirm
-        并 set() 唤醒本线程。
-
-        :param tool_call: provider.base.ToolCall
-        :param tool: tools.base.Tool
-        :returns: True 用户允许执行 / False 用户拒绝
-
-        副作用：在主线程弹出内联确认面板并等待用户交互。
+        :param kind: 交互种类标识（"confirm"/"clarify"/"approve"），用于结算时映射结果
+        :param show_fn: 在主线程展示面板的无参函数
+        :param default: 未明确选择（如异常路径）时的默认结果
+        :returns: 用户选择的结果
         """
-        box = {"event": threading.Event(), "result": False}
-        self._pending_confirm = box
-        # 在主线程显示面板并移焦；Worker 随后阻塞等待用户选择
-        self.call_from_thread(self._show_confirm_panel, tool_call, tool)
+        box = {"event": threading.Event(), "result": default, "kind": kind}
+        self._pending_interaction = box
+        self.call_from_thread(show_fn)
         box["event"].wait()
         return box["result"]
 
+    def _confirm_tool(self, tool_call, tool) -> ConfirmDecision:
+        """有副作用工具执行前确认（spec F6），返回三态决定。"""
+        return self._interact(
+            "confirm",
+            lambda: self._show_confirm_panel(tool_call, tool),
+            ConfirmDecision.DENY,
+        )
+
+    def _clarify(self, question, options):
+        """Plan Mode 需求澄清（spec F12），返回所选概述；用户取消返回 None。"""
+        self._clarify_options = options
+        return self._interact(
+            "clarify",
+            lambda: self._show_clarify_panel(question, options),
+            None,
+        )
+
+    def _approve_plan(self, plan: str) -> bool:
+        """Plan Mode 计划执行审批（spec F13），返回是否批准开始执行。"""
+        return self._interact(
+            "approve",
+            lambda: self._show_approve_panel(plan),
+            False,
+        )
+
     def _show_confirm_panel(self, tool_call, tool) -> None:
-        """
-        在主线程显示内联确认面板并把焦点移到它。
-
-        先隐藏命令面板避免叠加；填充确认面板后聚焦，使其原生的上/下/回车选择生效。
-
-        :param tool_call: provider.base.ToolCall
-        :param tool: tools.base.Tool
-        """
+        """在主线程展示工具确认面板并移焦。"""
         self.query_one(CommandPanel).hide()
         panel = self.query_one(ConfirmPanel)
         panel.show_for(tool_call, tool)
         panel.focus()
 
-    def _resolve_confirm(self, approved: bool) -> None:
+    def _show_clarify_panel(self, question, options) -> None:
         """
-        在主线程结算一次工具确认：隐藏面板、还焦输入框、唤醒被阻塞的 Worker。
+        在主线程展示需求澄清面板并移焦。
 
-        幂等：无待决确认时直接返回，避免重复结算（如选择后又收到取消消息）。
-
-        :param approved: True 放行执行 / False 拒绝
-
-        副作用：隐藏确认面板、改变焦点、set() 唤醒 Worker 线程。
+        与确认/审批不同：Plan Mode 澄清要求用户「只能在候选项间选择，不能输入文本」，
+        因此这里禁用输入框（disabled=True），阻止用户点击输入框继续打字；
+        结算交互时（_resolve_interaction）再恢复。其它交互（confirm/approve）不做此限制。
         """
-        box = self._pending_confirm
+        self.query_one(CommandPanel).hide()
+        self.query_one(InputBar).disabled = True
+        panel = self.query_one(ClarifyPanel)
+        panel.show_for(question, options)
+        panel.focus()
+
+    def _show_approve_panel(self, plan: str) -> None:
+        """在主线程展示计划审批面板（复用 ConfirmPanel 的通用是/否）并移焦。"""
+        self.query_one(CommandPanel).hide()
+        panel = self.query_one(ConfirmPanel)
+        # 计划全文可能很长，已作为聊天记录中的普通助手消息展示；这里仅询问是否进入执行阶段。
+        panel.show_prompt(
+            "📋 计划已就绪，是否开始执行？",
+            "✅ 开始执行  [dim]写文件/改文件/运行命令仍会逐个确认[/dim]",
+            "❌ 暂不执行  [dim]停止本次执行[/dim]",
+        )
+        panel.focus()
+
+    def _resolve_interaction(self, result) -> None:
+        """
+        在主线程结算一次交互：隐藏所有交互面板、还焦输入框、唤醒被阻塞的 Worker。
+
+        幂等：无待决交互时直接返回，避免重复结算（如选择后又收到取消消息）。
+        """
+        box = self._pending_interaction
         if box is None:
             return
-        self._pending_confirm = None
+        self._pending_interaction = None
         self.query_one(ConfirmPanel).hide()
-        # 焦点还给输入框，恢复正常输入状态
+        self.query_one(ClarifyPanel).hide()
+        # 恢复输入框：澄清面板期间被禁用（见 _show_clarify_panel），结算后统一解禁并还焦
+        self.query_one(InputBar).disabled = False
         self.query_one(InputBar).focus()
-        box["result"] = approved
+        box["result"] = result
         box["event"].set()
 
     def on_option_list_option_selected(self, event) -> None:
         """
-        处理确认面板的选择（回车/点击「执行」或「取消」）。
+        处理确认/审批/澄清面板的选择（回车/点击）。
 
-        仅当事件来自 ConfirmPanel 且有待决确认时才处理：依据 option.id 解析为放行/拒绝。
+        按「当前待决交互的种类」+「事件来源面板」分别把 option.id 解析为对应结果。
         命令面板从不取得焦点、不会触发此消息，故无需额外区分。
-
-        :param event: OptionList.OptionSelected，event.option.id 为 "yes"/"no"
         """
-        if isinstance(event.option_list, ConfirmPanel) and self._pending_confirm is not None:
+        box = self._pending_interaction
+        if box is None:
+            return
+        ol = event.option_list
+        kind = box["kind"]
+
+        if isinstance(ol, ConfirmPanel) and kind == "confirm":
             event.stop()
-            self._resolve_confirm(event.option.id == "yes")
+            mapping = {
+                "yes": ConfirmDecision.ALLOW,
+                "yes_always": ConfirmDecision.ALLOW_ALWAYS,
+                "no": ConfirmDecision.DENY,
+            }
+            self._resolve_interaction(mapping.get(event.option.id, ConfirmDecision.DENY))
+
+        elif isinstance(ol, ConfirmPanel) and kind == "approve":
+            event.stop()
+            self._resolve_interaction(event.option.id == "yes")
+
+        elif isinstance(ol, ClarifyPanel) and kind == "clarify":
+            event.stop()
+            try:
+                idx = int(event.option.id)
+                summary = self._clarify_options[idx].summary
+            except (ValueError, IndexError, TypeError):
+                summary = None
+            self._resolve_interaction(summary)
 
     def on_confirm_panel_cancelled(self, event: ConfirmPanel.Cancelled) -> None:
-        """处理确认面板的 Esc 取消：等价于拒绝执行。"""
-        self._resolve_confirm(False)
+        """确认/审批面板按 Esc 取消：确认视为 DENY、审批视为不批准。"""
+        box = self._pending_interaction
+        if box is None:
+            return
+        if box["kind"] == "confirm":
+            self._resolve_interaction(ConfirmDecision.DENY)
+        elif box["kind"] == "approve":
+            self._resolve_interaction(False)
+
+    def on_clarify_panel_cancelled(self, event: ClarifyPanel.Cancelled) -> None:
+        """澄清面板按 Esc 取消：返回 None，循环据此以「用户取消」结束。"""
+        if self._pending_interaction is not None:
+            self._resolve_interaction(None)

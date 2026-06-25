@@ -16,8 +16,11 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 
 from time import monotonic
 
+from rich.cells import cell_len
 from rich.console import Group as RichGroup
 from rich.markdown import Markdown as RichMarkdown
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -25,6 +28,9 @@ from textual.widgets import Static, Input, OptionList
 from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
+
+from rhinecode.agent.events import ClarifyOption
+from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 
 
 def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
@@ -52,23 +58,153 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     return summary
 
 
+# diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
+# 上下文行、行号、概要统一用灰色前景。
+# Rich 的 "on <color>" 表示设置背景色；不写前景即沿用终端默认字色。
+_DIFF_REMOVE_BG = "on #5f1f1f"   # 删除行：暗红底
+_DIFF_ADD_BG = "on #1f4f1f"      # 新增行：暗绿底
+_DIFF_DIM = "#808080"            # 上下文/行号/概要：灰色前景
+# 行号列宽度（右对齐），保证不同行的内容左缘对齐。
+_DIFF_NUM_WIDTH = 6
+
+
+def _count_phrase(added: int, removed: int) -> str:
+    """
+    把增删行数拼成自然语言概要，如 "Added 4 lines, removed 1 line"。
+
+    规则：有增才说 Added、有删才说 removed，单数用 line、复数用 lines；
+    句首词首字母大写（只删时即 "Removed 1 line"）；都为 0 时返回 "No changes"。
+
+    :param added: 新增行数
+    :param removed: 删除行数
+    :returns: 概要短语
+    """
+    parts = []
+    if added:
+        parts.append(f"Added {added} line{'s' if added != 1 else ''}")
+    if removed:
+        parts.append(f"removed {removed} line{'s' if removed != 1 else ''}")
+    if not parts:
+        return "No changes"
+    phrase = ", ".join(parts)
+    return phrase[0].upper() + phrase[1:]
+
+
+class _DiffBlock:
+    """
+    diff 块的自定义 Rich 渲染对象，供工具行展示。
+
+    布局（缩进体现「隶属于上方状态行」的层级，类似树形分支）：
+        ⎿  Added 4 lines, removed 1 line
+            279     上下文行（灰）
+            282 -   删除行（暗红底，整行高亮）
+            283 +   新增行（暗绿底，整行高亮）
+            ⋮               （hunk 之间的省略）
+
+    为什么用自定义渲染对象而非现成的 RichText：
+      终端里背景色只覆盖字符本身，文本短于行宽时右侧不会着色，背景条会「断在文末」。
+      要做到「整行背景都是背景色」，必须把高亮行补足空格到**当前可用宽度**。
+      可用宽度只有在真正渲染时才知道（且会随终端 resize 变化），因此实现 __rich_console__，
+      从渲染参数 options.max_width 取得实时宽度再补空格——这样高亮条能铺满整行并自适应宽度。
+
+    行号取值：上下文/新增显示新文件行号，删除显示旧文件行号；
+    与 DiffView.to_text() 的取值规则一致，保证人看到的与回灌给模型的对得上。
+    """
+
+    def __init__(self, view) -> None:
+        """:param view: tools.diff.DiffView"""
+        self._view = view
+
+    def __rich_console__(self, console, options):
+        """
+        Rich 渲染协议：产出本块的 Segment 序列。
+
+        每行先组装出文本与样式，并标记是否需要「整行背景」。需要背景的行（删除/新增）
+        按 options.max_width 补足空格，使背景铺满整行；其余行（概要/上下文/省略）原样输出。
+        行间以换行分隔，末行不补换行，避免产生多余空行。
+        """
+        view = self._view
+        width = options.max_width
+        dim = Style.parse(_DIFF_DIM)
+        remove_bg = Style.parse(_DIFF_REMOVE_BG)
+        add_bg = Style.parse(_DIFF_ADD_BG)
+
+        # 先收集每行的 (文本, 样式, 是否整行铺背景)
+        rows_out: list[tuple[str, Style, bool]] = []
+        # 概要分支行（灰色，无背景）
+        rows_out.append((f"  ⎿  {_count_phrase(view.added, view.removed)}", dim, False))
+        for row in view.rows:
+            if row.marker == MARK_GAP:
+                # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
+                rows_out.append(("        ⋮", dim, False))
+                continue
+            no = row.new_no if row.new_no is not None else row.old_no
+            num = f"    {no:>{_DIFF_NUM_WIDTH}} "  # 4 格缩进 + 右对齐行号
+            if row.marker == MARK_REMOVE:
+                rows_out.append((f"{num}- {row.text}", remove_bg, True))
+            elif row.marker == MARK_ADD:
+                rows_out.append((f"{num}+ {row.text}", add_bg, True))
+            else:  # MARK_CONTEXT：无背景，灰色前景
+                rows_out.append((f"{num}  {row.text}", dim, False))
+        if view.truncated:
+            rows_out.append(("        …（diff 已截断）", dim, False))
+
+        last = len(rows_out) - 1
+        for idx, (text, style, fill) in enumerate(rows_out):
+            if fill:
+                # 补空格到整行宽度（cell_len 正确计算中文/全角宽度），使背景铺满整行
+                pad = max(0, width - cell_len(text))
+                yield Segment(text + " " * pad, style)
+            else:
+                yield Segment(text, style)
+            if idx != last:
+                yield Segment.line()
+
+
+def render_diff_block(view) -> "_DiffBlock":
+    """
+    构造 diff 块的可渲染对象（见 _DiffBlock）。保留函数形式，调用方无需感知具体类型。
+
+    :param view: tools.diff.DiffView
+    :returns: 一个 Rich 可渲染对象，删除/新增行整行背景高亮、自适应宽度
+    """
+    return _DiffBlock(view)
+
+
+# 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签，
+# 与改文件工具的 "Update"/"Write" 风格统一。这里是「展示层」的映射：
+# - 真实工具名仍是各工具的 name（API 用、注册中心用），此表只决定 UI 标题怎么写；
+# - 未登记的工具回退到原始名，保证新增工具即便忘了登记也不会显示异常。
+_TOOL_LABELS = {
+    "read_file": "Read",
+    "glob_files": "Glob",
+    "grep_content": "Grep",
+    "run_command": "Run",
+    "edit_file": "Update",
+    "write_file": "Write",
+}
+
+
 class ToolCallWidget(Static):
     """
     单个工具调用的展示行，自管理执行计时。
 
+    标题统一用展示标签（_TOOL_LABELS，如 Read/Grep/Update）而非内部工具名（snake_case）。
+
     三种视觉状态：
-    - 执行中：橘色，显示 "🔧 工具名(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
-    - 成功：绿色 "● 工具名(参数摘要) 完成 (Ns) — 结果摘要"
-    - 失败：红色 "● 工具名(参数摘要) 失败 (Ns) — 错误摘要"
+    - 执行中：橘色，显示 "● 标签(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
+    - 成功：绿色 "● 标签(参数摘要) 完成 (Ns)" + 下方 "⎿ 结果摘要"
+    - 失败：红色 "● 标签(参数摘要) 失败 (Ns)" + 下方 "⎿ 错误摘要"
 
     计时不依赖 Worker 线程：on_mount 中用 set_interval 在主线程每秒触发 _tick，
     因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
     """
 
-    # 执行中橘色 / 成功绿色 / 失败红色
+    # 执行中橘色 / 成功绿色 / 失败红色 / "⎿ 摘要" 分支行灰色（次级信息）
     _COLOR_RUNNING = "#FFA500"
     _COLOR_OK = "#5FD75F"
     _COLOR_FAIL = "#FF5F5F"
+    _COLOR_BRANCH = "#808080"
 
     def __init__(self, tool_call) -> None:
         """
@@ -76,6 +212,8 @@ class ToolCallWidget(Static):
         """
         super().__init__(markup=True)
         self._name = tool_call.name
+        # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
+        self._label = _TOOL_LABELS.get(self._name, self._name)
         self._args_summary = summarize_args(tool_call.arguments)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
@@ -94,10 +232,10 @@ class ToolCallWidget(Static):
     def _render_running(self) -> None:
         """以橘色渲染执行中状态，显示当前已耗时。"""
         self.update(
-            f"[{self._COLOR_RUNNING}]🔧 {self._name}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
+            f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
         )
 
-    def finish(self, ok: bool, summary: str) -> None:
+    def finish(self, ok: bool, summary: str, diff=None) -> None:
         """
         结束计时并切换到成功/失败终态。
 
@@ -105,6 +243,8 @@ class ToolCallWidget(Static):
 
         :param ok: 工具是否成功（决定绿/红与图标）
         :param summary: 结果摘要文本（已由调用方取首行/截断）
+        :param diff: 可选的 tools.diff.DiffView。改文件类工具会带上它，
+                     此时在状态行下方追加渲染一个彩色 diff 块；其它工具留空。
 
         副作用：停止计时定时器，原地更新本行内容。
         """
@@ -112,11 +252,19 @@ class ToolCallWidget(Static):
             self._timer.stop()
         elapsed = self._elapsed()
         color = self._COLOR_OK if ok else self._COLOR_FAIL
-        icon = "●" if ok else "●"
-        self.update(
-            f"[{color}]{icon} {self._name}({self._args_summary}) "
-            f"{'完成' if ok else '失败'} ({elapsed}s) — {summary}[/]"
-        )
+        result = "完成" if ok else "失败"
+        # 统一为两行式：第一行 "● 标题 完成/失败 (Ns)"，第二行起为 "⎿ ..." 分支。
+        if diff is not None and diff.rows:
+            # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要更贴近改动语义），
+            # 分支由 render_diff_block 产出（首行 "⎿ Added.../removed..." 概要 + 彩色 diff 行）。
+            header = f"[{color}]● {diff.op}({diff.path}) {result} ({elapsed}s)[/]"
+            self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
+        else:
+            # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
+            header = f"[{color}]● {self._label}({self._args_summary}) {result} ({elapsed}s)[/]"
+            branch = RichText("  ⎿  ", style=self._COLOR_BRANCH)
+            branch.append(summary, style=self._COLOR_BRANCH)
+            self.update(RichGroup(RichText.from_markup(header), branch))
 
 
 class HistoryView(ScrollableContainer):
@@ -258,6 +406,7 @@ class CommandPanel(OptionList):
     # 命令注册表：(命令文本, 简要描述)
     COMMANDS: list[tuple[str, str]] = [
         ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
+        ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
@@ -325,21 +474,30 @@ class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：开启/关闭
-    每次 /think 命令执行后，App 层会调用 update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关
+    /think、/plan 命令执行后，App 层会调用 update_status() 刷新显示。
     """
 
-    def update_status(self, provider: str, model: str, thinking_effort: str) -> None:
+    def update_status(
+        self,
+        provider: str,
+        model: str,
+        thinking_effort: str,
+        plan_mode: bool = False,
+    ) -> None:
         """
         刷新状态栏显示内容。
 
         :param provider: Provider 协议名（anthropic / openai / deepseek）
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
+        :param plan_mode: 是否处于 Plan Mode（c4 新增，显示「计划模式：开/关」）
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
-        self.update(f" [{provider}] {model} | 思考模式：{state} ")
+        plan_state = "开" if plan_mode else "关"
+        text = f" [{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
+        self.update(text + " ")
 
 
 class ConfirmPanel(OptionList):
@@ -350,11 +508,16 @@ class ConfirmPanel(OptionList):
     「执行 / 取消」间选择，回车确认，Esc 取消，不遮挡历史区。
 
     用于写文件、改文件、执行命令等有副作用工具：顶部以橘色表头展示工具名与关键参数摘要
-    （仅展示、不可选），下方两个可选项分别对应放行与拒绝。
+    （仅展示、不可选），下方三个可选项分别对应「执行 / 执行且本会话不再询问 / 取消」。
 
-    结果如何回传：面板本身不持有协调层状态。用户选择「执行/取消」时由 OptionList 原生发出
-    OptionList.OptionSelected（App 据 option.id 解析为 True/False）；按 Esc 时发出本类的
+    结果如何回传：面板本身不持有协调层状态。用户选择某项时由 OptionList 原生发出
+    OptionList.OptionSelected（App 据 option.id 解析为 ConfirmDecision）；按 Esc 时发出本类的
     Cancelled 消息（App 视为拒绝）。App 再唤醒被阻塞的 Worker 线程（见 RhineApp._confirm_tool）。
+
+    三个可选项的 option.id 约定：
+    - "yes"        → 仅放行本次（ConfirmDecision.ALLOW）
+    - "yes_always" → 放行且本会话不再询问（ConfirmDecision.ALLOW_ALWAYS）
+    - "no"         → 拒绝（ConfirmDecision.DENY）
 
     设计取舍：确认期间 App 会把焦点临时移到本面板，从而直接复用 OptionList 原生的
     上/下/回车 选择能力（输入框为空时回车不会触发自定义提交消息，移焦到面板最稳健）。
@@ -398,10 +561,31 @@ class ConfirmPanel(OptionList):
                 disabled=True,
             )
         )
-        self.add_option(Option("✅ 执行  [dim]立即执行该工具[/dim]", id="yes"))
+        self.add_option(Option("✅ 执行  [dim]仅执行本次[/dim]", id="yes"))
+        self.add_option(Option("⏩ 执行且不再询问  [dim]本会话后续有副作用工具自动执行[/dim]", id="yes_always"))
         self.add_option(Option("❌ 取消  [dim]拒绝并让模型据此调整[/dim]", id="no"))
         self.display = True
         # 默认高亮「执行」，回车即执行（与 / 命令面板一致的顺手体验）
+        self.highlighted = self._YES_INDEX
+
+    def show_prompt(self, title: str, yes_label: str, no_label: str) -> None:
+        """
+        以通用「是/否」提示复用本面板（c4 用于 Plan Mode 的「是否开始执行」审批）。
+
+        与 show_for 不同：不展示工具名/参数，而是展示一段自定义标题，下面给出两个选项
+        （id 固定为 "yes"/"no"，无第三项）。App 据 option.id=="yes" 判定是否批准。
+
+        :param title: 表头提示文本（单行，过长请由调用方先截断）
+        :param yes_label: 「是」选项的展示文本
+        :param no_label: 「否」选项的展示文本
+
+        副作用：修改 OptionList 选项并使面板可见。
+        """
+        self.clear_options()
+        self.add_option(Option(f"[#FFA500]{title}[/#FFA500]", disabled=True))
+        self.add_option(Option(yes_label, id="yes"))
+        self.add_option(Option(no_label, id="no"))
+        self.display = True
         self.highlighted = self._YES_INDEX
 
     def hide(self) -> None:
@@ -410,4 +594,79 @@ class ConfirmPanel(OptionList):
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为拒绝执行。"""
+        self.post_message(self.Cancelled())
+
+
+class ClarifyPanel(OptionList):
+    """
+    Plan Mode 需求澄清面板（spec F12）。
+
+    模型在规划阶段通过 ask_user 工具发起提问时，App 用本面板把问题与候选项呈现给用户：
+    出现在输入框上方，方向键上下选择，回车确认，Esc 取消，不遮挡历史区（与确认面板同款交互）。
+
+    每个候选项展示「概述 + 详细描述」，但只有概述可被选中：
+    - 实现方式：每个候选项渲染为「可选的概述行」+ 紧随其后的「disabled 详情行」。
+      OptionList 的上下导航会自动跳过 disabled 项，从而做到「导航只在概述之间移动」，
+      同时详情仍然可见，帮助用户判断（对应需求：上下移动只在概述间移动、每个选择下有详细描述）。
+    - 最推荐的候选项排在第一位（由模型保证），概述文本自身已含推荐信息，不再额外加标记。
+
+    结果如何回传：用户选中某概述行时由 OptionList 原生发出 OptionList.OptionSelected
+    （option.id 为该候选项在 options 中的下标字符串，App 据此取回所选概述）；按 Esc 发出
+    本类的 Cancelled 消息（App 视为用户取消澄清）。App 再唤醒被阻塞的 Worker（见 RhineApp._clarify）。
+    """
+
+    # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
+    DEFAULT_CSS = "ClarifyPanel { display: none; }"
+
+    class Cancelled(TextualMessage):
+        """用户按 Esc 取消澄清时发出，由 App 视为用户取消。"""
+        pass
+
+    BINDINGS = [
+        # Esc 取消：发出 Cancelled 消息交给 App 处理
+        Binding("escape", "cancel", "取消", show=False),
+    ]
+
+    def show_for(self, question: str, options: list[ClarifyOption]) -> None:
+        """
+        为一次澄清提问填充并显示面板。
+
+        先清空旧选项再重建，避免残留上一次提问内容。结构为：
+        - 一个 disabled 表头（展示问题 question，不可选）
+        - 对每个候选项：一个可选概述行（id=下标字符串）+ 一个 disabled 详情行（若有 detail）
+
+        :param question: 模型要澄清的问题
+        :param options: 候选项列表；第一个为最推荐项（概述文本自身已含推荐信息）
+
+        副作用：修改 OptionList 选项并使面板可见。
+        """
+        self.clear_options()
+        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过
+        self.add_option(Option(f"[#7AEEFF]❓ {question}[/#7AEEFF]", disabled=True))
+
+        first_selectable: int | None = None
+        for idx, opt in enumerate(options):
+            # 概述行：可选，id 为该候选项下标（字符串）
+            # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
+            #     故不再额外加「⭐ 推荐」前缀，避免重复提示。
+            option_index = self.option_count  # 加入前的位置即本概述行的索引
+            self.add_option(Option(opt.summary, id=str(idx)))
+            if first_selectable is None:
+                first_selectable = option_index
+            # 详情行：disabled，仅展示，导航会跳过
+            # 不缩进，使详情与上方概述行左边缘对齐
+            if opt.detail:
+                self.add_option(Option(f"[dim]{opt.detail}[/dim]", disabled=True))
+
+        self.display = True
+        # 默认高亮第一个可选概述行
+        if first_selectable is not None:
+            self.highlighted = first_selectable
+
+    def hide(self) -> None:
+        """隐藏面板并收回布局空间。"""
+        self.display = False
+
+    def action_cancel(self) -> None:
+        """Esc 绑定：发出 Cancelled 消息，由 App 解释为用户取消澄清。"""
         self.post_message(self.Cancelled())

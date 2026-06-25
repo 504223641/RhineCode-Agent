@@ -6,6 +6,7 @@
 """
 
 from rhinecode.tools.base import Tool, ToolResult, human_size
+from rhinecode.tools.diff import build_diff
 from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
 
 
@@ -39,12 +40,12 @@ class WriteFileTool(Tool):
 
         执行步骤：
         1. 取出 path 与 content，解析绝对路径
-        2. 写前判断文件是否已存在（用于区分「新建」与「覆盖」）
+        2. 写前判断文件是否已存在（用于区分「新建」与「覆盖」），覆盖时读取旧内容以便算 diff
         3. 父目录不存在则递归创建
-        4. 以 UTF-8 写入，返回含新建/覆盖、行数、字节数的摘要
+        4. 以 UTF-8 写入，构造差异，返回含新建/覆盖、行数、字节数的摘要
 
         :param args: 含 "path" 与 "content" 键
-        :returns: 成功时 output 说明写入路径、新建/覆盖、行数与字节数；异常时 ok=False
+        :returns: 成功时 output 说明写入路径、新建/覆盖、行数与字节数，并附结构化 diff；异常时 ok=False
 
         副作用：创建/覆盖文件系统中的文件，可能创建父目录。
         """
@@ -61,6 +62,16 @@ class WriteFileTool(Tool):
             # 写入前判断，区分新建/覆盖（写入后再判断就分不清了）
             existed = abs_path.exists()
 
+            # 覆盖已有文件时先读旧内容，供 diff 对比；新建（或旧内容读不出）时按空文本处理。
+            # 二进制/编码异常不应阻断写入，只是退化为「全是新增行」的 diff，故吞掉异常。
+            old_content = ""
+            if existed and abs_path.is_file():
+                try:
+                    with open(abs_path, "r", encoding="utf-8") as f:
+                        old_content = f.read()
+                except (UnicodeDecodeError, OSError):
+                    old_content = ""
+
             # 父目录缺失时递归创建，避免因目录不存在导致写入失败
             abs_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -72,10 +83,14 @@ class WriteFileTool(Tool):
             line_count = 0 if content == "" else content.count("\n") + 1
             action = "覆盖" if existed else "新建"
 
+            # 结构化差异：新建时 old_content 为空 → 全部为新增行；覆盖时展示新旧逐行差异。
+            diff_view = build_diff("Write", path, old_content, content)
+
             return ToolResult(
                 ok=True,
-                output=f"已写入 {path}（{action}，{line_count} 行，{byte_len} 字节）",
+                output=f"已写入 {path}（{action}，{line_count} 行，{byte_len} 字节）\n{diff_view.to_text()}",
                 summary=f"{action} · {line_count} 行 · {human_size(byte_len)}",
+                diff=diff_view,
             )
 
         except PathGuardError as e:

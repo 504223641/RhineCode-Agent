@@ -62,6 +62,19 @@ class ToolRegistry:
         """
         return [tool.to_schema() for tool in self._tools.values()]
 
+    def readonly_schemas(self) -> list[dict]:
+        """
+        仅导出只读工具（read_only=True）的 API 描述列表。
+
+        供 Agent 循环在 Plan Mode 规划阶段使用：此时只向模型开放只读工具，
+        禁止其发起写文件 / 改文件 / 执行命令等有副作用的操作（spec F11）。
+
+        :returns: 只读工具的 function 描述列表
+
+        副作用：无（仅读取已注册工具并转换）。
+        """
+        return [tool.to_schema() for tool in self._tools.values() if tool.read_only]
+
     @classmethod
     def default(cls) -> "ToolRegistry":
         """

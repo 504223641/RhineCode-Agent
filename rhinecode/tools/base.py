@@ -11,6 +11,9 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Optional
+
+from rhinecode.tools.diff import DiffView
 
 
 def human_size(n_bytes: int) -> str:
@@ -43,10 +46,14 @@ class ToolResult:
     :param summary: 面向「TUI 单行展示」的简短摘要（如「读取 152 行 · 4.2K」）。
                     与 output 解耦：output 给模型看完整内容，summary 给人看量级与状态。
                     为空时 TUI 回退到取 output 首行（见 RhineApp._summarize_result）。
+    :param diff: 可选的结构化差异。改文件类工具（edit_file/write_file）填充它，
+                 TUI 据此在状态行下方渲染彩色 diff 块；其它工具留空（None）。
+                 与 output/summary 解耦：diff 是「结构化数据」，渲染样式由 TUI 决定。
     """
     ok: bool
     output: str
     summary: str = ""
+    diff: Optional[DiffView] = None
 
 
 class Tool(ABC):
