@@ -2,7 +2,7 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C4 Agent Loop：模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
+当前版本以 DeepSeek Provider 为主实现了 C5 阶段能力：在 C4 Agent Loop 基础上加入结构化系统提示、动态 system-reminder 注入与缓存命中调试日志。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 语言
 中文回答
@@ -23,6 +23,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - **逐项执行确认**：写文件、改文件、运行命令等副作用工具会弹出内联确认面板；计划获批不等于免确认，除非用户选择“执行且不再询问”。
 - **明确停止原因**：支持自然完成、迭代上限、用户取消、计划拒绝、连续未知工具、流错误等停止路径。
 - **路径安全边界**：文件类工具只能访问项目工作目录内路径，拒绝 `..`、越界绝对路径和指向项目外的符号链接。
+- **结构化系统提示**：七个固定提示模块走稳定可缓存通道，环境信息与 Plan Mode 提醒通过 `<system-reminder>` 作为动态补充注入。
 
 工具调用与 Plan Mode 目前仅在 `protocol: deepseek` 且启用默认工具注册中心时可用。
 
@@ -32,7 +33,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 - **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费 AgentEvent 并逐块渲染；`widgets.py` 提供 HistoryView / InputBar / StatusBar / 工具行 / diff / 确认和澄清面板。
 - **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、解析斜杠命令、管理思考模式和 Plan Mode、封装确认/澄清/计划审批回调。
-- **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环；`events.py` 定义 AgentEvent、停止原因和确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 和 `prompt.py` 支撑 Plan Mode。
+- **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环；`events.py` 定义 AgentEvent、停止原因和确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 支撑 Plan Mode 特殊工具；`prompt/` 负责结构化系统提示、环境信息与动态 reminder。
 - **Provider 层**（`rhinecode/provider/`）— `base.py` 定义 `BaseProvider`/`Message`/`StreamChunk` 抽象；`anthropic.py`、`openai.py`、`deepseek.py` 为具体实现；`factory.py` 的 `create_provider` 按 `protocol` 分发。
 - **Tools 层**（`rhinecode/tools/`）— `base.py` 定义 Tool / ToolResult 抽象；`registry.py` 注册默认工具；`path_guard.py` 负责路径边界；`read_file.py`、`write_file.py`、`edit_file.py`、`run_command.py`、`glob_files.py`、`grep_content.py` 是当前 6 个核心工具。
 
@@ -67,18 +68,20 @@ rhinecode --config config.yaml            # 安装后也可以用控制台脚本
 
 ## 配置
 
-`config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。
+`config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。
 
 ## Spec 驱动开发
 
-开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c4/`。
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c5/`。
 
-C4 文档描述当前 Agent Loop 与 Plan Mode 的实际行为：
+C5 文档描述当前结构化系统提示、缓存策略与 Agent Loop 接线的实际行为：
 
-- `docs/c4/spec.md`
-- `docs/c4/plan.md`
-- `docs/c4/task.md`
-- `docs/c4/checklist.md`
+- `docs/c5/spec.md`
+- `docs/c5/plan.md`
+- `docs/c5/task.md`
+- `docs/c5/checklist.md`
+
+C4 文档仍保留，用于追溯 Agent Loop 与 Plan Mode 的设计来源。
 
 ## 测试
 
@@ -106,6 +109,16 @@ python -m unittest discover -s tests
 - 指向项目外的符号链接会被拒绝或跳过。
 - 命令工具显式以项目根作为 `cwd`，但不做命令沙箱；危险命令仍需要用户判断确认。
 - `config.yaml` 可能包含真实 API Key，请勿提交到版本库。
+
+## 已知后续工程项
+
+以下问题已完成工程审查确认，但不属于当前阶段开发范围。后续章节会集中补齐；在当前阶段不要把它们视为阻塞项，除非用户明确要求处理：
+
+1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
+2. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。
+3. `write_file` / `edit_file` 的文件系统级原子写入。
+4. `run_command` 的权限策略、危险命令二次确认或更细粒度沙箱。
+5. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
 
 ## 代码注释规范
 
