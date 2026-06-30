@@ -407,6 +407,7 @@ class CommandPanel(OptionList):
     COMMANDS: list[tuple[str, str]] = [
         ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
         ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
+        ("/perm",  "循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
