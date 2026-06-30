@@ -501,7 +501,10 @@ class StatusBar(Static):
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
         plan_state = "开" if plan_mode else "关"
-        text = f" [{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
+        # Static(markup=True) 走 Textual 的 Content markup：`[xxx]` 会被当成样式标签解析。
+        # 这里 `[provider]` 的方括号是想当「字面量」显示的，必须转义开口的 `[`（写成 `\[`），
+        # 否则像 `[deepseek]` 会被解析成无效样式标签而整段消失（历史遗留显示 bug）。
+        text = f" \\[{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
         if permission_mode is not None:
             _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
             plabel = _PERM.get(permission_mode, permission_mode)
