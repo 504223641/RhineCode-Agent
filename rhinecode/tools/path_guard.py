@@ -46,6 +46,30 @@ def resolve_in_workspace(path: str) -> Path:
     return resolved
 
 
+def is_within_workspace(path: str) -> bool:
+    """
+    判断一个路径是否安全地落在项目工作目录内（布尔版的 resolve_in_workspace）。
+
+    供权限系统的②沙箱层调用：引擎需要的是「是否越界」的布尔结论，而不是抛异常或拿到
+    解析后的路径，因此这里复用 resolve_in_workspace 的边界逻辑，把它抛出的 PathGuardError
+    捕获并转成 False，绝不向上抛异常（保证 engine.decide 是纯判定、不会因坏输入崩溃）。
+
+    与 resolve_in_workspace 同样的边界：含 `..`、解析后越界的绝对路径、指向工作区外的
+    符号链接都判为越界（返回 False）。其它无法解析的异常同样按越界处理（fail-safe，spec N1）。
+
+    :param path: 待校验的文件路径（相对或绝对）
+    :returns: 位于工作区内返回 True；越界或无法安全解析返回 False
+    """
+    try:
+        resolve_in_workspace(path)
+        return True
+    except PathGuardError:
+        return False
+    except Exception:
+        # 任何意料外的解析异常都按「不安全」处理，宁可错拒不可错放（fail-safe）。
+        return False
+
+
 def validate_glob_pattern(pattern: str) -> None:
     """校验 glob 模式只能在工作区内部展开。"""
     raw = str(pattern)

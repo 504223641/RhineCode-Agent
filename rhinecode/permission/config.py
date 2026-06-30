@@ -1,0 +1,176 @@
+"""
+③规则层的配置支撑（spec F4/F9/N1）：三层 YAML 文件的定位、加载、容错与回写。
+
+三层配置（越靠近项目越「本地」，但求值用哲学 A 不分层级优先，见 rules.py）：
+- 用户级 ~/.rhinecode/permissions.yaml          —— 跨项目的全局默认
+- 项目级 <项目根>/.rhinecode/permissions.yaml   —— 随仓库走、可提交
+- 本地级 <项目根>/.rhinecode/permissions.local.yaml —— 不提交；F6「永久放行」写这里
+
+文件内容格式（人类可读、可手编）：
+    allow:
+      - "Bash(git *)"
+      - "Read(src/**)"
+    deny:
+      - "Bash(git push *)"
+
+容错原则（fail-safe，spec N1/F9）：文件缺失视为空规则集；YAML 解析失败时该层降级为
+空并收集一条可读错误，**绝不**因配置坏掉而崩溃或意外放开权限。
+"""
+
+from pathlib import Path
+from typing import Optional
+
+import yaml
+
+from rhinecode.permission.models import Rule
+from rhinecode.permission.rules import RuleSet
+from rhinecode.tools.path_guard import workspace_root
+
+# 配置目录与文件名常量，集中定义便于统一调整。
+_CONFIG_DIR_NAME = ".rhinecode"
+_CONFIG_FILE = "permissions.yaml"
+_LOCAL_FILE = "permissions.local.yaml"
+
+
+def user_config_path() -> Path:
+    """用户级配置路径：~/.rhinecode/permissions.yaml（跨项目全局默认）。"""
+    return Path.home() / _CONFIG_DIR_NAME / _CONFIG_FILE
+
+
+def project_config_path() -> Path:
+    """项目级配置路径：<项目根>/.rhinecode/permissions.yaml（随仓库走）。"""
+    return workspace_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
+
+
+def local_config_path() -> Path:
+    """本地级配置路径：<项目根>/.rhinecode/permissions.local.yaml（不提交，永久放行写此）。"""
+    return workspace_root() / _CONFIG_DIR_NAME / _LOCAL_FILE
+
+
+def parse_rule_string(text: str, effect: str, source: str) -> Optional[Rule]:
+    """
+    把一条配置里的规则字符串解析成 Rule。
+
+    支持两种写法：
+    - "Bash(git *)" → tool="Bash"，pattern="git *"
+    - "Bash"        → tool="Bash"，pattern=""（匹配该工具所有调用）
+
+    :param text: 规则字符串
+    :param effect: 该规则的效果，"allow" 或 "deny"（由它来自哪个 YAML 键决定）
+    :param source: 来源层（user/project/local/session），仅用于原因展示与调试
+    :returns: 解析出的 Rule；text 为空或非法时返回 None（调用方跳过该条）
+
+    副作用：无。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.endswith(")") and "(" in text:
+        idx = text.index("(")
+        tool = text[:idx].strip()
+        pattern = text[idx + 1 : -1].strip()
+    else:
+        tool = text
+        pattern = ""
+    if not tool:
+        return None
+    return Rule(effect=effect, tool=tool, pattern=pattern, source=source)
+
+
+def _load_layer(path: Path, source: str) -> tuple[list[Rule], Optional[str]]:
+    """
+    加载单层配置文件，返回 (规则列表, 错误信息或 None)。
+
+    容错（fail-safe）：
+    - 文件不存在 → ([], None)：视为该层无规则，正常情况。
+    - 读取/解析异常或结构非法 → ([], 可读错误)：该层降级为空，不抛异常、不放权。
+
+    :param path: 配置文件路径
+    :param source: 来源层标记，写入每条 Rule 的 source
+    :returns: (该层解析出的规则, 错误信息)；无错误时第二项为 None
+    """
+    if not path.exists():
+        return [], None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw)
+    except Exception as exc:  # noqa: BLE001 —— 任何读/解析异常都按降级处理
+        return [], f"配置文件解析失败（{path}）：{exc}"
+
+    if data is None:
+        return [], None
+    if not isinstance(data, dict):
+        return [], f"配置文件格式应为映射（allow/deny 列表）：{path}"
+
+    rules: list[Rule] = []
+    for effect in ("allow", "deny"):
+        items = data.get(effect)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            return [], f"配置项 {effect} 应为列表：{path}"
+        for item in items:
+            rule = parse_rule_string(str(item), effect, source)
+            if rule is not None:
+                rules.append(rule)
+    return rules, None
+
+
+def load_all() -> tuple[RuleSet, list[str]]:
+    """
+    加载三层配置并合并成一个 RuleSet。
+
+    逐层加载用户级 / 项目级 / 本地级，把各层规则汇总进同一个 RuleSet（合并后由
+    rules.py 以 deny 优先求值，层级不决定优先级）。任一层的加载错误收集进列表一并返回，
+    供上层（ConversationManager）以系统提示展示，但不阻断启动（fail-safe）。
+
+    :returns: (合并后的 RuleSet, 错误信息列表)；无错误时列表为空
+
+    副作用：读取文件系统上的三个配置文件（若存在）。
+    """
+    all_rules: list[Rule] = []
+    errors: list[str] = []
+    for path, source in (
+        (user_config_path(), "user"),
+        (project_config_path(), "project"),
+        (local_config_path(), "local"),
+    ):
+        rules, err = _load_layer(path, source)
+        all_rules.extend(rules)
+        if err is not None:
+            errors.append(err)
+    return RuleSet(all_rules), errors
+
+
+def append_local_allow(rule_string: str) -> None:
+    """
+    把一条 allow 规则追加写入本地级配置文件（spec F6「永久放行」）。
+
+    行为：
+    - 读取现有本地级 YAML（不存在或损坏则从空白开始，保证不丢失也不崩溃）。
+    - 在 allow 列表里追加 rule_string；若已存在相同条目则跳过（幂等）。
+    - 目录不存在时创建后写回，使用 UTF-8。
+
+    :param rule_string: 形如 "Bash(git *)" 的规则字符串
+
+    副作用：创建/写入本地级配置文件 permissions.local.yaml。
+    """
+    path = local_config_path()
+    data: dict = {}
+    if path.exists():
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:  # noqa: BLE001 —— 损坏则从空白重建，不影响写入
+            data = {}
+
+    allow_list = data.get("allow")
+    if not isinstance(allow_list, list):
+        allow_list = []
+    if rule_string not in allow_list:
+        allow_list.append(rule_string)
+    data["allow"] = allow_list
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")

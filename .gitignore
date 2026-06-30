@@ -16,3 +16,6 @@ TemText.txt
 
 # c5 缓存命中调试日志（运行时生成，用于验证缓存策略）
 .rhinecode_debug.log
+
+# c6 本地级权限配置（含「永久放行」自动追加的规则，按机器/个人，不提交）
+**/.rhinecode/*.local.yaml
