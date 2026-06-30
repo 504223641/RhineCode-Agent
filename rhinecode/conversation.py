@@ -28,10 +28,17 @@ from rhinecode.tools.path_guard import workspace_root
 from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import AgentEvent, ClarifyOption, ConfirmDecision
+from rhinecode.permission import (
+    DecisionResult,
+    PermissionEngine,
+    PermissionMode,
+    Rule,
+    to_request,
+)
 
-# 执行前确认回调类型：给定工具调用与工具实例，返回三态决定（执行/不再询问/拒绝）。
-# 由 TUI 层实现（弹确认面板），协调层只调用、不感知 TUI 细节。
-ConfirmCallback = Callable[[ToolCall, Tool], ConfirmDecision]
+# 人在回路（HITL）确认回调类型：给定工具调用、工具实例与决策结果（含拒绝原因），
+# 返回四态决定（本次/本会话/永久/拒绝）。由 TUI 层实现（弹确认面板），协调层只调用。
+ConfirmCallback = Callable[[ToolCall, Tool, DecisionResult], ConfirmDecision]
 # 需求澄清回调：给定问题与候选项，返回用户所选概述；返回 None 表示用户取消。
 ClarifyCallback = Callable[[str, list[ClarifyOption]], Optional[str]]
 # 计划审批回调：给定计划文本，返回用户是否批准开始执行。
@@ -50,6 +57,19 @@ class ConversationManager:
     _EFFORT_CYCLE = {"off": "high", "high": "max", "max": "off"}
     # 各档位对应的中文显示名称
     _EFFORT_LABEL = {"off": "关闭", "high": "高效（high）", "max": "最强（max）"}
+
+    # /perm 命令的三档循环顺序：默认 → 严格 → 放行 → 默认（c6）
+    _PERM_CYCLE = {
+        PermissionMode.DEFAULT: PermissionMode.STRICT,
+        PermissionMode.STRICT: PermissionMode.PERMISSIVE,
+        PermissionMode.PERMISSIVE: PermissionMode.DEFAULT,
+    }
+    # 各权限模式对应的中文显示名称
+    _PERM_LABEL = {
+        PermissionMode.STRICT: "严格（strict）",
+        PermissionMode.DEFAULT: "默认（default）",
+        PermissionMode.PERMISSIVE: "放行（permissive）",
+    }
 
     def __init__(
         self,
@@ -75,8 +95,9 @@ class ConversationManager:
         self.thinking_effort: str = "off"
         # Plan Mode 开关：开启时循环只放只读工具并注入引导提示（仅工具可用 Provider 生效）
         self.plan_mode: bool = False
-        # 会话级「免确认」：用户在确认面板选过「不再询问」后置真，本会话后续有副作用工具自动执行
-        self._always_allow: bool = False
+        # 权限决策引擎（c6）：启动时加载三层 YAML 规则，持有权限模式与会话级规则。
+        # 取代 c5 的「会话级一刀切免确认」标志——本会话放行改为按规则登记（见 _run 的 ask 闭包）。
+        self._engine: PermissionEngine = PermissionEngine.load()
         # 当前运行的取消信号；每次运行重建，置位即让循环尽快停止
         self._cancel_event: threading.Event = threading.Event()
 
@@ -89,6 +110,20 @@ class ConversationManager:
         self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
         self._agent = Agent(provider, registry)
+
+    @property
+    def permission_mode_value(self) -> Optional[str]:
+        """
+        当前权限模式的取值字符串（"strict"/"default"/"permissive"），供状态栏展示（c6）。
+
+        仅在工具可用（DeepSeek 工具模式）时有意义——其它 Provider 没有受控工具，
+        权限模式不参与任何判断，故返回 None，让状态栏不展示这一段，避免误导。
+
+        :returns: 模式值字符串；工具不可用时返回 None
+        """
+        if not self._tools_enabled:
+            return None
+        return self._engine.mode.value
 
     def clear(self) -> None:
         """
@@ -116,6 +151,7 @@ class ConversationManager:
         - "/clear" → 清空 history，返回确认文本
         - "/think" → 三态循环切换 thinking_effort（off→high→max→off）；不支持的 Provider 返回提示
         - "/plan"  → 切换 Plan Mode；仅工具可用 Provider 生效，否则返回不支持提示
+        - "/perm"  → 三档循环切换权限模式（默认→严格→放行）；仅工具可用 Provider 生效（c6）
         - 其他     → 追加用户消息到 history，委托 Agent 跑循环，返回事件流
 
         :param text: 用户原始输入（含前后空白）
@@ -152,6 +188,14 @@ class ConversationManager:
             self.plan_mode = not self.plan_mode
             return "计划模式：开启" if self.plan_mode else "计划模式：关闭"
 
+        if text == "/perm":
+            # 权限模式三档循环切换（c6）；仅在工具可用的 Provider 下有意义（无工具则无可控对象）
+            if not self._tools_enabled:
+                return "当前 Provider 不支持权限模式"
+            self._engine.set_mode(self._PERM_CYCLE[self._engine.mode])
+            label = self._PERM_LABEL[self._engine.mode]
+            return f"权限模式：{label}"
+
         # 普通消息：先追加到历史，再委托 Agent 跑循环
         self.history.append(Message(role="user", content=text))
         return self._run()
@@ -164,12 +208,14 @@ class ConversationManager:
         1. 重建取消信号（每次运行独立，避免上次的取消影响本次）。
         2. 采集环境信息并拼装结构化系统提示，分出 stable（可缓存）与 dynamic（动态）两段（c5）。
         3. 计算缓存调试日志路径（debug_log 关闭时为 None）。
-        4. 构造 confirm 闭包：把 TUI 的三态确认回调 + 会话级免确认，封装成循环只需的 bool 接口。
-        5. 调用 Agent.run，把历史、思考模式、Plan Mode、系统提示两段、日志路径、三类回调与取消信号注入。
+        4. 构造 ask 闭包：把 TUI 的四态确认回调封装成循环只需的 bool 接口，并在用户选
+           「本会话/永久放行」时把对应 allow 规则登记进引擎（会话级 / 写本地配置，c6 F6）。
+        5. 调用 Agent.run，注入历史、思考模式、Plan Mode、系统提示两段、日志路径、权限引擎、
+           四类回调与取消信号。
 
         :returns: Agent 产出的 AgentEvent 事件流
 
-        副作用：重建 self._cancel_event；可能在执行中置位 self._always_allow。
+        副作用：重建 self._cancel_event；ask 闭包可能向引擎登记会话规则或写本地配置文件。
         """
         self._cancel_event = threading.Event()
 
@@ -184,24 +230,43 @@ class ConversationManager:
             str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
         )
 
-        def confirm(tool_call: ToolCall, tool: Tool) -> bool:
+        def ask(tool_call: ToolCall, tool: Tool, decision: DecisionResult) -> bool:
             """
-            有副作用工具执行前确认（供循环调用，返回是否执行）。
+            人在回路确认（仅当决策为 ASK 时由循环调用，返回是否执行）。
 
-            - 会话级免确认已开启 → 直接放行
-            - 否则调用 TUI 三态确认回调：
-              ALLOW_ALWAYS → 置位会话级免确认并放行；ALLOW → 放行；DENY → 拒绝
-            - 无确认回调（理论上不该发生）→ fail-closed 拒绝，绝不擅自执行有副作用工具
+            - 无确认回调（理论上不该发生）→ fail-closed 拒绝，绝不擅自执行有副作用工具。
+            - 否则调用 TUI 四态确认回调，按所选处理：
+              本次（ALLOW）→ 放行本次；
+              本会话（ALLOW_SESSION）→ 为「该工具 + 本次目标」登记一条会话级 allow 规则后放行，
+                  本会话内后续相同调用经引擎直接 ALLOW，不再弹面板；
+              永久（ALLOW_PERMANENT）→ 把同样的 allow 规则写入本地级配置（重启仍生效）后放行；
+              拒绝（DENY）→ 不执行。
+
+            规则的工具名与匹配模式来自 adapter 的规范化结果（与引擎判断口径一致），
+            specifier 直接作为模式（精确匹配本次目标，偏保守、最小授权）。
             """
-            if self._always_allow:
-                return True
             if self.confirm_callback is None:
                 return False
-            decision = self.confirm_callback(tool_call, tool)
-            if decision == ConfirmDecision.ALLOW_ALWAYS:
-                self._always_allow = True
+            choice = self.confirm_callback(tool_call, tool, decision)
+            if choice == ConfirmDecision.DENY:
+                return False
+            if choice == ConfirmDecision.ALLOW:
                 return True
-            return decision == ConfirmDecision.ALLOW
+            # 本会话 / 永久：构造与本次调用同口径的 allow 规则。
+            req = to_request(tool, tool_call.arguments, self._engine.mode)
+            rule_string = f"{req.rule_name}({req.specifier})" if req.specifier else req.rule_name
+            if choice == ConfirmDecision.ALLOW_SESSION:
+                self._engine.add_session_rule(
+                    Rule(effect="allow", tool=req.rule_name, pattern=req.specifier, source="session")
+                )
+                return True
+            if choice == ConfirmDecision.ALLOW_PERMANENT:
+                if not self._engine.persist_local_rule(rule_string):
+                    self._engine.add_session_rule(
+                        Rule(effect="allow", tool=req.rule_name, pattern=req.specifier, source="session")
+                    )
+                return True
+            return False
 
         return self._agent.run(
             self.history,
@@ -211,7 +276,8 @@ class ConversationManager:
             assembled.dynamic,
             self._config.model,
             debug_log_path,
-            confirm,
+            self._engine,
+            ask,
             self.clarify_callback,
             self.approve_plan_callback,
             self._cancel_event,

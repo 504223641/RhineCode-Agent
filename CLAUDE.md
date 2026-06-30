@@ -2,7 +2,7 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C5 阶段能力：在 C4 Agent Loop 基础上加入结构化系统提示、动态 system-reminder 注入与缓存命中调试日志。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
+当前版本以 DeepSeek Provider 为主实现了 C6 阶段能力：在 C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套**五层防御权限系统**（危险命令黑名单 → 路径沙箱 → 可配置规则 → 权限模式 → 人在回路），在每个工具执行前由代码计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 语言
 中文回答
@@ -19,23 +19,24 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令。
-- **Plan Mode**：`/plan` 开启后先只允许只读调研和需求澄清，完整计划进入聊天记录，经用户批准后才进入执行阶段。
-- **逐项执行确认**：写文件、改文件、运行命令等副作用工具会弹出内联确认面板；计划获批不等于免确认，除非用户选择“执行且不再询问”。
+- **Plan Mode**：`/plan` 开启后先只允许只读调研和需求澄清，完整计划进入聊天记录，经用户批准后才进入执行阶段。与权限模式正交。
+- **五层防御权限系统**：每个工具执行前由 `permission/` 包的纯逻辑引擎按固定顺序计算决定——①危险命令黑名单（不可被任何配置/模式放开）→②路径沙箱→③可配置规则（`Tool(模式)`，deny 永远优先）→④权限模式（严格/默认/放行，`/perm` 切换）→⑤人在回路（确认面板四选项：本次/本会话/永久/拒绝）。被拒不终止循环，结构化原因回灌模型让其调整策略。
+- **可配置权限规则**：三层 YAML（用户级 `~/.rhinecode/`、项目级 `<根>/.rhinecode/`、本地级 `*.local.yaml` 不提交）声明 allow/deny；跨层合并后 deny 优先求值。
 - **明确停止原因**：支持自然完成、迭代上限、用户取消、计划拒绝、连续未知工具、流错误等停止路径。
-- **路径安全边界**：文件类工具只能访问项目工作目录内路径，拒绝 `..`、越界绝对路径和指向项目外的符号链接。
 - **结构化系统提示**：七个固定提示模块走稳定可缓存通道，环境信息与 Plan Mode 提醒通过 `<system-reminder>` 作为动态补充注入。
 
-工具调用与 Plan Mode 目前仅在 `protocol: deepseek` 且启用默认工具注册中心时可用。
+工具调用、Plan Mode 与权限系统目前仅在 `protocol: deepseek` 且启用默认工具注册中心时可用。
 
 ## 架构
 
 当前核心分层如下，上层尽量不感知下层具体实现，通过抽象接口和事件流解耦：
 
 - **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费 AgentEvent 并逐块渲染；`widgets.py` 提供 HistoryView / InputBar / StatusBar / 工具行 / diff / 确认和澄清面板。
-- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、解析斜杠命令、管理思考模式和 Plan Mode、封装确认/澄清/计划审批回调。
-- **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环；`events.py` 定义 AgentEvent、停止原因和确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 支撑 Plan Mode 特殊工具；`prompt/` 负责结构化系统提示、环境信息与动态 reminder。
+- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、解析斜杠命令（含 `/perm` 切换权限模式）、管理思考模式和 Plan Mode、构建权限引擎并封装 ask（四态人工确认）/澄清/计划审批回调。
+- **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环，并在 `_execute` 单点接入权限决策预扫；`events.py` 定义 AgentEvent、停止原因和四态确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 支撑 Plan Mode 特殊工具；`prompt/` 负责结构化系统提示、环境信息与动态 reminder。
+- **Permission 层**（`rhinecode/permission/`）— 五层防御权限系统，纯逻辑、与 TUI/Provider 解耦：`models.py` 数据结构与枚举；`matching.py` 命令/路径匹配与命令拆分；`blacklist.py` 危险命令黑名单；`rules.py` deny 优先求值；`config.py` 三层 YAML 加载/容错/回写；`adapter.py` 把工具调用规范化为权限请求（收口工具知识）；`engine.py` 的 `PermissionEngine.decide` 组装四层管线。
 - **Provider 层**（`rhinecode/provider/`）— `base.py` 定义 `BaseProvider`/`Message`/`StreamChunk` 抽象；`anthropic.py`、`openai.py`、`deepseek.py` 为具体实现；`factory.py` 的 `create_provider` 按 `protocol` 分发。
-- **Tools 层**（`rhinecode/tools/`）— `base.py` 定义 Tool / ToolResult 抽象；`registry.py` 注册默认工具；`path_guard.py` 负责路径边界；`read_file.py`、`write_file.py`、`edit_file.py`、`run_command.py`、`glob_files.py`、`grep_content.py` 是当前 6 个核心工具。
+- **Tools 层**（`rhinecode/tools/`）— `base.py` 定义 Tool / ToolResult 抽象；`registry.py` 注册默认工具；`path_guard.py` 负责路径边界（`resolve_in_workspace` 抛异常版、`is_within_workspace` 布尔版供权限引擎②沙箱层复用）；`read_file.py`、`write_file.py`、`edit_file.py`、`run_command.py`、`glob_files.py`、`grep_content.py` 是当前 6 个核心工具。
 
 新增 Provider：在 `provider/` 下继承 `BaseProvider` 实现 `stream_chat`，再到 `factory.py` 添加 `elif` 分支，配置中 `protocol` 改为新值即可。
 
@@ -46,7 +47,16 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - 产出 `StreamChunk(type="tool_call")`。
 - 能序列化历史中的 `assistant(tool_calls)` 与 `role="tool"` 消息。
 
-新增工具：在 `tools/` 下继承 `Tool`，声明 `name`、`description`、`parameters`、`read_only`，实现 `execute`，再到 `ToolRegistry.default()` 注册。文件类工具必须复用 `path_guard.py` 的路径边界校验。
+新增工具：在 `tools/` 下继承 `Tool`，声明 `name`、`description`、`parameters`、`read_only`，实现 `execute`，再到 `ToolRegistry.default()` 注册。文件类工具必须复用 `path_guard.py` 的路径边界校验。若新工具要纳入细粒度权限控制（映射到 Bash/Read/Edit/Write 规则名与对应 specifier），在 `permission/adapter.py` 的 `_TOOL_MAP` 加一行映射即可；未映射的工具自动落到 `other` 分支（仅按工具名匹配整工具规则 + 走权限模式兜底），不会漏过权限检查。
+
+新增斜杠命令：必须**成对维护**两处，缺一会出现「命令能用但补全列表看不到」或反之——① 在 `conversation.py` 的 `handle_input` 加分支实现命令逻辑；② 在 `tui/widgets.py` 的 `CommandPanel.COMMANDS` 注册表追加 `(命令文本, 简要描述)`，输入 `/` 才会在补全面板列出。若命令带选项面板/回调（如确认四态），还需同步 `tui/app.py` 的事件处理与回调注入。
+
+> 「成对维护点」备忘（改一处常需同步另一处，避免遗漏）：
+> - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）
+> - 新增斜杠命令 → `conversation.py`（逻辑）+ `tui/widgets.py` `CommandPanel.COMMANDS`（补全列表）+（若改了状态栏可见状态）`tui/app.py` 提交处理里 `if text in (...)` 的状态栏刷新白名单
+> - 新增状态栏展示字段 → `tui/widgets.py` `StatusBar.update_status`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）+ 触发刷新的命令需在上面那个白名单里
+> - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+> - 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
 
 ## 常用命令
 
@@ -61,6 +71,7 @@ rhinecode --config config.yaml            # 安装后也可以用控制台脚本
 
 - `/think`：在 off / high / max 间循环切换思考模式（Anthropic / DeepSeek 生效）。
 - `/plan`：切换 Plan Mode，先规划、澄清和审批，再执行（DeepSeek 工具模式生效）。
+- `/perm`：在 默认 / 严格 / 放行 间循环切换权限模式，只影响「规则未命中」的灰色地带兜底（DeepSeek 工具模式生效）。
 - `/clear`：清空当前对话历史。
 - `/exit`：退出程序。
 
@@ -70,18 +81,26 @@ rhinecode --config config.yaml            # 安装后也可以用控制台脚本
 
 `config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。
 
+权限规则配置（c6，可选，从 `permissions.example.yaml` 复制）：三层 YAML，`allow` / `deny` 列表，每条写成 `Tool(模式)`（如 `Bash(git *)`、`Read(config.yaml)`）。位置与优先语义——
+
+- 用户级 `~/.rhinecode/permissions.yaml`（跨项目默认）
+- 项目级 `<项目根>/.rhinecode/permissions.yaml`（随仓库走、可提交）
+- 本地级 `<项目根>/.rhinecode/permissions.local.yaml`（git 忽略；「永久放行」自动写这里）
+
+三层合并后按 **deny 永远优先**求值（不按层级覆盖）；命令用前缀+glob（`npm:*` 带词边界），文件用 gitignore 风格。危险命令黑名单与路径沙箱是更靠前、不可被规则放开的硬防线。
+
 ## Spec 驱动开发
 
-开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c5/`。
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c6/`。
 
-C5 文档描述当前结构化系统提示、缓存策略与 Agent Loop 接线的实际行为：
+C6 文档描述五层防御权限系统的需求、架构、任务与验收（决策管线、deny 优先哲学、与 loop/TUI 的接线）：
 
-- `docs/c5/spec.md`
-- `docs/c5/plan.md`
-- `docs/c5/task.md`
-- `docs/c5/checklist.md`
+- `docs/c6/spec.md`
+- `docs/c6/plan.md`
+- `docs/c6/task.md`
+- `docs/c6/checklist.md`
 
-C4 文档仍保留，用于追溯 Agent Loop 与 Plan Mode 的设计来源。
+C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 测试
 
@@ -92,7 +111,7 @@ python -m compileall rhinecode tests
 python -m unittest discover -s tests
 ```
 
-当前测试覆盖路径越界防护、确认回调、会话级免确认、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认等关键行为。
+当前测试覆盖路径越界防护、四态确认回调、本会话放行登记规则、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认，以及权限系统的命令/路径匹配、危险命令黑名单（含复合命令逐段与 fork 炸弹）、deny 优先求值、配置三层加载与容错、工具规范化映射、四层决策管线、loop 决策接入（被拒不停循环、allow 规则免确认）等关键行为（`tests/test_perm_*.py`）。
 
 涉及 TUI 行为时，再用 tmux 或真实终端做端到端测试：
 
@@ -103,12 +122,18 @@ python -m unittest discover -s tests
 
 ## 安全边界
 
-- 文件、glob、grep 工具以启动 RhineCode 时的当前工作目录作为项目根。
-- 工具路径不能包含 `..`。
-- 绝对路径必须解析后仍位于项目根内。
-- 指向项目外的符号链接会被拒绝或跳过。
-- 命令工具显式以项目根作为 `cwd`，但不做命令沙箱；危险命令仍需要用户判断确认。
-- `config.yaml` 可能包含真实 API Key，请勿提交到版本库。
+权限决定由工具层代码强制，不由模型/prompt 决定（可抵抗 prompt 注入）。每个工具执行前过五层决策管线：
+
+1. **危险命令黑名单**（`permission/blacklist.py`）：正则拦截 `rm -rf` / `git push --force` / fork 炸弹 / `format`、`Remove-Item -Recurse -Force` 等已知高危命令，复合命令逐段+整条双重检查；**不可被任何配置或权限模式放开**。
+2. **路径沙箱**（复用 `path_guard`）：文件、glob、grep 工具以启动时的当前工作目录为项目根；拒绝含 `..`、解析后越界的绝对路径、指向项目外的符号链接。
+3. **可配置规则**：三层 YAML 的 allow/deny，deny 永远优先。
+4. **权限模式**（`/perm`）：严格/默认/放行，只兜底「规则未命中」的灰色地带，翻不了①②③的 deny。
+5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次/本会话/永久/拒绝）。
+
+被拒不终止 Agent Loop，结构化拒绝原因回灌模型。其它注意：
+
+- 沙箱是应用层前缀校验，管得住文件工具，但管不住 `run_command` 跑起来的脚本自己用代码 open 的文件（已知边界，OS 级沙箱留待后续）。
+- `config.yaml` 可能包含真实 API Key，请勿提交到版本库；可用 `deny Read(config.yaml)` 规则进一步阻止模型读取。
 
 ## 已知后续工程项
 
@@ -117,8 +142,9 @@ python -m unittest discover -s tests
 1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
 2. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。
 3. `write_file` / `edit_file` 的文件系统级原子写入。
-4. `run_command` 的权限策略、危险命令二次确认或更细粒度沙箱。
-5. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
+4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问——C6 的应用层黑名单+路径沙箱已覆盖命令与文件工具的常见高危场景，但管不住子进程内部的间接访问。
+5. 权限系统后续项：网络请求限制、资源配额、审计日志（C6 spec 明确不做，留待后续章节）。
+6. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
 
 ## 代码注释规范
 

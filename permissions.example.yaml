@@ -1,0 +1,33 @@
+# RhineCode 权限规则示例（c6 五层防御 · 第③层「可配置规则」）
+#
+# 把本文件复制到下列任一位置即可生效（三层，越靠近项目越本地；但求值用 deny 优先，
+# 不按层级覆盖）：
+#   ~/.rhinecode/permissions.yaml                 用户级（跨项目全局默认）
+#   <项目根>/.rhinecode/permissions.yaml          项目级（随仓库走、可提交）
+#   <项目根>/.rhinecode/permissions.local.yaml    本地级（不提交；「永久放行」自动写这里）
+#
+# 规则语法：  工具名(模式)
+#   - 工具名：Bash（对应 run_command）、Read（read_file/glob_files/grep_content）、
+#             Write（write_file）、Edit（edit_file）
+#   - 模式：命令用前缀+glob（末尾 ` *` 或 `:*` 带词边界，`npm:*` 不误伤 `npmx`）；
+#           文件用 gitignore 风格（`.env` 任意深度命中、`src/**` 跨目录）
+#   - 只写工具名（不带括号）表示匹配该工具的所有调用
+#
+# 求值规则（决策管线第③层）：
+#   - 任意一条 deny 命中即拒绝，deny 不可被 allow 翻案（deny 永远优先）
+#   - 没有 deny 命中、有 allow 命中则放行
+#   - 都没命中 → 交给「权限模式」兜底（严格→拒 / 默认→问 / 放行→允）
+#
+# 注意：危险命令黑名单（如 rm -rf /）与路径沙箱（项目目录外）是更靠前、不可被本文件
+#       放开的硬防线——这里写 allow 也翻不了它们。
+
+allow:
+  - "Bash(git status)"      # 放行查看 git 状态
+  - "Bash(git diff *)"      # 放行查看差异
+  - "Bash(npm run *)"       # 放行 npm 脚本
+  - "Read(src/**)"          # 放行读取源码目录
+
+deny:
+  - "Bash(git push *)"      # 始终拦截推送（即便放行档也拦）
+  - "Read(config.yaml)"     # 保护含 API Key 的配置文件，禁止模型读取
+  - "Read(.env)"            # 保护任意层级的 .env

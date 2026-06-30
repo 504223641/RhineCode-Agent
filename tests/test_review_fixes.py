@@ -212,34 +212,37 @@ class ConversationManagerTests(unittest.TestCase):
         self.assertFalse(results[0].tool_result.ok)
 
     def test_confirm_callback_controls_side_effect_execution(self) -> None:
-        # c4：确认回调返回 ConfirmDecision 三态（不再是 bool）
+        # c6：副作用工具在默认档判为 ASK，确认回调（四态）决定是否执行；签名为 (tc, tool, decision)
         denied_tool = RecordingTool()
         denied_manager = manager_with_tool(ToolCallingProvider(), denied_tool)
-        denied_manager.confirm_callback = lambda _tc, _tool: ConfirmDecision.DENY
+        denied_manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.DENY
         list(denied_manager.handle_input("run it"))
         self.assertFalse(denied_tool.executed)
 
         approved_tool = RecordingTool()
         approved_manager = manager_with_tool(ToolCallingProvider(), approved_tool)
-        approved_manager.confirm_callback = lambda _tc, _tool: ConfirmDecision.ALLOW
+        approved_manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW
         list(approved_manager.handle_input("run it"))
         self.assertTrue(approved_tool.executed)
 
-    def test_allow_always_suppresses_subsequent_confirms(self) -> None:
-        # c4：选 ALLOW_ALWAYS 后，本会话后续有副作用工具自动执行、不再触发确认回调
+    def test_session_allow_registers_session_rule(self) -> None:
+        # c6：选 ALLOW_SESSION 后执行本次，并向引擎登记一条会话级 allow 规则（取代 c5 的一刀切免确认）
         tool = RecordingTool()
         manager = manager_with_tool(ToolCallingProvider(), tool)
         calls = {"n": 0}
 
-        def cb(_tc, _tool):
+        def cb(_tc, _tool, _dec):
             calls["n"] += 1
-            return ConfirmDecision.ALLOW_ALWAYS
+            return ConfirmDecision.ALLOW_SESSION
 
         manager.confirm_callback = cb
         list(manager.handle_input("run it"))
         self.assertTrue(tool.executed)
         self.assertEqual(calls["n"], 1)
-        self.assertTrue(manager._always_allow)
+        # 会话级规则已登记：工具名 danger（未映射 → rule_name 取工具自身名），来源 session
+        self.assertEqual(len(manager._engine.session_rules), 1)
+        self.assertEqual(manager._engine.session_rules[0].effect, "allow")
+        self.assertEqual(manager._engine.session_rules[0].source, "session")
 
     def test_present_plan_is_emitted_as_full_text_event(self) -> None:
         plan = "1. Read the current code\n2. Update the approval flow\n3. Run regression tests"
@@ -278,7 +281,7 @@ class ConversationManagerTests(unittest.TestCase):
         manager.approve_plan_callback = lambda _plan: True
         confirm_calls = {"n": 0}
 
-        def deny(_tc, _tool):
+        def deny(_tc, _tool, _dec):
             confirm_calls["n"] += 1
             return ConfirmDecision.DENY
 
@@ -299,7 +302,7 @@ class ConversationManagerTests(unittest.TestCase):
         # c4：二轮流出错 → 先产出 ERROR，再以 FINISHED(STREAM_ERROR) 收尾；不追加 partial 文本
         tool = RecordingTool()
         manager = manager_with_tool(ToolCallingProvider(second_error=True), tool)
-        manager.confirm_callback = lambda _tc, _tool: ConfirmDecision.ALLOW
+        manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW
 
         events = list(manager.handle_input("run it"))
         types = [e.type for e in events]

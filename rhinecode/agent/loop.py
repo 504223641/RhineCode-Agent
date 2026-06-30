@@ -37,6 +37,7 @@ from rhinecode.agent.events import (
 from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
+from rhinecode.permission import Decision, DecisionResult, PermissionEngine, to_request
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
 MAX_ITERATIONS = 25
@@ -44,12 +45,21 @@ MAX_ITERATIONS = 25
 MAX_CONSECUTIVE_UNKNOWN = 3
 
 # 回调类型别名（由 ConversationManager 注入；均预期在 Worker 线程被调用）。
-# confirm：有副作用工具是否执行（已在上层闭包里解析过三态与会话级免确认，循环只看 bool）
-ConfirmFn = Callable[[ToolCall, Tool], bool]
+# ask：当决策管线判定为 ASK（交人工确认）时调用，弹 HITL 面板。上层闭包已封装四选项
+# （本次/本会话/永久/拒绝）与对应的会话规则登记 / 永久落盘，循环只看返回的 bool（是否执行）。
+AskFn = Callable[[ToolCall, Tool, DecisionResult], bool]
 # clarify：弹澄清面板，返回用户所选概述；返回 None 表示用户取消
 ClarifyFn = Callable[[str, list[ClarifyOption]], Optional[str]]
 # approve_plan：弹「是否开始执行」审批，返回是否批准
 ApprovePlanFn = Callable[[str], bool]
+
+
+def _invalid_args_result(tc: ToolCall) -> ToolResult:
+    return ToolResult(
+        ok=False,
+        output=f"工具 {tc.name} 的参数必须是 JSON 对象，请检查格式后重试。",
+        summary="参数格式错误",
+    )
 
 
 class _RoundContext:
@@ -122,7 +132,8 @@ class Agent:
         dynamic: str,
         model: str,
         debug_log_path: Optional[str],
-        confirm: ConfirmFn,
+        engine: PermissionEngine,
+        ask: AskFn,
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
@@ -137,7 +148,8 @@ class Agent:
         :param dynamic: 动态内容（环境信息等）；每轮与会话级开关提醒合并进 <system-reminder> 注入
         :param model: 当前模型名，仅用于缓存调试日志记录
         :param debug_log_path: 缓存调试日志文件路径；为 None 表示关闭日志（c5 F10）
-        :param confirm: 有副作用工具是否执行的回调（已解析三态/免确认，返回 bool）
+        :param engine: 权限决策引擎（c6）；每个工具执行前调 engine.decide 算放行/拒绝/问
+        :param ask: 人工确认回调；仅当决策为 ASK 时调用，返回是否执行（已封装四选项与规则登记）
         :param clarify: 需求澄清回调（ask_user 用），可为 None
         :param approve_plan: 计划审批回调（present_plan 用），可为 None
         :param cancel_event: 取消信号；循环在安全点轮询，置位即尽快停止
@@ -215,7 +227,7 @@ class Agent:
             ctx = _RoundContext()
             yield from self._execute(
                 tool_calls, results, ctx,
-                confirm, clarify, approve_plan,
+                engine, ask, clarify, approve_plan,
                 cancel_event,
             )
 
@@ -272,35 +284,46 @@ class Agent:
         tool_calls: list[ToolCall],
         results: dict[str, ToolResult],
         ctx: _RoundContext,
-        confirm: ConfirmFn,
+        engine: PermissionEngine,
+        ask: AskFn,
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
     ) -> Iterator[AgentEvent]:
         """
-        执行本轮所有工具调用，按类别分流：
+        执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
 
-        - 特殊工具（ask_user / present_plan）：串行，路由到 clarify / approve_plan 回调
-        - 普通只读工具：并发执行（互不冲突，提升效率）
-        - 普通有副作用工具 / 未知工具：串行执行（副作用工具按需确认）
+        决策预扫（每个已知工具调用执行前由代码算放行/拒绝/问，spec F1）：
+        - 用 adapter.to_request 把调用规范化，调 engine.decide 得到 DecisionResult。
+        - ALLOW + 只读 → 进并发桶（无需确认）。
+        - ALLOW + 副作用 → 进串行桶，直接执行（命中 allow 规则即免确认，spec AC4）。
+        - DENY → 进串行桶，产出结构化拒绝结果、不执行（不终止循环，spec F8）。
+        - ASK → 进串行桶，执行前调 ask 回调弹 HITL 面板。
 
-        所有结果写入 results（键为 tool_call.id），并把状态变化记录到 ctx 供主循环判断。
-        每个工具开始/结束分别产出 TOOL_START / TOOL_RESULT 事件。
+        分流后：
+        - 特殊工具（ask_user / present_plan）：串行，路由到 clarify / approve_plan。
+        - 只读且 ALLOW：并发执行（互不冲突，提升效率）。
+        - 其余（副作用 / 被拒 / 待确认 / 未知 / 参数错误）：串行执行。
+
+        所有结果写入 results（键为 tool_call.id）；状态变化记录到 ctx 供主循环判断。
 
         :param tool_calls: 本轮工具调用
         :param results: 输出参数，写入 id → ToolResult
         :param ctx: 本轮上下文，记录 cancelled/approved/known/unknown
-        :param confirm/clarify/approve_plan: 三类交互回调
-        :param execution_phase: Plan Mode 是否已获批执行（仅影响本轮可用工具集合）
+        :param engine: 权限决策引擎（决策预扫用）
+        :param ask: 人工确认回调（仅 ASK 时调用）
+        :param clarify/approve_plan: 特殊工具的交互回调
         :param cancel_event: 取消信号，串行执行前检查
 
         副作用：实际执行工具（可能读写文件、跑命令）；通过回调与用户交互。
         """
         special: list[ToolCall] = []
         readonly: list[tuple[ToolCall, Tool]] = []
-        side_effect: list[tuple[ToolCall, Optional[Tool]]] = []
+        # 串行桶元素：(调用, 工具或None, 决策或None)。
+        # tool=None → 未知工具；decision=None → 参数解析失败（两者都不进引擎）。
+        serial: list[tuple[ToolCall, Optional[Tool], Optional[DecisionResult]]] = []
 
-        # 分流：先认特殊工具名，再按是否在注册中心 / 是否只读归类
+        # 分流 + 决策预扫
         for tc in tool_calls:
             if tc.name in (ASK_USER, PRESENT_PLAN):
                 special.append(tc)
@@ -308,16 +331,22 @@ class Agent:
                 continue
             tool = self._registry.get(tc.name) if self._registry else None
             if tool is None:
-                side_effect.append((tc, None))
+                serial.append((tc, None, None))
                 ctx.unknown_count += 1
-            elif tool.read_only:
+                continue
+            ctx.known_count += 1
+            if not isinstance(tc.arguments, dict):
+                # 参数解析失败或非对象 JSON：不进引擎，留待串行路径产出结构化错误。
+                serial.append((tc, tool, None))
+                continue
+            # 权限决策：规范化 → engine.decide。
+            decision = engine.decide(to_request(tool, tc.arguments, engine.mode))
+            if decision.decision == Decision.ALLOW and tool.read_only:
                 readonly.append((tc, tool))
-                ctx.known_count += 1
             else:
-                side_effect.append((tc, tool))
-                ctx.known_count += 1
+                serial.append((tc, tool, decision))
 
-        # 只读工具：并发
+        # 只读且放行：并发
         if readonly:
             yield from self._run_readonly_concurrent(readonly, results)
 
@@ -330,14 +359,14 @@ class Agent:
             if ctx.cancelled or ctx.plan_rejected:
                 break
 
-        # 有副作用 / 未知工具：串行
-        for tc, tool in side_effect:
+        # 其余：串行
+        for tc, tool, decision in serial:
             if ctx.cancelled or ctx.plan_rejected:
                 break
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_one_serial(tc, tool, results, confirm)
+            yield from self._run_one_serial(tc, tool, decision, results, ask)
 
     def _run_special(
         self,
@@ -358,8 +387,8 @@ class Agent:
         """
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
 
-        if tc.arguments is None:
-            res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查格式后重试。")
+        if not isinstance(tc.arguments, dict):
+            res = _invalid_args_result(tc)
             results[tc.id] = res
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
@@ -436,12 +465,12 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
 
         for tc, _tool in items:
-            if tc.arguments is None:
-                res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查格式后重试。")
+            if not isinstance(tc.arguments, dict):
+                res = _invalid_args_result(tc)
                 results[tc.id] = res
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
-        valid = [(tc, tool) for tc, tool in items if tc.arguments is not None]
+        valid = [(tc, tool) for tc, tool in items if isinstance(tc.arguments, dict)]
         if not valid:
             return
 
@@ -463,16 +492,24 @@ class Agent:
         self,
         tc: ToolCall,
         tool: Optional[Tool],
+        decision: Optional[DecisionResult],
         results: dict[str, ToolResult],
-        confirm: ConfirmFn,
+        ask: AskFn,
     ) -> Iterator[AgentEvent]:
         """
-        串行执行单个有副作用工具（或处理未知工具 / 参数错误），迁移自 c3 并适配 c4。
+        串行处理单个工具调用：未知 / 参数错误 / 权限拒绝 / 待确认 / 放行（c6）。
 
-        已知的有副作用工具始终调 confirm（已封装三态 + 会话免确认）决定是否执行；
-        只有用户明确选择「本会话不再询问」后，上层 confirm 闭包才会自动放行。
+        各分支的结果都写入 results 并产出事件；任何「不执行」的分支（未知、参数错误、
+        权限拒绝、用户拒绝）都返回 ok=False 的结构化结果回灌模型，但**不终止循环**
+        （spec F8）——与未知工具/参数错误的既有处理一致。
+
+        :param tc: 工具调用
+        :param tool: 对应工具实例；None 表示未知工具
+        :param decision: 权限决策结果；None 表示参数解析失败（未进引擎）
+        :param results: 输出参数，写入 id → ToolResult
+        :param ask: 人工确认回调（仅 decision 为 ASK 时调用）
         """
-        # 未知工具：结构化错误
+        # 未知工具：结构化错误（沿用既有行为，含 TOOL_START）
         if tool is None:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = ToolResult(ok=False, output=f"未知工具: {tc.name}")
@@ -480,22 +517,35 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
-        # 参数解析失败
-        if tc.arguments is None:
+        # 参数解析失败（decision 为 None）
+        if decision is None:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
-            res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查格式后重试。")
+            res = _invalid_args_result(tc)
             results[tc.id] = res
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
-        # 计划审批只开放执行阶段，不等于免确认；副作用工具仍逐个走确认回调。
-        approved = confirm(tc, tool)
-        if not approved:
-            res = ToolResult(ok=False, output="用户拒绝执行该工具。")
+        # 权限拒绝：产出结构化拒绝结果，不执行（与「用户拒绝」一致，仅产出 TOOL_RESULT）
+        if decision.decision == Decision.DENY:
+            res = ToolResult(
+                ok=False,
+                output=f"[权限拒绝·{decision.layer.value}] {decision.reason}",
+                summary="权限拒绝",
+            )
             results[tc.id] = res
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
+        # 待确认：弹 HITL 面板，用户拒绝则不执行
+        if decision.decision == Decision.ASK:
+            approved = ask(tc, tool, decision)
+            if not approved:
+                res = ToolResult(ok=False, output="用户拒绝执行该工具。")
+                results[tc.id] = res
+                yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
+                return
+
+        # 放行（ALLOW 或确认通过）：执行工具
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
         try:
             res = tool.execute(tc.arguments)

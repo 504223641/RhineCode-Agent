@@ -54,15 +54,22 @@ class StopReason(str, Enum):
 
 class ConfirmDecision(str, Enum):
     """
-    有副作用工具执行前确认面板的三态返回值（spec F6）。
+    人在回路（HITL）确认面板的四态返回值（c6 spec F6）。
+
+    当决策管线对某工具调用判定为 ASK 时弹出面板，用户从四个选项里择一：
 
     - ALLOW：仅放行本次执行
-    - ALLOW_ALWAYS：放行，且本会话（直到退出）后续有副作用工具不再询问、自动执行
-    - DENY：拒绝执行（把「用户拒绝执行」作为结构化结果回灌模型）
+    - ALLOW_SESSION：本会话放行——为「该工具 + 本次目标」登记一条会话级 allow 规则，
+      本会话内后续相同调用直接放行（关程序即失效）。注意这是「按规则」的放行，
+      不再是 c5 那种「一刀切免确认」
+    - ALLOW_PERMANENT：永久放行——把同样的 allow 规则写入本地级配置文件，
+      重启后仍生效（spec F6）
+    - DENY：拒绝执行（把「用户拒绝执行」作为结构化结果回灌模型，不终止循环）
     """
 
     ALLOW = "allow"
-    ALLOW_ALWAYS = "allow_always"
+    ALLOW_SESSION = "allow_session"
+    ALLOW_PERMANENT = "allow_permanent"
     DENY = "deny"
 
 

@@ -18,6 +18,7 @@ from time import monotonic
 
 from rich.cells import cell_len
 from rich.console import Group as RichGroup
+from rich.markup import escape
 from rich.markdown import Markdown as RichMarkdown
 from rich.segment import Segment
 from rich.style import Style
@@ -46,6 +47,8 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     """
     if arguments is None:
         return "<参数解析失败>"
+    if not isinstance(arguments, dict):
+        return "<参数格式错误>"
     parts = []
     for key, value in arguments.items():
         text = str(value).replace("\n", " ")
@@ -55,7 +58,7 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     summary = ", ".join(parts)
     if len(summary) > max_len:
         summary = summary[:max_len] + "…"
-    return summary
+    return escape(summary)
 
 
 # diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
@@ -213,7 +216,7 @@ class ToolCallWidget(Static):
         super().__init__(markup=True)
         self._name = tool_call.name
         # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
-        self._label = _TOOL_LABELS.get(self._name, self._name)
+        self._label = escape(_TOOL_LABELS.get(self._name, self._name))
         self._args_summary = summarize_args(tool_call.arguments)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
@@ -257,7 +260,7 @@ class ToolCallWidget(Static):
         if diff is not None and diff.rows:
             # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要更贴近改动语义），
             # 分支由 render_diff_block 产出（首行 "⎿ Added.../removed..." 概要 + 彩色 diff 行）。
-            header = f"[{color}]● {diff.op}({diff.path}) {result} ({elapsed}s)[/]"
+            header = f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) {result} ({elapsed}s)[/]"
             self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
         else:
             # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
@@ -299,7 +302,7 @@ class HistoryView(ScrollableContainer):
 
     def append_user(self, text: str) -> None:
         """追加一条用户消息，以青色粗体 "◈" 为前缀。"""
-        self._add_widget(f"[bold #99FFFF]◈[/bold #99FFFF] {text}")
+        self._add_widget(f"[bold #99FFFF]◈[/bold #99FFFF] {escape(text)}")
 
     def begin_assistant_turn(self) -> Static:
         """
@@ -374,11 +377,11 @@ class HistoryView(ScrollableContainer):
 
     def append_system(self, text: str) -> None:
         """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
-        self._add_widget(f"[dim]◆ {text}[/dim]")
+        self._add_widget(f"[dim]◆ {escape(text)}[/dim]")
 
     def append_error(self, text: str) -> None:
         """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
-        self._add_widget(f"[bold red]● 错误：{text}[/bold red]")
+        self._add_widget(f"[bold red]● 错误：{escape(text)}[/bold red]")
 
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
@@ -407,6 +410,7 @@ class CommandPanel(OptionList):
     COMMANDS: list[tuple[str, str]] = [
         ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
         ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
+        ("/perm",  "循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
@@ -474,8 +478,8 @@ class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关
-    /think、/plan 命令执行后，App 层会调用 update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | 权限模式：X
+    /think、/plan、/perm 命令执行后，App 层会调用 update_status() 刷新显示。
     """
 
     def update_status(
@@ -484,6 +488,7 @@ class StatusBar(Static):
         model: str,
         thinking_effort: str,
         plan_mode: bool = False,
+        permission_mode: "str | None" = None,
     ) -> None:
         """
         刷新状态栏显示内容。
@@ -492,11 +497,28 @@ class StatusBar(Static):
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
         :param plan_mode: 是否处于 Plan Mode（c4 新增，显示「计划模式：开/关」）
+        :param permission_mode: 权限模式取值（"strict"/"default"/"permissive"）；c6 新增。
+                                为 None（工具不可用的 Provider）时不展示该段，避免误导。
+                                放行档以橘色高亮，提醒用户当前处于「灰色地带默认放行」的状态。
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
         plan_state = "开" if plan_mode else "关"
-        text = f" [{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
+        # Static(markup=True) 走 Textual 的 Content markup：`[xxx]` 会被当成样式标签解析。
+        # 这里 `[provider]` 的方括号是想当「字面量」显示的，必须转义开口的 `[`（写成 `\[`），
+        # 否则像 `[deepseek]` 会被解析成无效样式标签而整段消失（历史遗留显示 bug）。
+        text = (
+            f" \\[{escape(str(provider))}] {escape(str(model))} | "
+            f"思考模式：{escape(str(state))} | 计划模式：{escape(plan_state)}"
+        )
+        if permission_mode is not None:
+            _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
+            plabel = _PERM.get(permission_mode, permission_mode)
+            seg = f"权限模式：{escape(str(plabel))}"
+            # 放行档影响安全（灰色地带默认放行），用橘色（与确认面板同色）醒目提示。
+            if permission_mode == "permissive":
+                seg = f"[#FFA500]{seg}[/#FFA500]"
+            text += f" | {seg}"
         self.update(text + " ")
 
 
@@ -507,17 +529,18 @@ class ConfirmPanel(OptionList):
     交互体验与斜杠命令面板 CommandPanel 一致：出现在输入框上方，用方向键在
     「执行 / 取消」间选择，回车确认，Esc 取消，不遮挡历史区。
 
-    用于写文件、改文件、执行命令等有副作用工具：顶部以橘色表头展示工具名与关键参数摘要
-    （仅展示、不可选），下方三个可选项分别对应「执行 / 执行且本会话不再询问 / 取消」。
+    用于决策管线判定为 ASK（交人工确认）的工具调用：顶部以橘色表头展示工具名、关键参数
+    摘要与「为何需要确认」的原因（仅展示、不可选），下方四个可选项对应四态放行（c6 F6）。
 
     结果如何回传：面板本身不持有协调层状态。用户选择某项时由 OptionList 原生发出
     OptionList.OptionSelected（App 据 option.id 解析为 ConfirmDecision）；按 Esc 时发出本类的
     Cancelled 消息（App 视为拒绝）。App 再唤醒被阻塞的 Worker 线程（见 RhineApp._confirm_tool）。
 
-    三个可选项的 option.id 约定：
-    - "yes"        → 仅放行本次（ConfirmDecision.ALLOW）
-    - "yes_always" → 放行且本会话不再询问（ConfirmDecision.ALLOW_ALWAYS）
-    - "no"         → 拒绝（ConfirmDecision.DENY）
+    四个可选项的 option.id 约定（c6）：
+    - "yes"           → 仅放行本次（ConfirmDecision.ALLOW）
+    - "yes_session"   → 本会话放行（ConfirmDecision.ALLOW_SESSION，登记会话级 allow 规则）
+    - "yes_permanent" → 永久放行（ConfirmDecision.ALLOW_PERMANENT，写入本地级配置）
+    - "no"            → 拒绝（ConfirmDecision.DENY）
 
     设计取舍：确认期间 App 会把焦点临时移到本面板，从而直接复用 OptionList 原生的
     上/下/回车 选择能力（输入框为空时回车不会触发自定义提交消息，移焦到面板最稳健）。
@@ -539,33 +562,39 @@ class ConfirmPanel(OptionList):
         Binding("escape", "cancel", "取消", show=False),
     ]
 
-    def show_for(self, tool_call, tool) -> None:
+    def show_for(self, tool_call, tool, decision=None) -> None:
         """
-        为一次工具调用填充并显示确认面板。
+        为一次工具调用填充并显示确认面板（c6 四态放行）。
 
         每次调用先清空旧选项再重建，避免残留上一次确认的内容。
-        表头（disabled）展示工具名与参数摘要供用户判断；其后是「执行」「取消」两个可选项，
-        默认高亮「执行」（_YES_INDEX），用户直接回车即放行。
+        表头（disabled）展示工具名、参数摘要与「为何需要确认」的原因供用户判断；
+        其后是四个可选项（本次/本会话/永久/拒绝），默认高亮「本次放行」（_YES_INDEX）。
 
         :param tool_call: provider.base.ToolCall，提供工具名与参数
         :param tool: tools.base.Tool（暂用于潜在扩展，如展示描述）
+        :param decision: 决策管线给出的 DecisionResult；其 reason 展示在表头说明缘由。
+                         为 None 时仅展示工具信息（向后兼容）。
 
         副作用：修改 OptionList 选项并使面板可见。
         """
         args_summary = summarize_args(tool_call.arguments, max_len=200)
+        # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
+        reason = f"  [dim]· {escape(decision.reason)}[/dim]" if decision is not None else ""
+        safe_name = escape(str(tool_call.name))
         self.clear_options()
         # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航
         self.add_option(
             Option(
-                f"[#FFA500]⚠ 确认执行：{tool_call.name}({args_summary})[/#FFA500]",
+                f"[#FFA500]⚠ 确认执行：{safe_name}({args_summary})[/#FFA500]{reason}",
                 disabled=True,
             )
         )
-        self.add_option(Option("✅ 执行  [dim]仅执行本次[/dim]", id="yes"))
-        self.add_option(Option("⏩ 执行且不再询问  [dim]本会话后续有副作用工具自动执行[/dim]", id="yes_always"))
-        self.add_option(Option("❌ 取消  [dim]拒绝并让模型据此调整[/dim]", id="no"))
+        self.add_option(Option("✅ 本次放行  [dim]仅执行本次[/dim]", id="yes"))
+        self.add_option(Option("🟢 本会话放行  [dim]本会话内相同调用不再询问[/dim]", id="yes_session"))
+        self.add_option(Option("💾 永久放行  [dim]写入本地配置，重启仍生效[/dim]", id="yes_permanent"))
+        self.add_option(Option("❌ 拒绝  [dim]拒绝并让模型据此调整[/dim]", id="no"))
         self.display = True
-        # 默认高亮「执行」，回车即执行（与 / 命令面板一致的顺手体验）
+        # 默认高亮「本次放行」，回车即执行（与 / 命令面板一致的顺手体验）
         self.highlighted = self._YES_INDEX
 
     def show_prompt(self, title: str, yes_label: str, no_label: str) -> None:
@@ -582,7 +611,7 @@ class ConfirmPanel(OptionList):
         副作用：修改 OptionList 选项并使面板可见。
         """
         self.clear_options()
-        self.add_option(Option(f"[#FFA500]{title}[/#FFA500]", disabled=True))
+        self.add_option(Option(f"[#FFA500]{escape(title)}[/#FFA500]", disabled=True))
         self.add_option(Option(yes_label, id="yes"))
         self.add_option(Option(no_label, id="no"))
         self.display = True
@@ -642,7 +671,7 @@ class ClarifyPanel(OptionList):
         """
         self.clear_options()
         # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过
-        self.add_option(Option(f"[#7AEEFF]❓ {question}[/#7AEEFF]", disabled=True))
+        self.add_option(Option(f"[#7AEEFF]❓ {escape(question)}[/#7AEEFF]", disabled=True))
 
         first_selectable: int | None = None
         for idx, opt in enumerate(options):
@@ -650,13 +679,13 @@ class ClarifyPanel(OptionList):
             # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
             #     故不再额外加「⭐ 推荐」前缀，避免重复提示。
             option_index = self.option_count  # 加入前的位置即本概述行的索引
-            self.add_option(Option(opt.summary, id=str(idx)))
+            self.add_option(Option(escape(opt.summary), id=str(idx)))
             if first_selectable is None:
                 first_selectable = option_index
             # 详情行：disabled，仅展示，导航会跳过
             # 不缩进，使详情与上方概述行左边缘对齐
             if opt.detail:
-                self.add_option(Option(f"[dim]{opt.detail}[/dim]", disabled=True))
+                self.add_option(Option(f"[dim]{escape(opt.detail)}[/dim]", disabled=True))
 
         self.display = True
         # 默认高亮第一个可选概述行
