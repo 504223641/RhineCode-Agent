@@ -53,8 +53,10 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 > 「成对维护点」备忘（改一处常需同步另一处，避免遗漏）：
 > - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）
-> - 新增斜杠命令 → `conversation.py`（逻辑）+ `tui/widgets.py` `CommandPanel.COMMANDS`（补全）
+> - 新增斜杠命令 → `conversation.py`（逻辑）+ `tui/widgets.py` `CommandPanel.COMMANDS`（补全列表）+（若改了状态栏可见状态）`tui/app.py` 提交处理里 `if text in (...)` 的状态栏刷新白名单
+> - 新增状态栏展示字段 → `tui/widgets.py` `StatusBar.update_status`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）+ 触发刷新的命令需在上面那个白名单里
 > - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+> - 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
 
 ## 常用命令
 
