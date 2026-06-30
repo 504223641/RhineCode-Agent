@@ -49,6 +49,13 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 新增工具：在 `tools/` 下继承 `Tool`，声明 `name`、`description`、`parameters`、`read_only`，实现 `execute`，再到 `ToolRegistry.default()` 注册。文件类工具必须复用 `path_guard.py` 的路径边界校验。若新工具要纳入细粒度权限控制（映射到 Bash/Read/Edit/Write 规则名与对应 specifier），在 `permission/adapter.py` 的 `_TOOL_MAP` 加一行映射即可；未映射的工具自动落到 `other` 分支（仅按工具名匹配整工具规则 + 走权限模式兜底），不会漏过权限检查。
 
+新增斜杠命令：必须**成对维护**两处，缺一会出现「命令能用但补全列表看不到」或反之——① 在 `conversation.py` 的 `handle_input` 加分支实现命令逻辑；② 在 `tui/widgets.py` 的 `CommandPanel.COMMANDS` 注册表追加 `(命令文本, 简要描述)`，输入 `/` 才会在补全面板列出。若命令带选项面板/回调（如确认四态），还需同步 `tui/app.py` 的事件处理与回调注入。
+
+> 「成对维护点」备忘（改一处常需同步另一处，避免遗漏）：
+> - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）
+> - 新增斜杠命令 → `conversation.py`（逻辑）+ `tui/widgets.py` `CommandPanel.COMMANDS`（补全）
+> - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+
 ## 常用命令
 
 ```bash
