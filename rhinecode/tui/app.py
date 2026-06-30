@@ -147,12 +147,13 @@ class RhineApp(App):
         self.query_one(InputBar).focus()
 
     def _refresh_status(self) -> None:
-        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式。"""
+        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式、权限模式。"""
         self.query_one(StatusBar).update_status(
             self._config.protocol,
             self._config.model,
             self._manager.thinking_effort,
             self._manager.plan_mode,
+            self._manager.permission_mode_value,
         )
 
     # ------------------------------------------------------------------ #

@@ -475,8 +475,8 @@ class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关
-    /think、/plan 命令执行后，App 层会调用 update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | 权限模式：X
+    /think、/plan、/perm 命令执行后，App 层会调用 update_status() 刷新显示。
     """
 
     def update_status(
@@ -485,6 +485,7 @@ class StatusBar(Static):
         model: str,
         thinking_effort: str,
         plan_mode: bool = False,
+        permission_mode: "str | None" = None,
     ) -> None:
         """
         刷新状态栏显示内容。
@@ -493,11 +494,22 @@ class StatusBar(Static):
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
         :param plan_mode: 是否处于 Plan Mode（c4 新增，显示「计划模式：开/关」）
+        :param permission_mode: 权限模式取值（"strict"/"default"/"permissive"）；c6 新增。
+                                为 None（工具不可用的 Provider）时不展示该段，避免误导。
+                                放行档以橘色高亮，提醒用户当前处于「灰色地带默认放行」的状态。
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
         plan_state = "开" if plan_mode else "关"
         text = f" [{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
+        if permission_mode is not None:
+            _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
+            plabel = _PERM.get(permission_mode, permission_mode)
+            seg = f"权限模式：{plabel}"
+            # 放行档影响安全（灰色地带默认放行），用橘色（与确认面板同色）醒目提示。
+            if permission_mode == "permissive":
+                seg = f"[#FFA500]{seg}[/#FFA500]"
+            text += f" | {seg}"
         self.update(text + " ")
 
 

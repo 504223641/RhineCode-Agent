@@ -111,6 +111,20 @@ class ConversationManager:
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
         self._agent = Agent(provider, registry)
 
+    @property
+    def permission_mode_value(self) -> Optional[str]:
+        """
+        当前权限模式的取值字符串（"strict"/"default"/"permissive"），供状态栏展示（c6）。
+
+        仅在工具可用（DeepSeek 工具模式）时有意义——其它 Provider 没有受控工具，
+        权限模式不参与任何判断，故返回 None，让状态栏不展示这一段，避免误导。
+
+        :returns: 模式值字符串；工具不可用时返回 None
+        """
+        if not self._tools_enabled:
+            return None
+        return self._engine.mode.value
+
     def clear(self) -> None:
         """
         清空对话历史。
