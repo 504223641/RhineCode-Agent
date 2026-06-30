@@ -19,6 +19,7 @@ RhineApp 是 TUI 层的核心，负责：
 
 import threading
 
+from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import Key
@@ -335,7 +336,7 @@ class RhineApp(App):
                     self.call_from_thread(
                         history_view.update_widget,
                         thinking_widget,
-                        f"[dim italic]💭 {''.join(thinking_chunks)}[/dim italic]",
+                        f"[dim italic]💭 {escape(''.join(thinking_chunks))}[/dim italic]",
                     )
 
                 elif etype == AgentEventType.TEXT:

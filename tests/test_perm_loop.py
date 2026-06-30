@@ -32,16 +32,18 @@ class FakeRunCommand(Tool):
 class OneToolProvider(BaseProvider):
     """第一轮发一个 run_command 调用，第二轮自然完成。"""
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str = "echo ok", arguments: object | None = None) -> None:
         self.command = command
+        self.arguments = arguments
         self.calls = 0
 
     def stream_chat(self, messages, thinking_effort="off", tools=None, system=None):
         self.calls += 1
         if self.calls == 1:
+            arguments = self.arguments if self.arguments is not None else {"command": self.command}
             yield StreamChunk(
                 type="tool_call",
-                tool_call=ToolCall(id="c1", name="run_command", arguments={"command": self.command}),
+                tool_call=ToolCall(id="c1", name="run_command", arguments=arguments),
             )
             yield StreamChunk(type="done")
             return
@@ -97,6 +99,20 @@ class LoopPermissionTests(unittest.TestCase):
 
         self.assertTrue(tool.executed)
         self.assertEqual(ask_calls["n"], 0)
+
+    def test_non_object_tool_arguments_return_structured_error(self) -> None:
+        tool = FakeRunCommand()
+        engine = PermissionEngine(RuleSet([]), mode=PermissionMode.PERMISSIVE)
+
+        events = run_agent(OneToolProvider(arguments=["not", "an", "object"]), tool, engine, lambda *_: True)
+
+        self.assertFalse(tool.executed)
+        results = [e for e in events if e.type == AgentEventType.TOOL_RESULT]
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].tool_result.ok)
+        self.assertIn("JSON 对象", results[0].tool_result.output)
+        self.assertEqual(events[-1].type, AgentEventType.FINISHED)
+        self.assertEqual(events[-1].stop_reason, StopReason.COMPLETED)
 
 
 if __name__ == "__main__":

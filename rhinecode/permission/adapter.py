@@ -48,7 +48,7 @@ def to_request(tool: Tool, args: Optional[dict], mode: PermissionMode) -> Permis
 
     副作用：无（纯数据转换）。
     """
-    a = args or {}
+    a = args if isinstance(args, dict) else {}
     mapper = _TOOL_MAP.get(tool.name)
     if mapper is not None:
         rule_name, specifier, kind = mapper(a)

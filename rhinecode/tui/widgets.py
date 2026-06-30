@@ -18,6 +18,7 @@ from time import monotonic
 
 from rich.cells import cell_len
 from rich.console import Group as RichGroup
+from rich.markup import escape
 from rich.markdown import Markdown as RichMarkdown
 from rich.segment import Segment
 from rich.style import Style
@@ -46,6 +47,8 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     """
     if arguments is None:
         return "<参数解析失败>"
+    if not isinstance(arguments, dict):
+        return "<参数格式错误>"
     parts = []
     for key, value in arguments.items():
         text = str(value).replace("\n", " ")
@@ -55,7 +58,7 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     summary = ", ".join(parts)
     if len(summary) > max_len:
         summary = summary[:max_len] + "…"
-    return summary
+    return escape(summary)
 
 
 # diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
@@ -213,7 +216,7 @@ class ToolCallWidget(Static):
         super().__init__(markup=True)
         self._name = tool_call.name
         # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
-        self._label = _TOOL_LABELS.get(self._name, self._name)
+        self._label = escape(_TOOL_LABELS.get(self._name, self._name))
         self._args_summary = summarize_args(tool_call.arguments)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
@@ -257,7 +260,7 @@ class ToolCallWidget(Static):
         if diff is not None and diff.rows:
             # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要更贴近改动语义），
             # 分支由 render_diff_block 产出（首行 "⎿ Added.../removed..." 概要 + 彩色 diff 行）。
-            header = f"[{color}]● {diff.op}({diff.path}) {result} ({elapsed}s)[/]"
+            header = f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) {result} ({elapsed}s)[/]"
             self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
         else:
             # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
@@ -299,7 +302,7 @@ class HistoryView(ScrollableContainer):
 
     def append_user(self, text: str) -> None:
         """追加一条用户消息，以青色粗体 "◈" 为前缀。"""
-        self._add_widget(f"[bold #99FFFF]◈[/bold #99FFFF] {text}")
+        self._add_widget(f"[bold #99FFFF]◈[/bold #99FFFF] {escape(text)}")
 
     def begin_assistant_turn(self) -> Static:
         """
@@ -374,11 +377,11 @@ class HistoryView(ScrollableContainer):
 
     def append_system(self, text: str) -> None:
         """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
-        self._add_widget(f"[dim]◆ {text}[/dim]")
+        self._add_widget(f"[dim]◆ {escape(text)}[/dim]")
 
     def append_error(self, text: str) -> None:
         """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
-        self._add_widget(f"[bold red]● 错误：{text}[/bold red]")
+        self._add_widget(f"[bold red]● 错误：{escape(text)}[/bold red]")
 
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
@@ -504,11 +507,14 @@ class StatusBar(Static):
         # Static(markup=True) 走 Textual 的 Content markup：`[xxx]` 会被当成样式标签解析。
         # 这里 `[provider]` 的方括号是想当「字面量」显示的，必须转义开口的 `[`（写成 `\[`），
         # 否则像 `[deepseek]` 会被解析成无效样式标签而整段消失（历史遗留显示 bug）。
-        text = f" \\[{provider}] {model} | 思考模式：{state} | 计划模式：{plan_state}"
+        text = (
+            f" \\[{escape(str(provider))}] {escape(str(model))} | "
+            f"思考模式：{escape(str(state))} | 计划模式：{escape(plan_state)}"
+        )
         if permission_mode is not None:
             _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
             plabel = _PERM.get(permission_mode, permission_mode)
-            seg = f"权限模式：{plabel}"
+            seg = f"权限模式：{escape(str(plabel))}"
             # 放行档影响安全（灰色地带默认放行），用橘色（与确认面板同色）醒目提示。
             if permission_mode == "permissive":
                 seg = f"[#FFA500]{seg}[/#FFA500]"
@@ -573,12 +579,13 @@ class ConfirmPanel(OptionList):
         """
         args_summary = summarize_args(tool_call.arguments, max_len=200)
         # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
-        reason = f"  [dim]· {decision.reason}[/dim]" if decision is not None else ""
+        reason = f"  [dim]· {escape(decision.reason)}[/dim]" if decision is not None else ""
+        safe_name = escape(str(tool_call.name))
         self.clear_options()
         # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航
         self.add_option(
             Option(
-                f"[#FFA500]⚠ 确认执行：{tool_call.name}({args_summary})[/#FFA500]{reason}",
+                f"[#FFA500]⚠ 确认执行：{safe_name}({args_summary})[/#FFA500]{reason}",
                 disabled=True,
             )
         )
@@ -604,7 +611,7 @@ class ConfirmPanel(OptionList):
         副作用：修改 OptionList 选项并使面板可见。
         """
         self.clear_options()
-        self.add_option(Option(f"[#FFA500]{title}[/#FFA500]", disabled=True))
+        self.add_option(Option(f"[#FFA500]{escape(title)}[/#FFA500]", disabled=True))
         self.add_option(Option(yes_label, id="yes"))
         self.add_option(Option(no_label, id="no"))
         self.display = True
@@ -664,7 +671,7 @@ class ClarifyPanel(OptionList):
         """
         self.clear_options()
         # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过
-        self.add_option(Option(f"[#7AEEFF]❓ {question}[/#7AEEFF]", disabled=True))
+        self.add_option(Option(f"[#7AEEFF]❓ {escape(question)}[/#7AEEFF]", disabled=True))
 
         first_selectable: int | None = None
         for idx, opt in enumerate(options):
@@ -672,13 +679,13 @@ class ClarifyPanel(OptionList):
             # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
             #     故不再额外加「⭐ 推荐」前缀，避免重复提示。
             option_index = self.option_count  # 加入前的位置即本概述行的索引
-            self.add_option(Option(opt.summary, id=str(idx)))
+            self.add_option(Option(escape(opt.summary), id=str(idx)))
             if first_selectable is None:
                 first_selectable = option_index
             # 详情行：disabled，仅展示，导航会跳过
             # 不缩进，使详情与上方概述行左边缘对齐
             if opt.detail:
-                self.add_option(Option(f"[dim]{opt.detail}[/dim]", disabled=True))
+                self.add_option(Option(f"[dim]{escape(opt.detail)}[/dim]", disabled=True))
 
         self.display = True
         # 默认高亮第一个可选概述行

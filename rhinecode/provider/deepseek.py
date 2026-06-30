@@ -205,10 +205,14 @@ class DeepSeekProvider(BaseProvider):
                 buf = tool_buffers[idx]
                 raw_args = buf["arguments"] or "{}"
                 try:
-                    parsed = json.loads(raw_args)
+                    parsed_raw = json.loads(raw_args)
                 except (json.JSONDecodeError, TypeError):
                     # 模型可能生成非法 JSON：标记 arguments=None，由协调层转结构化错误
                     parsed = None
+                else:
+                    # Function-calling arguments must be a JSON object. Other JSON values
+                    # are treated like a parse failure so permission code never sees them.
+                    parsed = parsed_raw if isinstance(parsed_raw, dict) else None
                 yield StreamChunk(
                     type="tool_call",
                     tool_call=ToolCall(id=buf["id"], name=buf["name"], arguments=parsed),

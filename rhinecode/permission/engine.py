@@ -118,15 +118,21 @@ class PermissionEngine:
         """登记一条会话级规则（「本会话放行」调用）；仅存内存，关程序即失效。"""
         self.session_rules.append(rule)
 
-    def persist_local_rule(self, rule_string: str) -> None:
+    def persist_local_rule(self, rule_string: str) -> bool:
         """
         永久放行：把一条 allow 规则写入本地级配置，并同步登记为会话规则使其本次立即生效。
 
         :param rule_string: 形如 "Bash(git *)" 的规则字符串
+        :returns: 是否成功写入本地级配置
 
         副作用：写入本地级 permissions.local.yaml；向 session_rules 追加一条等价规则。
         """
-        config.append_local_allow(rule_string)
+        try:
+            config.append_local_allow(rule_string)
+        except Exception as exc:  # noqa: BLE001 - UI should not crash if local permission write fails.
+            self.load_errors.append(f"写入本地权限配置失败：{exc}")
+            return False
         rule = config.parse_rule_string(rule_string, "allow", "local")
         if rule is not None:
             self.session_rules.append(rule)
+        return True

@@ -8,6 +8,7 @@
 """
 
 from dataclasses import dataclass
+from typing import Any
 import yaml
 
 
@@ -31,6 +32,18 @@ class Config:
     api_key: str
     # 调试日志开关：默认开启便于随时验证缓存；非必填字段，老配置不写也能正常加载。
     debug_log: bool = True
+
+
+def _parse_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"配置字段 {field_name} 必须是布尔值 true/false")
 
 
 def load(path: str) -> Config:
@@ -65,13 +78,13 @@ def load(path: str) -> Config:
         if not data.get(field):
             raise ValueError(f"配置文件缺少必填字段 {field}")
 
-    # debug_log 为可选项：缺省或写成非布尔值时，统一按布尔语义取值，默认 True。
-    debug_log = data.get("debug_log", True)
+    # debug_log 为可选项：缺省为 True，字符串写法需显式表达 true/false，避免 "false" 被当成 True。
+    debug_log = _parse_bool(data.get("debug_log", True), "debug_log")
 
     return Config(
         protocol=data["protocol"],
         model=data["model"],
         base_url=data["base_url"],
         api_key=data["api_key"],
-        debug_log=bool(debug_log),
+        debug_log=debug_log,
     )

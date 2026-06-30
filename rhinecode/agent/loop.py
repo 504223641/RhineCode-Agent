@@ -54,6 +54,14 @@ ClarifyFn = Callable[[str, list[ClarifyOption]], Optional[str]]
 ApprovePlanFn = Callable[[str], bool]
 
 
+def _invalid_args_result(tc: ToolCall) -> ToolResult:
+    return ToolResult(
+        ok=False,
+        output=f"工具 {tc.name} 的参数必须是 JSON 对象，请检查格式后重试。",
+        summary="参数格式错误",
+    )
+
+
 class _RoundContext:
     """
     单轮工具执行的上下文，用于把 _execute 内部发生的「状态变化」回传给主循环。
@@ -327,8 +335,8 @@ class Agent:
                 ctx.unknown_count += 1
                 continue
             ctx.known_count += 1
-            if tc.arguments is None:
-                # 参数解析失败：不进引擎，留待串行路径产出结构化错误。
+            if not isinstance(tc.arguments, dict):
+                # 参数解析失败或非对象 JSON：不进引擎，留待串行路径产出结构化错误。
                 serial.append((tc, tool, None))
                 continue
             # 权限决策：规范化 → engine.decide。
@@ -379,8 +387,8 @@ class Agent:
         """
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
 
-        if tc.arguments is None:
-            res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查格式后重试。")
+        if not isinstance(tc.arguments, dict):
+            res = _invalid_args_result(tc)
             results[tc.id] = res
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
@@ -457,12 +465,12 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
 
         for tc, _tool in items:
-            if tc.arguments is None:
-                res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查格式后重试。")
+            if not isinstance(tc.arguments, dict):
+                res = _invalid_args_result(tc)
                 results[tc.id] = res
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
-        valid = [(tc, tool) for tc, tool in items if tc.arguments is not None]
+        valid = [(tc, tool) for tc, tool in items if isinstance(tc.arguments, dict)]
         if not valid:
             return
 
@@ -512,7 +520,7 @@ class Agent:
         # 参数解析失败（decision 为 None）
         if decision is None:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
-            res = ToolResult(ok=False, output=f"工具 {tc.name} 的参数 JSON 解析失败，请检查格式后重试。")
+            res = _invalid_args_result(tc)
             results[tc.id] = res
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return

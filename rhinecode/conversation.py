@@ -261,7 +261,10 @@ class ConversationManager:
                 )
                 return True
             if choice == ConfirmDecision.ALLOW_PERMANENT:
-                self._engine.persist_local_rule(rule_string)
+                if not self._engine.persist_local_rule(rule_string):
+                    self._engine.add_session_rule(
+                        Rule(effect="allow", tool=req.rule_name, pattern=req.specifier, source="session")
+                    )
                 return True
             return False
 
