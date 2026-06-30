@@ -441,11 +441,17 @@ class RhineApp(App):
         box["event"].wait()
         return box["result"]
 
-    def _confirm_tool(self, tool_call, tool) -> ConfirmDecision:
-        """有副作用工具执行前确认（spec F6），返回三态决定。"""
+    def _confirm_tool(self, tool_call, tool, decision) -> ConfirmDecision:
+        """
+        人在回路确认（c6 spec F6），返回四态决定。
+
+        :param tool_call: 待确认的工具调用
+        :param tool: 工具实例
+        :param decision: 决策管线给出的 DecisionResult，面板用其 reason 告知用户为何需要确认
+        """
         return self._interact(
             "confirm",
-            lambda: self._show_confirm_panel(tool_call, tool),
+            lambda: self._show_confirm_panel(tool_call, tool, decision),
             ConfirmDecision.DENY,
         )
 
@@ -466,11 +472,11 @@ class RhineApp(App):
             False,
         )
 
-    def _show_confirm_panel(self, tool_call, tool) -> None:
-        """在主线程展示工具确认面板并移焦。"""
+    def _show_confirm_panel(self, tool_call, tool, decision) -> None:
+        """在主线程展示工具确认面板并移焦（c6：传入 decision 以展示拒绝/询问原因）。"""
         self.query_one(CommandPanel).hide()
         panel = self.query_one(ConfirmPanel)
-        panel.show_for(tool_call, tool)
+        panel.show_for(tool_call, tool, decision)
         panel.focus()
 
     def _show_clarify_panel(self, question, options) -> None:
@@ -534,7 +540,8 @@ class RhineApp(App):
             event.stop()
             mapping = {
                 "yes": ConfirmDecision.ALLOW,
-                "yes_always": ConfirmDecision.ALLOW_ALWAYS,
+                "yes_session": ConfirmDecision.ALLOW_SESSION,
+                "yes_permanent": ConfirmDecision.ALLOW_PERMANENT,
                 "no": ConfirmDecision.DENY,
             }
             self._resolve_interaction(mapping.get(event.option.id, ConfirmDecision.DENY))

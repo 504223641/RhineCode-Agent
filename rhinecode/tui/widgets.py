@@ -507,17 +507,18 @@ class ConfirmPanel(OptionList):
     交互体验与斜杠命令面板 CommandPanel 一致：出现在输入框上方，用方向键在
     「执行 / 取消」间选择，回车确认，Esc 取消，不遮挡历史区。
 
-    用于写文件、改文件、执行命令等有副作用工具：顶部以橘色表头展示工具名与关键参数摘要
-    （仅展示、不可选），下方三个可选项分别对应「执行 / 执行且本会话不再询问 / 取消」。
+    用于决策管线判定为 ASK（交人工确认）的工具调用：顶部以橘色表头展示工具名、关键参数
+    摘要与「为何需要确认」的原因（仅展示、不可选），下方四个可选项对应四态放行（c6 F6）。
 
     结果如何回传：面板本身不持有协调层状态。用户选择某项时由 OptionList 原生发出
     OptionList.OptionSelected（App 据 option.id 解析为 ConfirmDecision）；按 Esc 时发出本类的
     Cancelled 消息（App 视为拒绝）。App 再唤醒被阻塞的 Worker 线程（见 RhineApp._confirm_tool）。
 
-    三个可选项的 option.id 约定：
-    - "yes"        → 仅放行本次（ConfirmDecision.ALLOW）
-    - "yes_always" → 放行且本会话不再询问（ConfirmDecision.ALLOW_ALWAYS）
-    - "no"         → 拒绝（ConfirmDecision.DENY）
+    四个可选项的 option.id 约定（c6）：
+    - "yes"           → 仅放行本次（ConfirmDecision.ALLOW）
+    - "yes_session"   → 本会话放行（ConfirmDecision.ALLOW_SESSION，登记会话级 allow 规则）
+    - "yes_permanent" → 永久放行（ConfirmDecision.ALLOW_PERMANENT，写入本地级配置）
+    - "no"            → 拒绝（ConfirmDecision.DENY）
 
     设计取舍：确认期间 App 会把焦点临时移到本面板，从而直接复用 OptionList 原生的
     上/下/回车 选择能力（输入框为空时回车不会触发自定义提交消息，移焦到面板最稳健）。
@@ -539,33 +540,38 @@ class ConfirmPanel(OptionList):
         Binding("escape", "cancel", "取消", show=False),
     ]
 
-    def show_for(self, tool_call, tool) -> None:
+    def show_for(self, tool_call, tool, decision=None) -> None:
         """
-        为一次工具调用填充并显示确认面板。
+        为一次工具调用填充并显示确认面板（c6 四态放行）。
 
         每次调用先清空旧选项再重建，避免残留上一次确认的内容。
-        表头（disabled）展示工具名与参数摘要供用户判断；其后是「执行」「取消」两个可选项，
-        默认高亮「执行」（_YES_INDEX），用户直接回车即放行。
+        表头（disabled）展示工具名、参数摘要与「为何需要确认」的原因供用户判断；
+        其后是四个可选项（本次/本会话/永久/拒绝），默认高亮「本次放行」（_YES_INDEX）。
 
         :param tool_call: provider.base.ToolCall，提供工具名与参数
         :param tool: tools.base.Tool（暂用于潜在扩展，如展示描述）
+        :param decision: 决策管线给出的 DecisionResult；其 reason 展示在表头说明缘由。
+                         为 None 时仅展示工具信息（向后兼容）。
 
         副作用：修改 OptionList 选项并使面板可见。
         """
         args_summary = summarize_args(tool_call.arguments, max_len=200)
+        # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
+        reason = f"  [dim]· {decision.reason}[/dim]" if decision is not None else ""
         self.clear_options()
         # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航
         self.add_option(
             Option(
-                f"[#FFA500]⚠ 确认执行：{tool_call.name}({args_summary})[/#FFA500]",
+                f"[#FFA500]⚠ 确认执行：{tool_call.name}({args_summary})[/#FFA500]{reason}",
                 disabled=True,
             )
         )
-        self.add_option(Option("✅ 执行  [dim]仅执行本次[/dim]", id="yes"))
-        self.add_option(Option("⏩ 执行且不再询问  [dim]本会话后续有副作用工具自动执行[/dim]", id="yes_always"))
-        self.add_option(Option("❌ 取消  [dim]拒绝并让模型据此调整[/dim]", id="no"))
+        self.add_option(Option("✅ 本次放行  [dim]仅执行本次[/dim]", id="yes"))
+        self.add_option(Option("🟢 本会话放行  [dim]本会话内相同调用不再询问[/dim]", id="yes_session"))
+        self.add_option(Option("💾 永久放行  [dim]写入本地配置，重启仍生效[/dim]", id="yes_permanent"))
+        self.add_option(Option("❌ 拒绝  [dim]拒绝并让模型据此调整[/dim]", id="no"))
         self.display = True
-        # 默认高亮「执行」，回车即执行（与 / 命令面板一致的顺手体验）
+        # 默认高亮「本次放行」，回车即执行（与 / 命令面板一致的顺手体验）
         self.highlighted = self._YES_INDEX
 
     def show_prompt(self, title: str, yes_label: str, no_label: str) -> None:
