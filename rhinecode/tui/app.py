@@ -243,8 +243,8 @@ class RhineApp(App):
             if text == "/clear":
                 history_view.clear_all()
             history_view.append_system(result)
-            # /think 与 /plan 改变了状态，需要同步刷新状态栏
-            if text in ("/think", "/plan"):
+            # /think、/plan、/perm 改变了状态栏展示的状态，需要同步刷新状态栏
+            if text in ("/think", "/plan", "/perm"):
                 self._refresh_status()
         else:
             # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history。
