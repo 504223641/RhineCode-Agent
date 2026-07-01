@@ -19,6 +19,7 @@ import os
 import subprocess
 import threading
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import Any, Optional
 
 import httpx
@@ -118,6 +119,9 @@ class StdioTransport(Transport):
         self._env = env
         self._proc: Optional[subprocess.Popen] = None
         self._reader: Optional[threading.Thread] = None
+        self._stderr_reader: Optional[threading.Thread] = None
+        self._stderr_tail: deque[str] = deque(maxlen=50)
+        self._stderr_lock = threading.Lock()
         self._write_lock = threading.Lock()
         # id → _Pending；reader 与调用线程共享，用 _pending_lock 保护结构性读写
         self._pending: dict[int, _Pending] = {}
@@ -150,6 +154,37 @@ class StdioTransport(Transport):
         self._alive = True
         self._reader = threading.Thread(target=self._read_loop, name=f"mcp-stdio-{self._command}", daemon=True)
         self._reader.start()
+        self._stderr_reader = threading.Thread(
+            target=self._drain_stderr,
+            name=f"mcp-stderr-{self._command}",
+            daemon=True,
+        )
+        self._stderr_reader.start()
+
+    def _drain_stderr(self) -> None:
+        """持续排空 stderr，避免 MCP Server 因日志管道写满而阻塞。"""
+        if self._proc is None or self._proc.stderr is None:
+            return
+        try:
+            for line in self._proc.stderr:
+                line = line.rstrip()
+                if not line:
+                    continue
+                with self._stderr_lock:
+                    self._stderr_tail.append(line)
+        except Exception:
+            return
+
+    def recent_stderr(self) -> list[str]:
+        """返回最近若干行 stderr，供诊断连接/超时问题。"""
+        with self._stderr_lock:
+            return list(self._stderr_tail)
+
+    def _stderr_suffix(self) -> str:
+        tail = self.recent_stderr()
+        if not tail:
+            return ""
+        return "；stderr: " + " | ".join(tail[-3:])
 
     def _read_loop(self) -> None:
         """
@@ -174,7 +209,7 @@ class StdioTransport(Transport):
                     self._dispatch(msg)
                 # 其它类型（通知/服务端请求）本章不处理
         finally:
-            self._fail_all("MCP 子进程输出流已结束（连接断开）")
+            self._fail_all("MCP 子进程输出流已结束（连接断开）" + self._stderr_suffix())
 
     def _dispatch(self, msg: dict) -> None:
         """把一条响应交给对应 id 的在途请求并唤醒它。"""
@@ -211,13 +246,13 @@ class StdioTransport(Transport):
         except (OSError, ValueError) as exc:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
-            raise TransportError(f"写入 MCP 子进程失败：{exc}") from exc
+            raise TransportError(f"写入 MCP 子进程失败：{exc}{self._stderr_suffix()}") from exc
 
         # 阻塞等待 reader 唤醒或超时。
         if not pending.event.wait(timeout):
             with self._pending_lock:
                 self._pending.pop(req_id, None)
-            raise TransportError(f"MCP 请求超时（{method}，{timeout}s）")
+            raise TransportError(f"MCP 请求超时（{method}，{timeout}s）{self._stderr_suffix()}")
 
         # 传输错误（连接断开）优先。
         if pending.box[1] is not None:
@@ -233,7 +268,7 @@ class StdioTransport(Transport):
                 self._proc.stdin.write(payload)
                 self._proc.stdin.flush()
         except (OSError, ValueError) as exc:
-            raise TransportError(f"写入 MCP 子进程失败：{exc}") from exc
+            raise TransportError(f"写入 MCP 子进程失败：{exc}{self._stderr_suffix()}") from exc
 
     def close(self) -> None:
         """关闭 stdin → 温和终止 → 限时等待 → 必要时强杀。reader 是守护线程，随进程退出。"""

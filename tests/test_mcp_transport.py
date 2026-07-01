@@ -20,6 +20,48 @@ def _make_client() -> MCPClient:
     return MCPClient("mock", transport, call_timeout=10.0)
 
 
+_NOISY_SERVER = r"""
+import json
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
+for i in range(5000):
+    sys.stderr.write("stderr noise " + ("x" * 200) + "\n")
+sys.stderr.flush()
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    req_id = req.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "noisy", "version": "0.0.1"},
+            },
+        })
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": []}})
+"""
+
+
+def _make_noisy_client() -> MCPClient:
+    transport = StdioTransport(sys.executable, ["-c", _NOISY_SERVER], {})
+    return MCPClient("noisy", transport, call_timeout=10.0)
+
+
 class StdioSessionTests(unittest.TestCase):
     def test_initialize_and_list_tools(self) -> None:
         # AC5：initialize → tools/list 全流程，拿到 echo/boom。
@@ -65,6 +107,15 @@ class StdioSessionTests(unittest.TestCase):
         client.close()
         # 给终止一点时间：close 内部已 wait，poll 应非 None
         self.assertIsNotNone(transport._proc.poll())
+
+    def test_stderr_is_drained_so_noisy_server_does_not_block(self) -> None:
+        client = _make_noisy_client()
+        try:
+            client.initialize()
+            self.assertEqual(client.list_tools(), [])
+            self.assertTrue(client._transport.recent_stderr())
+        finally:
+            client.close()
 
 
 if __name__ == "__main__":

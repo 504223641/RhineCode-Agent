@@ -8,6 +8,7 @@
 import os
 import re
 from pathlib import Path
+from typing import Callable
 
 from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace, workspace_root
@@ -16,6 +17,8 @@ from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace, wor
 MAX_MATCHES = 200
 # 跳过的目录名（版本控制、虚拟环境、缓存等），减少噪声与无意义遍历。
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
+
+PathFilter = Callable[[str], bool]
 
 
 class GrepTool(Tool):
@@ -41,6 +44,21 @@ class GrepTool(Tool):
         "required": ["pattern"],
     }
     read_only = True
+
+    def __init__(self, path_filter: PathFilter | None = None):
+        self._path_filter = path_filter
+
+    def set_path_filter(self, path_filter: PathFilter | None) -> None:
+        """设置实际读取文件前的权限过滤器；None 表示不过滤。"""
+        self._path_filter = path_filter
+
+    def _is_allowed(self, rel_path: str) -> bool:
+        if self._path_filter is None:
+            return True
+        try:
+            return bool(self._path_filter(rel_path))
+        except Exception:
+            return False
 
     def execute(self, args: dict) -> ToolResult:
         """
@@ -100,17 +118,21 @@ class GrepTool(Tool):
 
             # 收集 (相对路径, 行号, 行内容) 三元组，保持遍历顺序，便于后续按文件分组
             matches: list[tuple[str, int, str]] = []
+            skipped = 0
             for fp in files:
                 if len(matches) >= MAX_MATCHES:
                     break
                 try:
+                    rel = str(fp.relative_to(base))
+                except ValueError:
+                    rel = str(fp)
+                if not self._is_allowed(rel):
+                    skipped += 1
+                    continue
+                try:
                     with open(fp, "r", encoding="utf-8") as f:
                         for lineno, line in enumerate(f, start=1):
                             if regex.search(line):
-                                try:
-                                    rel = str(fp.relative_to(base))
-                                except ValueError:
-                                    rel = str(fp)
                                 matches.append((rel, lineno, line.rstrip()))
                                 if len(matches) >= MAX_MATCHES:
                                     break
@@ -120,7 +142,9 @@ class GrepTool(Tool):
 
             total = len(matches)
             if total == 0:
-                return ToolResult(ok=True, output=f"无匹配内容（模式: {pattern}）", summary="无匹配")
+                suffix = f"；跳过 {skipped} 个被权限规则拒绝的文件" if skipped else ""
+                summary = f"无匹配 · 跳过 {skipped} 个" if skipped else "无匹配"
+                return ToolResult(ok=True, output=f"无匹配内容（模式: {pattern}）{suffix}", summary=summary)
 
             file_count = len({rel for rel, _, _ in matches})
             capped = total >= MAX_MATCHES
@@ -135,9 +159,13 @@ class GrepTool(Tool):
                 lines_out.append(f"  {lineno}│ {line}")
             if capped:
                 lines_out.append(f"…（已达上限 {MAX_MATCHES} 条，可能还有更多）")
+            if skipped:
+                lines_out.append(f"…（跳过 {skipped} 个被权限规则拒绝的文件）")
             output = "\n".join(lines_out)
 
             summary = f"≥{MAX_MATCHES} 处（已截断）" if capped else f"{total} 处匹配 · {file_count} 个文件"
+            if skipped:
+                summary += f" · 跳过 {skipped} 个"
             return ToolResult(ok=True, output=output, summary=summary)
 
         except PathGuardError as e:

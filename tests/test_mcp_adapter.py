@@ -2,7 +2,7 @@
 
 import unittest
 
-from rhinecode.mcp.tool_adapter import MCPTool
+from rhinecode.mcp.tool_adapter import MCPTool, sanitize_mcp_tool_name
 
 
 class _StubClient:
@@ -41,6 +41,20 @@ class NamingTests(unittest.TestCase):
     def test_description_fallback_to_name(self) -> None:
         t = MCPTool(_StubClient(), "srv", "echo", "", None)
         self.assertEqual(t.description, "echo")
+
+    def test_invalid_remote_name_is_sanitized_but_original_is_called(self) -> None:
+        client = _StubClient(result={"content": [{"type": "text", "text": "ok"}]})
+        t = MCPTool(client, "bad-server", "tool.name/with space", "desc", None)
+
+        self.assertEqual(t.name, "mcp__bad_server__tool_name_with_space")
+        t.execute({"x": 1})
+        self.assertEqual(client.calls[0], ("tool.name/with space", {"x": 1}))
+
+    def test_long_tool_name_gets_stable_hash_suffix(self) -> None:
+        name = sanitize_mcp_tool_name("server" * 20, "tool" * 30)
+
+        self.assertLessEqual(len(name), 64)
+        self.assertRegex(name, r"^mcp__[A-Za-z0-9_]+__[A-Za-z0-9_]+_[0-9a-f]{8}$")
 
 
 class ConversionTests(unittest.TestCase):

@@ -9,6 +9,8 @@
 - 健壮性：execute 捕获一切异常转 ok=False，绝不外抛（spec N2），保证 Agent Loop 不崩。
 """
 
+import hashlib
+import re
 from typing import Optional
 
 from rhinecode.mcp.client import MCPClient
@@ -16,6 +18,36 @@ from rhinecode.tools.base import Tool, ToolResult
 
 # 远端工具未提供 inputSchema 时的兜底：一个合法的空 object schema，避免把 None 发给模型 API。
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
+_MAX_FUNCTION_NAME = 64
+_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _safe_name_part(value: str) -> str:
+    part = _UNSAFE_NAME_CHARS.sub("_", str(value)).strip("_")
+    return part or "unnamed"
+
+
+def sanitize_mcp_tool_name(server_name: str, remote_name: str) -> str:
+    """
+    生成 OpenAI/DeepSeek function name 兼容的 MCP 注册名。
+
+    远端 MCP 名字可能包含点号、斜杠、空格等 API function name 不接受的字符；这里把
+    server/tool 两段压成字母数字下划线，并在过长时加稳定 hash，保证名字可发送给模型。
+    """
+    server = _safe_name_part(server_name)
+    remote = _safe_name_part(remote_name)
+    candidate = f"mcp__{server}__{remote}"
+    if len(candidate) <= _MAX_FUNCTION_NAME:
+        return candidate
+
+    digest = hashlib.sha1(f"{server_name}\0{remote_name}".encode("utf-8")).hexdigest()[:8]
+    fixed = len("mcp__") + len("__") + len("_") + len(digest)
+    budget = max(12, _MAX_FUNCTION_NAME - fixed)
+    server_budget = max(4, min(len(server), budget // 3))
+    remote_budget = max(4, budget - server_budget)
+    server = server[:server_budget].rstrip("_") or "srv"
+    remote = remote[:remote_budget].rstrip("_") or "tool"
+    return f"mcp__{server}__{remote}_{digest}"
 
 
 class MCPTool(Tool):
@@ -36,6 +68,7 @@ class MCPTool(Tool):
         remote_name: str,
         description: str,
         parameters: Optional[dict],
+        registered_name: Optional[str] = None,
     ):
         """
         :param client: 所属 MCPClient
@@ -48,9 +81,10 @@ class MCPTool(Tool):
         self._server_name = server_name
         self._remote_name = remote_name
         # 实例属性覆盖类属性：注册中心与 API schema 都读 self.name/description/parameters
-        self.name = f"mcp__{server_name}__{remote_name}"
+        self.name = registered_name or sanitize_mcp_tool_name(server_name, remote_name)
         self.description = description or remote_name
         self.parameters = parameters if isinstance(parameters, dict) and parameters else _EMPTY_SCHEMA
+        self.original_name = f"{server_name}/{remote_name}"
 
     def execute(self, args: dict) -> ToolResult:
         """

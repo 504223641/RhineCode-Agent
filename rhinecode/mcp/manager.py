@@ -9,12 +9,12 @@
 - 状态汇总（F15/F16）：status_line 供底部状态栏，status_report 供 /mcp 命令。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from rhinecode.mcp.client import MCPClient
 from rhinecode.mcp.config import MCPServerConfig
-from rhinecode.mcp.tool_adapter import MCPTool
+from rhinecode.mcp.tool_adapter import MCPTool, sanitize_mcp_tool_name
 from rhinecode.mcp.transport import HttpTransport, StdioTransport, Transport
 from rhinecode.tools.registry import ToolRegistry
 
@@ -35,6 +35,7 @@ class ServerState:
     connected: bool
     tool_count: int = 0
     error: Optional[str] = None
+    aliases: list[str] = field(default_factory=list)
 
 
 class MCPManager:
@@ -57,6 +58,18 @@ class MCPManager:
         if cfg.kind == "stdio":
             return StdioTransport(cfg.command or "", cfg.args, cfg.env)
         return HttpTransport(cfg.url or "", cfg.headers)
+
+    @staticmethod
+    def _unique_tool_name(base_name: str, registry: ToolRegistry) -> str:
+        """避免规范化后的 MCP 工具名与已有工具重名。"""
+        if registry.get(base_name) is None:
+            return base_name
+        for i in range(2, 1000):
+            suffix = f"_{i}"
+            candidate = base_name[:64 - len(suffix)].rstrip("_") + suffix
+            if registry.get(candidate) is None:
+                return candidate
+        raise ValueError(f"MCP 工具名冲突过多：{base_name}")
 
     def connect_all(
         self,
@@ -84,22 +97,32 @@ class MCPManager:
                 client.initialize()
                 tools = client.list_tools()
                 count = 0
+                aliases: list[str] = []
                 for tool in tools:
                     remote_name = tool.get("name")
                     if not remote_name:
                         continue
-                    registry.register(
-                        MCPTool(
-                            client=client,
-                            server_name=cfg.name,
-                            remote_name=str(remote_name),
-                            description=str(tool.get("description") or ""),
-                            parameters=tool.get("inputSchema"),
-                        )
+                    original_name = f"mcp__{cfg.name}__{remote_name}"
+                    safe_name = self._unique_tool_name(
+                        sanitize_mcp_tool_name(cfg.name, str(remote_name)),
+                        registry,
                     )
+                    mcp_tool = MCPTool(
+                        client=client,
+                        server_name=cfg.name,
+                        remote_name=str(remote_name),
+                        description=str(tool.get("description") or ""),
+                        parameters=tool.get("inputSchema"),
+                        registered_name=safe_name,
+                    )
+                    registry.register(mcp_tool)
+                    if safe_name != original_name:
+                        aliases.append(f"{safe_name} <- {cfg.name}/{remote_name}")
                     count += 1
                 self._clients.append(client)
-                self.states.append(ServerState(cfg.name, cfg.kind, connected=True, tool_count=count))
+                self.states.append(
+                    ServerState(cfg.name, cfg.kind, connected=True, tool_count=count, aliases=aliases)
+                )
             except Exception as exc:  # noqa: BLE001 —— 单 Server 失败隔离，不影响其它
                 # 失败的 client 尽力关闭，回收可能已拉起的子进程
                 if client is not None:
@@ -137,6 +160,8 @@ class MCPManager:
         for s in self.states:
             if s.connected:
                 lines.append(f"{s.name} ({s.kind}) ✓ 已连接 · {s.tool_count} 工具")
+                for alias in s.aliases:
+                    lines.append(f"  {alias}")
             else:
                 lines.append(f"{s.name} ({s.kind}) ✗ 失败：{s.error}")
 

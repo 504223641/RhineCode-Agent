@@ -30,9 +30,11 @@ from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import AgentEvent, ClarifyOption, ConfirmDecision
 from rhinecode.permission import (
+    Decision,
     DecisionResult,
     PermissionEngine,
     PermissionMode,
+    PermissionRequest,
     Rule,
     to_request,
 )
@@ -114,8 +116,34 @@ class ConversationManager:
 
         # 工具/循环能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
         self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
+        if registry is not None:
+            self._install_path_filters(registry)
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
         self._agent = Agent(provider, registry)
+
+    def _install_path_filters(self, registry: ToolRegistry) -> None:
+        """
+        给会递归发现文件的只读工具注入文件级权限过滤器。
+
+        read_file 的单文件路径在执行前已由权限管线判断；grep/glob 这类目录级工具还会在
+        execute 内部发现更多文件，因此需要在真正读取或返回每个文件前再次用 Read 规则判定。
+        """
+        def allow_read_path(rel_path: str) -> bool:
+            req = PermissionRequest(
+                tool_name="read_file",
+                rule_name="Read",
+                specifier=rel_path,
+                kind="read_path",
+                is_read_only=True,
+                mode=self._engine.mode,
+            )
+            return self._engine.decide(req).decision != Decision.DENY
+
+        for name in ("grep_content", "glob_files"):
+            tool = registry.get(name)
+            setter = getattr(tool, "set_path_filter", None)
+            if callable(setter):
+                setter(allow_read_path)
 
     @property
     def permission_mode_value(self) -> Optional[str]:

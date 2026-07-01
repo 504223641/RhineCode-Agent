@@ -10,8 +10,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
-- **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令。
-- **MCP 客户端**：启动时按配置连接外部 MCP Server（stdio 子进程 / Streamable HTTP），自动发现并注册其工具（命名为 `mcp__<server>__<tool>`），Agent 调用时无感；多 Server 连接缓存与隔离，单个挂掉不影响其它；底部状态栏显示连接状态，`/mcp` 查看明细。
+- **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
+- **MCP 客户端**：启动时按配置连接外部 MCP Server（stdio 子进程 / Streamable HTTP），自动发现并注册其工具（以 `mcp__<server>__<tool>` 为基础命名，必要时规范化为安全 function name），Agent 调用时无感；多 Server 连接缓存与隔离，单个挂掉不影响其它；底部状态栏显示连接状态，`/mcp` 查看明细。
 - **五层防御权限系统**：每个工具执行前由 `permission/` 包的纯逻辑引擎按固定顺序计算决定——①危险命令黑名单（不可被任何配置/模式放开）→ ②路径沙箱 → ③可配置规则（`Tool(模式)`，deny 永远优先）→ ④权限模式（严格/默认/放行，`/perm` 切换）→ ⑤人在回路（确认面板四选项）。
 - **可配置权限规则**：三层 YAML（用户级、项目级、本地级）声明 allow/deny；跨层合并后 deny 优先求值。
 - **Plan Mode**：`/plan` 开启后先只允许只读调研和需求澄清，完整计划进入聊天记录，经用户批准后才进入执行阶段。与权限模式正交。
@@ -115,9 +115,9 @@ DeepSeek 工具模式会向模型暴露以下工具：
 
 | 工具 | 说明 | 只读 |
 |------|------|------|
-| `read_file` | 读取项目内文本文件，并带行号返回内容 | 是 |
-| `glob_files` | 按 glob 模式查找项目内文件 | 是 |
-| `grep_content` | 在项目内文本文件中按正则搜索内容 | 是 |
+| `read_file` | 读取项目内文本文件，并带行号返回内容；超过 1 MiB 的文件必须用 `start_line` / `max_lines` 分段读取，单次最多 2000 行 | 是 |
+| `glob_files` | 按 glob 模式查找项目内文件；命中 `Read(...)` deny 的文件会被跳过并显示跳过数量 | 是 |
+| `grep_content` | 在项目内文本文件中按正则搜索内容；命中 `Read(...)` deny 的文件不会被打开，结果会显示跳过数量 | 是 |
 | `write_file` | 新建或覆盖项目内文件，并生成 diff | 否 |
 | `edit_file` | 用唯一匹配的原文片段精确替换；支持 `edits` 数组批量替换 | 否 |
 | `run_command` | 在项目工作目录下执行 shell 命令 | 否 |
@@ -128,11 +128,11 @@ DeepSeek 工具模式会向模型暴露以下工具：
 
 RhineCode 可作为 [MCP](https://modelcontextprotocol.io) 客户端接入外部 MCP Server，把它们提供的工具接进工具中心，无需改动源码。启动时自动完成「连接 → `initialize` 握手 → `tools/list` 发现 → 注册」；之后远端工具与内置工具走同一套 Agent Loop 与权限管线。
 
-- **两种传输**：本地子进程走 stdio 管道，远程走 Streamable HTTP。底层按 JSON-RPC 2.0 收发，请求带 id、响应按 id 配对（stdio 单管道复用靠后台 reader 线程派发）。
-- **命名与隔离**：远端工具注册名为 `mcp__<server>__<tool>`，与内置工具、其它 Server 天然隔离，不会重名冲突。
+- **两种传输**：本地子进程走 stdio 管道，远程走 Streamable HTTP。底层按 JSON-RPC 2.0 收发，请求带 id、响应按 id 配对（stdio 单管道复用靠后台 reader 线程派发）；stdio 的 stderr 会被后台线程持续 drain，避免 Server 大量写错误日志时堵塞握手或工具发现。
+- **命名与隔离**：远端工具注册名以 `mcp__<server>__<tool>` 为基础；若远端名字含空格、斜杠等不适合作为 function name 的字符，会规范化为安全名称，`/mcp` 明细会展示 `registered_name <- server/tool`。
 - **连接生命周期**：多 Server 连接缓存、单点隔离（某 Server 连接/发现失败只跳过并记录，不影响其它 Server 与启动）；程序退出时统一关闭连接、回收 stdio 子进程。
-- **安全默认**：MCP 工具一律视为非只读，默认权限模式下每次调用都经人在回路确认；可用权限规则 `allow: mcp__<server>__*` 一次放行整个 Server（见下）。
-- **可观测**：底部状态栏显示「MCP：已连接 N/M · 工具 K」；`/mcp` 命令列出每个 Server 的连接状态、传输类型、工具数与失败原因。
+- **安全默认**：MCP 工具一律视为非只读，默认权限模式下每次调用都经人在回路确认；可用权限规则 `allow: mcp__<server>__*` 一次放行整个 Server（见下）。若工具名被规范化，请以 `/mcp` 显示的注册名写规则。
+- **可观测**：底部状态栏显示「MCP：已连接 N/M · 工具 K」；`/mcp` 命令列出每个 Server 的连接状态、传输类型、工具数、失败原因与被规范化的工具名。
 
 > 本阶段只接 MCP 的**工具**能力，不做资源 / 提示词 / 采样，也不做 Server 健康检查与自动重连。
 
@@ -187,8 +187,10 @@ mcpServers:
 - 规则语法：`Bash(git *)`、`Read(config.yaml)`、`Write(src/**)`、`Edit(...)`；只写工具名（不带括号）表示匹配该工具全部调用。
 - 工具名映射：`Bash`→`run_command`，`Read`→`read_file`/`glob_files`/`grep_content`，`Write`→`write_file`，`Edit`→`edit_file`。
 - 命令用前缀 + glob（末尾 ` *` 或 `:*` 带词边界，`npm:*` 不误伤 `npmx`）；文件用 gitignore 风格（`.env` 任意深度命中、`src/**` 跨目录）。
-- MCP 远端工具未做细粒度映射，落到「整工具规则」的 `other` 分支：规则直接写工具名，且支持 `fnmatch` 通配——`allow: mcp__everything__echo` 精确放行单个工具，`allow: mcp__everything__*` 一次放行整个 Server（无 `*` 时等价精确匹配，向后兼容普通工具名）。
+- `Read(...)` deny 会同时约束直接读取和间接发现：例如 `deny: Read(config.yaml)` 会阻止 `read_file config.yaml`，也会让 `grep_content path="."` 跳过该文件、让 `glob_files "**/*"` 不输出该文件。
+- MCP 远端工具未做细粒度映射，落到「整工具规则」的 `other` 分支：规则直接写注册后的工具名，且支持 `fnmatch` 通配——`allow: mcp__everything__echo` 精确放行单个工具，`allow: mcp__everything__*` 一次放行整个 Server（无 `*` 时等价精确匹配，向后兼容普通工具名）；如果远端名被规范化，以 `/mcp` 里展示的 `registered_name` 为准。
 - 三层合并后按 **deny 永远优先**求值（不按层级覆盖）：任一条 deny 命中即拒绝，deny 不可被 allow 翻案；没有 deny 命中、有 allow 命中则放行；都没命中交给权限模式兜底。
+- 「永久放行」写入本地级配置前会先解析已有 `permissions.local.yaml`；如果文件损坏或顶层不是映射，RhineCode 不会覆盖原文件，而是保留本次会话放行并报告/记录写入失败。
 
 ## Plan Mode
 
@@ -208,7 +210,7 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 - 权限决定由工具层代码强制，不由模型/prompt 决定（可抵抗 prompt 注入）。
 - 危险命令黑名单与路径沙箱是最靠前、不可被规则或权限模式放开的硬防线。
 - 沙箱是应用层前缀校验，管得住文件工具，但管不住 `run_command` 跑起来的脚本自己用代码 open 的文件（已知边界，OS 级沙箱留待后续）。
-- `config.yaml` 可能包含真实 API Key，请勿提交到版本库；可用 `deny Read(config.yaml)` 规则进一步阻止模型读取。
+- `config.yaml` 可能包含真实 API Key，请勿提交到版本库；可用 `deny Read(config.yaml)` 规则进一步阻止模型读取，并阻止 grep/glob 间接泄露该文件内容或路径。
 
 ## 项目结构
 
@@ -268,9 +270,9 @@ python -m compileall rhinecode tests
 python -m unittest discover -s tests
 ```
 
-当前测试覆盖路径越界防护、四态确认回调、本会话放行登记规则、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认，以及权限系统的命令/路径匹配、危险命令黑名单（含复合命令逐段与 fork 炸弹）、deny 优先求值、配置三层加载与容错、工具规范化映射、四层决策管线、loop 决策接入（被拒不停循环、allow 规则免确认）等关键行为（`tests/test_perm_*.py`）。
+当前测试覆盖路径越界防护、四态确认回调、本会话放行登记规则、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认，以及权限系统的命令/路径匹配、危险命令黑名单（含复合命令逐段与 fork 炸弹）、deny 优先求值、配置三层加载与容错、工具规范化映射、四层决策管线、loop 决策接入（被拒不停循环、allow 规则免确认）、`grep_content` / `glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地权限配置不被覆盖等关键行为（`tests/test_perm_*.py`、`tests/test_review_fixes.py`）。
 
-MCP 客户端部分覆盖两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 传输三步会话与按 id 配对（用内置模拟 Server 端到端）、`CallToolResult→ToolResult` 转换（含 `isError` 与非文本占位）、单 Server 失败隔离与工具注册、以及 `other` 分支 fnmatch 通配放行（`tests/test_mcp_*.py`、`tests/test_perm_other_glob.py`）。
+MCP 客户端部分覆盖两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 传输三步会话与按 id 配对（用内置模拟 Server 端到端）、stderr drain 防阻塞、非法远端工具名规范化且仍调用原始远端名、`CallToolResult→ToolResult` 转换（含 `isError` 与非文本占位）、单 Server 失败隔离与工具注册、以及 `other` 分支 fnmatch 通配放行（`tests/test_mcp_*.py`、`tests/test_perm_other_glob.py`）。
 
 ## 当前阶段文档
 

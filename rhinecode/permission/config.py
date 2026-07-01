@@ -187,7 +187,7 @@ def append_local_allow(rule_string: str) -> None:
     把一条 allow 规则追加写入本地级配置文件（spec F6「永久放行」）。
 
     行为：
-    - 读取现有本地级 YAML（不存在或损坏则从空白开始，保证不丢失也不崩溃）。
+    - 读取现有本地级 YAML；若文件损坏或顶层不是映射，则拒绝写入，避免覆盖用户内容。
     - 在 allow 列表里追加 rule_string；若已存在相同条目则跳过（幂等）。
     - 目录不存在时创建后写回，使用 UTF-8。
 
@@ -200,10 +200,14 @@ def append_local_allow(rule_string: str) -> None:
     if path.exists():
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:  # noqa: BLE001 —— 损坏则从空白重建，不影响写入
+        except Exception as exc:  # noqa: BLE001 —— 坏文件不覆盖，交由上层会话级规则兜底
+            raise ValueError(f"本地权限配置解析失败，未写入：{path}：{exc}") from exc
+        if loaded is None:
             data = {}
+        elif isinstance(loaded, dict):
+            data = loaded
+        else:
+            raise ValueError(f"本地权限配置顶层应为映射，未写入：{path}")
 
     allow_list = data.get("allow")
     if not isinstance(allow_list, list):
