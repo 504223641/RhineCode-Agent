@@ -19,6 +19,8 @@ from rhinecode.config import load
 from rhinecode.provider.factory import create_provider
 from rhinecode.conversation import ConversationManager
 from rhinecode.tools.registry import ToolRegistry
+from rhinecode.mcp import config as mcp_config
+from rhinecode.mcp.manager import MCPManager
 from rhinecode.tui.app import RhineApp
 
 
@@ -59,10 +61,21 @@ def main() -> None:
     # 工具仅在 DeepSeek 协议下实际生效，其余协议下协调层会自动忽略（见 ConversationManager）。
     registry = ToolRegistry.default()
 
+    # 加载 MCP 配置并连接外部 Server，把发现到的远端工具注册进同一个 registry（c7）。
+    # connect_all 逐 Server 隔离：单个失败只跳过、不影响内置工具与启动（spec F13）；
+    # 无 mcp.yaml 时 configs 为空、无任何 MCP 工具，行为与 c6 完全一致。
+    mcp_configs, mcp_errors = mcp_config.load_all()
+    mcp_manager = MCPManager()
+    mcp_manager.connect_all(mcp_configs, registry, extra_errors=mcp_errors)
+
     # 依次构建各层组件，层间通过依赖注入解耦
-    manager = ConversationManager(provider, cfg, registry)
+    manager = ConversationManager(provider, cfg, registry, mcp_manager=mcp_manager)
     app = RhineApp(manager, cfg)
-    app.run()
+    # try/finally 保证无论正常退出还是异常，都统一回收 MCP 连接与 stdio 子进程（spec F12/AC11）。
+    try:
+        app.run()
+    finally:
+        mcp_manager.close_all()
 
 
 if __name__ == "__main__":

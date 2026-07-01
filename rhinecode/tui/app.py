@@ -155,6 +155,8 @@ class RhineApp(App):
             self._manager.thinking_effort,
             self._manager.plan_mode,
             self._manager.permission_mode_value,
+            # MCP 连接状态（c7）：启动后不变，随每次刷新一并带上即可。
+            self._manager.mcp_status_line(),
         )
 
     # ------------------------------------------------------------------ #

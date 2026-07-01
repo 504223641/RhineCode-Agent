@@ -11,6 +11,9 @@ dependencies = [
     "anthropic>=0.40.0",
     "openai>=1.50.0",
     "pyyaml>=6.0",
+    # c7：MCP 客户端的 Streamable HTTP 传输需要流式读取 SSE（text/event-stream），
+    # httpx 的 stream()/iter_lines() 支持得干净；openai 已传递依赖 httpx，此处显式声明。
+    "httpx>=0.27",
 ]
 
 [project.scripts]

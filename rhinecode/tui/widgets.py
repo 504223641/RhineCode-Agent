@@ -411,6 +411,7 @@ class CommandPanel(OptionList):
         ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
         ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
         ("/perm",  "循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）"),
+        ("/mcp",   "查看 MCP 服务连接状态（Server / 工具 / 失败原因）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
@@ -489,6 +490,7 @@ class StatusBar(Static):
         thinking_effort: str,
         plan_mode: bool = False,
         permission_mode: "str | None" = None,
+        mcp_status: "str | None" = None,
     ) -> None:
         """
         刷新状态栏显示内容。
@@ -500,6 +502,8 @@ class StatusBar(Static):
         :param permission_mode: 权限模式取值（"strict"/"default"/"permissive"）；c6 新增。
                                 为 None（工具不可用的 Provider）时不展示该段，避免误导。
                                 放行档以橘色高亮，提醒用户当前处于「灰色地带默认放行」的状态。
+        :param mcp_status: MCP 连接状态摘要（如「MCP：已连接 2/3 · 工具 11」）；c7 新增。
+                           为 None（未启用 MCP / 无 Server）时不展示该段。
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
@@ -519,6 +523,9 @@ class StatusBar(Static):
             if permission_mode == "permissive":
                 seg = f"[#FFA500]{seg}[/#FFA500]"
             text += f" | {seg}"
+        # MCP 段（c7）：仅在启用且有 Server 时展示；文本可能含字面 `[`，统一 escape 兜底。
+        if mcp_status is not None:
+            text += f" | {escape(str(mcp_status))}"
         self.update(text + " ")
 
 

@@ -10,6 +10,7 @@
 具体的字符串/路径匹配委托给 matching 模块；本模块只负责「按 deny→allow 顺序扫描」。
 """
 
+import fnmatch
 from typing import Optional
 
 from rhinecode.permission.models import Decision, DecisionResult, Layer, PermissionRequest, Rule
@@ -20,24 +21,33 @@ def _rule_matches(rule: Rule, request: PermissionRequest) -> bool:
     """
     判断单条规则是否命中本次请求。
 
-    先比工具名（规则体系名，如 Bash/Read/Edit/Write），不一致直接不命中；
-    再按请求种类 kind 选择匹配方式：
-    - command → 命令模式匹配（match_command）
-    - read_path / write_path / glob → 路径模式匹配（match_path）
-    - other（未映射工具，无 specifier）→ 仅当规则是「整工具规则」（pattern 为空）时命中
+    按请求种类 kind 选择匹配方式：
+    - command → 工具名须精确等于规则体系名（Bash），再做命令模式匹配（match_command）
+    - read_path / write_path / glob → 工具名精确匹配（Read/Edit/Write），再做路径匹配（match_path）
+    - other（未映射工具，无 specifier）→ 仅当规则是「整工具规则」（pattern 为空）时，
+      用 fnmatch 对工具名做通配匹配（c7 决策 A）。
+
+    为什么 other 分支用 fnmatch 而其它分支用精确相等：
+    command/path 分支的 rule.tool 是固定的规则体系名（Bash/Read/Edit/Write），必须精确对上；
+    而 other 分支的 rule.tool 就是工具自身的 name（如 MCP 工具 mcp__server__tool）。改用
+    fnmatch 后——不含 `*` 的名字仍是精确匹配（**向后兼容**，普通工具名不含 `*`），而 MCP 用户
+    可用 `allow: mcp__everything__*` 一次放行整个 Server 的工具（spec AC9）。
 
     :param rule: 待检规则
     :param request: 本次权限请求
     :returns: 命中返回 True
     """
-    if rule.tool != request.rule_name:
-        return False
     if request.kind == "command":
+        if rule.tool != request.rule_name:
+            return False
         return match_command(rule.pattern, request.specifier)
     if request.kind in ("read_path", "write_path", "glob"):
+        if rule.tool != request.rule_name:
+            return False
         return match_path(rule.pattern, request.specifier)
-    # other：没有可匹配的 specifier，只有「匹配该工具全部」的空模式规则才算命中。
-    return rule.pattern == ""
+    # other：没有可匹配的 specifier，只有「匹配该工具全部」的空模式规则才算命中；
+    # 工具名用 fnmatch 通配（无 `*` 时等价精确匹配，向后兼容）。
+    return rule.pattern == "" and fnmatch.fnmatch(request.rule_name, rule.tool)
 
 
 def _describe(rule: Rule) -> str:

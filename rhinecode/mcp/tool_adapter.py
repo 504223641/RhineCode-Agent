@@ -1,0 +1,99 @@
+"""
+适配层（c7，spec F8/F9/F10/F11）：把一个远端 MCP 工具包装成 RhineCode 的 Tool。
+
+这是 MCP 世界与 RhineCode 工具体系的接缝：
+- 命名：注册名统一加 mcp__<server>__<tool> 前缀，与内置工具、其它 Server 天然隔离（F9）。
+- 参数：直接透传远端 inputSchema 给模型（F10）。
+- 只读性：一律 read_only=False——外部 Server 不可信，默认每次经人在回路确认（F11）。
+- 结果转换：把 MCP 的 CallToolResult（content 块数组 + isError）翻译成统一的 ToolResult（F8）。
+- 健壮性：execute 捕获一切异常转 ok=False，绝不外抛（spec N2），保证 Agent Loop 不崩。
+"""
+
+from typing import Optional
+
+from rhinecode.mcp.client import MCPClient
+from rhinecode.tools.base import Tool, ToolResult
+
+# 远端工具未提供 inputSchema 时的兜底：一个合法的空 object schema，避免把 None 发给模型 API。
+_EMPTY_SCHEMA = {"type": "object", "properties": {}}
+
+
+class MCPTool(Tool):
+    """
+    把一个远端 MCP 工具适配成 RhineCode Tool。
+
+    :ivar _client: 所属 Server 的会话客户端（execute 时用它发 tools/call）
+    :ivar _remote_name: 远端工具原名（不带前缀），调用时用它
+    :ivar _server_name: Server 名字（用于 summary 展示）
+    """
+
+    read_only = False  # 外部 Server 不可信：默认走确认（spec F11）
+
+    def __init__(
+        self,
+        client: MCPClient,
+        server_name: str,
+        remote_name: str,
+        description: str,
+        parameters: Optional[dict],
+    ):
+        """
+        :param client: 所属 MCPClient
+        :param server_name: Server 名字，用于命名前缀与展示
+        :param remote_name: 远端工具原名
+        :param description: 远端工具描述（缺失时回退到工具名）
+        :param parameters: 远端 inputSchema（缺失/非法时回退空 object schema）
+        """
+        self._client = client
+        self._server_name = server_name
+        self._remote_name = remote_name
+        # 实例属性覆盖类属性：注册中心与 API schema 都读 self.name/description/parameters
+        self.name = f"mcp__{server_name}__{remote_name}"
+        self.description = description or remote_name
+        self.parameters = parameters if isinstance(parameters, dict) and parameters else _EMPTY_SCHEMA
+
+    def execute(self, args: dict) -> ToolResult:
+        """
+        调用远端工具并把结果转成 ToolResult。
+
+        执行步骤：
+        1. 用所属 client 发 tools/call（远端原名 + 参数）。
+        2. 遍历返回的 content 块：text 块累加文本；非 text 块以 [非文本内容: <type>] 占位。
+        3. isError 为真 → ok=False；否则 ok=True。
+
+        :param args: 模型给出的参数字典
+        :returns: 统一 ToolResult；任何异常都兜底为 ok=False（绝不外抛，spec N2）
+
+        副作用：发起一次远端 tools/call 请求（网络 / 子进程 IO）。
+        """
+        try:
+            result = self._client.call_tool(self._remote_name, args)
+        except Exception as exc:  # noqa: BLE001 —— 传输/协议/超时/其它一律兜底为可读失败
+            return ToolResult(
+                ok=False,
+                output=f"MCP 工具调用失败：{exc}",
+                summary="MCP 调用失败",
+            )
+
+        # 拼接 content：text 块取文本，其它类型给占位说明。
+        content = result.get("content")
+        parts: list[str] = []
+        block_count = 0
+        if isinstance(content, list):
+            block_count = len(content)
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(str(block.get("text", "")))
+                else:
+                    parts.append(f"[非文本内容: {btype}]")
+        output = "\n".join(parts)
+
+        is_error = bool(result.get("isError"))
+        summary = f"MCP {self._server_name}/{self._remote_name} · {block_count} 块"
+        if is_error:
+            # 工具执行报错：output 为对端给出的错误文本（供模型据此调整）
+            return ToolResult(ok=False, output=output or "MCP 工具返回错误", summary=summary)
+        return ToolResult(ok=True, output=output, summary=summary)
