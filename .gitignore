@@ -18,4 +18,7 @@ TemText.txt
 .rhinecode_debug.log
 
 # c6 本地级权限配置（含「永久放行」自动追加的规则，按机器/个人，不提交）
+# c7 MCP 本地级配置同样按此模式忽略（如需机器私有的 mcp.local.yaml）。
+# 注：项目级 .rhinecode/mcp.yaml 是「随仓库走、可提交」的（密钥用 ${VAR} 引用、不落盘），故不忽略；
+#     用户级 ~/.rhinecode/mcp.yaml 在仓库外，天然不会被提交。
 **/.rhinecode/*.local.yaml

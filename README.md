@@ -2,13 +2,16 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C6 阶段能力：在 C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套**五层防御权限系统**（危险命令黑名单 → 路径沙箱 → 可配置规则 → 权限模式 → 人在回路）。每个工具执行前由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
+当前版本以 DeepSeek Provider 为主实现了 C7 阶段能力：在 C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一个 **MCP（Model Context Protocol）客户端**——启动时按配置连接外部 MCP Server（本地子进程走 stdio、远程走 Streamable HTTP），发现其工具并包装成 RhineCode 已有的 `Tool` 接口注册进工具中心，对 Agent Loop、权限系统、TUI 完全无感。
+
+在此之下，每个工具执行前仍由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具（含 MCP 远端工具）、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 功能
 
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令。
+- **MCP 客户端**：启动时按配置连接外部 MCP Server（stdio 子进程 / Streamable HTTP），自动发现并注册其工具（命名为 `mcp__<server>__<tool>`），Agent 调用时无感；多 Server 连接缓存与隔离，单个挂掉不影响其它；底部状态栏显示连接状态，`/mcp` 查看明细。
 - **五层防御权限系统**：每个工具执行前由 `permission/` 包的纯逻辑引擎按固定顺序计算决定——①危险命令黑名单（不可被任何配置/模式放开）→ ②路径沙箱 → ③可配置规则（`Tool(模式)`，deny 永远优先）→ ④权限模式（严格/默认/放行，`/perm` 切换）→ ⑤人在回路（确认面板四选项）。
 - **可配置权限规则**：三层 YAML（用户级、项目级、本地级）声明 allow/deny；跨层合并后 deny 优先求值。
 - **Plan Mode**：`/plan` 开启后先只允许只读调研和需求澄清，完整计划进入聊天记录，经用户批准后才进入执行阶段。与权限模式正交。
@@ -80,6 +83,7 @@ rhinecode --config config.yaml
 | `/think` | 在 off / high / max 间循环切换思考模式（Anthropic / DeepSeek 生效） |
 | `/plan` | 切换 Plan Mode：先规划、澄清和审批，再执行（DeepSeek 工具模式生效） |
 | `/perm` | 在 默认 / 严格 / 放行 间循环切换权限模式，只影响「规则未命中」的灰色地带兜底（DeepSeek 工具模式生效） |
+| `/mcp` | 查看各 MCP Server 的连接状态、传输类型、注册工具数与失败原因 |
 | `/clear` | 清空当前对话历史 |
 | `/exit` | 退出程序 |
 
@@ -99,6 +103,44 @@ DeepSeek 工具模式会向模型暴露以下工具：
 | `run_command` | 在项目工作目录下执行 shell 命令 | 否 |
 
 只读工具经权限引擎放行后可并发执行；有副作用工具串行执行，是否需要确认由权限系统的五层决策管线决定（命中 allow 规则免确认、命中 deny 规则直接拒绝、灰色地带按权限模式兜底）。当决策为「问用户」时弹出确认面板，四选项：本次放行 / 本会话放行 / 永久放行 / 拒绝。
+
+## MCP 客户端
+
+RhineCode 可作为 [MCP](https://modelcontextprotocol.io) 客户端接入外部 MCP Server，把它们提供的工具接进工具中心，无需改动源码。启动时自动完成「连接 → `initialize` 握手 → `tools/list` 发现 → 注册」；之后远端工具与内置工具走同一套 Agent Loop 与权限管线。
+
+- **两种传输**：本地子进程走 stdio 管道，远程走 Streamable HTTP。底层按 JSON-RPC 2.0 收发，请求带 id、响应按 id 配对（stdio 单管道复用靠后台 reader 线程派发）。
+- **命名与隔离**：远端工具注册名为 `mcp__<server>__<tool>`，与内置工具、其它 Server 天然隔离，不会重名冲突。
+- **连接生命周期**：多 Server 连接缓存、单点隔离（某 Server 连接/发现失败只跳过并记录，不影响其它 Server 与启动）；程序退出时统一关闭连接、回收 stdio 子进程。
+- **安全默认**：MCP 工具一律视为非只读，默认权限模式下每次调用都经人在回路确认；可用权限规则 `allow: mcp__<server>__*` 一次放行整个 Server（见下）。
+- **可观测**：底部状态栏显示「MCP：已连接 N/M · 工具 K」；`/mcp` 命令列出每个 Server 的连接状态、传输类型、工具数与失败原因。
+
+> 本阶段只接 MCP 的**工具**能力，不做资源 / 提示词 / 采样，也不做 Server 健康检查与自动重连。
+
+### 配置
+
+从 `mcp.example.yaml` 复制，写成两层 YAML（顶层键 `mcpServers`，`name → 条目`）：
+
+| 位置 | 层级 | 说明 |
+|------|------|------|
+| `~/.rhinecode/mcp.yaml` | 用户级 | 跨项目全局默认 |
+| `<项目根>/.rhinecode/mcp.yaml` | 项目级 | 随仓库走、可提交 |
+
+两层按 Server 名字合并，同名**项目级覆盖用户级**。类型自动判定：含 `command` 视为 stdio，含 `url` 视为 http。`env` 与 `headers` 的值支持 `${VAR}` 环境变量展开（变量不存在时展开为空字符串）。
+
+```yaml
+mcpServers:
+  everything:                 # stdio：本地子进程
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything"]
+    env:
+      TOKEN: ${MY_TOKEN}
+  remote-api:                 # http：Streamable HTTP 端点
+    url: https://example.com/mcp
+    headers:
+      Authorization: Bearer ${API_KEY}
+```
+
+容错（fail-safe）：配置文件缺失视为「无 Server」正常启动；YAML 解析失败或条目结构非法时跳过问题项并收集可读错误，绝不因配置坏掉而崩溃。
 
 ## 权限系统
 
@@ -125,6 +167,7 @@ DeepSeek 工具模式会向模型暴露以下工具：
 - 规则语法：`Bash(git *)`、`Read(config.yaml)`、`Write(src/**)`、`Edit(...)`；只写工具名（不带括号）表示匹配该工具全部调用。
 - 工具名映射：`Bash`→`run_command`，`Read`→`read_file`/`glob_files`/`grep_content`，`Write`→`write_file`，`Edit`→`edit_file`。
 - 命令用前缀 + glob（末尾 ` *` 或 `:*` 带词边界，`npm:*` 不误伤 `npmx`）；文件用 gitignore 风格（`.env` 任意深度命中、`src/**` 跨目录）。
+- MCP 远端工具未做细粒度映射，落到「整工具规则」的 `other` 分支：规则直接写工具名，且支持 `fnmatch` 通配——`allow: mcp__everything__echo` 精确放行单个工具，`allow: mcp__everything__*` 一次放行整个 Server（无 `*` 时等价精确匹配，向后兼容普通工具名）。
 - 三层合并后按 **deny 永远优先**求值（不按层级覆盖）：任一条 deny 命中即拒绝，deny 不可被 allow 翻案；没有 deny 命中、有 allow 命中则放行；都没命中交给权限模式兜底。
 
 ## Plan Mode
@@ -169,6 +212,13 @@ rhinecode/
 │   ├── config.py        # 三层 YAML 加载/容错/回写
 │   ├── adapter.py       # 工具调用规范化为 PermissionRequest（收口工具知识）
 │   └── engine.py        # PermissionEngine.decide 组装四层管线
+├── mcp/                 # MCP 客户端（c7，五层：配置→JSON-RPC→传输→会话→适配→编排）
+│   ├── config.py        # 两层 mcp.yaml 加载、${VAR} 展开、容错
+│   ├── jsonrpc.py       # JSON-RPC 2.0 构造/解析、id 生成、错误类型（纯数据）
+│   ├── transport.py     # Transport 抽象 + StdioTransport + HttpTransport
+│   ├── client.py        # MCPClient：initialize / tools/list / tools/call
+│   ├── tool_adapter.py  # MCPTool（Tool 子类）+ CallToolResult→ToolResult 转换
+│   └── manager.py       # MCPManager：多 Server 连接缓存/隔离/生命周期/状态
 ├── provider/
 │   ├── base.py          # BaseProvider / Message / StreamChunk / ToolCall 抽象
 │   ├── anthropic.py     # Anthropic 纯对话实现
@@ -200,16 +250,18 @@ python -m unittest discover -s tests
 
 当前测试覆盖路径越界防护、四态确认回调、本会话放行登记规则、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认，以及权限系统的命令/路径匹配、危险命令黑名单（含复合命令逐段与 fork 炸弹）、deny 优先求值、配置三层加载与容错、工具规范化映射、四层决策管线、loop 决策接入（被拒不停循环、allow 规则免确认）等关键行为（`tests/test_perm_*.py`）。
 
+MCP 客户端部分覆盖两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 传输三步会话与按 id 配对（用内置模拟 Server 端到端）、`CallToolResult→ToolResult` 转换（含 `isError` 与非文本占位）、单 Server 失败隔离与工具注册、以及 `other` 分支 fnmatch 通配放行（`tests/test_mcp_*.py`、`tests/test_perm_other_glob.py`）。
+
 ## 当前阶段文档
 
-C6 的规格、实现计划、任务拆解和验收清单位于：
+C7 的规格、实现计划、任务拆解和验收清单位于：
 
-- `docs/c6/spec.md`
-- `docs/c6/plan.md`
-- `docs/c6/task.md`
-- `docs/c6/checklist.md`
+- `docs/c7/spec.md`
+- `docs/c7/plan.md`
+- `docs/c7/task.md`
+- `docs/c7/checklist.md`
 
-这些文档描述五层防御权限系统的需求、架构、任务与验收（决策管线、deny 优先哲学、与 loop/TUI 的接线）。C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
+这些文档描述 MCP 客户端的需求、架构、任务与验收（两种传输、JSON-RPC 按 id 配对、三步会话、工具适配与注册、多 Server 隔离与生命周期、与权限/状态栏的接线）。C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 后续补齐项
 
@@ -221,6 +273,7 @@ C6 的规格、实现计划、任务拆解和验收清单位于：
 4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
 5. 权限系统后续项：网络请求限制、资源配额、审计日志。
 6. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
+7. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
 
 ## 扩展新 Provider
 
