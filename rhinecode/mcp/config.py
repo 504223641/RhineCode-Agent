@@ -38,6 +38,27 @@ _CONFIG_FILE = "mcp.yaml"
 # ${VAR} 占位符正则：捕获花括号内的变量名（非贪婪到第一个 }）。
 _ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
+# 首次运行自动生成的 MCP 配置模板。内容**全部注释**：yaml.safe_load 全注释文件得到 None，
+# _load_layer 对 None 返回空 map，因此「有此模板」与「无文件」等价——不连接任何外部 Server，
+# 只用内置工具。生成它只为方便用户发现和编辑，绝不改变运行时行为（fail-safe 不变）。
+_CONFIG_TEMPLATE = """\
+# RhineCode MCP Server 配置（可选）。
+# 全部注释时等价于「不连接任何外部 MCP Server」，只使用内置工具。
+# 取消下面的注释即可声明外部 Server（stdio 本地子进程 / http 远程），
+# env、headers 的值支持 ${VAR} 环境变量展开。
+#
+# mcpServers:
+#   everything:                      # stdio 型：本地子进程
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-everything"]
+#     env:
+#       TOKEN: ${MY_TOKEN}           # 引用环境变量，避免明文密钥落盘
+#   remote-api:                      # http 型：远程 Streamable HTTP
+#     url: https://example.com/mcp
+#     headers:
+#       Authorization: Bearer ${API_KEY}
+"""
+
 
 @dataclass
 class MCPServerConfig:
@@ -69,6 +90,28 @@ def user_config_path() -> Path:
 def project_config_path() -> Path:
     """项目级配置路径：<项目根>/.rhinecode/mcp.yaml（随仓库走）。"""
     return workspace_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
+
+
+def scaffold_user_config(path: Path) -> bool:
+    """
+    在指定路径生成 MCP 配置模板，供首次运行引导使用（与 rhinecode/config.py 同构）。
+
+    执行步骤：
+    1. 目标文件已存在 → 直接返回 False，绝不覆盖用户已有配置（幂等、防误伤）。
+    2. 创建父目录（parents=True, exist_ok=True）。
+    3. 写入 _CONFIG_TEMPLATE（全注释，解析后无任何 Server，行为等价于无文件）。
+
+    :param path: 目标配置文件路径（通常是 user_config_path()）
+    :returns: 实际写入了模板返回 True；文件已存在未改动返回 False
+    :raises OSError: 目录创建或文件写入失败时抛出（由调用方决定如何提示）
+
+    副作用：可能创建目录并写入文件。
+    """
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+    return True
 
 
 def _expand_env(value: str) -> str:

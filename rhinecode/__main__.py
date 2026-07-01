@@ -22,6 +22,7 @@ from rhinecode.config import load, user_config_path, scaffold_user_config, PLACE
 from rhinecode.provider.factory import create_provider
 from rhinecode.conversation import ConversationManager
 from rhinecode.tools.registry import ToolRegistry
+from rhinecode.permission import config as perm_config
 from rhinecode.mcp import config as mcp_config
 from rhinecode.mcp.manager import MCPManager
 from rhinecode.tui.app import RhineApp
@@ -58,15 +59,26 @@ def main() -> None:
     explicit = args.config is not None
     config_path = Path(args.config) if explicit else user_config_path()
 
-    # 首次运行引导：缺省全局配置不存在时，自动写一份模板并提示用户填 api_key 后重来。
-    if not explicit and not config_path.exists():
+    # 首次运行引导：仅在缺省流程（未显式 --config）里为用户级 ~/.rhinecode 生成三类模板。
+    # 三类语义不同：
+    # - config.yaml 必需（含 api_key）→ 本次才生成时，引导填 key 后退出。
+    # - permissions.yaml / mcp.yaml 可选（fail-safe，缺省即空）→ 模板全注释、等价于空，
+    #   静默生成、不因它们退出；已有 config.yaml 的老用户下次运行会顺带补上这两份。
+    if not explicit:
         try:
-            scaffold_user_config(config_path)
+            config_created = scaffold_user_config(config_path)
+            perm_config.scaffold_user_config(perm_config.user_config_path())
+            mcp_config.scaffold_user_config(mcp_config.user_config_path())
         except OSError as e:
-            print(f"无法生成配置模板 {config_path}：{e}", file=sys.stderr)
+            print(f"无法生成配置模板：{e}", file=sys.stderr)
             sys.exit(1)
-        print(f"已在 {config_path} 生成配置模板，请填入真实 api_key 后重新运行 rhine。")
-        sys.exit(0)
+        if config_created:
+            print(
+                f"已在 {config_path.parent} 生成配置模板"
+                "（config.yaml / permissions.yaml / mcp.yaml），"
+                "请在 config.yaml 填入真实 api_key 后重新运行 rhine。"
+            )
+            sys.exit(0)
 
     # 加载配置，捕获文件缺失和字段缺失两类错误并友好提示
     try:

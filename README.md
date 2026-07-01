@@ -34,14 +34,17 @@ pip install -e .
 
 ## 配置
 
-安装后**首次运行 `rhine`**会在 `~/.rhinecode/config.yaml` 自动生成一份配置模板，并提示你填入真实 `api_key`：
+安装后**首次运行 `rhine`**会在 `~/.rhinecode/` 下自动生成三份配置模板，并提示你填入真实 `api_key`：
 
 ```bash
 rhine
-# → 已在 ~/.rhinecode/config.yaml 生成配置模板，请填入真实 api_key 后重新运行 rhine。
+# → 已在 ~/.rhinecode 生成配置模板（config.yaml / permissions.yaml / mcp.yaml），请在 config.yaml 填入真实 api_key 后重新运行 rhine。
 ```
 
-这份用户级全局配置在**任意目录**运行 `rhine` 都会读到，不必再 `cd` 回源码目录、也不必每次带 `--config`。填好 `api_key` 再次运行即可（若仍是占位符 `YOUR_API_KEY`，会被拦下并提示）。
+- `config.yaml`：主配置（**必需**），含 `api_key`。填好后即可在**任意目录**运行 `rhine`，不必再 `cd` 回源码目录、也不必每次带 `--config`（若仍是占位符 `YOUR_API_KEY`，会被拦下并提示）。
+- `permissions.yaml` / `mcp.yaml`：可选增强，生成的模板**内容全是注释、默认不生效**（等价于无文件，行为不变）；想用时取消注释即可，无需从示例文件复制。
+
+这三份是**用户级全局配置**，在任意目录运行 `rhine` 都会读到。
 
 你也可以手动从示例文件复制一份到项目内使用，并用 `--config` 显式指定：
 
