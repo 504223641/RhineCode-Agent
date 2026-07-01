@@ -17,7 +17,9 @@ dependencies = [
 ]
 
 [project.scripts]
-rhinecode = "rhinecode.__main__:main"
+# 安装后暴露的全局命令名。包名/源码目录仍是 rhinecode，这里只改对外命令为 rhine，
+# 让用户在任意目录直接敲 `rhine` 启动（`python -m rhinecode` 不依赖此项，仍可用）。
+rhine = "rhinecode.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

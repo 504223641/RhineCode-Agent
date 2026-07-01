@@ -34,7 +34,16 @@ pip install -e .
 
 ## 配置
 
-复制示例配置文件并填入 API Key：
+安装后**首次运行 `rhine`**会在 `~/.rhinecode/config.yaml` 自动生成一份配置模板，并提示你填入真实 `api_key`：
+
+```bash
+rhine
+# → 已在 ~/.rhinecode/config.yaml 生成配置模板，请填入真实 api_key 后重新运行 rhine。
+```
+
+这份用户级全局配置在**任意目录**运行 `rhine` 都会读到，不必再 `cd` 回源码目录、也不必每次带 `--config`。填好 `api_key` 再次运行即可（若仍是占位符 `YOUR_API_KEY`，会被拦下并提示）。
+
+你也可以手动从示例文件复制一份到项目内使用，并用 `--config` 显式指定：
 
 ```bash
 cp config.example.yaml config.yaml
@@ -66,14 +75,22 @@ api_key: YOUR_API_KEY
 
 ## 启动
 
+安装后在**任意目录**直接运行（读 `~/.rhinecode/config.yaml`，当前目录即 AI 操作的项目根）：
+
 ```bash
-python -m rhinecode --config config.yaml
+rhine
 ```
 
-也可以使用安装后的命令：
+需要临时使用其它配置文件时用 `--config` 覆盖：
 
 ```bash
-rhinecode --config config.yaml
+rhine --config config.yaml
+```
+
+未安装或开发调试时，也可用等价的模块入口（需在源码目录）：
+
+```bash
+python -m rhinecode --config config.yaml
 ```
 
 ## 斜杠命令

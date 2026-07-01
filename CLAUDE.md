@@ -67,10 +67,10 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 ## 常用命令
 
 ```bash
-pip install -e .                          # 安装（开发模式）
-cp config.example.yaml config.yaml        # 创建配置后填入真实 api_key
-python -m rhinecode --config config.yaml  # 启动
-rhinecode --config config.yaml            # 安装后也可以用控制台脚本启动
+pip install -e .                          # 安装（开发模式），生成全局命令 rhine
+rhine                                      # 任意目录启动；首次运行自动生成 ~/.rhinecode/config.yaml 模板并引导填 api_key
+rhine --config config.yaml                # 显式指定配置文件覆盖全局配置
+python -m rhinecode --config config.yaml  # 未安装/开发调试时的等价入口（需在源码目录）
 ```
 
 运行时斜杠命令：
@@ -87,6 +87,8 @@ rhinecode --config config.yaml            # 安装后也可以用控制台脚本
 ## 配置
 
 `config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。
+
+配置定位（`rhinecode/config.py` + `__main__.py`）：命令**不带 `--config` 时缺省读用户级全局配置 `~/.rhinecode/config.yaml`**，使 `rhine` 在任意工作目录都能读到同一份配置（工作目录本身仍作为 AI 操作的项目根，二者互不影响）。该缺省文件不存在时首次运行会自动写入模板（`scaffold_user_config`，占位 `api_key: YOUR_API_KEY`）并提示后退出；模板占位符会被 `__main__` 单独拦下引导（占位符是非空串、能过 `load()` 校验，不拦会带假 key 启动）。显式 `--config <路径>` 优先且指向不存在的文件时按错误处理（不自动造文件）。
 
 权限规则配置（c6，可选，从 `permissions.example.yaml` 复制）：三层 YAML，`allow` / `deny` 列表，每条写成 `Tool(模式)`（如 `Bash(git *)`、`Read(config.yaml)`）。位置与优先语义——
 
