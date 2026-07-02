@@ -6,6 +6,7 @@ import unittest
 
 from rhinecode.mcp.config import MCPServerConfig
 from rhinecode.mcp.manager import MCPManager
+from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.registry import ToolRegistry
 
 _MOCK_SERVER = os.path.join(os.path.dirname(__file__), "fixtures", "mock_mcp_server.py")
@@ -19,6 +20,28 @@ def _good_cfg() -> MCPServerConfig:
 def _bad_cfg() -> MCPServerConfig:
     """指向不存在可执行文件的必然失败配置。"""
     return MCPServerConfig(name="bad", kind="stdio", command="definitely_not_a_real_command_xyz", args=[])
+
+
+class _OldTool(Tool):
+    """模拟某个旧 MCP Server 曾经注册过的工具。"""
+
+    name = "old_tool"
+    description = "old"
+    parameters = {"type": "object", "properties": {}}
+    read_only = True
+
+    def execute(self, args: dict) -> ToolResult:
+        return ToolResult(ok=True, output="old")
+
+
+class _FakeClient:
+    """模拟旧 MCPClient，用于验证 reload 会关闭旧连接。"""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class ManagerTests(unittest.TestCase):
@@ -75,6 +98,39 @@ class ManagerTests(unittest.TestCase):
         manager = MCPManager()
         manager.connect_all([], ToolRegistry(), extra_errors=["坏配置示例"])
         self.assertIn("坏配置示例", manager.status_report())
+
+
+    def test_reload_drops_previous_tools_and_client(self) -> None:
+        # reload 前手动塞入旧连接和旧工具所有权，验证只清理目标 server 的资源。
+        registry = ToolRegistry()
+        registry.register(_OldTool())
+        manager = MCPManager()
+        fake_client = _FakeClient()
+        manager._clients.append(fake_client)
+        manager._clients_by_server["old"] = fake_client
+        manager._tools_by_server["old"] = ["old_tool"]
+
+        state = manager.reload_server(
+            MCPServerConfig(name="old", kind="stdio", command="definitely_not_real", args=[]),
+            registry,
+        )
+
+        self.assertTrue(fake_client.closed)
+        self.assertIsNone(registry.get("old_tool"))
+        self.assertFalse(state.connected)
+
+    def test_reload_registers_new_tools(self) -> None:
+        # reload 成功后新 server 的工具应立即进入 registry，供当前会话后续工具调用使用。
+        registry = ToolRegistry()
+        manager = MCPManager()
+        try:
+            state = manager.reload_server(_good_cfg(), registry)
+
+            self.assertTrue(state.connected)
+            self.assertIsNotNone(registry.get("mcp__good__echo"))
+            self.assertIn("mcp__good__echo", state.tool_names)
+        finally:
+            manager.close_all()
 
 
 if __name__ == "__main__":

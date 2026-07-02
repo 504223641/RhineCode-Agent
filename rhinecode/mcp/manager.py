@@ -1,12 +1,9 @@
-"""
-编排层（c7，spec F12/F13/F14/F15/F16）：MCPManager 管理多 Server 的连接。
+"""MCP Server 运行时编排。
 
-职责：
-- 启动发现（F14）：对每个配置的 Server 依次连接 → 握手 → 列出工具 → 注册进 ToolRegistry。
-- 单点隔离（F13）：每个 Server 用独立 try/except 包住，任一失败只跳过该 Server、记录原因，
-  不影响其它 Server、内置工具与 RhineCode 启动。
-- 生命周期（F12）：持有所有成功连接的 client，程序退出时统一 close_all 回收（含 stdio 子进程）。
-- 状态汇总（F15/F16）：status_line 供底部状态栏，status_report 供 /mcp 命令。
+`MCPManager` 负责把配置里的 MCP Server 连接起来，并把远端工具注册到共享
+`ToolRegistry`。它同时承担 TUI 状态汇总、进程/HTTP 客户端清理，以及自动添加 MCP 后
+“只重载目标 server”的运行时更新能力。单个 server 的失败必须被隔离，不能影响内置工具
+和 RhineCode 主流程。
 """
 
 from dataclasses import dataclass, field
@@ -21,47 +18,40 @@ from rhinecode.tools.registry import ToolRegistry
 
 @dataclass
 class ServerState:
-    """
-    一个 Server 在本次运行中的连接结果，供状态栏与 /mcp 展示。
+    """单个 MCP Server 的运行时状态。
 
-    :ivar name: Server 名字
-    :ivar kind: 传输类型（stdio/http）
-    :ivar connected: 是否成功连上并列出工具
-    :ivar tool_count: 成功注册的工具数
-    :ivar error: 失败原因（连接/握手/列表任一步失败）；成功为 None
+    `tool_names` 记录该 server 实际注册进 registry 的工具名，重载或关闭时依赖它做精确
+    清理，避免误删其它 server 或内置工具。
     """
+
     name: str
     kind: str
     connected: bool
     tool_count: int = 0
     error: Optional[str] = None
     aliases: list[str] = field(default_factory=list)
+    tool_names: list[str] = field(default_factory=list)
 
 
 class MCPManager:
-    """
-    多 MCP Server 的连接管理器。一个进程持有一个实例。
-
-    :ivar states: 每个 Server 的连接结果（含成功与失败），按配置顺序
-    :ivar config_errors: 配置解析阶段收集的错误（来自 config.load_all）
-    """
+    """管理 MCP 连接、工具注册和按 server 的运行时重载。"""
 
     def __init__(self) -> None:
         self.states: list[ServerState] = []
         self.config_errors: list[str] = []
-        # 仅保存成功连接的 client，供退出时统一关闭
         self._clients: list[MCPClient] = []
+        # 下面两个索引按 server name 建立所有权关系，支持 reload 时只清理目标 server。
+        self._clients_by_server: dict[str, MCPClient] = {}
+        self._tools_by_server: dict[str, list[str]] = {}
 
     @staticmethod
     def _build_transport(cfg: MCPServerConfig) -> Transport:
-        """按配置类型构造对应传输实例（未 start）。"""
         if cfg.kind == "stdio":
             return StdioTransport(cfg.command or "", cfg.args, cfg.env)
         return HttpTransport(cfg.url or "", cfg.headers)
 
     @staticmethod
     def _unique_tool_name(base_name: str, registry: ToolRegistry) -> str:
-        """避免规范化后的 MCP 工具名与已有工具重名。"""
         if registry.get(base_name) is None:
             return base_name
         for i in range(2, 1000):
@@ -69,7 +59,7 @@ class MCPManager:
             candidate = base_name[:64 - len(suffix)].rstrip("_") + suffix
             if registry.get(candidate) is None:
                 return candidate
-        raise ValueError(f"MCP 工具名冲突过多：{base_name}")
+        raise ValueError(f"MCP 工具命名冲突过多：{base_name}")
 
     def connect_all(
         self,
@@ -77,37 +67,73 @@ class MCPManager:
         registry: ToolRegistry,
         extra_errors: Optional[list[str]] = None,
     ) -> None:
+        """连接所有已配置 MCP Server，并隔离单个 server 的失败。
+
+        启动阶段可能同时加载用户级和项目级配置；这里逐个 server 建立连接，某个配置坏掉时
+        只记录状态，不阻断其它 server 和内置工具继续可用。
         """
-        连接所有配置的 Server 并把其工具注册进 registry（启动阶段调用）。
 
-        每个 Server 独立 try/except 隔离：成功则注册工具并记 connected 状态；
-        失败则记录 error 并继续下一个（spec F13）。
-
-        :param configs: 规范化后的 Server 配置列表
-        :param registry: 目标工具注册中心（就地写入 MCPTool）
-        :param extra_errors: 配置解析阶段的错误（一并纳入 config_errors 展示）
-
-        副作用：建立网络/子进程连接；向 registry 注册工具；填充 self.states/_clients。
-        """
         self.config_errors = list(extra_errors or [])
         for cfg in configs:
-            client: Optional[MCPClient] = None
+            self._drop_server(cfg.name, registry)
+            self._connect_one(cfg, registry)
+
+    def reload_server(self, cfg: MCPServerConfig, registry: ToolRegistry) -> ServerState:
+        """在配置变化后只重载一个 MCP Server。
+
+        自动添加 MCP 时不应重连全部 server，因为其它已连接 server 可能有长会话、昂贵初始化
+        或临时故障。这里先精确清理目标 server，再按新配置连接并注册工具。
+        """
+
+        self._drop_server(cfg.name, registry)
+        return self._connect_one(cfg, registry)
+
+    def _drop_server(self, name: str, registry: ToolRegistry) -> None:
+        """关闭并注销一个 server 拥有的资源。
+
+        副作用：关闭旧 MCPClient、从 registry 移除该 server 注册的工具、删除状态记录。清理
+        过程 best-effort，关闭异常不会阻止 registry 清理继续执行。
+        """
+
+        client = self._clients_by_server.pop(name, None)
+        if client is not None:
             try:
-                client = MCPClient(cfg.name, self._build_transport(cfg))
-                client.initialize()
-                tools = client.list_tools()
-                count = 0
-                aliases: list[str] = []
-                for tool in tools:
-                    remote_name = tool.get("name")
-                    if not remote_name:
-                        continue
-                    original_name = f"mcp__{cfg.name}__{remote_name}"
-                    safe_name = self._unique_tool_name(
-                        sanitize_mcp_tool_name(cfg.name, str(remote_name)),
-                        registry,
-                    )
-                    mcp_tool = MCPTool(
+                client.close()
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                pass
+            self._clients = [c for c in self._clients if c is not client]
+
+        for tool_name in self._tools_by_server.pop(name, []):
+            registry.unregister(tool_name)
+        self.states = [s for s in self.states if s.name != name]
+
+    def _connect_one(self, cfg: MCPServerConfig, registry: ToolRegistry) -> ServerState:
+        """连接一个 server、注册其远端工具，并记录状态。
+
+        注册工具时会把 `<server>/<remote_name>` 归一化成全局唯一的工具名；若发生冲突则添加
+        后缀并记录 alias，便于 `/mcp` 报告解释最终名字。任何异常都会回滚本次已注册工具。
+        """
+
+        client: Optional[MCPClient] = None
+        tool_names: list[str] = []
+        try:
+            client = MCPClient(cfg.name, self._build_transport(cfg))
+            client.initialize()
+            tools = client.list_tools()
+            aliases: list[str] = []
+
+            for tool in tools:
+                remote_name = tool.get("name")
+                if not remote_name:
+                    continue
+                # original_name 用于判断是否发生重命名；safe_name 才是实际注册到 registry 的名字。
+                original_name = f"mcp__{cfg.name}__{remote_name}"
+                safe_name = self._unique_tool_name(
+                    sanitize_mcp_tool_name(cfg.name, str(remote_name)),
+                    registry,
+                )
+                registry.register(
+                    MCPTool(
                         client=client,
                         server_name=cfg.name,
                         remote_name=str(remote_name),
@@ -115,31 +141,40 @@ class MCPManager:
                         parameters=tool.get("inputSchema"),
                         registered_name=safe_name,
                     )
-                    registry.register(mcp_tool)
-                    if safe_name != original_name:
-                        aliases.append(f"{safe_name} <- {cfg.name}/{remote_name}")
-                    count += 1
-                self._clients.append(client)
-                self.states.append(
-                    ServerState(cfg.name, cfg.kind, connected=True, tool_count=count, aliases=aliases)
                 )
-            except Exception as exc:  # noqa: BLE001 —— 单 Server 失败隔离，不影响其它
-                # 失败的 client 尽力关闭，回收可能已拉起的子进程
-                if client is not None:
-                    try:
-                        client.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                self.states.append(
-                    ServerState(cfg.name, cfg.kind, connected=False, error=str(exc))
-                )
+                tool_names.append(safe_name)
+                if safe_name != original_name:
+                    aliases.append(f"{safe_name} <- {cfg.name}/{remote_name}")
+
+            self._clients.append(client)
+            self._clients_by_server[cfg.name] = client
+            self._tools_by_server[cfg.name] = tool_names
+            state = ServerState(
+                name=cfg.name,
+                kind=cfg.kind,
+                connected=True,
+                tool_count=len(tool_names),
+                aliases=aliases,
+                tool_names=tool_names,
+            )
+            self.states.append(state)
+            return state
+        except Exception as exc:  # noqa: BLE001 - one server must not break startup/runtime
+            # 连接或工具注册中途失败时，只回滚本 server 的部分成果，保留其它 server/内置工具。
+            for tool_name in tool_names:
+                registry.unregister(tool_name)
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            state = ServerState(cfg.name, cfg.kind, connected=False, error=str(exc))
+            self.states.append(state)
+            return state
 
     def status_line(self) -> Optional[str]:
-        """
-        状态栏用的一行摘要。
+        """返回状态栏使用的一行 MCP 摘要。"""
 
-        :returns: 形如「MCP：已连接 2/3 · 工具 11」；未配置任何 Server 时返回 None（不占状态栏）
-        """
         total = len(self.states)
         if total == 0:
             return None
@@ -148,11 +183,8 @@ class MCPManager:
         return f"MCP：已连接 {ok}/{total} · 工具 {tools}"
 
     def status_report(self) -> str:
-        """
-        /mcp 命令用的多行明细。
+        """返回 `/mcp` 命令展示的多行状态报告。"""
 
-        :returns: 每个 Server 一行（含 ✓/✗ 与工具数或失败原因），附配置错误；无 Server 时给提示
-        """
         lines: list[str] = []
         if not self.states and not self.config_errors:
             return "未配置任何 MCP Server（可在 ~/.rhinecode/mcp.yaml 或项目级 .rhinecode/mcp.yaml 声明）。"
@@ -170,10 +202,17 @@ class MCPManager:
         return "\n".join(lines)
 
     def close_all(self) -> None:
-        """关闭所有成功连接的 client（best-effort，逐个吞异常），退出时调用（spec F12）。"""
-        for client in self._clients:
+        """以 best-effort 方式关闭所有 MCP 客户端。
+
+        该方法通常在 CLI/TUI 退出时调用；关闭失败不再上抛，避免退出流程因为子进程状态异常
+        而卡住。
+        """
+
+        for client in list(self._clients):
             try:
                 client.close()
-            except Exception:  # noqa: BLE001 —— 清理阶段不因单个失败中断
+            except Exception:  # noqa: BLE001
                 pass
         self._clients.clear()
+        self._clients_by_server.clear()
+        self._tools_by_server.clear()

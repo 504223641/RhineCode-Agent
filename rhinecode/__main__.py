@@ -22,6 +22,7 @@ from rhinecode.config import load, user_config_path, scaffold_user_config, PLACE
 from rhinecode.provider.factory import create_provider
 from rhinecode.conversation import ConversationManager
 from rhinecode.tools.registry import ToolRegistry
+from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.permission import config as perm_config
 from rhinecode.mcp import config as mcp_config
 from rhinecode.mcp.manager import MCPManager
@@ -112,6 +113,9 @@ def main() -> None:
     # 无 mcp.yaml 时 configs 为空、无任何 MCP 工具，行为与 c6 完全一致。
     mcp_configs, mcp_errors = mcp_config.load_all()
     mcp_manager = MCPManager()
+    # mcp_add_server 需要同时写配置、重载目标 server、更新 registry，因此必须在 MCPManager
+    # 创建后注入运行时依赖；只读的 mcp_resolve_server 已在 ToolRegistry.default() 中注册。
+    registry.register(MCPAddServerTool(mcp_manager, registry))
     mcp_manager.connect_all(mcp_configs, registry, extra_errors=mcp_errors)
 
     # 依次构建各层组件，层间通过依赖注入解耦

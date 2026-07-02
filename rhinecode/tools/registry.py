@@ -15,6 +15,7 @@ from rhinecode.tools.edit_file import EditFileTool
 from rhinecode.tools.run_command import RunCommandTool
 from rhinecode.tools.glob_files import GlobTool
 from rhinecode.tools.grep_content import GrepTool
+from rhinecode.tools.mcp_config import MCPResolveServerTool
 
 
 class ToolRegistry:
@@ -50,6 +51,17 @@ class ToolRegistry:
         :returns: 对应的 Tool 实例；不存在时返回 None（由调用方转结构化错误）
         """
         return self._tools.get(name)
+
+    def unregister(self, name: str) -> bool:
+        """
+        按名称注销一个工具。
+
+        MCP 重载时需要移除旧 server 暴露的远端工具；返回值用于测试和诊断，调用方无需先
+        判断工具是否存在。
+
+        :returns: 实际移除了工具时返回 True；原本不存在时返回 False。
+        """
+        return self._tools.pop(name, None) is not None
 
     def schemas(self) -> list[dict]:
         """
@@ -92,4 +104,6 @@ class ToolRegistry:
         registry.register(RunCommandTool())
         registry.register(GlobTool())
         registry.register(GrepTool())
+        # 解析 MCP 只访问 registry/NPM 元数据，不依赖运行时 MCPManager，因此可作为默认工具注册。
+        registry.register(MCPResolveServerTool())
         return registry

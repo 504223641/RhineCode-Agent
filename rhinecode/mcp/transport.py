@@ -16,6 +16,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 from abc import ABC, abstractmethod
@@ -32,6 +33,32 @@ from rhinecode.mcp.jsonrpc import (
     is_response,
     next_id,
 )
+
+
+def resolve_stdio_command(command: str) -> str:
+    """在交给 `subprocess.Popen` 前解析 stdio 可执行文件。
+
+    Windows 上 `npx`/`npm` 这类命令经常是 `.cmd` 包装脚本；`Popen` 不经过 shell 时不会像
+    交互式命令行那样自动兜底到 `npx.cmd`。这里优先查找 `.cmd/.exe/.bat`，若仍找不到则
+    返回原始值，让底层错误信息保持可诊断。
+    """
+
+    raw = str(command or "").strip()
+    if not raw:
+        return raw
+    if os.path.isabs(raw) or os.path.dirname(raw):
+        return raw
+
+    # 仅对裸命令名做 PATH 解析；用户已经提供绝对路径或带目录的路径时不擅自改写。
+    candidates = [raw]
+    if os.name == "nt" and not os.path.splitext(raw)[1]:
+        candidates = [f"{raw}.cmd", f"{raw}.exe", f"{raw}.bat", raw]
+
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return raw
 
 
 class Transport(ABC):
@@ -136,9 +163,11 @@ class StdioTransport(Transport):
         配置 env 优先级更高）。stderr 单独捕获，避免污染 stdout 的 JSON 流。
         """
         merged_env = {**os.environ, **self._env}
+        # 先解析命令再启动子进程，避免 Windows 下 `command: npx` 找不到真实批处理入口。
+        command = resolve_stdio_command(self._command)
         try:
             self._proc = subprocess.Popen(
-                [self._command, *self._args],
+                [command, *self._args],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

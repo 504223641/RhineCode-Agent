@@ -373,6 +373,9 @@ class RhineApp(App):
                     self.call_from_thread(history_view.append_error, event.message)
         finally:
             self.call_from_thread(self._set_streaming, False)
+            # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；
+            # 收尾时刷新状态栏，让新工具数量或失败信息立即反映到界面上。
+            self.call_from_thread(self._refresh_status)
 
     @staticmethod
     def _finish_line(stop_reason, message: str) -> str:
