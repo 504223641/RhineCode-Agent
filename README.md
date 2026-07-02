@@ -11,7 +11,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
-- **MCP 客户端**：启动时按配置连接外部 MCP Server（stdio 子进程 / Streamable HTTP），自动发现并注册其工具（以 `mcp__<server>__<tool>` 为基础命名，必要时规范化为安全 function name），Agent 调用时无感；多 Server 连接缓存与隔离，单个挂掉不影响其它；底部状态栏显示连接状态，`/mcp` 查看明细。
+- **MCP 客户端**：启动时按配置连接外部 MCP Server（stdio 子进程 / Streamable HTTP），自动发现并注册其工具（以 `mcp__<server>__<tool>` 为基础命名，必要时规范化为安全 function name），Agent 调用时无感；也支持用户直接说“帮我添加 context7 MCP”，由 Agent 解析候选、写入配置并在当前会话中重载；多 Server 连接缓存与隔离，单个挂掉不影响其它；底部状态栏显示连接状态，`/mcp` 查看明细。
 - **五层防御权限系统**：每个工具执行前由 `permission/` 包的纯逻辑引擎按固定顺序计算决定——①危险命令黑名单（不可被任何配置/模式放开）→ ②路径沙箱 → ③可配置规则（`Tool(模式)`，deny 永远优先）→ ④权限模式（严格/默认/放行，`/perm` 切换）→ ⑤人在回路（确认面板四选项）。
 - **可配置权限规则**：三层 YAML（用户级、项目级、本地级）声明 allow/deny；跨层合并后 deny 优先求值。
 - **Plan Mode**：`/plan` 开启后先只允许只读调研和需求澄清，完整计划进入聊天记录，经用户批准后才进入执行阶段。与权限模式正交。
@@ -121,6 +121,8 @@ DeepSeek 工具模式会向模型暴露以下工具：
 | `write_file` | 新建或覆盖项目内文件，并生成 diff | 否 |
 | `edit_file` | 用唯一匹配的原文片段精确替换；支持 `edits` 数组批量替换 | 否 |
 | `run_command` | 在项目工作目录下执行 shell 命令 | 否 |
+| `mcp_resolve_server` | 解析用户给出的 MCP 名称、NPM 包名或 HTTP URL，返回候选配置、来源、置信度和风险提示 | 是 |
+| `mcp_add_server` | 将已解析的 MCP 配置写入用户级或项目级 `mcp.yaml`，并只重载目标 Server | 否 |
 
 只读工具经权限引擎放行后可并发执行；有副作用工具串行执行，是否需要确认由权限系统的五层决策管线决定（命中 allow 规则免确认、命中 deny 规则直接拒绝、灰色地带按权限模式兜底）。当决策为「问用户」时弹出确认面板，四选项：本次放行 / 本会话放行 / 永久放行 / 拒绝。
 
@@ -135,6 +137,25 @@ RhineCode 可作为 [MCP](https://modelcontextprotocol.io) 客户端接入外部
 - **可观测**：底部状态栏显示「MCP：已连接 N/M · 工具 K」；`/mcp` 命令列出每个 Server 的连接状态、传输类型、工具数、失败原因与被规范化的工具名。
 
 > 本阶段只接 MCP 的**工具**能力，不做资源 / 提示词 / 采样，也不做 Server 健康检查与自动重连。
+
+### 自动添加 MCP
+
+用户可以在对话里直接提出自然语言请求，例如：
+
+```text
+帮我添加 context7 MCP
+添加 @upstash/context7-mcp
+添加 https://example.com/mcp
+```
+
+Agent 会先调用只读工具 `mcp_resolve_server` 解析输入：URL 会直接生成 HTTP MCP 配置；自然语言名称或包名会优先通过 NPM registry 推断 stdio MCP 包。解析成功后，Agent 会向用户说明候选来源、写入位置和将要启动的外部命令，再调用 `mcp_add_server` 写入配置并只重载该 Server。未明确范围时默认写入项目级 `<项目根>/.rhinecode/mcp.yaml`；如果用户明确说“全局、所有项目、以后都用”，则写入用户级 `~/.rhinecode/mcp.yaml`。
+
+安全边界：
+
+- 写入配置和首次启动外部 MCP 前仍会经过现有权限确认流程。
+- Windows 下自动生成的 stdio 配置会使用 `npx.cmd`，避免 `subprocess.Popen` 找不到 `npx` 时出现 `[WinError 2]`。
+- 不会自动猜测或写入真实密钥；需要凭据时应使用 `${VAR}` 环境变量占位。
+- 同名同配置会 no-op；同名不同配置不会静默覆盖，必须显式替换。
 
 ### 配置
 
@@ -236,6 +257,7 @@ rhinecode/
 │   └── engine.py        # PermissionEngine.decide 组装四层管线
 ├── mcp/                 # MCP 客户端（c7，五层：配置→JSON-RPC→传输→会话→适配→编排）
 │   ├── config.py        # 两层 mcp.yaml 加载、${VAR} 展开、容错
+│   ├── auto_config.py   # MCP 名称/URL 自动解析与 mcp.yaml 安全写入
 │   ├── jsonrpc.py       # JSON-RPC 2.0 构造/解析、id 生成、错误类型（纯数据）
 │   ├── transport.py     # Transport 抽象 + StdioTransport + HttpTransport
 │   ├── client.py        # MCPClient：initialize / tools/list / tools/call
@@ -251,6 +273,7 @@ rhinecode/
 │   ├── base.py          # Tool / ToolResult 抽象
 │   ├── diff.py          # 结构化 diff 构造
 │   ├── registry.py      # 工具注册中心
+│   ├── mcp_config.py    # mcp_resolve_server / mcp_add_server 内置工具
 │   ├── path_guard.py    # 项目工作目录路径守卫（沙箱层复用）
 │   ├── read_file.py
 │   ├── write_file.py
@@ -272,7 +295,7 @@ python -m unittest discover -s tests
 
 当前测试覆盖路径越界防护、四态确认回调、本会话放行登记规则、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认，以及权限系统的命令/路径匹配、危险命令黑名单（含复合命令逐段与 fork 炸弹）、deny 优先求值、配置三层加载与容错、工具规范化映射、四层决策管线、loop 决策接入（被拒不停循环、allow 规则免确认）、`grep_content` / `glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地权限配置不被覆盖等关键行为（`tests/test_perm_*.py`、`tests/test_review_fixes.py`）。
 
-MCP 客户端部分覆盖两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 传输三步会话与按 id 配对（用内置模拟 Server 端到端）、stderr drain 防阻塞、非法远端工具名规范化且仍调用原始远端名、`CallToolResult→ToolResult` 转换（含 `isError` 与非文本占位）、单 Server 失败隔离与工具注册、以及 `other` 分支 fnmatch 通配放行（`tests/test_mcp_*.py`、`tests/test_perm_other_glob.py`）。
+MCP 客户端部分覆盖两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 传输三步会话与按 id 配对（用内置模拟 Server 端到端）、stderr drain 防阻塞、非法远端工具名规范化且仍调用原始远端名、`CallToolResult→ToolResult` 转换（含 `isError` 与非文本占位）、单 Server 失败隔离与工具注册、运行时单 Server 重载、自动解析/写入 MCP 配置、Windows `npx.cmd` 兼容，以及 `other` 分支 fnmatch 通配放行（`tests/test_mcp_*.py`、`tests/test_mcp_auto_config.py`、`tests/test_perm_other_glob.py`）。
 
 ## 当前阶段文档
 
