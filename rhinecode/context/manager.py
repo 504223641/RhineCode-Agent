@@ -65,21 +65,19 @@ class ContextManager:
         window: int,
         store_dir: Path,
         auto_margin: int = 13000,
-        manual_margin: int = 3000,
     ) -> None:
         """
         :param provider: Provider，用于第二层摘要的 LLM 调用（复用 stream_chat）
         :param model: 模型名（当前仅备用/日志语义，摘要请求直接走 provider 默认模型）
         :param window: 上下文窗口上限（token），来自 config.context_window
         :param store_dir: 第一层存盘目录（<项目根>/.rhinecode/context/）
-        :param auto_margin: 自动触发的安全余量（默认 13K，防估算误差）
-        :param manual_margin: 手动 /compact 的安全余量（默认 3K，更贴近上限）
+        :param auto_margin: 自动触发的安全余量（默认 13K，防估算误差）。
+                            手动 /compact 不设余量阈值（用户主动触发即尽力压缩），故无对应参数。
         """
         self._provider = provider
         self._model = model
         self.window = window
         self.auto_margin = auto_margin
-        self.manual_margin = manual_margin
         self._offloader = Offloader(store_dir)
         # 估算锚点：上次 API 的精确 prompt_tokens 及其覆盖的历史条数；None 表示暂无锚点。
         self._anchor_tokens: Optional[int] = None
@@ -134,23 +132,21 @@ class ContextManager:
     # ------------------------------------------------------------------ #
     def manual_compact(self, history: list[Message]) -> CompactionNotice:
         """
-        用户手动触发的第二层压缩（更窄的 3K 余量，F14）。
+        用户手动触发的第二层摘要（F14）。
 
-        与自动路径一致走阈值判断，只是余量收窄：估算未超「窗口 − 手动余量」时不压缩，
-        返回 noop 告知「上下文尚宽裕」；超过则执行摘要。即便已熔断，用户显式请求仍尝试一次
-        （手动是用户主动意图，不受自动熔断压制），但仍受单次失败计数影响。
+        与自动路径不同，手动**不设余量阈值**：用户显式敲 /compact 就是主动要压，
+        故不拿「窗口 − 余量」的闸门拦他，直接尝试摘要。但仍受一个物理约束——
+        compute_retain_index 在历史没有够旧的早段（全部落在近 ~10K token 保留区）时
+        返回 0，_do_summary 据此返回 noop「无可摘要的早段」；这是「确实没得压」而非拒绝。
+        即便已熔断，用户显式请求仍尝试一次（不受自动熔断压制），但仍受单次失败计数影响。
+
+        注意：手动路径只做第二层摘要，不做第一层 offload（第一层由自动路径 before_request 承担）。
 
         :param history: 当前对话历史（可能被原地重构）
-        :returns: 压缩结果通知
+        :returns: 压缩结果通知（summary / noop / circuit_break）
 
         副作用：可能发起摘要 LLM 调用并原地重构 history。
         """
-        est = self._estimate(history)
-        if est <= self.window - self.manual_margin:
-            return CompactionNotice(
-                kind="noop",
-                message=f"上下文尚宽裕（估算 {est} / 上限 {self.window} token），无需压缩。",
-            )
         return self._do_summary(history)
 
     # ------------------------------------------------------------------ #

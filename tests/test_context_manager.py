@@ -120,16 +120,20 @@ class ManualCompactTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_noop_when_lean(self) -> None:
-        # 窗口极大 → 估算远低于「窗口 - 3K」→ noop
-        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=1_000_000, store_dir=self.store)
-        notice = cm.manual_compact(_big_history())
+    def test_noop_when_nothing_to_summarize(self) -> None:
+        # 手动已无余量阈值：noop 只在「没有够旧的早段可摘要」时出现（物理约束，非拒绝）。
+        # 小历史全部落在保留区 → _do_summary 直接 noop，且不调用模型。
+        prov = FakeProvider(_OK_CHUNKS)
+        cm = ContextManager(prov, "m", window=1_000_000, store_dir=self.store)
+        small = [Message(role="user", content="hi"), Message(role="assistant", content="yo")]
+        notice = cm.manual_compact(small)
         self.assertEqual(notice.kind, "noop")
-        self.assertIn("宽裕", notice.message)
+        self.assertIn("无可摘要", notice.message)
+        self.assertEqual(prov.calls, 0)
 
-    def test_compacts_when_over_manual_threshold(self) -> None:
-        # 窗口小到估算超过「窗口 - 3K」→ 触发摘要
-        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=3200, store_dir=self.store, manual_margin=3000)
+    def test_compacts_regardless_of_headroom(self) -> None:
+        # 阈值已移除：即便窗口极大、余量宽裕（旧逻辑会 noop），只要有够旧的早段就直接摘要。
+        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=1_000_000, store_dir=self.store)
         notice = cm.manual_compact(_big_history())
         self.assertEqual(notice.kind, "summary")
 

@@ -117,7 +117,7 @@ def reconstruct(summary_text: str, retained: list[Message]) -> list[Message]: ..
 ```python
 class ContextManager:
     def __init__(self, provider, model, window, store_dir,
-                 auto_margin=13000, manual_margin=3000): ...
+                 auto_margin=13000): ...
     # 会话级状态：
     #   _anchor_tokens: Optional[int]；_anchor_len: int（锚点覆盖的历史条数）
     #   _offloader: Offloader
@@ -131,7 +131,8 @@ class ContextManager:
         # _anchor_tokens = usage.prompt_tokens；_anchor_len = sent_len。
 
     def manual_compact(self, history) -> CompactionNotice: ...
-        # /compact：est > window - manual_margin 才摘要，否则返回 noop「上下文尚宽裕」。
+        # /compact：无余量阈值，直接 _do_summary(history)；无够旧早段时由 _do_summary
+        #   返回 noop「无可摘要的早段」。只做第二层摘要，不做第一层 offload。
 
     def usage_report(self, history) -> str: ...   # /context 的只读文本
 

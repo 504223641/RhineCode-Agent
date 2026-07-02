@@ -102,11 +102,11 @@
 **文件：** `rhinecode/context/manager.py`
 **依赖：** T3, T4, T5, T6
 **步骤：**
-1. `class ContextManager.__init__(self, provider, model, window, store_dir, auto_margin=13000, manual_margin=3000)`：初始化 `_offloader`、`_anchor_tokens=None`、`_anchor_len=0`、`_summary_failures=0`、`_circuit_broken=False`。
+1. `class ContextManager.__init__(self, provider, model, window, store_dir, auto_margin=13000)`：初始化 `_offloader`、`_anchor_tokens=None`、`_anchor_len=0`、`_summary_failures=0`、`_circuit_broken=False`。
 2. `_estimate(self, history) -> int`：调 `estimate_tokens(history, self._anchor_tokens, self._anchor_len)`。
 3. `before_request(self, history) -> list[CompactionNotice]`：先 `notices = self._offloader.run(history)`；再 `if not self._circuit_broken and self._estimate(history) > self.window - self.auto_margin:` → append `self._do_summary(history)`。返回 notices。
 4. `record_usage(self, usage, sent_len)`：`_anchor_tokens = usage.prompt_tokens`、`_anchor_len = sent_len`。
-5. `manual_compact(self, history) -> CompactionNotice`：`if self._estimate(history) <= self.window - self.manual_margin:` → 返回 `noop`「上下文尚宽裕（估算 X / 上限 Y），无需压缩」；否则 `return self._do_summary(history)`。
+5. `manual_compact(self, history) -> CompactionNotice`：无余量阈值，直接 `return self._do_summary(history)`（用户主动触发即尝试摘要）；无够旧早段时由 `_do_summary` 返回 `noop`「无可摘要的早段」。只做第二层摘要，不做第一层 offload。
 6. `_do_summary(self, history) -> CompactionNotice`：
    - `idx = compute_retain_index(history)`；`idx==0`（无可摘要早段）→ 返回 `noop`。
    - `to_summarize, retained = history[:idx], history[idx:]`。
