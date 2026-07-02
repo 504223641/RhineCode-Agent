@@ -1,5 +1,8 @@
 # 复制此文件为 config.yaml，填入真实 API key 后使用
 # cp config.example.yaml config.yaml
+#
+# 也可放到 ~/.rhinecode/config.yaml 作为全局默认：这样在任意目录直接敲 `rhine` 都会读到，
+# 无需每次带 --config（首次运行 rhine 时若该文件不存在，会自动生成同款模板）。
 
 # 使用 Anthropic Claude
 # protocol: anthropic

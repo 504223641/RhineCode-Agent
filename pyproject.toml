@@ -11,10 +11,15 @@ dependencies = [
     "anthropic>=0.40.0",
     "openai>=1.50.0",
     "pyyaml>=6.0",
+    # c7：MCP 客户端的 Streamable HTTP 传输需要流式读取 SSE（text/event-stream），
+    # httpx 的 stream()/iter_lines() 支持得干净；openai 已传递依赖 httpx，此处显式声明。
+    "httpx>=0.27",
 ]
 
 [project.scripts]
-rhinecode = "rhinecode.__main__:main"
+# 安装后暴露的全局命令名。包名/源码目录仍是 rhinecode，这里只改对外命令为 rhine，
+# 让用户在任意目录直接敲 `rhine` 启动（`python -m rhinecode` 不依赖此项，仍可用）。
+rhine = "rhinecode.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

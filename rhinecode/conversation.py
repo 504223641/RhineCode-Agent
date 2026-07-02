@@ -25,13 +25,16 @@ from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.tools.path_guard import workspace_root
+from rhinecode.mcp.manager import MCPManager
 from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import AgentEvent, ClarifyOption, ConfirmDecision
 from rhinecode.permission import (
+    Decision,
     DecisionResult,
     PermissionEngine,
     PermissionMode,
+    PermissionRequest,
     Rule,
     to_request,
 )
@@ -76,6 +79,7 @@ class ConversationManager:
         provider: BaseProvider,
         config: Config,
         registry: Optional[ToolRegistry] = None,
+        mcp_manager: "Optional[MCPManager]" = None,
     ):
         """
         初始化对话管理器。
@@ -84,9 +88,13 @@ class ConversationManager:
         :param config: 运行配置；提供 protocol（判断思考/工具能力）、model 与 debug_log（c5）。
                        构造结构化系统提示与环境信息、决定缓存调试日志是否开启时都要用到
         :param registry: 工具注册中心；为 None 时不启用工具能力
+        :param mcp_manager: MCP 连接管理器（c7）；为 None 时 /mcp 命令与状态栏 MCP 段不展示。
+                            仅用于状态查询，工具已在启动时注册进 registry，不经此引用调用。
         """
         self._provider = provider
         self._config = config
+        # MCP 连接管理器：仅供 /mcp 命令与状态栏读取连接状态；工具走 registry，与此解耦。
+        self._mcp_manager = mcp_manager
         # 协议名沿用配置里的 protocol，逻辑与此前一致（仅入参由字符串换成整份 config）。
         self._protocol = config.protocol
         self._registry = registry
@@ -108,8 +116,34 @@ class ConversationManager:
 
         # 工具/循环能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
         self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
+        if registry is not None:
+            self._install_path_filters(registry)
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
         self._agent = Agent(provider, registry)
+
+    def _install_path_filters(self, registry: ToolRegistry) -> None:
+        """
+        给会递归发现文件的只读工具注入文件级权限过滤器。
+
+        read_file 的单文件路径在执行前已由权限管线判断；grep/glob 这类目录级工具还会在
+        execute 内部发现更多文件，因此需要在真正读取或返回每个文件前再次用 Read 规则判定。
+        """
+        def allow_read_path(rel_path: str) -> bool:
+            req = PermissionRequest(
+                tool_name="read_file",
+                rule_name="Read",
+                specifier=rel_path,
+                kind="read_path",
+                is_read_only=True,
+                mode=self._engine.mode,
+            )
+            return self._engine.decide(req).decision != Decision.DENY
+
+        for name in ("grep_content", "glob_files"):
+            tool = registry.get(name)
+            setter = getattr(tool, "set_path_filter", None)
+            if callable(setter):
+                setter(allow_read_path)
 
     @property
     def permission_mode_value(self) -> Optional[str]:
@@ -196,9 +230,29 @@ class ConversationManager:
             label = self._PERM_LABEL[self._engine.mode]
             return f"权限模式：{label}"
 
+        if text == "/mcp":
+            # 展示 MCP 各 Server 的连接状态、工具数与失败原因（c7 F16）。
+            # 与 /perm 等不同，本命令纯只读、不改任何状态，也不受工具能力开关限制。
+            if self._mcp_manager is None:
+                return "未启用 MCP（未配置任何 MCP Server）"
+            return self._mcp_manager.status_report()
+
         # 普通消息：先追加到历史，再委托 Agent 跑循环
         self.history.append(Message(role="user", content=text))
         return self._run()
+
+    def mcp_status_line(self) -> "str | None":
+        """
+        返回底部状态栏用的 MCP 一行摘要（c7 F15）。
+
+        :returns: 形如「MCP：已连接 2/3 · 工具 11」；未启用 MCP 或无 Server 时返回 None
+                  （None 时状态栏不展示 MCP 段，避免误导）。
+
+        副作用：无（仅读取 manager 状态）。
+        """
+        if self._mcp_manager is None:
+            return None
+        return self._mcp_manager.status_line()
 
     def _run(self) -> Iterator[AgentEvent]:
         """

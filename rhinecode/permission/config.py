@@ -31,6 +31,24 @@ _CONFIG_DIR_NAME = ".rhinecode"
 _CONFIG_FILE = "permissions.yaml"
 _LOCAL_FILE = "permissions.local.yaml"
 
+# 首次运行自动生成的权限配置模板。内容**全部注释**：yaml.safe_load 一个全注释文件得到 None，
+# _load_layer 对 None 返回空规则集，因此「有此模板」与「无文件」对权限系统完全等价——
+# 生成它只为方便用户发现和编辑，绝不改变运行时行为（fail-safe 不变）。
+_CONFIG_TEMPLATE = """\
+# RhineCode 权限规则配置（可选）。
+# 全部注释时等价于「无额外规则」：权限系统仍由危险命令黑名单 / 路径沙箱 /
+# 权限模式 / 人在回路四层防御正常工作，本文件只是让你「额外声明」放行或拒绝。
+#
+# 每条写成 Tool(模式)；多层配置合并后 **deny 永远优先**（不按层级覆盖）。
+# 取消下面的注释即可生效：
+#
+# allow:
+#   - "Bash(git *)"       # 放行 git 子命令（前缀 + glob，带词边界）
+#   - "Read(src/**)"      # 放行读取 src 目录（gitignore 风格路径）
+# deny:
+#   - "Bash(git push *)"  # 拒绝 push（deny 优先于任何 allow）
+"""
+
 
 def user_config_path() -> Path:
     """用户级配置路径：~/.rhinecode/permissions.yaml（跨项目全局默认）。"""
@@ -45,6 +63,28 @@ def project_config_path() -> Path:
 def local_config_path() -> Path:
     """本地级配置路径：<项目根>/.rhinecode/permissions.local.yaml（不提交，永久放行写此）。"""
     return workspace_root() / _CONFIG_DIR_NAME / _LOCAL_FILE
+
+
+def scaffold_user_config(path: Path) -> bool:
+    """
+    在指定路径生成权限配置模板，供首次运行引导使用（与 rhinecode/config.py 同构）。
+
+    执行步骤：
+    1. 目标文件已存在 → 直接返回 False，绝不覆盖用户已有规则（幂等、防误伤）。
+    2. 创建父目录（parents=True, exist_ok=True）。
+    3. 写入 _CONFIG_TEMPLATE（全注释，解析后为空规则集，行为等价于无文件）。
+
+    :param path: 目标配置文件路径（通常是 user_config_path()）
+    :returns: 实际写入了模板返回 True；文件已存在未改动返回 False
+    :raises OSError: 目录创建或文件写入失败时抛出（由调用方决定如何提示）
+
+    副作用：可能创建目录并写入文件。
+    """
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+    return True
 
 
 def parse_rule_string(text: str, effect: str, source: str) -> Optional[Rule]:
@@ -147,7 +187,7 @@ def append_local_allow(rule_string: str) -> None:
     把一条 allow 规则追加写入本地级配置文件（spec F6「永久放行」）。
 
     行为：
-    - 读取现有本地级 YAML（不存在或损坏则从空白开始，保证不丢失也不崩溃）。
+    - 读取现有本地级 YAML；若文件损坏或顶层不是映射，则拒绝写入，避免覆盖用户内容。
     - 在 allow 列表里追加 rule_string；若已存在相同条目则跳过（幂等）。
     - 目录不存在时创建后写回，使用 UTF-8。
 
@@ -160,10 +200,14 @@ def append_local_allow(rule_string: str) -> None:
     if path.exists():
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:  # noqa: BLE001 —— 损坏则从空白重建，不影响写入
+        except Exception as exc:  # noqa: BLE001 —— 坏文件不覆盖，交由上层会话级规则兜底
+            raise ValueError(f"本地权限配置解析失败，未写入：{path}：{exc}") from exc
+        if loaded is None:
             data = {}
+        elif isinstance(loaded, dict):
+            data = loaded
+        else:
+            raise ValueError(f"本地权限配置顶层应为映射，未写入：{path}")
 
     allow_list = data.get("allow")
     if not isinstance(allow_list, list):

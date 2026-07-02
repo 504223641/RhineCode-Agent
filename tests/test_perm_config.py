@@ -73,6 +73,15 @@ class ConfigLoadTests(TempWorkspaceHomeTest):
         self.assertIsNotNone(result)
         self.assertEqual(result.decision, Decision.ALLOW)
 
+    def test_append_local_allow_does_not_overwrite_broken_yaml(self) -> None:
+        broken = "allow: [unclosed\n"
+        self._write(config.local_config_path(), broken)
+
+        with self.assertRaisesRegex(ValueError, "未写入"):
+            config.append_local_allow("Bash(git status)")
+
+        self.assertEqual(config.local_config_path().read_text(encoding="utf-8"), broken)
+
 
 if __name__ == "__main__":
     unittest.main()

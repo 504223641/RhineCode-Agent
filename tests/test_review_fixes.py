@@ -96,6 +96,21 @@ class PathGuardTests(TempWorkspaceTest):
         self.assertFalse(read_result.ok)
         self.assertEqual(read_result.summary, "路径越界")
 
+    def test_large_read_file_requires_explicit_range(self) -> None:
+        lines = [f"line {i}\n" for i in range(1, 140000)]
+        Path("large.txt").write_text("".join(lines), encoding="utf-8")
+
+        full = ReadFileTool().execute({"path": "large.txt"})
+        self.assertFalse(full.ok)
+        self.assertEqual(full.summary, "文件过大")
+
+        ranged = ReadFileTool().execute({"path": "large.txt", "start_line": 10, "max_lines": 3})
+        self.assertTrue(ranged.ok)
+        self.assertIn("10│ line 10", ranged.output)
+        self.assertIn("12│ line 12", ranged.output)
+        self.assertNotIn("13│ line 13", ranged.output)
+        self.assertIn("范围读取 3 行", ranged.summary)
+
 
 class RecordingTool(Tool):
     name = "danger"
@@ -191,6 +206,68 @@ def manager_with_tool(provider: BaseProvider, tool: RecordingTool) -> Conversati
         debug_log=False,
     )
     return ConversationManager(provider, config, registry)
+
+
+class PermissionFilterTests(TempWorkspaceTest):
+    def _manager_with_default_tools(self) -> tuple[ConversationManager, ToolRegistry]:
+        Path(".rhinecode").mkdir(exist_ok=True)
+        Path(".rhinecode/permissions.yaml").write_text(
+            'deny:\n  - "Read(config.yaml)"\n',
+            encoding="utf-8",
+        )
+        registry = ToolRegistry.default()
+        config = Config(
+            protocol="deepseek",
+            model="test-model",
+            base_url="http://test",
+            api_key="test-key",
+            debug_log=False,
+        )
+        return ConversationManager(ToolCallingProvider(), config, registry), registry
+
+    def test_grep_skips_files_denied_by_read_rules(self) -> None:
+        Path("config.yaml").write_text("api_key: SECRET\n", encoding="utf-8")
+        Path("visible.txt").write_text("api_key: visible\n", encoding="utf-8")
+        _manager, registry = self._manager_with_default_tools()
+
+        result = registry.get("grep_content").execute({"pattern": "api_key", "path": "."})
+
+        self.assertTrue(result.ok)
+        self.assertIn("visible.txt", result.output)
+        self.assertIn("visible", result.output)
+        self.assertNotIn("SECRET", result.output)
+        self.assertNotIn("config.yaml", result.output)
+        self.assertIn("跳过 1 个", result.summary)
+
+    def test_glob_skips_files_denied_by_read_rules(self) -> None:
+        Path("config.yaml").write_text("api_key: SECRET\n", encoding="utf-8")
+        Path("visible.txt").write_text("ok\n", encoding="utf-8")
+        _manager, registry = self._manager_with_default_tools()
+
+        result = registry.get("glob_files").execute({"pattern": "*"})
+
+        self.assertTrue(result.ok)
+        self.assertIn("visible.txt", result.output)
+        self.assertNotIn("config.yaml", result.output)
+        self.assertIn("跳过 1 个", result.summary)
+
+
+class PermanentAllowFallbackTests(TempWorkspaceTest):
+    def test_broken_local_permissions_file_falls_back_to_session_rule(self) -> None:
+        Path(".rhinecode").mkdir(exist_ok=True)
+        local_path = Path(".rhinecode/permissions.local.yaml")
+        broken = "allow: [unclosed\n"
+        local_path.write_text(broken, encoding="utf-8")
+        tool = RecordingTool()
+        manager = manager_with_tool(ToolCallingProvider(), tool)
+        manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW_PERMANENT
+
+        list(manager.handle_input("run it"))
+
+        self.assertTrue(tool.executed)
+        self.assertEqual(local_path.read_text(encoding="utf-8"), broken)
+        self.assertEqual(len(manager._engine.session_rules), 1)
+        self.assertTrue(any("写入本地权限配置失败" in err for err in manager._engine.load_errors))
 
 
 class ConversationManagerTests(unittest.TestCase):

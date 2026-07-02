@@ -1,0 +1,23 @@
+# MCP Server 配置示例（c7）
+#
+# 复制到以下任一位置启用（两层，按 Server 名字合并，项目级覆盖用户级）：
+#   用户级：~/.rhinecode/mcp.yaml          （跨项目全局默认）
+#   项目级：<项目根>/.rhinecode/mcp.yaml   （随仓库走、可提交）
+#
+# env / headers 的值支持 ${VAR} 环境变量展开；引用的变量不存在时展开为空字符串。
+# 类型自动判定：含 command 视为 stdio（本地子进程），含 url 视为 http（Streamable HTTP）。
+
+mcpServers:
+  # —— stdio 型：拉起本地子进程，通过标准输入/输出管道通信 ——
+  everything:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything"]
+    env:
+      # 例：把宿主环境变量 MY_TOKEN 注入子进程
+      TOKEN: ${MY_TOKEN}
+
+  # —— http 型：连接远程 Streamable HTTP 端点 ——
+  remote-api:
+    url: https://example.com/mcp
+    headers:
+      Authorization: Bearer ${API_KEY}

@@ -8,8 +8,78 @@
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 import yaml
+
+
+# 用户级配置目录/文件名：与权限、MCP 配置同放 ~/.rhinecode 下，仅文件名不同。
+_CONFIG_DIR_NAME = ".rhinecode"
+_CONFIG_FILE = "config.yaml"
+
+# 模板里的占位 api_key。它是「非空字符串」，能通过 load() 的非空校验，
+# 因此需要单独识别，用来区分「用户已填真实 key」和「刚生成模板还没填」。
+PLACEHOLDER_API_KEY = "YOUR_API_KEY"
+
+# 首次运行自动生成的配置模板。内容与 config.example.yaml 对齐（默认 deepseek），
+# api_key 用占位符，引导用户填入真实值后再运行。
+_CONFIG_TEMPLATE = """\
+# RhineCode 全局配置。填入真实 api_key 后即可在任意目录运行 `rhine`。
+# 也可用 `rhine --config <路径>` 指定其它配置文件覆盖本文件。
+
+# 使用 DeepSeek（默认，支持工具调用 / Plan Mode / 权限系统）
+protocol: deepseek
+model: deepseek-chat
+base_url: https://api.deepseek.com
+api_key: YOUR_API_KEY
+
+# 使用 Anthropic Claude（纯对话）
+# protocol: anthropic
+# model: claude-sonnet-4-6
+# base_url: https://api.anthropic.com
+# api_key: sk-ant-...
+
+# 使用 OpenAI（纯对话）
+# protocol: openai
+# model: gpt-4o
+# base_url: https://api.openai.com/v1
+# api_key: sk-...
+"""
+
+
+def user_config_path() -> Path:
+    """
+    返回用户级全局配置文件路径 ~/.rhinecode/config.yaml。
+
+    这是「命令未显式传 --config 时」的缺省配置位置：把 api_key 等全局设置放在
+    用户主目录下的固定位置，使 `rhine` 在任意工作目录都能读到同一份配置
+    （工作目录本身仍作为 AI 操作的项目根，二者互不影响）。
+
+    :returns: ~/.rhinecode/config.yaml 的 Path（不保证文件已存在）
+    """
+    return Path.home() / _CONFIG_DIR_NAME / _CONFIG_FILE
+
+
+def scaffold_user_config(path: Path) -> bool:
+    """
+    在指定路径生成配置模板，供首次运行引导使用。
+
+    执行步骤：
+    1. 若目标文件已存在，直接返回 False，绝不覆盖用户已有配置（幂等、防误伤）。
+    2. 创建父目录（parents=True, exist_ok=True）。
+    3. 写入 _CONFIG_TEMPLATE 模板（含占位 api_key）。
+
+    :param path: 目标配置文件路径（通常是 user_config_path()）
+    :returns: 实际写入了模板返回 True；文件已存在未改动返回 False
+    :raises OSError: 目录创建或文件写入失败时抛出（由调用方决定如何提示）
+
+    副作用：可能创建目录并写入文件。
+    """
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+    return True
 
 
 @dataclass

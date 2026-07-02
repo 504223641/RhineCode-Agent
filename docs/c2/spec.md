@@ -48,4 +48,4 @@ RhineCode 是一个从零构建的终端 AI 编程助手，对标 Claude Code。
 - AC6（OpenAI 下 /think）：OpenAI 模式下输入 `/think`，历史区显示「当前 Provider 不支持 Extended Thinking」，不崩溃
 - AC7（/clear）：输入 `/clear` 后历史区清空，下一轮对话不携带之前上下文
 - AC8（错误处理）：配置文件缺少 api_key 或 API 请求失败时，历史区显示可读错误信息，程序保持运行
-- AC9（/exit）：输入 `/exit` 或按 Ctrl+C，程序正常退出，不留残余进程
+- AC9（/exit）：输入 `/exit` 或按 Ctrl+Q，程序正常退出，不留残余进程；Ctrl+C 用于复制场景，不应触发退出

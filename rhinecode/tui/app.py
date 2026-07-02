@@ -21,7 +21,6 @@ import threading
 
 from rich.markup import escape
 from textual.app import App, ComposeResult
-from textual.binding import Binding
 from textual.events import Key
 from textual.widgets import Static, Input
 
@@ -102,11 +101,6 @@ class RhineApp(App):
     }
     """
 
-    BINDINGS = [
-        # Ctrl+C 绑定到内置 quit action，确保用户可以随时退出
-        Binding("ctrl+c", "quit", "退出", show=False),
-    ]
-
     def __init__(self, manager: ConversationManager, config: Config):
         """
         :param manager: 已初始化的对话管理器，持有 Provider / Agent 和对话历史
@@ -130,7 +124,7 @@ class RhineApp(App):
         yield CommandPanel()
         yield ConfirmPanel()
         yield ClarifyPanel()
-        yield InputBar(placeholder="输入消息，/ 查看命令，运行中按 Esc 取消，Ctrl+C 退出")
+        yield InputBar(placeholder="输入消息，/ 查看命令，运行中按 Esc 取消，Ctrl+Q 退出")
         yield StatusBar()
 
     def on_mount(self) -> None:
@@ -155,6 +149,8 @@ class RhineApp(App):
             self._manager.thinking_effort,
             self._manager.plan_mode,
             self._manager.permission_mode_value,
+            # MCP 连接状态（c7）：启动后不变，随每次刷新一并带上即可。
+            self._manager.mcp_status_line(),
         )
 
     # ------------------------------------------------------------------ #
@@ -377,6 +373,9 @@ class RhineApp(App):
                     self.call_from_thread(history_view.append_error, event.message)
         finally:
             self.call_from_thread(self._set_streaming, False)
+            # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；
+            # 收尾时刷新状态栏，让新工具数量或失败信息立即反映到界面上。
+            self.call_from_thread(self._refresh_status)
 
     @staticmethod
     def _finish_line(stop_reason, message: str) -> str:
