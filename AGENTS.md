@@ -21,7 +21,7 @@ RhineCode 是一个 Python 3.11+ 项目，主包位于 `rhinecode/`。核心目�
 
 ## 提交与 Pull Request 规范
 
-历史提交同时存在普通描述和 Conventional Commit 风格；建议优先使用简洁的带作用域格式，例如 `feat(cli): add first-run config bootstrap` 或 `docs(c7): update MCP notes`。Pull Request 应包含行为变更摘要、已运行的测试命令与结果、相关 issue 或规格文档链接；涉及 TUI 可见变化时，应补充截图或终端说明。
+历史提交同时存在普通描述和 Conventional Commit 风格；建议优先使用简洁的带作用域格式，例如 `feat(cli): add first-run config bootstrap` 或 `docs(c7): update MCP notes`。优先使用中文commit。Pull Request 应包含行为变更摘要、已运行的测试命令与结果、相关 issue 或规格文档链接；涉及 TUI 可见变化时，应补充截图或终端说明。
 
 ## 安全与配置提示
 
