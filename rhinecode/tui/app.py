@@ -371,6 +371,10 @@ class RhineApp(App):
 
                 elif etype == AgentEventType.ERROR:
                     self.call_from_thread(history_view.append_error, event.message)
+
+                elif etype == AgentEventType.NOTICE:
+                    # 系统级提示（c8：上下文压缩发生等），以系统行展示，不影响正文/工具渲染。
+                    self.call_from_thread(history_view.append_system, event.message)
         finally:
             self.call_from_thread(self._set_streaming, False)
             # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；

@@ -1,0 +1,172 @@
+"""
+第二层·重量兜底的纯逻辑（c8 F9~F13）。
+
+当整体历史逼近窗口上限时，用 LLM 把「较早的消息」压成结构化摘要，「近期的消息」保留原文。
+本模块只放**纯逻辑与常量**（保留边界计算、转录、Prompt、草稿/正文解析、历史重构），
+真正的 provider 调用与失败/熔断处理留在 manager.py——这样纯逻辑可脱离网络单测。
+
+关键设计：
+- 保留边界回退到最近的 role="user"：保证重构后的历史对 API 合法（不切碎消息、不拆散
+  assistant(tool_calls) 与其 tool 结果），且保留区以 user 开头。
+- 摘要请求把待摘要段渲染成「一条 user 转录文本」发出，规避裸 tool 消息缺配对的 API 校验。
+- 边界消息做成一条合成 assistant 轮：既是 F12 的「重读文件」提示，又恢复 user→assistant→user
+  角色交替，让重构后的历史合法。
+"""
+
+from typing import Optional
+
+from rhinecode.provider.base import Message
+from rhinecode.context.estimate import estimate_message_tokens
+
+# 从尾部保留原文的目标 token 量。
+RETAIN_TOKENS: int = 10000
+# 无论 token 多少，至少保留的尾部消息条数（保证近期上下文不被压没）。
+MIN_RETAIN_MESSAGES: int = 5
+# 草稿与正式摘要的分隔标记：模型先自由写分析草稿，再在此标记后写正式摘要。
+SUMMARY_MARKER: str = "<<<正式摘要>>>"
+
+# 摘要系统提示（F10 固定结构 + F11 禁工具 + 先草稿后正文）。
+SUMMARY_SYSTEM_PROMPT: str = (
+    "你是一个对话历史压缩器。你的唯一任务是把下面提供的一段较早的对话历史，"
+    "压缩成一份忠实、结构化的摘要，供后续对话继续使用。\n\n"
+    "严格约束：\n"
+    "1. 禁止调用任何工具，也不要请求调用工具——你只能输出纯文本。\n"
+    "2. 先写一段【分析草稿】：梳理这段历史里发生了什么、哪些信息必须保留。"
+    "草稿只用于帮你理清思路，不会被保存。\n"
+    f"3. 然后输出一行分隔标记 {SUMMARY_MARKER}，其后写【正式摘要】。\n"
+    "4. 正式摘要必须忠实保留用户的原始诉求与关键决策，不得改写或臆造。\n"
+    "5. 涉及具体文件内容或代码细节时，只概述「读过/改过哪个文件、结论是什么」，"
+    "不要大段复制原文——后续需要细节会重新读取文件。\n\n"
+    "正式摘要按以下固定五部分组织（用小标题分隔）：\n"
+    "① 任务目标：用户想要达成什么。\n"
+    "② 已完成的关键步骤与结论：做了哪些操作、得到哪些结果。\n"
+    "③ 涉及的关键文件与改动：动过或读过的文件路径及其要点。\n"
+    "④ 当前状态与待办：进行到哪一步、下一步要做什么。\n"
+    "⑤ 重要约束与决策：必须遵守的限制、已敲定的技术选择。"
+)
+
+# 边界消息文本（F12）：合成的 assistant 轮，提示模型重读文件、勿照摘要脑补。
+BOUNDARY_MESSAGE: str = (
+    "以上是早前对话的结构化摘要。如需具体文件内容或代码细节，"
+    "我会重新读取相关文件，绝不照摘要臆测代码。"
+)
+
+
+def compute_retain_index(history: list[Message]) -> int:
+    """
+    计算「保留区」的起始下标：history[idx:] 保留原文，history[:idx] 交给摘要。
+
+    步骤：
+    1. 从尾部往前累加 estimate_message_tokens，直到累计 >= RETAIN_TOKENS
+       或已数满 MIN_RETAIN_MESSAGES 条——两条件谁先「让保留区更靠前（保留更多）」就用谁，
+       即取更小的 idx。
+    2. 把该 idx 回退到「<= idx 的最近一个 role='user' 消息下标」，保证保留区以 user 开头，
+       从而不切碎消息、不拆散 assistant(tool_calls)↔tool 配对，重构后历史对 API 合法。
+    3. 找不到任何 user（极端情况）→ 返回 0（即全部保留、无可摘要段，由上层按 noop 处理）。
+
+    :param history: 当前对话历史
+    :returns: 保留区起始下标 idx（0 表示没有可摘要的早段）
+
+    副作用：无。
+    """
+    n = len(history)
+    if n == 0:
+        return 0
+
+    # —— 步骤 1：先按 token 从尾部回数，得到「按 token」的边界 idx_tok ——
+    acc = 0
+    idx_tok = n  # 若循环没提前 break，说明全部累加仍不足 RETAIN_TOKENS，边界落在 0
+    for i in range(n - 1, -1, -1):
+        acc += estimate_message_tokens(history[i])
+        if acc >= RETAIN_TOKENS:
+            idx_tok = i
+            break
+    else:
+        idx_tok = 0
+
+    # 按条数的边界：至少保留 MIN_RETAIN_MESSAGES 条。
+    idx_cnt = max(0, n - MIN_RETAIN_MESSAGES)
+
+    # 取更靠前者（保留更多原文）。
+    idx = min(idx_tok, idx_cnt)
+
+    # —— 步骤 2：回退到最近的 user 边界 ——
+    while idx > 0 and history[idx].role != "user":
+        idx -= 1
+    # idx 停在某个 user 上；若一路退到 0 且 history[0] 也非 user，则无可用 user 边界。
+    if idx == 0 and history[0].role != "user":
+        return 0
+    return idx
+
+
+def render_transcript(messages: list[Message]) -> str:
+    """
+    把待摘要消息渲染成一段纯文本转录，作为「一条 user 消息」发给摘要模型。
+
+    渲染成转录而非直接转发原始消息，是为了规避 API 对 tool 消息「必须紧跟对应 tool_calls」
+    的配对校验，同时让格式完全可控。不同角色加中文前缀；assistant 的工具调用与 tool 结果
+    也如实转出（附 tool_call_id），供模型理解发生过哪些工具动作。
+
+    :param messages: 待摘要的历史消息
+    :returns: 转录文本
+    """
+    lines: list[str] = []
+    for m in messages:
+        if m.role == "user":
+            lines.append(f"【用户】{m.content}")
+        elif m.role == "assistant":
+            text = m.content or ""
+            if m.tool_calls:
+                calls = ", ".join(f"{tc.name}({tc.id})" for tc in m.tool_calls)
+                text = (text + f"\n（发起工具调用：{calls}）").strip()
+            lines.append(f"【助手】{text}")
+        elif m.role == "tool":
+            lines.append(f"【工具结果·{m.tool_call_id}】{m.content}")
+        else:  # system 等其它角色，原样带上角色名
+            lines.append(f"【{m.role}】{m.content}")
+    return "\n\n".join(lines)
+
+
+def parse_summary(text: str) -> Optional[str]:
+    """
+    从摘要模型的完整输出里提取正式摘要，丢弃草稿（F11）。
+
+    以 SUMMARY_MARKER 分割：取标记之后的最后一段并 strip；无标记则退化为整段 strip
+    （宽松兜底：即便模型没按格式给标记，也不至于丢失摘要）。结果为空返回 None（视为失败）。
+
+    :param text: 摘要模型输出的完整文本
+    :returns: 正式摘要文本；无有效内容返回 None
+
+    副作用：无。
+    """
+    if text is None:
+        return None
+    if SUMMARY_MARKER in text:
+        # 取最后一次标记之后的内容，避免草稿里恰好也提到标记时误取。
+        tail = text.rsplit(SUMMARY_MARKER, 1)[1].strip()
+    else:
+        tail = text.strip()
+    return tail or None
+
+
+def reconstruct(summary_text: str, retained: list[Message]) -> list[Message]:
+    """
+    用摘要 + 边界消息 + 保留区原文，重构出新的历史列表（F12）。
+
+    结构固定为：
+        [ user(结构化摘要), assistant(边界提示), *retained ]
+    - 摘要作为一条 user 消息置顶，保证历史以 user 开头。
+    - 边界提示作为合成 assistant 轮：兼作「重读文件」提示，并恢复 user→assistant→user
+      角色交替（retained 以 user 开头），使重构后的历史对 API 合法。
+
+    :param summary_text: 正式摘要正文
+    :param retained: 保留区原文消息（应以 user 消息开头）
+    :returns: 重构后的新历史列表
+
+    副作用：无（返回新列表，由调用方决定如何原地替换）。
+    """
+    return [
+        Message(role="user", content=f"[早前对话的结构化摘要]\n{summary_text}"),
+        Message(role="assistant", content=BOUNDARY_MESSAGE),
+        *retained,
+    ]

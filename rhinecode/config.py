@@ -95,6 +95,9 @@ class Config:
     - debug_log：是否把每次请求的缓存命中/未命中 token 追加到 <项目根>/.rhinecode_debug.log，
                  用于验证缓存策略是否生效（c5 F10）。可选字段，缺省为 True；每次请求仅写一行，
                  IO 异常会静默降级，不影响对话。不想生成该文件时在配置里设为 false。
+    - context_window：上下文窗口上限（token），作为「历史是否逼近溢出」的判断基准（c8 F1）。
+                 可选字段，缺省 65536；不同模型/账号窗口不同，可按需调大调小。非法或 <=0 时
+                 由 load() 回退默认值，不阻断启动（fail-safe）。
     """
     protocol: str
     model: str
@@ -102,6 +105,33 @@ class Config:
     api_key: str
     # 调试日志开关：默认开启便于随时验证缓存；非必填字段，老配置不写也能正常加载。
     debug_log: bool = True
+    # 上下文窗口上限（token）：c8 两层压缩据此判断是否逼近溢出；非必填，老配置不写也能加载。
+    context_window: int = 65536
+
+
+def _parse_int(value: Any, field_name: str, default: int) -> int:
+    """
+    把配置值解析为正整数，fail-safe：非法/缺失/非正数一律回退默认值，不抛异常。
+
+    与 _parse_bool 不同，这里刻意「不抛错」——context_window 是可选调优项，
+    即便用户写错也不该阻断启动，回退到内置默认值即可保证行为稳定（c8 F1 容错）。
+
+    :param value: 原始配置值（可能是 int、数字字符串，或任意非法值）
+    :param field_name: 字段名（仅用于潜在调试，本函数不抛错故当前未用到）
+    :param default: 回退默认值
+    :returns: 解析出的正整数；无法解析或 <=0 时返回 default
+    """
+    if isinstance(value, bool):
+        # bool 是 int 的子类，需先排除，避免 True 被当成 1 静默接受。
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            n = int(text)
+            return n if n > 0 else default
+    return default
 
 
 def _parse_bool(value: Any, field_name: str) -> bool:
@@ -151,10 +181,14 @@ def load(path: str) -> Config:
     # debug_log 为可选项：缺省为 True，字符串写法需显式表达 true/false，避免 "false" 被当成 True。
     debug_log = _parse_bool(data.get("debug_log", True), "debug_log")
 
+    # context_window 为可选项：缺省 65536，非法/非正值回退默认（c8 F1，见 _parse_int）。
+    context_window = _parse_int(data.get("context_window", 65536), "context_window", 65536)
+
     return Config(
         protocol=data["protocol"],
         model=data["model"],
         base_url=data["base_url"],
         api_key=data["api_key"],
         debug_log=debug_log,
+        context_window=context_window,
     )

@@ -412,6 +412,8 @@ class CommandPanel(OptionList):
         ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
         ("/perm",  "循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）"),
         ("/mcp",   "查看 MCP 服务连接状态（Server / 工具 / 失败原因）"),
+        ("/context", "查看当前上下文用量（估算 token / 余量 / 已存盘数）"),
+        ("/compact", "压缩上下文：LLM 摘要早前对话，保留近期原文"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
