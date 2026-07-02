@@ -33,6 +33,24 @@ from rhinecode.context.models import CompactionNotice, ContextStats
 # 摘要连续失败达到此次数即熔断，避免在失败上死循环（F15）。
 MAX_SUMMARY_FAILURES: int = 3
 
+# 状态栏上下文段的高亮阈值：估算用量达到窗口的此比例即视为「接近上限」，
+# 与自动压缩的 13K 余量线大致同一量级（64K 窗口下 80% ≈ 剩 ~13K），
+# 让用户在自动摘要即将触发前就能从状态栏颜色感知到。
+_WARN_RATIO: float = 0.8
+
+
+def _abbrev(n: int) -> str:
+    """
+    把 token 数缩写成状态栏友好的短串：小于 1000 原样显示，否则按 KiB 保留一位小数，
+    整千场景去掉多余的 `.0`（如 65536 → "64K"，12595 → "12.3K"，512 → "512"）。
+
+    :param n: 待缩写的非负整数 token 数
+    :returns: 缩写字符串
+    """
+    if n < 1000:
+        return str(n)
+    return f"{n / 1024:.1f}K".replace(".0K", "K")
+
 
 class ContextManager:
     """
@@ -236,6 +254,26 @@ class ContextManager:
             offloaded_count=self._offloader.count,
             circuit_broken=self._circuit_broken,
         )
+
+    def status_line(self, history: list[Message]) -> tuple[str, bool]:
+        """
+        底部状态栏用的上下文用量一行摘要（对标 MCP 的 status_line）。
+
+        基于只读的 stats() 组装，不重复估算逻辑、无副作用。格式如
+        「上下文：19% · 12.3K/64K」，熔断时追加「 ⚠」提示。
+
+        :param history: 当前对话历史
+        :returns: (文本, 是否高亮预警)。高亮条件：估算占比达窗口的 _WARN_RATIO，
+                  或第二层摘要已熔断（用橘色提醒用户接近上限 / 自动压缩已失效）。
+        """
+        s = self.stats(history)
+        # window 恒 >0（config 的 _parse_int 保证），除零仅作防御性兜底。
+        percent = round(s.estimated_tokens / s.window * 100) if s.window > 0 else 0
+        text = f"上下文：{percent}% · {_abbrev(s.estimated_tokens)}/{_abbrev(s.window)}"
+        warn = s.estimated_tokens >= s.window * _WARN_RATIO or s.circuit_broken
+        if s.circuit_broken:
+            text += " ⚠"
+        return text, warn
 
     def usage_report(self, history: list[Message]) -> str:
         """

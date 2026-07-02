@@ -176,5 +176,41 @@ class UsageReportTest(unittest.TestCase):
             self.assertIn("余量", report)
 
 
+class StatusLineTest(unittest.TestCase):
+    """状态栏一行摘要（c8 UI）：格式、低用量不高亮、越阈值高亮、熔断标记。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_lean_history_no_warn(self) -> None:
+        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=65536, store_dir=self.store)
+        text, warn = cm.status_line([Message(role="user", content="hi")])
+        self.assertTrue(text.startswith("上下文："))
+        self.assertIn("%", text)
+        self.assertIn("/", text)  # 形如 x/64K
+        self.assertFalse(warn)
+
+    def test_over_threshold_warns(self) -> None:
+        # 窗口很小 → 大历史轻易越过 window*0.8 → 高亮
+        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=500, store_dir=self.store)
+        _, warn = cm.status_line(_big_history())
+        self.assertTrue(warn)
+
+    def test_circuit_broken_marks_and_warns(self) -> None:
+        prov = FakeProvider(_ERR_CHUNKS)
+        cm = ContextManager(prov, "m", window=1_000_000, store_dir=self.store)
+        for _ in range(MAX_SUMMARY_FAILURES):
+            cm._do_summary(_big_history())
+        self.assertTrue(cm._circuit_broken)
+        # 即便窗口极大（用量占比很低），熔断本身也应高亮并带 ⚠
+        text, warn = cm.status_line([Message(role="user", content="hi")])
+        self.assertTrue(warn)
+        self.assertIn("⚠", text)
+
+
 if __name__ == "__main__":
     unittest.main()

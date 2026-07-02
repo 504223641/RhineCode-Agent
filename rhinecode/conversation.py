@@ -307,6 +307,20 @@ class ConversationManager:
             return None
         return self._mcp_manager.status_line()
 
+    def context_status_line(self) -> "tuple[str, bool] | None":
+        """
+        返回底部状态栏用的上下文用量摘要（c8）。
+
+        :returns: (文本, 是否高亮) 如 ("上下文：19% · 12.3K/64K", False)；
+                  工具不可用的 Provider（无 ContextManager）返回 None，此时状态栏
+                  不展示该段，语义与 mcp_status_line 的「None 即隐藏」一致。
+
+        副作用：无（仅只读估算当前历史用量）。
+        """
+        if self._context_manager is None:
+            return None
+        return self._context_manager.status_line(self.history)
+
     def _run(self) -> Iterator[AgentEvent]:
         """
         构造一次 Agent 运行并返回其事件流。
