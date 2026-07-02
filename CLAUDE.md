@@ -2,7 +2,7 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C7 阶段能力：在 C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一个 **MCP 客户端**——启动时按两层配置连接外部 MCP Server（本地子进程走 stdio、远程走 Streamable HTTP），发现其工具并包装成已有的 `Tool` 接口注册进工具中心，对 Agent Loop / 权限系统 / TUI 完全无感。其下每个工具执行前仍由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具（含 MCP 远端工具）、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
+当前版本以 DeepSeek Provider 为主实现了 C8 阶段能力：在 C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **上下文管理（两层压缩）**——每次 API 请求前，先用「锚点 + 增量」近似估算当前历史 token 用量；**第一层**零成本地把过大的工具结果存盘、历史里只留预览与路径占位；若估算仍逼近窗口上限，**第二层**调一次 LLM 把较早的消息压成结构化摘要、近期原文保留，并补一条「要细节请重读文件、勿照摘要脑补」的边界消息。全程幂等、fail-safe，连续摘要失败 3 次熔断，用户原始消息永不被改写；`/context` 查看用量、`/compact` 手动压缩，底部状态栏常驻用量指示。其下 C7 的 MCP 客户端仍在：启动时按两层配置连接外部 MCP Server（本地子进程走 stdio、远程走 Streamable HTTP），发现其工具并包装成已有的 `Tool` 接口注册进工具中心，对 Agent Loop / 权限系统 / TUI 完全无感。每个工具执行前仍由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具（含 MCP 远端工具）、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 语言
 中文回答
@@ -21,6 +21,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；`read_file` 对大文件强制范围读取，`glob_files` / `grep_content` 会逐文件应用 `Read(...)` deny 过滤。
 - **MCP 客户端**（c7）：启动时按两层 `mcp.yaml` 连接外部 MCP Server（stdio / Streamable HTTP），走 JSON-RPC 2.0（请求带 id、响应按 id 配对）完成 `initialize → tools/list → tools/call` 三步，把远端工具包装成 `mcp__<server>__<tool>` 风格的工具注册进工具中心；非法 function name 会规范化，真实远端名仍用于 `tools/call`；stdio stderr 后台 drain 防止 Server 大量写日志时阻塞；多 Server 连接缓存与隔离（单个失败不影响其它），退出统一回收；支持用户通过自然语言添加 MCP，Agent 先用 `mcp_resolve_server` 解析候选，再用 `mcp_add_server` 写入配置并单 Server 重载；MCP 工具一律非只读默认走确认，`/mcp` 命令与状态栏展示连接状态。仅接工具能力，不做资源/提示词/采样与健康检查/自动重连。
+- **上下文管理**（c8）：独立 `context/` 层（对标 permission/mcp：纯逻辑 + 单点接入），仅在 DeepSeek 工具模式生效。每轮请求前经 `loop.py` 单点调用两层压缩——**估算**用「锚点（上次 API `usage.prompt_tokens`，精确）+ 增量（锚点后新增消息按字符估）」，误差只积累在增量小段；**第一层预防**把单个 >4K token 或合计 >16K token 的工具结果按大到小存盘到 `<项目根>/.rhinecode/context/<id>.txt`，历史留「预览 + 路径」占位（幂等键 `tool_call_id`，只动 `role="tool"`，写盘失败保留原文）；**第二层兜底**在估算逼近窗口（自动留 13K 余量）时调 LLM 生成五段式结构化摘要，保留边界回退到最近 `user`（不拆散 `assistant(tool_calls)↔tool`），重构为 `[摘要, 边界提示, 近期原文]`。摘要 Prompt 禁用工具、要求先草稿后正文（`<<<正式摘要>>>` 分隔、草稿丢弃）；连续失败 3 次熔断，`/clear` 复位。`/context` 只读报告、`/compact` 手动压缩（**无余量阈值，主动触发即尝试摘要**，无够旧早段时如实回「无可摘要的早段」），状态栏常驻「上下文：19% · 12.3K/64K」（≥80% 或熔断橘色高亮）。窗口大小由 `config.context_window`（默认 65536）配置。
 - **Plan Mode**：`/plan` 开启后先只允许只读调研和需求澄清，完整计划进入聊天记录，经用户批准后才进入执行阶段。与权限模式正交。
 - **五层防御权限系统**：每个工具执行前由 `permission/` 包的纯逻辑引擎按固定顺序计算决定——①危险命令黑名单（不可被任何配置/模式放开）→②路径沙箱→③可配置规则（`Tool(模式)`，deny 永远优先）→④权限模式（严格/默认/放行，`/perm` 切换）→⑤人在回路（确认面板四选项：本次/本会话/永久/拒绝）。被拒不终止循环，结构化原因回灌模型让其调整策略。
 - **可配置权限规则**：三层 YAML（用户级 `~/.rhinecode/`、项目级 `<根>/.rhinecode/`、本地级 `*.local.yaml` 不提交）声明 allow/deny；跨层合并后 deny 优先求值。
@@ -34,10 +35,11 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 当前核心分层如下，上层尽量不感知下层具体实现，通过抽象接口和事件流解耦：
 
 - **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费 AgentEvent 并逐块渲染；`widgets.py` 提供 HistoryView / InputBar / StatusBar / 工具行 / diff / 确认和澄清面板。
-- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、解析斜杠命令（含 `/perm` 切换权限模式、`/mcp` 查看 MCP 状态）、管理思考模式和 Plan Mode、构建权限引擎并封装 ask（四态人工确认）/澄清/计划审批回调；构建权限引擎后会把 `Read(...)` 路径过滤器注入 `glob_files` / `grep_content`，避免只读搜索工具绕过文件级 deny；持有 `MCPManager` 引用仅用于 `/mcp` 与状态栏（`mcp_status_line`），MCP 工具本身已注册进 registry、与此引用解耦。
-- **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环，并在 `_execute` 单点接入权限决策预扫；`events.py` 定义 AgentEvent、停止原因和四态确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 支撑 Plan Mode 特殊工具；`prompt/` 负责结构化系统提示、环境信息与动态 reminder。
+- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、解析斜杠命令（含 `/perm` 切换权限模式、`/mcp` 查看 MCP 状态、`/context` 查看上下文用量、`/compact` 手动压缩）、管理思考模式和 Plan Mode、构建权限引擎并封装 ask（四态人工确认）/澄清/计划审批回调；构建权限引擎后会把 `Read(...)` 路径过滤器注入 `glob_files` / `grep_content`，避免只读搜索工具绕过文件级 deny；持有 `MCPManager` 引用仅用于 `/mcp` 与状态栏（`mcp_status_line`），MCP 工具本身已注册进 registry、与此引用解耦；仅在工具模式下构造 `ContextManager`（c8），把它作为末位参数传入 `agent.run` 实现每轮请求前的两层压缩，并暴露 `context_status_line` 给状态栏、`/context`·`/compact` 命令分支（`/compact` 走事件流在 Worker 线程执行，因摘要 LLM 调用会阻塞、不能卡 UI 主线程），`clear()` 时调 `reset()` 复位压缩状态。
+- **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环，并在 `_execute` 单点接入权限决策预扫，还在每轮请求前单点调用 `context_manager.before_request`（两层压缩，产出 `NOTICE` 事件）、拿到 usage 后 `record_usage` 更新估算锚点（`context_manager` 为 None 时整段跳过，保持 c8 之前行为）；`events.py` 定义 AgentEvent（含 c8 的 `NOTICE` 系统提示事件）、停止原因和四态确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 支撑 Plan Mode 特殊工具；`prompt/` 负责结构化系统提示、环境信息与动态 reminder。
 - **Permission 层**（`rhinecode/permission/`）— 五层防御权限系统，纯逻辑、与 TUI/Provider 解耦：`models.py` 数据结构与枚举；`matching.py` 命令/路径匹配与命令拆分；`blacklist.py` 危险命令黑名单；`rules.py` deny 优先求值；`config.py` 三层 YAML 加载/容错/回写；`adapter.py` 把工具调用规范化为权限请求（收口工具知识）；`engine.py` 的 `PermissionEngine.decide` 组装四层管线。
 - **MCP 层**（`rhinecode/mcp/`）— MCP 客户端，五层从下到上、下层不感知上层：`config.py` 两层 `mcp.yaml` 加载/`${VAR}` 展开/容错；`auto_config.py` 负责 URL/NPM MCP 名称解析、候选置信度、`npx.cmd` 平台默认值和 `mcp.yaml` 安全写入；`jsonrpc.py` JSON-RPC 2.0 消息构造/分类/id 生成（纯数据，无 I/O）；`transport.py` `Transport` 抽象 + `StdioTransport`（子进程 + 后台 reader 线程按 id 派发，另有 stderr drain 线程保留最近错误日志）+ `HttpTransport`（Streamable HTTP + SSE，同步阻塞），并在 Windows 下解析裸命令到 `.cmd/.exe/.bat`；`client.py` `MCPClient` 封装 `initialize/list_tools/call_tool` 三步；`tool_adapter.py` `MCPTool(Tool)` + 安全注册名规范化 + `CallToolResult→ToolResult` 转换；`manager.py` `MCPManager` 编排多 Server 的连接缓存/单点隔离/生命周期/状态汇总，并支持按 server 精确 `reload_server`、清理旧工具和旧连接。同步线程模型（不引入 asyncio）以契合现有 Textual Worker 同步执行模型。在 `__main__.py` 启动时 `connect_all` 注册工具、`finally` 里 `close_all` 回收。
+- **Context 层**（`rhinecode/context/`）— 上下文两层压缩，纯逻辑 + 单点接入、与 TUI/Provider 解耦（c8）：`models.py` 两个数据类（`CompactionNotice` 压缩动作通知、`ContextStats` 用量快照）；`estimate.py` 近似估算纯函数（锚点 + 增量，`CHARS_PER_TOKEN=3.0` 偏小以倾向高估求安全）；`offload.py` `Offloader` 第一层存盘（单结果 >4K / 合计 >16K 两趟、幂等键 `tool_call_id`、只动 `role="tool"`、写盘失败保留原文）；`summarize.py` 第二层纯逻辑（`compute_retain_index` 尾部 10K token 或 ≥5 条并 snap 回最近 user、`render_transcript` 把待摘要段渲成一条 user 转录规避裸 tool 缺配对、`SUMMARY_SYSTEM_PROMPT` 五段式禁工具提示、`parse_summary` 丢草稿、`reconstruct` 重构为 `[摘要, 边界, 保留区]`）；`manager.py` `ContextManager` 唯一持 provider 引用与副作用编排（`before_request` 自动路径、`manual_compact` 手动路径无阈值、`record_usage` 更新锚点、熔断计数、`status_line`/`usage_report` 可观测、`reset` 复位）。仅 DeepSeek 工具模式构造，跨消息长期持有以累积锚点与熔断状态。
 - **Provider 层**（`rhinecode/provider/`）— `base.py` 定义 `BaseProvider`/`Message`/`StreamChunk` 抽象；`anthropic.py`、`openai.py`、`deepseek.py` 为具体实现；`factory.py` 的 `create_provider` 按 `protocol` 分发。
 - **Tools 层**（`rhinecode/tools/`）— `base.py` 定义 Tool / ToolResult 抽象；`registry.py` 注册默认工具，并提供 `unregister` 给 MCP 重载清理旧工具；`mcp_config.py` 暴露 `mcp_resolve_server`（只读解析）和 `mcp_add_server`（写配置并重载，非只读）两个内置工具；`path_guard.py` 负责路径边界（`resolve_in_workspace` 抛异常版、`is_within_workspace` 布尔版供权限引擎②沙箱层复用）；`read_file.py` 支持 `start_line` / `max_lines` 并对超过 1 MiB 的文件强制范围读取；`glob_files.py`、`grep_content.py` 支持可注入 `path_filter`，输出前逐文件过滤被 `Read(...)` deny 的路径；`write_file.py`、`edit_file.py`、`run_command.py` 是当前其它核心工具。
 
@@ -79,14 +81,16 @@ python -m rhinecode --config config.yaml  # 未安装/开发调试时的等价�
 - `/plan`：切换 Plan Mode，先规划、澄清和审批，再执行（DeepSeek 工具模式生效）。
 - `/perm`：在 默认 / 严格 / 放行 间循环切换权限模式，只影响「规则未命中」的灰色地带兜底（DeepSeek 工具模式生效）。
 - `/mcp`：查看各 MCP Server 的连接状态、传输类型、注册工具数与失败原因（纯只读，不改状态）。
-- `/clear`：清空当前对话历史。
+- `/context`：查看当前上下文近似用量（估算 token / 窗口上限 / 余量 / 已存盘工具结果数 / 是否熔断），纯只读（DeepSeek 工具模式生效）。
+- `/compact`：手动触发第二层 LLM 摘要压缩，无余量阈值——主动触发即尝试；历史尚无够旧的早段可摘要时如实回「无可摘要的早段」（DeepSeek 工具模式生效）。
+- `/clear`：清空当前对话历史（并复位上下文压缩的锚点/熔断/已存盘状态）。
 - `/exit`：退出程序。
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
 
 ## 配置
 
-`config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。
+`config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。可选字段 `context_window`（c8）声明上下文窗口上限（token），作为「历史是否逼近溢出、何时压缩」的判断基准；缺省 / 非法 / 非正值都由 `_parse_int` fail-safe 回退默认 65536（不抛异常），故首次生成的模板**不含**此项——没写即用默认值，想调大/调小手动加一行即可。注意它只影响 RhineCode 的压缩时机，不改变模型真实上限，应贴近所用模型的实际上下文长度。
 
 配置定位（`rhinecode/config.py` + `__main__.py`）：命令**不带 `--config` 时缺省读用户级全局配置 `~/.rhinecode/config.yaml`**，使 `rhine` 在任意工作目录都能读到同一份配置（工作目录本身仍作为 AI 操作的项目根，二者互不影响）。该缺省文件不存在时首次运行会自动写入模板（`scaffold_user_config`，占位 `api_key: YOUR_API_KEY`）并提示后退出；模板占位符会被 `__main__` 单独拦下引导（占位符是非空串、能过 `load()` 校验，不拦会带假 key 启动）。显式 `--config <路径>` 优先且指向不存在的文件时按错误处理（不自动造文件）。
 
@@ -106,16 +110,16 @@ MCP Server 配置（c7，可选，从 `mcp.example.yaml` 复制或由 `mcp_add_s
 
 ## Spec 驱动开发
 
-开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c7/`。
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c8/`。
 
-C7 文档描述 MCP 客户端的需求、架构、任务与验收（两种传输、JSON-RPC 按 id 配对、三步会话、工具适配与注册、多 Server 隔离与生命周期、与权限/状态栏接线）：
+C8 文档描述上下文管理（两层压缩）的需求、架构、任务与验收（近似估算、第一层工具结果存盘、第二层 LLM 结构化摘要、保留边界与角色交替、熔断、`/context`·`/compact`、与状态栏接线）：
 
-- `docs/c7/spec.md`
-- `docs/c7/plan.md`
-- `docs/c7/task.md`
-- `docs/c7/checklist.md`
+- `docs/c8/spec.md`
+- `docs/c8/plan.md`
+- `docs/c8/task.md`
+- `docs/c8/checklist.md`
 
-C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
+C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 测试
 
@@ -129,6 +133,8 @@ python -m unittest discover -s tests
 当前测试覆盖路径越界防护、四态确认回调、本会话放行登记规则、Plan Mode 完整计划展示、拒绝计划停止、计划获批后仍逐项确认，以及权限系统的命令/路径匹配、危险命令黑名单（含复合命令逐段与 fork 炸弹）、deny 优先求值、配置三层加载与容错、工具规范化映射、四层决策管线、loop 决策接入（被拒不停循环、allow 规则免确认）、`grep_content` / `glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地权限配置不被覆盖等关键行为（`tests/test_perm_*.py`、`tests/test_review_fixes.py`）。
 
 MCP 客户端测试（`tests/test_mcp_*.py`、`tests/test_mcp_auto_config.py`、`tests/test_perm_other_glob.py`）：两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 三步会话与按 id 配对（用 `tests/fixtures/mock_mcp_server.py` 端到端起真实子进程）、stderr drain 防阻塞、非法远端工具名规范化且仍调用原始远端名、`CallToolResult→ToolResult` 转换（含 `isError` 与非文本占位、异常兜底不外抛）、单 Server 失败隔离与工具注册进 registry、运行时单 Server 重载、URL/NPM 自动解析、歧义候选处理、YAML 安全写入、Windows `npx.cmd` 兼容、`other` 分支 fnmatch 通配放行。HTTP 传输与真实 Server 端到端留作手测（见 `docs/c7/checklist.md` 场景）。
+
+上下文管理测试（`tests/test_context_*.py`，用假 provider 断言摘要请求不带工具）：近似估算（无锚点全量、有锚点=锚点+增量、越界兜底）、第一层存盘（单结果 / 聚合挑大先存 / user 不动 / 幂等 / 写盘失败保留原文）、第二层纯逻辑（保留边界 snap 到 user 不拆 tool 对、草稿丢弃、重构结构与角色交替、转录渲染）、编排（摘要成功重构并失效锚点、连续失败熔断与复位、`manual_compact` 无阈值——小历史 noop「无可摘要」且不调模型 / 大历史无视余量直接摘要、`before_request` 先 offload 降估算、`status_line` 格式与高亮/熔断标记）。真实 LLM 摘要与 TUI 渲染的端到端 5 场景留作手测（见 `docs/c8/checklist.md`）。
 
 涉及 TUI 行为时，再用 tmux 或真实终端做端到端测试：
 
@@ -152,6 +158,7 @@ MCP 客户端测试（`tests/test_mcp_*.py`、`tests/test_mcp_auto_config.py`、
 - 沙箱是应用层前缀校验，管得住文件工具，但管不住 `run_command` 跑起来的脚本自己用代码 open 的文件（已知边界，OS 级沙箱留待后续）。
 - `config.yaml` 可能包含真实 API Key，请勿提交到版本库；可用 `deny Read(config.yaml)` 规则进一步阻止模型读取，并阻止 grep/glob 间接泄露该文件内容或路径。
 - MCP 工具（c7）：远端 Server 是外部程序、不可信，故 MCP 工具一律 `read_only=False`，默认权限模式下每次调用都经人在回路确认；`kind="other"` 会跳过①黑名单与②沙箱（它们针对本地命令/路径），但仍走③规则（`allow: mcp__server__*` 可放行）与④模式兜底。若工具名被规范化，规则要写注册名而不是远端原名。stdio Server 的子进程行为不受路径沙箱约束（与 `run_command` 同属已知边界）；`mcp_add_server` 会写配置并启动外部 MCP，必须保持 `read_only=False` 且先让用户确认；`mcp.yaml` 的 `env`/`headers` 可能含密钥（如 `${API_KEY}`），同样勿提交真实值，也不要让自动解析逻辑生成真实密钥。
+- 上下文管理（c8）：第一层存盘写入 `<项目根>/.rhinecode/context/<id>.txt` 属**内部可信写盘**，不经工具权限管线（不是模型发起的工具调用）；存盘内容是工具结果原文，可能含被读过的敏感文件片段，故 `.rhinecode/context/` 应随 `.rhinecode/` 一并 git 忽略、勿提交。第二层摘要会把「较早的对话历史（含工具结果）」作为一条 user 转录发给 LLM——与正常对话同样是把上下文交给模型，无额外外泄面，但若用了 `deny Read(敏感文件)`，注意该文件内容一旦已进入历史仍可能被摘要带走（deny 只挡新读取，挡不住已在历史里的内容）。摘要请求强制 `tools=None`，模型在摘要阶段无法调用任何工具。
 
 ## 已知后续工程项
 
@@ -164,6 +171,7 @@ MCP 客户端测试（`tests/test_mcp_*.py`、`tests/test_mcp_auto_config.py`、
 5. 权限系统后续项：网络请求限制、资源配额、审计日志（C6 spec 明确不做，留待后续章节）。
 6. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
 7. MCP 后续项（C7 spec 明确不做）：Server 健康检查与自动重连、资源/提示词/采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化、stdio 之外的旧版 HTTP+SSE 传输、MCP 工具结果里图片/二进制内容的实际渲染。
+8. 上下文管理后续项（C8 spec 明确不做）：精确 tokenizer（当前仅「锚点+增量」近似估算）、摘要策略的机器学习/质量优化、存盘文件的清理与生命周期管理（`/clear` 只复位幂等状态、不删磁盘文件）、除窗口大小外其它阈值（存盘/保留/余量等）的可配置化、摘要内容的分段/多轮压缩与跨会话持久化。
 
 ## 代码注释规范
 
