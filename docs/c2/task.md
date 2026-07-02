@@ -120,7 +120,7 @@
 4. Worker 函数中迭代 StreamChunk：type="text" 时调用 `call_from_thread(history_view.append_assistant_chunk, chunk.content)`；type="thinking" 时追加灰色思考内容；type="error" 时追加红色错误信息；type="done" 时将完整回复追加到 manager.history
 5. 提交输入前调用 `history_view.append_user(text)` 和 `history_view.begin_assistant_turn()`
 6. `on_mount` 时调用 `status_bar.update_status()` 初始化；/think 命令返回后刷新状态栏
-7. 捕获 `SystemExit` 调用 `self.exit()`；绑定 Ctrl+C 到退出
+7. 捕获 `SystemExit` 调用 `self.exit()`；退出保留 `/exit` 和 Ctrl+Q，避免占用 Ctrl+C 复制
 
 **验证：** `python -m rhinecode --config config.yaml` 启动后，三个区域正常渲染，状态栏显示模型名和 Provider 名
 
