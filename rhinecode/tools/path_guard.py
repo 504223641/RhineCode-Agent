@@ -3,9 +3,18 @@
 
 所有本地工具都以进程启动时的当前工作目录作为项目根。文件路径在使用前必须解析到
 该根目录之内；glob 模式也不得使用绝对路径或 `..` 跳出项目根。
+
+c9 补充「额外只读根目录」白名单：用户级记忆目录（~/.rhinecode/memory/）位于项目
+工作目录之外，但模型需要按记忆索引**只读**其中的笔记全文（spec F18）。白名单是
+精确到目录的例外——只对「读」类判定生效（resolve_readable / is_readable_path），
+写类判定仍走原有的 resolve_in_workspace / is_within_workspace，边界完全不动（N6③）。
 """
 
 from pathlib import Path
+
+# 额外只读根目录白名单：仅 read 类判定查询。启动时由协调层注册
+# （当前只注册用户级 memory 目录），运行期不再变动。
+_EXTRA_READ_ROOTS: list[Path] = []
 
 
 class PathGuardError(ValueError):
@@ -44,6 +53,77 @@ def resolve_in_workspace(path: str) -> Path:
     except ValueError as exc:
         raise PathGuardError(f"路径超出项目工作目录: {raw}") from exc
     return resolved
+
+
+def register_read_root(path: Path) -> None:
+    """
+    注册一个额外只读根目录（c9）。
+
+    幂等：重复注册同一目录忽略。解析失败（如目录所在盘符异常）静默跳过——
+    白名单是增强项，注册失败最坏是「模型读不了用户级笔记全文」，不该阻断启动。
+
+    :param path: 要放行只读访问的目录（如 ~/.rhinecode/memory）
+
+    副作用：向模块级白名单追加一项。
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return
+    if resolved not in _EXTRA_READ_ROOTS:
+        _EXTRA_READ_ROOTS.append(resolved)
+
+
+def clear_read_roots() -> None:
+    """清空只读白名单（仅测试用，避免用例间互相污染）。"""
+    _EXTRA_READ_ROOTS.clear()
+
+
+def resolve_readable(path: str) -> Path:
+    """
+    「读」类路径解析：工作区内 **或** 只读白名单内均放行（c9 F18）。
+
+    执行流程：
+    1. 先按原有规则尝试 resolve_in_workspace（覆盖绝大多数正常读取）；
+    2. 越界时走白名单分支：仍拒绝显式 `..`（防「先跳出再解析回来」绕过审计）、
+       仅接受绝对路径（相对路径的基准永远是工作区，落到白名单只能靠绝对路径——
+       记忆索引里给模型的正是绝对目录）；resolve 后位于任一白名单根内才放行；
+    3. 两条路都不通 → 重抛工作区越界错误（对模型的报错口径与原来一致）。
+
+    :param path: 待解析的文件路径
+    :returns: 解析后的绝对路径
+    :raises PathGuardError: 既不在工作区内、也不在任何只读白名单根内
+    """
+    raw = str(path)
+    try:
+        return resolve_in_workspace(raw)
+    except PathGuardError as workspace_error:
+        candidate = Path(raw)
+        _ensure_no_parent_ref(candidate, raw)
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+            for root in _EXTRA_READ_ROOTS:
+                try:
+                    resolved.relative_to(root)
+                    return resolved
+                except ValueError:
+                    continue
+        raise workspace_error
+
+
+def is_readable_path(path: str) -> bool:
+    """
+    resolve_readable 的布尔版（供权限引擎②沙箱层的 read 类判定使用，c9）。
+
+    与 is_within_workspace 同样的 fail-safe 语义：任何异常都按越界处理（False）。
+    """
+    try:
+        resolve_readable(path)
+        return True
+    except PathGuardError:
+        return False
+    except Exception:
+        return False
 
 
 def is_within_workspace(path: str) -> bool:

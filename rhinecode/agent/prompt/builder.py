@@ -87,15 +87,30 @@ class SystemPromptBuilder:
         )
 
 
-def build_default_prompt(env: EnvironmentInfo) -> AssembledPrompt:
+def build_default_prompt(
+    env: EnvironmentInfo,
+    custom_instructions: str = "",
+    memory_index: str = "",
+) -> AssembledPrompt:
     """
-    构造 RhineCode 默认系统提示：7 固定模块 + 环境信息 + 3 可选空槽。
+    构造 RhineCode 默认系统提示：7 固定模块 + 环境信息 + 可选槽位（c5 预留、c9 填充）。
 
     这是上层（ConversationManager）每次运行调用的便捷入口。环境信息被包装成一个
     priority=100、cacheable=False 的模块，因此它排在 7 个固定模块之后、走动态通道（F2/F5）。
 
+    c9 起两个预留槽位有了真实内容：
+    - custom_instructions（「自定义指令」，priority 110）：三层 RHINE.md 拼接结果；
+    - memory_index（「长期记忆」，priority 130）：两级记忆索引。
+    两者都以 **cacheable=True** 进稳定通道，覆盖 c5 空槽的 False 预设——动态通道的
+    内容每轮作为不缓存的尾巴重发，RHINE.md 可达数百行、索引最大 25KB，每轮重发太贵；
+    而这两块在会话内基本稳定（RHINE.md 启动加载后不变、索引仅笔记更新后变化），
+    进 stable 尾部可被 DeepSeek 前缀缓存命中，索引变化也只失效它自己那段尾部缓存
+    （c9 plan 技术决策）。传空串时槽位照旧整体跳过，输出与 c8 完全一致。
+
     :param env: 已采集的环境信息，其 render() 作为环境模块的内容
-    :returns: AssembledPrompt(stable=7 固定模块, dynamic=环境信息)；c5 中可选空槽无内容被跳过
+    :param custom_instructions: 「自定义指令」槽位内容（c9：RHINE.md 拼接结果），空串跳过
+    :param memory_index: 「长期记忆」槽位内容（c9：记忆索引），空串跳过
+    :returns: AssembledPrompt(stable=固定模块+两个记忆槽位, dynamic=环境信息)
 
     副作用：无。
     """
@@ -105,6 +120,16 @@ def build_default_prompt(env: EnvironmentInfo) -> AssembledPrompt:
     builder.add(
         PromptModule(name="环境信息", priority=100, cacheable=False, content=env.render())
     )
+    # c9 实际填充的两个槽位（优先级沿用 c5 预留值：110 自定义指令 / 130 长期记忆）。
+    builder.add(
+        PromptModule(name="自定义指令", priority=110, cacheable=True, content=custom_instructions)
+    )
+    builder.add(
+        PromptModule(name="长期记忆", priority=130, cacheable=True, content=memory_index)
+    )
+    # 其余仍为空的预留槽（「已激活 Skill」等）：跳过 c9 已实际填充的两个，避免重复。
     for slot in optional_slots():
+        if slot.name in ("自定义指令", "长期记忆"):
+            continue
         builder.add(slot)
     return builder.build()

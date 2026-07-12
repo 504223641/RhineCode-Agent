@@ -20,6 +20,7 @@ from rhinecode.agent.prompt.texts.tone import TONE
 from rhinecode.agent.prompt.texts.text_output import TEXT_OUTPUT
 from rhinecode.agent.prompt.texts.plan import PLAN_FULL, PLAN_BRIEF
 from rhinecode.agent.prompt.texts.environment import ENVIRONMENT_TEMPLATE
+from rhinecode.agent.prompt.texts.init import INIT_PROMPT
 
 __all__ = [
     "IDENTITY",
@@ -32,4 +33,5 @@ __all__ = [
     "PLAN_FULL",
     "PLAN_BRIEF",
     "ENVIRONMENT_TEMPLATE",
+    "INIT_PROMPT",
 ]
