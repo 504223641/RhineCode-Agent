@@ -12,5 +12,6 @@ MemoryManager 在上、通过少量单点接入挂进现有流程：
 - manager.py       MemoryManager：唯一持 provider 引用与副作用编排
 """
 
-# MemoryManager 在 T10（manager.py）完成后导出；开发期间先保持包可导入。
-__all__: list[str] = []
+from rhinecode.memory.manager import MemoryManager
+
+__all__ = ["MemoryManager"]
