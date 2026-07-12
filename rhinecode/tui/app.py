@@ -138,8 +138,29 @@ class RhineApp(App):
         self._manager.confirm_callback = self._confirm_tool
         self._manager.clarify_callback = self._clarify
         self._manager.approve_plan_callback = self._approve_plan
+
+        # 记忆系统接线（c9）：
+        # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
+        # 2. 笔记通知回调：笔记线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；
+        # 3. 会话锁心跳：每 2 分钟 touch 一次，保证「进程活着锁就新鲜」（过期阈值 10 分钟）。
+        if self._manager.startup_notice:
+            self.query_one(HistoryView).append_system(self._manager.startup_notice)
+        self._manager.memory_manager.notify = self._notify_memory
+        self.set_interval(120, self._manager.memory_manager.touch_session_lock)
+
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
+
+    def _notify_memory(self, text: str) -> None:
+        """
+        笔记更新的低打扰通知（c9 F20）。运行在笔记 daemon 线程，
+        用 call_from_thread 把渲染调度回主线程（Textual 线程安全要求）。
+        """
+        try:
+            self.call_from_thread(self.query_one(HistoryView).append_system, text)
+        except Exception:
+            # 应用正在退出等边缘情况：通知丢弃即可，不影响任何状态。
+            pass
 
     def _refresh_status(self) -> None:
         """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式、权限模式、上下文用量。"""

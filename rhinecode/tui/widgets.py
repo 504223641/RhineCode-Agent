@@ -414,6 +414,9 @@ class CommandPanel(OptionList):
         ("/mcp",   "查看 MCP 服务连接状态（Server / 工具 / 失败原因）"),
         ("/context", "查看当前上下文用量（估算 token / 余量 / 已存盘数）"),
         ("/compact", "压缩上下文：LLM 摘要早前对话，保留近期原文"),
+        ("/resume", "恢复历史会话：无参列出最近会话，带编号/ID 载入"),
+        ("/memory", "查看记忆系统状态（RHINE.md / 笔记 / 会话存档 / 锁）"),
+        ("/init",  "分析项目并生成 RHINE.md 项目指令文件（DeepSeek 工具模式）"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]

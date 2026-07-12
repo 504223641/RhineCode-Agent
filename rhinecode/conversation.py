@@ -18,17 +18,20 @@ TUI 层调用 handle_input() 获取结果，结果类型决定后续行为：
 """
 
 import threading
+from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
-from rhinecode.tools.path_guard import workspace_root
+from rhinecode.tools.path_guard import workspace_root, register_read_root
 from rhinecode.mcp.manager import MCPManager
 from rhinecode.context import ContextManager
+from rhinecode.memory import MemoryManager
 from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
+from rhinecode.agent.prompt.texts import INIT_PROMPT
 from rhinecode.agent.events import (
     AgentEvent,
     AgentEventType,
@@ -87,6 +90,7 @@ class ConversationManager:
         config: Config,
         registry: Optional[ToolRegistry] = None,
         mcp_manager: "Optional[MCPManager]" = None,
+        resume_latest: bool = False,
     ):
         """
         初始化对话管理器。
@@ -97,6 +101,7 @@ class ConversationManager:
         :param registry: 工具注册中心；为 None 时不启用工具能力
         :param mcp_manager: MCP 连接管理器（c7）；为 None 时 /mcp 命令与状态栏 MCP 段不展示。
                             仅用于状态查询，工具已在启动时注册进 registry，不经此引用调用。
+        :param resume_latest: True = `rhine --continue`：启动时恢复最近的未锁定会话（c9 F10）
         """
         self._provider = provider
         self._config = config
@@ -139,6 +144,25 @@ class ConversationManager:
                 config.context_window,
                 workspace_root() / ".rhinecode" / "context",
             )
+
+        # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
+        # 工具能力；自动笔记由 notes_enabled 门控（仅工具模式，F21）。
+        user_dir = Path.home() / ".rhinecode"
+        self.memory_manager = MemoryManager(
+            provider,
+            config.model,
+            workspace_root(),
+            user_dir,
+            notes_enabled=self._tools_enabled,
+        )
+        # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。
+        # 注册本身无副作用（写类判定不受影响），无条件执行即可。
+        register_read_root(user_dir / "memory")
+        # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
+        # 返回的提示由 TUI 挂载时展示（无提示为 None）。
+        self.startup_notice: Optional[str] = self.memory_manager.startup(
+            resume_latest, self.history
+        )
 
     def _install_path_filters(self, registry: ToolRegistry) -> None:
         """
@@ -185,10 +209,13 @@ class ConversationManager:
         副作用：self.history 被重置为空列表，下次请求将不携带任何上下文；
         同时重置上下文压缩器的会话级状态（估算锚点、熔断计数、已存盘幂等集合，c8 F15）——
         历史清空后旧锚点与熔断态都不再适用，必须一并归零。
+        c9：会话存档随之「开新档」——旧存档保留不动、后续消息写入新文件（F8），
+        笔记高水位一并归零。
         """
         self.history = []
         if self._context_manager is not None:
             self._context_manager.reset()
+        self.memory_manager.on_clear()
 
     def request_cancel(self) -> None:
         """
@@ -209,7 +236,10 @@ class ConversationManager:
         - "/think" → 三态循环切换 thinking_effort（off→high→max→off）；不支持的 Provider 返回提示
         - "/plan"  → 切换 Plan Mode；仅工具可用 Provider 生效，否则返回不支持提示
         - "/perm"  → 三档循环切换权限模式（默认→严格→放行）；仅工具可用 Provider 生效（c6）
-        - 其他     → 追加用户消息到 history，委托 Agent 跑循环，返回事件流
+        - "/memory" → 记忆系统只读报告（c9）
+        - "/resume" → 无参列出最近会话；带编号/ID 返回载入事件流（c9）
+        - "/init"  → 内置指令走 Agent Loop 生成 RHINE.md；仅工具可用 Provider 生效（c9）
+        - 其他     → 追加用户消息到 history（并写入会话存档），委托 Agent 跑循环，返回事件流
 
         :param text: 用户原始输入（含前后空白）
         :returns: str（斜杠命令反馈）或 Iterator[AgentEvent]（循环事件流）
@@ -274,8 +304,32 @@ class ConversationManager:
                 return "当前 Provider 不支持上下文管理"
             return self._manual_compact()
 
-        # 普通消息：先追加到历史，再委托 Agent 跑循环
-        self.history.append(Message(role="user", content=text))
+        if text == "/memory":
+            # 记忆系统只读报告（c9 F19）：纯读不改状态，同步返回即可。
+            return self.memory_manager.memory_report()
+
+        if text == "/resume" or text.startswith("/resume "):
+            # 会话恢复（c9 F9）。无参 → 同步返回列表；带参 → 事件流走 Worker——
+            # 载入后可能触发 C8 压缩（阻塞的摘要 LLM 调用），不能卡 UI 主线程。
+            key = text[len("/resume"):].strip()
+            if not key:
+                return self.memory_manager.resume_list()
+            return self._resume_stream(key)
+
+        if text == "/init":
+            # /init（c9 F25）：把内置指令作为一条普通 user 消息交给 Agent Loop——
+            # 探索用只读工具、写 RHINE.md 走 write_file 的完整权限管线（人在回路确认）。
+            if not self._tools_enabled:
+                return "当前 Provider 不支持 /init（需要 DeepSeek 工具模式）"
+            init_msg = Message(role="user", content=INIT_PROMPT)
+            self.history.append(init_msg)
+            self.memory_manager.record_message(init_msg)
+            return self._run()
+
+        # 普通消息：先追加到历史（并写入会话存档，c9 F6），再委托 Agent 跑循环
+        user_msg = Message(role="user", content=text)
+        self.history.append(user_msg)
+        self.memory_manager.record_message(user_msg)
         return self._run()
 
     def _manual_compact(self) -> Iterator[AgentEvent]:
@@ -292,6 +346,29 @@ class ConversationManager:
         """
         notice = self._context_manager.manual_compact(self.history)
         yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
+        yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
+
+    def _resume_stream(self, key: str) -> Iterator[AgentEvent]:
+        """
+        /resume <编号或ID> 的事件流：在后台 Worker 里接管并载入目标会话（c9 F9/F11）。
+
+        步骤：
+        1. memory_manager.resume_into：锁检查 → 接管 → 容错载入 → 原地替换 history；
+        2. 成功且有上下文压缩器时：先 reset()（旧估算锚点对应旧历史，换历史不复位会
+           严重低估用量，c9 plan 技术决策），再跑一次 before_request——载入的历史若已
+           逼近窗口上限就地压一次（F11③），不逼近则无动作；
+        3. 结果以 NOTICE 反馈，FINISHED(COMPLETED) 收尾。
+
+        :returns: 事件流（NOTICE 若干 + FINISHED）
+
+        副作用：可能切换会话锁、改写 self.history、发起摘要 LLM 调用。
+        """
+        ok, message = self.memory_manager.resume_into(key, self.history)
+        if ok and self._context_manager is not None:
+            self._context_manager.reset()
+            for notice in self._context_manager.before_request(self.history):
+                yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
+        yield AgentEvent(type=AgentEventType.NOTICE, message=message)
         yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
 
     def mcp_status_line(self) -> "str | None":
@@ -345,7 +422,20 @@ class ConversationManager:
         # Plan Mode 的引导不再在此构造，改由循环按轮节奏注入（见 loop.run / reminders）。
         project_root = str(workspace_root())
         env = collect_environment(self._config, project_root)
-        assembled = build_default_prompt(env)
+        # c9：把 RHINE.md 拼接结果与记忆索引填进 110/130 槽位（两者都可能为空串，
+        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，笔记线程会话中途
+        # 更新后，下一条消息就能看到新索引。
+        assembled = build_default_prompt(
+            env,
+            custom_instructions=self.memory_manager.custom_instructions(),
+            memory_index=self.memory_manager.memory_index(),
+        )
+        # 一次性动态提醒（c9：恢复会话的时间跨度提醒）：并入本次 dynamic，取走即清，
+        # 不进持久历史、不被存档（它是「此刻的环境事实」）。
+        dynamic = assembled.dynamic
+        pending = self.memory_manager.consume_pending_notice()
+        if pending:
+            dynamic = f"{dynamic}\n\n{pending}" if dynamic else pending
         # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
         debug_log_path = (
             str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
@@ -389,12 +479,12 @@ class ConversationManager:
                 return True
             return False
 
-        return self._agent.run(
+        events = self._agent.run(
             self.history,
             self.thinking_effort,
             self.plan_mode,
             assembled.stable,
-            assembled.dynamic,
+            dynamic,
             self._config.model,
             debug_log_path,
             self._engine,
@@ -403,4 +493,26 @@ class ConversationManager:
             self.approve_plan_callback,
             self._cancel_event,
             self._context_manager,
+            self.memory_manager.record_message,
         )
+        return self._wrap_events(events)
+
+    def _wrap_events(self, events: Iterator[AgentEvent]) -> Iterator[AgentEvent]:
+        """
+        Agent 事件流的包装生成器（c9 自然停止钩子，单点接入）。
+
+        逐个透传事件；看到 FINISHED 且停止原因为 COMPLETED（自然完成）时，先触发
+        MemoryManager 的异步笔记更新再透传——钩子只是「起一个 daemon 线程」，
+        本身不阻塞事件流。其它停止原因（取消/出错/迭代上限）不触发笔记：
+        非自然结束的对话大概率不完整，不值得沉淀。
+
+        :param events: Agent 产出的原始事件流
+        :returns: 语义完全相同的事件流（仅多了钩子副作用）
+        """
+        for event in events:
+            if (
+                event.type == AgentEventType.FINISHED
+                and event.stop_reason == StopReason.COMPLETED
+            ):
+                self.memory_manager.on_natural_stop(self.history)
+            yield event
