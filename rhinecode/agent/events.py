@@ -35,6 +35,7 @@ class AgentEventType(str, Enum):
     PROGRESS = "progress"    # 进入新一轮迭代
     FINISHED = "finished"    # 循环结束（携带结束原因）
     ERROR = "error"          # 发生错误（携带可读描述）
+    NOTICE = "notice"        # 系统级提示（c8：上下文压缩发生等），载荷在 message
 
 
 class StopReason(str, Enum):
@@ -127,6 +128,7 @@ class AgentEvent:
     - PROGRESS：iteration 为当前迭代序号（从 1 开始）
     - FINISHED：stop_reason 为结束原因，message 为可选补充说明
     - ERROR：message 为可读错误描述
+    - NOTICE：message 为系统级提示文本（如「已摘要早前 N 条消息」），仅展示、不参与决策
 
     :param type: 事件类型
     :param text: TEXT/THINKING 的增量文本

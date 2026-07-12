@@ -26,9 +26,16 @@ from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.tools.path_guard import workspace_root
 from rhinecode.mcp.manager import MCPManager
+from rhinecode.context import ContextManager
 from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
-from rhinecode.agent.events import AgentEvent, ClarifyOption, ConfirmDecision
+from rhinecode.agent.events import (
+    AgentEvent,
+    AgentEventType,
+    ClarifyOption,
+    ConfirmDecision,
+    StopReason,
+)
 from rhinecode.permission import (
     Decision,
     DecisionResult,
@@ -121,6 +128,18 @@ class ConversationManager:
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
         self._agent = Agent(provider, registry)
 
+        # 上下文压缩器（c8）：仅在工具可用模式构造——压缩的主要对象是工具结果，
+        # 且循环/工具只在该模式存在。长期持有，跨消息累积估算锚点与熔断状态。
+        # 存盘目录锁定在项目根 .rhinecode/context/（与其它 .rhinecode 配置同处，可 gitignore）。
+        self._context_manager: Optional[ContextManager] = None
+        if self._tools_enabled:
+            self._context_manager = ContextManager(
+                provider,
+                config.model,
+                config.context_window,
+                workspace_root() / ".rhinecode" / "context",
+            )
+
     def _install_path_filters(self, registry: ToolRegistry) -> None:
         """
         给会递归发现文件的只读工具注入文件级权限过滤器。
@@ -163,9 +182,13 @@ class ConversationManager:
         """
         清空对话历史。
 
-        副作用：self.history 被重置为空列表，下次请求将不携带任何上下文。
+        副作用：self.history 被重置为空列表，下次请求将不携带任何上下文；
+        同时重置上下文压缩器的会话级状态（估算锚点、熔断计数、已存盘幂等集合，c8 F15）——
+        历史清空后旧锚点与熔断态都不再适用，必须一并归零。
         """
         self.history = []
+        if self._context_manager is not None:
+            self._context_manager.reset()
 
     def request_cancel(self) -> None:
         """
@@ -237,9 +260,39 @@ class ConversationManager:
                 return "未启用 MCP（未配置任何 MCP Server）"
             return self._mcp_manager.status_report()
 
+        if text == "/context":
+            # 只读展示当前上下文用量（c8 F16）；纯读、不改状态，同步返回字符串即可
+            # （不涉及阻塞的 LLM 调用，故不必走 Worker）。
+            if not self._tools_enabled or self._context_manager is None:
+                return "当前 Provider 不支持上下文管理"
+            return self._context_manager.usage_report(self.history)
+
+        if text == "/compact":
+            # 手动触发重量压缩（c8 F14）。摘要是阻塞的 LLM 调用，若在此同步执行会卡死 UI 线程，
+            # 故返回事件流生成器交给 TUI 的后台 Worker 消费（与普通消息同一执行路径）。
+            if not self._tools_enabled or self._context_manager is None:
+                return "当前 Provider 不支持上下文管理"
+            return self._manual_compact()
+
         # 普通消息：先追加到历史，再委托 Agent 跑循环
         self.history.append(Message(role="user", content=text))
         return self._run()
+
+    def _manual_compact(self) -> Iterator[AgentEvent]:
+        """
+        /compact 的事件流：在后台 Worker 里执行一次手动压缩并反馈结果（c8 F14/F17）。
+
+        与普通消息不同，这里**不**向 history 追加任何 user 消息——/compact 是命令而非对话；
+        只调 ContextManager.manual_compact（可能原地重构 history），把结果作为 NOTICE 展示，
+        再产出一个 FINISHED(COMPLETED) 让 TUI 收尾（自然完成，不额外打扰）。
+
+        :returns: 仅含一条 NOTICE 与一条 FINISHED 的事件流
+
+        副作用：可能发起摘要 LLM 调用并原地重构 self.history。
+        """
+        notice = self._context_manager.manual_compact(self.history)
+        yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
+        yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
 
     def mcp_status_line(self) -> "str | None":
         """
@@ -253,6 +306,20 @@ class ConversationManager:
         if self._mcp_manager is None:
             return None
         return self._mcp_manager.status_line()
+
+    def context_status_line(self) -> "tuple[str, bool] | None":
+        """
+        返回底部状态栏用的上下文用量摘要（c8）。
+
+        :returns: (文本, 是否高亮) 如 ("上下文：19% · 12.3K/64K", False)；
+                  工具不可用的 Provider（无 ContextManager）返回 None，此时状态栏
+                  不展示该段，语义与 mcp_status_line 的「None 即隐藏」一致。
+
+        副作用：无（仅只读估算当前历史用量）。
+        """
+        if self._context_manager is None:
+            return None
+        return self._context_manager.status_line(self.history)
 
     def _run(self) -> Iterator[AgentEvent]:
         """
@@ -335,4 +402,5 @@ class ConversationManager:
             self.clarify_callback,
             self.approve_plan_callback,
             self._cancel_event,
+            self._context_manager,
         )

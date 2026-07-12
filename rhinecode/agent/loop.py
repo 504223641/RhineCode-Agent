@@ -22,7 +22,11 @@ Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_ph
 
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
+
+if TYPE_CHECKING:
+    # 仅类型检查期导入，运行期用字符串注解——避免与 context 层产生任何潜在导入顺序问题。
+    from rhinecode.context import ContextManager
 
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
@@ -137,6 +141,7 @@ class Agent:
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
+        context_manager: "Optional[ContextManager]" = None,
     ) -> Iterator[AgentEvent]:
         """
         跑一次完整的 ReAct 循环，逐个产出 AgentEvent。
@@ -153,6 +158,9 @@ class Agent:
         :param clarify: 需求澄清回调（ask_user 用），可为 None
         :param approve_plan: 计划审批回调（present_plan 用），可为 None
         :param cancel_event: 取消信号；循环在安全点轮询，置位即尽快停止
+        :param context_manager: 上下文压缩器（c8）；为 None（非 DeepSeek 工具模式）时不压缩，
+                                行为与 c8 之前完全一致。非 None 时每轮请求前跑两层压缩、
+                                每轮拿到 usage 后更新估算锚点。
         :returns: AgentEvent 迭代器；末尾必为一个 FINISHED 事件
 
         副作用：向 history 追加消息；通过 provider 发起多次网络请求；通过回调与用户交互；
@@ -169,6 +177,14 @@ class Agent:
 
             yield AgentEvent(type=AgentEventType.PROGRESS, iteration=iteration)
 
+            # 上下文压缩（c8 F3）：每次 API 请求前先跑两层压缩（先第一层存盘、再按需第二层摘要），
+            # 把可能过长的历史压回 token 预算内。压缩可能原地修改 history（改写工具结果 / 重构列表）。
+            # 每条压缩动作都以 NOTICE 事件反馈给 TUI（F17）。context_manager 为 None 时整段跳过，
+            # 保持 c8 之前的行为不变（N1 低侵入）。
+            if context_manager is not None:
+                for notice in context_manager.before_request(history):
+                    yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
+
             tools = self._schema_for(plan_mode, execution_phase)
 
             # 组装请求消息（c5 分通道）：
@@ -181,6 +197,10 @@ class Agent:
                 iteration, active=plan_mode and not execution_phase
             )
             reminder = build_system_reminder(dynamic, toggle)
+            # 记录本轮「纯历史消息条数」作为估算锚点长度（c8）：必须在 append reminder 之前、
+            # 用 history 的长度而非 req_messages——reminder 是每轮临时拼的尾巴，不属于持久历史，
+            # 而估算锚点覆盖的正是 usage 对应的这段纯历史。
+            sent_len = len(history)
             req_messages: list[Message] = list(history)
             if reminder:
                 req_messages.append(Message(role="system", content=reminder))
@@ -202,6 +222,11 @@ class Agent:
             # 即使随后判定流出错也照常记录——usage 可能已先于错误到达，记录它有助于排查。
             if debug_log_path and collector.usage is not None:
                 log_cache_usage(collector.usage, model, debug_log_path)
+
+            # 更新估算锚点（c8）：本轮 usage.prompt_tokens 是 API 亲口给出的精确输入 token 数，
+            # 覆盖 sent_len 条纯历史消息；后续请求只需对锚点之后的新增消息做字符估算。
+            if context_manager is not None and collector.usage is not None:
+                context_manager.record_usage(collector.usage, sent_len)
 
             # 停止条件：流出错
             if stream_error is not None:

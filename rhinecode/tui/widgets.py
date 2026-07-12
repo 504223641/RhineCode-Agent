@@ -412,6 +412,8 @@ class CommandPanel(OptionList):
         ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
         ("/perm",  "循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）"),
         ("/mcp",   "查看 MCP 服务连接状态（Server / 工具 / 失败原因）"),
+        ("/context", "查看当前上下文用量（估算 token / 余量 / 已存盘数）"),
+        ("/compact", "压缩上下文：LLM 摘要早前对话，保留近期原文"),
         ("/clear", "清空当前对话历史"),
         ("/exit",  "退出 RhineCode"),
     ]
@@ -479,8 +481,9 @@ class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | 权限模式：X
-    /think、/plan、/perm 命令执行后，App 层会调用 update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | 权限模式：X | MCP：… | 上下文：19% · 12.3K/64K
+    /think、/plan、/perm、/clear 命令执行后（以及每轮流式结束时），App 层会调用
+    update_status() 刷新显示。
     """
 
     def update_status(
@@ -491,6 +494,8 @@ class StatusBar(Static):
         plan_mode: bool = False,
         permission_mode: "str | None" = None,
         mcp_status: "str | None" = None,
+        context_status: "str | None" = None,
+        context_warn: bool = False,
     ) -> None:
         """
         刷新状态栏显示内容。
@@ -504,6 +509,9 @@ class StatusBar(Static):
                                 放行档以橘色高亮，提醒用户当前处于「灰色地带默认放行」的状态。
         :param mcp_status: MCP 连接状态摘要（如「MCP：已连接 2/3 · 工具 11」）；c7 新增。
                            为 None（未启用 MCP / 无 Server）时不展示该段。
+        :param context_status: 上下文用量摘要（如「上下文：19% · 12.3K/64K」）；c8 新增。
+                               为 None（工具不可用的 Provider / 无 ContextManager）时不展示该段。
+        :param context_warn: 上下文是否接近上限或已熔断；为真时该段橘色高亮预警。
         """
         _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
         state = _LABEL.get(thinking_effort, thinking_effort)
@@ -526,6 +534,14 @@ class StatusBar(Static):
         # MCP 段（c7）：仅在启用且有 Server 时展示；文本可能含字面 `[`，统一 escape 兜底。
         if mcp_status is not None:
             text += f" | {escape(str(mcp_status))}"
+        # 上下文段（c8）：仅在有 ContextManager 时展示。接近上限/熔断时橘色高亮——
+        # 与 permissive、确认面板同色，语义都是「需要用户留意」。注意先 escape 文本再包裹
+        # 颜色标签（颜色标签本身不能被转义，否则会被当字面量显示）。
+        if context_status is not None:
+            seg = escape(str(context_status))
+            if context_warn:
+                seg = f"[#FFA500]{seg}[/#FFA500]"
+            text += f" | {seg}"
         self.update(text + " ")
 
 

@@ -142,7 +142,10 @@ class RhineApp(App):
         self.query_one(InputBar).focus()
 
     def _refresh_status(self) -> None:
-        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式、权限模式。"""
+        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式、权限模式、上下文用量。"""
+        # 上下文用量（c8）：随对话增长实时变化，故每次刷新都重新取值；
+        # 返回 (文本, 是否高亮) 或 None（工具不可用的 Provider）。
+        ctx = self._manager.context_status_line()
         self.query_one(StatusBar).update_status(
             self._config.protocol,
             self._config.model,
@@ -151,6 +154,8 @@ class RhineApp(App):
             self._manager.permission_mode_value,
             # MCP 连接状态（c7）：启动后不变，随每次刷新一并带上即可。
             self._manager.mcp_status_line(),
+            context_status=ctx[0] if ctx else None,
+            context_warn=bool(ctx and ctx[1]),
         )
 
     # ------------------------------------------------------------------ #
@@ -240,8 +245,9 @@ class RhineApp(App):
             if text == "/clear":
                 history_view.clear_all()
             history_view.append_system(result)
-            # /think、/plan、/perm 改变了状态栏展示的状态，需要同步刷新状态栏
-            if text in ("/think", "/plan", "/perm"):
+            # /think、/plan、/perm 改变了状态栏展示的状态，需要同步刷新状态栏；
+            # /clear 会重置上下文用量（ctx.reset() 后估算归零），也要立即反映到状态栏。
+            if text in ("/think", "/plan", "/perm", "/clear"):
                 self._refresh_status()
         else:
             # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history。
@@ -371,6 +377,10 @@ class RhineApp(App):
 
                 elif etype == AgentEventType.ERROR:
                     self.call_from_thread(history_view.append_error, event.message)
+
+                elif etype == AgentEventType.NOTICE:
+                    # 系统级提示（c8：上下文压缩发生等），以系统行展示，不影响正文/工具渲染。
+                    self.call_from_thread(history_view.append_system, event.message)
         finally:
             self.call_from_thread(self._set_streaming, False)
             # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；

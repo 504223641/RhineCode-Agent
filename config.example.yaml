@@ -21,3 +21,7 @@ protocol: deepseek
 model: deepseek-chat
 base_url: https://api.deepseek.com
 api_key: YOUR_API_KEY
+
+# 可选：上下文窗口上限（token），c8 两层压缩据此判断历史是否逼近溢出。
+# 缺省 65536；不同模型/账号窗口不同，可按需调整。非法或 <=0 会回退默认值。
+# context_window: 65536
