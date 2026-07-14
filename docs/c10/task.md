@@ -864,7 +864,7 @@
 2. 将 `build_builtin_registry` 替换为抛 `CommandRegistrationError` 的假实现。
 3. 断言入口以退出码 1 结束并输出冲突标识。
 4. 断言冲突时 `create_provider` 未调用。
-5. 断言冲突时 ToolRegistry、MCPManager、MCP 子进程和会话锁均未创建。
+5. 断言冲突时 ToolRegistry、MCPManager、MCP 子进程、会话锁和 RhineApp 均未创建。
 
 **验证：** 运行 `python -m unittest tests.test_command_startup`，期望全部通过。
 

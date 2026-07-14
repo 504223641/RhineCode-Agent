@@ -201,13 +201,13 @@ class CompletionItem:
     is_alias: bool
 ```
 
-别名作为独立候选出现，并明确标注其规范命令。例如输入 `/c` 时可看到：
+别名作为独立候选出现，并明确标注其规范命令。例如输入 `/c` 时可看到（按注册顺序，见第 7 节登记表）：
 
-- `/clear` — 清空当前对话
-- `/compact` — 手动压缩上下文
 - `/context` — 查看上下文用量
-- `/continue` — `/resume` 的别名
 - `/ctx` — `/context` 的别名
+- `/compact` — 手动压缩上下文
+- `/continue` — `/resume` 的别名
+- `/clear` — 清空当前对话
 
 候选顺序稳定：按命令注册顺序排列；每条命令先规范名、后按声明顺序排列别名。
 
@@ -494,10 +494,10 @@ tools_enabled() -> bool
 @dataclass
 class Message:
     role: str
-    content: str
-    tool_calls: list[dict] | None = None
-    tool_call_id: str | None = None
-    display_content: str | None = None
+    content: str = ""
+    tool_calls: Optional[list[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+    display_content: Optional[str] = None
 ```
 
 语义：
