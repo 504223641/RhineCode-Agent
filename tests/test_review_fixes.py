@@ -262,7 +262,7 @@ class PermanentAllowFallbackTests(TempWorkspaceTest):
         manager = manager_with_tool(ToolCallingProvider(), tool)
         manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW_PERMANENT
 
-        list(manager.handle_input("run it"))
+        list(manager.submit_user_message("run it"))
 
         self.assertTrue(tool.executed)
         self.assertEqual(local_path.read_text(encoding="utf-8"), broken)
@@ -272,8 +272,10 @@ class PermanentAllowFallbackTests(TempWorkspaceTest):
 
 class ConversationManagerTests(unittest.TestCase):
     """
-    c4：handle_input 现在返回 AgentEvent 事件流（不再是 StreamChunk）。
+    c4：Agent 运行返回 AgentEvent 事件流（不再是 StreamChunk）。
     AgentEventType 继承 str，故 `event.type == "tool_result"` 等字符串比较仍成立。
+    c10：普通消息入口由 handle_input 改为 submit_user_message（命令解析已迁出到
+    commands 层，本文件只保留领域行为回归；命令分发测试见 test_command_*.py）。
     """
 
     def test_side_effect_tool_without_confirm_callback_is_rejected(self) -> None:
@@ -281,7 +283,7 @@ class ConversationManagerTests(unittest.TestCase):
         tool = RecordingTool()
         manager = manager_with_tool(ToolCallingProvider(), tool)
 
-        events = list(manager.handle_input("run it"))
+        events = list(manager.submit_user_message("run it"))
 
         self.assertFalse(tool.executed)
         results = [e for e in events if e.type == "tool_result"]
@@ -293,13 +295,13 @@ class ConversationManagerTests(unittest.TestCase):
         denied_tool = RecordingTool()
         denied_manager = manager_with_tool(ToolCallingProvider(), denied_tool)
         denied_manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.DENY
-        list(denied_manager.handle_input("run it"))
+        list(denied_manager.submit_user_message("run it"))
         self.assertFalse(denied_tool.executed)
 
         approved_tool = RecordingTool()
         approved_manager = manager_with_tool(ToolCallingProvider(), approved_tool)
         approved_manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW
-        list(approved_manager.handle_input("run it"))
+        list(approved_manager.submit_user_message("run it"))
         self.assertTrue(approved_tool.executed)
 
     def test_session_allow_registers_session_rule(self) -> None:
@@ -313,7 +315,7 @@ class ConversationManagerTests(unittest.TestCase):
             return ConfirmDecision.ALLOW_SESSION
 
         manager.confirm_callback = cb
-        list(manager.handle_input("run it"))
+        list(manager.submit_user_message("run it"))
         self.assertTrue(tool.executed)
         self.assertEqual(calls["n"], 1)
         # 会话级规则已登记：工具名 danger（未映射 → rule_name 取工具自身名），来源 session
@@ -329,7 +331,7 @@ class ConversationManagerTests(unittest.TestCase):
         manager.plan_mode = True
         manager.approve_plan_callback = lambda _plan: False
 
-        events = list(manager.handle_input("make a plan"))
+        events = list(manager.submit_user_message("make a plan"))
 
         self.assertIn(plan, [e.text for e in events if e.type == "text"])
         self.assertEqual(provider.calls, 1)
@@ -344,7 +346,7 @@ class ConversationManagerTests(unittest.TestCase):
         manager.plan_mode = True
         manager.approve_plan_callback = lambda _plan: False
 
-        events = list(manager.handle_input("make a plan"))
+        events = list(manager.submit_user_message("make a plan"))
 
         self.assertEqual(provider.calls, 1)
         self.assertFalse(tool.executed)
@@ -364,7 +366,7 @@ class ConversationManagerTests(unittest.TestCase):
 
         manager.confirm_callback = deny
 
-        events = list(manager.handle_input("make a plan"))
+        events = list(manager.submit_user_message("make a plan"))
 
         self.assertEqual(confirm_calls["n"], 1)
         self.assertFalse(tool.executed)
@@ -381,7 +383,7 @@ class ConversationManagerTests(unittest.TestCase):
         manager = manager_with_tool(ToolCallingProvider(second_error=True), tool)
         manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW
 
-        events = list(manager.handle_input("run it"))
+        events = list(manager.submit_user_message("run it"))
         types = [e.type for e in events]
 
         self.assertIn("error", types)
@@ -419,3 +421,127 @@ class ConfigLoadTests(unittest.TestCase):
     def test_missing_required_field_is_value_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "api_key"):
             load(self.write_config("protocol: deepseek\nmodel: x\nbase_url: https://example.test\n"))
+
+
+class DisplayContentPassthroughTests(unittest.TestCase):
+    """c10 T34：submit_user_message 的 display_content 透传——模型内容与显示内容分离。"""
+
+    def test_display_content_stored_in_history(self) -> None:
+        tool = RecordingTool()
+        manager = manager_with_tool(ToolCallingProvider(), tool)
+        manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW
+
+        list(manager.submit_user_message("完整展开的提示词", display_content="/init"))
+
+        user_msgs = [m for m in manager.history if m.role == "user"]
+        self.assertEqual(user_msgs[0].content, "完整展开的提示词")
+        self.assertEqual(user_msgs[0].display_content, "/init")
+
+    def test_plain_message_has_no_display_content(self) -> None:
+        tool = RecordingTool()
+        manager = manager_with_tool(ToolCallingProvider(), tool)
+        list(manager.submit_user_message("普通消息"))
+        user_msgs = [m for m in manager.history if m.role == "user"]
+        self.assertIsNone(user_msgs[0].display_content)
+
+
+class ProviderDisplayContentIsolationTests(unittest.TestCase):
+    """
+    c10 T34：display_content 不进入三个 Provider 的请求负载（spec C51）。
+
+    用 SDK 客户端替身捕获请求 kwargs——不发真实网络请求、不修改 Provider 生产实现。
+    """
+
+    _MESSAGES = [
+        Message(role="user", content="展开后的完整提示词", display_content="/init"),
+        Message(role="assistant", content="好的"),
+    ]
+
+    def _assert_payload_clean(self, sdk_messages: list) -> None:
+        """断言负载消息只含协议字段，绝无 display_content。"""
+        self.assertTrue(sdk_messages)
+        for item in sdk_messages:
+            self.assertIsInstance(item, dict)
+            self.assertNotIn("display_content", item)
+        # 模型收到的是完整 content（语义历史），不是显示别名
+        self.assertIn(
+            "展开后的完整提示词", [item.get("content") for item in sdk_messages]
+        )
+
+    def _make_config(self, protocol: str) -> Config:
+        return Config(
+            protocol=protocol,
+            model="test-model",
+            base_url="http://test",
+            api_key="test-key",
+            debug_log=False,
+        )
+
+    def test_deepseek_payload_excludes_display_content(self) -> None:
+        from rhinecode.provider.deepseek import DeepSeekProvider
+
+        provider = DeepSeekProvider(self._make_config("deepseek"))
+        captured: dict = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return iter(())  # 空流：立即结束
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        provider._client = FakeClient()
+        list(provider.stream_chat(self._MESSAGES))
+        self._assert_payload_clean(captured["messages"])
+
+    def test_openai_payload_excludes_display_content(self) -> None:
+        from rhinecode.provider.openai import OpenAIProvider
+
+        provider = OpenAIProvider(self._make_config("openai"))
+        captured: dict = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return iter(())
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        provider._client = FakeClient()
+        list(provider.stream_chat(self._MESSAGES))
+        self._assert_payload_clean(captured["messages"])
+
+    def test_anthropic_payload_excludes_display_content(self) -> None:
+        from rhinecode.provider.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(self._make_config("anthropic"))
+        captured: dict = {}
+
+        class FakeStream:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def __enter__(self):
+                return iter(())
+
+            def __exit__(self, *args):
+                return False
+
+        class FakeMessages:
+            def stream(self, **kwargs):
+                return FakeStream(**kwargs)
+
+        class FakeClient:
+            messages = FakeMessages()
+
+        provider._client = FakeClient()
+        list(provider.stream_chat(self._MESSAGES))
+        self._assert_payload_clean(captured["messages"])

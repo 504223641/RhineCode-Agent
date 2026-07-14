@@ -3,9 +3,10 @@ Textual App 主类模块。
 
 RhineApp 是 TUI 层的核心，负责：
 1. 组合各面板（HistoryView / CommandPanel / ConfirmPanel / ClarifyPanel / InputBar / StatusBar）
-2. 监听用户输入事件，调用 ConversationManager 处理
+2. 监听用户输入事件，交给 CommandDispatcher 统一分流（c10：普通消息与斜杠命令）
 3. 将 Agent 循环产出的 AgentEvent 通过 Worker + call_from_thread 安全地渲染到 UI
-4. 响应斜杠命令结果（状态栏刷新、历史区清空、程序退出、Plan Mode 切换）
+4. 实现命令层的 CommandController 协议（显示、发送、模式切换、报告、状态刷新、
+   清空、压缩、恢复、退出），命令处理函数经该窄接口驱动界面而不感知 Textual
 5. 提供三类用户交互回调（有副作用工具确认 / Plan Mode 需求澄清 / 计划执行审批）
 6. 提供运行中取消（按 Esc）
 
@@ -18,6 +19,7 @@ RhineApp 是 TUI 层的核心，负责：
 """
 
 import threading
+from typing import Optional
 
 from rich.markup import escape
 from textual.app import App, ComposeResult
@@ -25,6 +27,12 @@ from textual.events import Key
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
+from rhinecode.commands import (
+    CommandDispatcher,
+    CommandRegistry,
+    ModeTarget,
+    ReportTarget,
+)
 from rhinecode.conversation import ConversationManager, SessionListRequest
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
 from rhinecode.tui.widgets import (
@@ -113,14 +121,25 @@ class RhineApp(App):
     }
     """
 
-    def __init__(self, manager: ConversationManager, config: Config):
+    def __init__(
+        self,
+        manager: ConversationManager,
+        config: Config,
+        command_registry: CommandRegistry,
+    ):
         """
         :param manager: 已初始化的对话管理器，持有 Provider / Agent 和对话历史
         :param config: 配置对象，用于在状态栏展示 Provider 和模型信息
+        :param command_registry: 启动早期构建的命令注册表（c10）。App 不自建注册表——
+                                 同一实例同时注入分发器、命令面板与输入高亮器（spec F3），
+                                 保证执行、补全与帮助共享同一份事实来源
         """
         super().__init__()
         self._manager = manager
         self._config = config
+        # 命令层接线（c10）：单个分发器实例，提交入口的唯一分流点。
+        self._command_registry = command_registry
+        self._dispatcher = CommandDispatcher(command_registry)
         # 待决的用户交互（确认/澄清/审批）：None 表示当前无交互在进行；
         # 进行中时为 {"event": threading.Event, "result": Any, "kind": str}，
         # 由回调在 Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
@@ -134,13 +153,16 @@ class RhineApp(App):
         self._session_panel_active = False
 
     def compose(self) -> ComposeResult:
-        """按从上到下的顺序挂载各面板。"""
+        """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
         yield HistoryView()
-        yield CommandPanel()
+        yield CommandPanel(self._command_registry)
         yield ConfirmPanel()
         yield ClarifyPanel()
         yield SessionPanel()
-        yield InputBar(placeholder="输入消息，/ 查看命令，运行中按 Esc 取消，Ctrl+Q 退出")
+        yield InputBar(
+            self._command_registry,
+            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，Ctrl+Q 退出",
+        )
         yield StatusBar()
 
     def on_mount(self) -> None:
@@ -200,14 +222,104 @@ class RhineApp(App):
         )
 
     # ------------------------------------------------------------------ #
+    # CommandController 协议实现（c10 T43/T45）：命令处理函数经此驱动界面
+    # ------------------------------------------------------------------ #
+    @property
+    def tools_enabled(self) -> bool:
+        """当前 Provider 是否具备工具能力（委托 Manager，供 /init 等命令判断）。"""
+        return self._manager.tools_enabled
+
+    def show_user_input(self, text: str) -> None:
+        """聊天区回显一次用户输入（仅显示，不写入模型历史；由分发器统一调用）。"""
+        self.query_one(HistoryView).append_user(text)
+
+    def show_message(self, text: str) -> None:
+        """显示本地命令结果或错误（系统行）。"""
+        self.query_one(HistoryView).append_system(text)
+
+    def send_user_message(self, content: str, display_content: Optional[str] = None) -> None:
+        """
+        把用户消息交给现有对话路径：Manager 追加历史/存档后返回事件流，
+        统一经 _consume_manager_result 启动后台 Worker 流式消费。
+        """
+        self._consume_manager_result(
+            self._manager.submit_user_message(content, display_content)
+        )
+
+    def switch_mode(self, target: ModeTarget) -> str:
+        """按目标模式调用对应领域方法，返回供界面显示的结果文本。"""
+        if target == ModeTarget.THINKING:
+            return self._manager.cycle_thinking()
+        if target == ModeTarget.PLAN:
+            return self._manager.toggle_plan()
+        if target == ModeTarget.PERMISSION:
+            return self._manager.cycle_permission()
+        # 未知枚举值明确报错（不静默选默认分支）：新增 ModeTarget 时必须同步这里
+        raise ValueError(f"未知的模式目标：{target!r}")
+
+    def query_report(self, target: ReportTarget) -> str:
+        """按目标报告调用对应只读领域方法。"""
+        if target == ReportTarget.MCP:
+            return self._manager.mcp_report()
+        if target == ReportTarget.CONTEXT:
+            return self._manager.context_report()
+        if target == ReportTarget.MEMORY:
+            return self._manager.memory_report()
+        raise ValueError(f"未知的报告目标：{target!r}")
+
+    def refresh_status(self) -> None:
+        """刷新状态栏（命令处理函数显式调用，取代旧的命令字符串白名单）。"""
+        self._refresh_status()
+
+    def clear_conversation(self) -> None:
+        """清空对话：领域侧清历史/开新档 + 界面侧清聊天区（确认文本由命令层显示）。"""
+        self._manager.clear()
+        self.query_one(HistoryView).clear_all()
+
+    def compact_context(self) -> None:
+        """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
+        self._consume_manager_result(self._manager.manual_compact())
+
+    def resume_session(self, key: Optional[str]) -> None:
+        """
+        恢复会话：key 为 None 弹选择面板、非 None 直接载入。
+        面板选中路径与命令路径复用本方法（c10 起不再伪造 "/resume <id>" 文本）。
+        """
+        self._consume_manager_result(self._manager.resume(key))
+
+    def exit_application(self) -> None:
+        """退出应用（/exit 经此退出，不再依赖 SystemExit 穿透，c10）。"""
+        self.exit()
+
+    def _consume_manager_result(self, result) -> None:
+        """
+        统一消费 Manager 领域方法的三类返回值（c10 T44）：
+
+        - str：本地反馈文本，直接显示；
+        - SessionListRequest：打开会话选择面板；
+        - 事件迭代器：设置 streaming 状态并在下一帧启动现有 Worker 流式消费
+          （同一时间只允许一个流式 Worker，由 exclusive=True 与提交守卫共同保证）。
+        """
+        if isinstance(result, str):
+            self.show_message(result)
+        elif isinstance(result, SessionListRequest):
+            self._show_session_panel(result)
+        else:
+            self._set_streaming(True)
+            # 先让本帧渲染（用户输入回显等）完成，再启动后台 Worker——
+            # 避免用户消息与首块回复合并在同一帧绘制（观感上像输入被延迟显示）。
+            self.call_after_refresh(self._start_stream_worker, result)
+
+    # ------------------------------------------------------------------ #
     # 输入与命令面板
     # ------------------------------------------------------------------ #
     def on_input_changed(self, event: Input.Changed) -> None:
         """
         监听输入框内容变化，控制命令提示面板的显示与过滤。
 
-        输入以 "/" 开头时显示并过滤命令面板，否则隐藏。交互进行中、流式运行中
-        或会话选择面板展示中不处理，避免与其它面板或运行状态交错。
+        仅当输入以 "/" 开头且仍处于命令字段（尚无空白分隔符，即尚未进入参数区）
+        时显示候选面板；参数区输入、普通文本、零候选均隐藏（c10 plan 10.2）。
+        交互进行中、流式运行中或会话选择面板展示中不处理。
         """
         if (
             self._pending_interaction is not None
@@ -216,10 +328,42 @@ class RhineApp(App):
         ):
             return
         panel = self.query_one(CommandPanel)
-        if event.value.startswith("/"):
-            panel.show_for(event.value)
+        value = event.value
+        if value.startswith("/") and not any(ch.isspace() for ch in value):
+            panel.show_for(value)
         else:
             panel.hide()
+
+    def on_input_bar_command_completion_requested(
+        self, event: InputBar.CommandCompletionRequested
+    ) -> None:
+        """
+        处理命令字段的 Tab 补全请求（c10 T47，spec F22）。
+
+        - 单候选：直接替换输入框命令字段；候选规范命令有参数提示时末尾保留一个空格；
+        - 多候选：显示稳定排序的候选菜单（焦点保持在 InputBar，方向键经 on_key
+          转发给面板移动高亮，Enter 执行当前高亮项）；
+        - 零候选：隐藏面板，不做任何改动。
+        """
+        if (
+            self._pending_interaction is not None
+            or self._stream_active
+            or self._session_panel_active
+        ):
+            return
+        items = self._command_registry.complete(event.prefix)
+        panel = self.query_one(CommandPanel)
+        if not items:
+            panel.hide()
+            return
+        if len(items) == 1:
+            item = items[0]
+            spec = self._command_registry.resolve(item.canonical_name)
+            trailing = bool(spec and spec.argument_hint)
+            self.query_one(InputBar).apply_completion(item.value, trailing_space=trailing)
+            panel.hide()
+            return
+        panel.show_for(event.prefix)
 
     def on_key(self, event: Key) -> None:
         """
@@ -259,15 +403,15 @@ class RhineApp(App):
 
     def on_input_bar_input_submitted(self, event: InputBar.InputSubmitted) -> None:
         """
-        处理用户提交输入。
+        处理用户提交输入（c10：唯一入口是 CommandDispatcher）。
 
         步骤：
-        1. 若命令面板有高亮条目，用高亮命令替换文本（Enter 确认逻辑）。
-        2. 隐藏命令面板，显示用户消息到历史区。
-        3. 调用 ConversationManager.handle_input() 分发：
-           - str：斜杠命令反馈（/clear 清屏、/think 与 /plan 刷新状态栏）。
-           - SessionListRequest：/resume 无参 → 弹出会话选择面板（c9 交互化）。
-           - Iterator：Agent 事件流，启动 Worker 在后台消费并渲染。
+        1. 保留交互待决、流式运行、会话面板展示时的提交守卫；
+        2. 若命令面板有高亮候选，用候选文本替换待提交文本（Enter 执行当前高亮项，
+           即使用户只输入了部分前缀，spec F23）；
+        3. 隐藏命令面板后只调用 dispatcher.dispatch(text, self)——回显、命令执行、
+           未知命令提示与错误边界全部由分发器统一负责，App 不再区分具体命令名，
+           也不再维护状态刷新白名单。
         """
         # 交互进行中 / 流式运行中 / 会话选择面板展示中：忽略普通输入提交
         if (
@@ -284,45 +428,16 @@ class RhineApp(App):
             text = event.text
 
         panel.hide()
-        history_view = self.query_one(HistoryView)
-        history_view.append_user(text)
-
-        try:
-            result = self._manager.handle_input(text)
-        except SystemExit:
-            self.exit()
-            return
-
-        if isinstance(result, str):
-            if text == "/clear":
-                history_view.clear_all()
-            history_view.append_system(result)
-            # /think、/plan、/perm 改变了状态栏展示的状态，需要同步刷新状态栏；
-            # /clear 会重置上下文用量（ctx.reset() 后估算归零），也要立即反映到状态栏。
-            if text in ("/think", "/plan", "/perm", "/clear"):
-                self._refresh_status()
-        elif isinstance(result, SessionListRequest):
-            # /resume 无参：弹出交互式会话选择面板（c9 交互化）。
-            # 选中后由 on_option_list_option_selected 的 SessionPanel 分支
-            # 以 "/resume <session_id>" 重新进入带参载入路径。
-            self._show_session_panel(result)
-        else:
-            # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history。
-            self._set_streaming(True)
-            # 关键：先让刚挂载的用户消息完成本帧渲染，再启动后台 Worker。
-            # 否则 Textual 按帧合并重绘时，用户消息的挂载可能与「回复很快时的首块文本」落在同一帧，
-            # 观感上像「用户输入等到 AI 回复才一起出现」。call_after_refresh 把 Worker 的启动
-            # 推迟到下一次刷新之后，确保用户消息先单独绘制出来（spec：输入即时回显）。
-            self.call_after_refresh(self._start_stream_worker, result)
+        self._dispatcher.dispatch(text, self)
 
     def _start_stream_worker(self, gen) -> None:
         """
-        在用户消息完成渲染后，启动后台线程 Worker 消费 Agent 事件流。
+        在本帧渲染完成后，启动后台线程 Worker 消费 Agent 事件流。
 
-        由 on_input_bar_input_submitted 通过 call_after_refresh 调度，运行在主线程消息循环中，
+        由 _consume_manager_result 通过 call_after_refresh 调度，运行在主线程消息循环中，
         因此可安全调用 run_worker。exclusive=True 保证同一时间只有一个流式 Worker。
 
-        :param gen: ConversationManager.handle_input 返回的 AgentEvent 生成器
+        :param gen: Manager 领域方法返回的 AgentEvent 生成器
         """
         self.run_worker(
             lambda: self._do_stream(gen),
@@ -353,7 +468,7 @@ class RhineApp(App):
         本交互由主线程发起（用户输入命令的直接结果），没有 Worker 在阻塞等待，
         因此**不需要** _interact 的 threading.Event 机制。
 
-        :param request: handle_input("/resume") 返回的会话列表信号
+        :param request: Manager.resume(None) 返回的会话列表信号
         """
         self.query_one(CommandPanel).hide()
         self.query_one(InputBar).disabled = True
@@ -646,12 +761,11 @@ class RhineApp(App):
             event.stop()
             session_id = event.option.id
             self._close_session_panel()
-            # 复用 handle_input 的带参 /resume 路径（与手输同一条代码路径）：
-            # option.id 携带完整 session_id，_resolve_key 按精确 ID 匹配必中。
-            # 载入可能触发 C8 压缩（阻塞的摘要 LLM 调用），必须走后台 Worker。
-            result = self._manager.handle_input(f"/resume {session_id}")
-            self._set_streaming(True)
-            self.call_after_refresh(self._start_stream_worker, result)
+            # 直接复用恢复控制器（c10 T48）：与 /resume <id> 命令同一领域入口，
+            # 不再伪造用户没有手输的 "/resume <session_id>" 文本（也不回显它）。
+            # option.id 携带完整 session_id，_resolve_key 按精确 ID 匹配必中；
+            # 载入可能触发 C8 压缩（阻塞的摘要 LLM 调用），统一消费路径走后台 Worker。
+            self.resume_session(session_id)
             return
 
         box = self._pending_interaction

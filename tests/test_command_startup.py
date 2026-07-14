@@ -1,0 +1,88 @@
+"""
+启动接线测试（c10 T54）：命令注册表在昂贵资源之前构建、冲突时 fail-fast。
+
+用 unittest.mock.patch 替换 __main__ 里的重量构造（Provider / 工具注册中心 /
+MCP / ConversationManager / RhineApp），验证：
+- 正常路径：build_builtin_registry 的同一实例注入 RhineApp；
+- 冲突路径：以退出码 1 结束、stderr 含冲突标识，且 create_provider、
+  ToolRegistry.default、MCPManager、RhineApp 均未被调用（spec F2/N4/C08）。
+"""
+
+import io
+import unittest
+from contextlib import redirect_stderr
+from unittest.mock import MagicMock, patch
+
+import rhinecode.__main__ as entry
+from rhinecode.commands import CommandRegistrationError, CommandRegistry
+
+
+def _fake_config() -> MagicMock:
+    """构造能通过占位符校验的假 Config。"""
+    cfg = MagicMock()
+    cfg.api_key = "real-key"
+    cfg.protocol = "deepseek"
+    cfg.model = "test-model"
+    return cfg
+
+
+class StartupWiringTests(unittest.TestCase):
+    def test_registry_instance_injected_into_app(self) -> None:
+        """正常构建：同一命令注册表实例注入 RhineApp（spec F3 单一来源）。"""
+        registry = CommandRegistry()
+        fake_app = MagicMock()
+        with (
+            patch.object(entry, "load", return_value=_fake_config()),
+            patch.object(entry, "build_builtin_registry", return_value=registry) as build,
+            patch.object(entry, "create_provider", return_value=MagicMock()),
+            patch.object(entry.ToolRegistry, "default", return_value=MagicMock()),
+            patch.object(entry.mcp_config, "load_all", return_value=({}, [])),
+            patch.object(entry, "MCPManager") as mcp_cls,
+            patch.object(entry, "MCPAddServerTool", return_value=MagicMock()),
+            patch.object(entry, "ConversationManager", return_value=MagicMock()),
+            patch.object(entry, "RhineApp", return_value=fake_app) as app_cls,
+            patch("sys.argv", ["rhine", "--config", "fake.yaml"]),
+        ):
+            entry.main()
+        build.assert_called_once()
+        # RhineApp 的第三个位置参数就是命令注册表实例（同一对象，非拷贝）
+        self.assertIs(app_cls.call_args.args[2], registry)
+        fake_app.run.assert_called_once()
+        mcp_cls.return_value.close_all.assert_called_once()
+
+    def test_registration_conflict_exits_before_expensive_resources(self) -> None:
+        """冲突路径：退出码 1、stderr 含冲突标识，昂贵资源均未创建（C03–C08）。"""
+        conflict = CommandRegistrationError(
+            "command name collision: /ctx is declared by /context and /other"
+        )
+        stderr = io.StringIO()
+        with (
+            patch.object(entry, "load", return_value=_fake_config()),
+            patch.object(entry, "build_builtin_registry", side_effect=conflict),
+            patch.object(entry, "create_provider") as create_provider,
+            patch.object(entry.ToolRegistry, "default") as tool_default,
+            patch.object(entry, "MCPManager") as mcp_cls,
+            patch.object(entry, "ConversationManager") as manager_cls,
+            patch.object(entry, "RhineApp") as app_cls,
+            patch("sys.argv", ["rhine", "--config", "fake.yaml"]),
+            redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                entry.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        message = stderr.getvalue()
+        self.assertIn("/ctx", message)
+        self.assertIn("/context", message)
+        self.assertIn("/other", message)
+        # 冲突发生在昂贵资源之前：Provider、工具注册中心、MCP、Manager（会话锁）、
+        # RhineApp 均未创建（spec N4 / checklist C08）
+        create_provider.assert_not_called()
+        tool_default.assert_not_called()
+        mcp_cls.assert_not_called()
+        manager_cls.assert_not_called()
+        app_cls.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

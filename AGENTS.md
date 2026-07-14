@@ -2,7 +2,7 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C9 阶段能力：在 C8 上下文管理、C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **记忆系统（项目指令 · 会话存档 · 自动笔记）**——三层 RHINE.md 项目指令（用户级→项目 .rhinecode→项目根拼接、支持 @include 展开）与两级记忆索引在处理首个请求前注入系统提示预留槽位；每条消息即时以 JSONL 追加写入 `<项目根>/.rhinecode/sessions/`，`/resume`、`rhine --continue` 可容错恢复（坏行跳过、不成对工具调用丢组、超窗先压缩、超 24h 插时间跨度提醒）；Agent Loop 自然停止后异步调一次 LLM 把值得记的内容沉淀为四类笔记（用户偏好/纠正反馈/项目知识/参考资料，用户级与项目级分开存），索引每次注入、正文按需读取；多实例并发由锁文件防护（原子创建、非阻塞退让、过期自愈）。其下 C8 的 **上下文管理（两层压缩）** 仍在——每次 API 请求前，先用「锚点 + 增量」近似估算当前历史 token 用量；**第一层**零成本地把过大的工具结果存盘、历史里只留预览与路径占位；若估算仍逼近窗口上限，**第二层**调一次 LLM 把较早的消息压成结构化摘要、近期原文保留，并补一条「要细节请重读文件、勿照摘要脑补」的边界消息。全程幂等、fail-safe，连续摘要失败 3 次熔断，用户原始消息永不被改写；`/context` 查看用量、`/compact` 手动压缩，底部状态栏常驻用量指示。其下 C7 的 MCP 客户端仍在：启动时按两层配置连接外部 MCP Server（本地子进程走 stdio、远程走 Streamable HTTP），发现其工具并包装成已有的 `Tool` 接口注册进工具中心，对 Agent Loop / 权限系统 / TUI 完全无感。每个工具执行前仍由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具（含 MCP 远端工具）、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
+当前版本以 DeepSeek Provider 为主实现了 C10 阶段能力：在 C9 记忆系统、C8 上下文管理、C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **斜杠命令注册与分发系统**——独立 `commands/` 层以单一 `CommandSpec` 注册表统一管理 12 条规范命令与 8 个别名（执行、`/help` 帮助、补全候选、输入高亮共享同一份事实来源）；用户输入先经 `CommandDispatcher` 分流，本地/界面命令绕过 Agent（不耗 Token、不入模型历史），未知命令只给本地 `/help` 引导；命令名与别名大小写不敏感、参数原样保留；启动早期（Provider/MCP 之前）批量原子注册并做名称冲突 fail-fast；提示词命令（`/init`）采用双内容模型（`Message.content` 给模型、`display_content` 给界面与回放）；Tab 单候选直补/多候选菜单、菜单回车执行高亮项、完整命中的命令字段青色高亮；状态栏以 `[DEFAULT]`/`[PLAN]` 标记模式。其下 C9 的 **记忆系统（项目指令 · 会话存档 · 自动笔记）** 仍在——三层 RHINE.md 项目指令（用户级→项目 .rhinecode→项目根拼接、支持 @include 展开）与两级记忆索引在处理首个请求前注入系统提示预留槽位；每条消息即时以 JSONL 追加写入 `<项目根>/.rhinecode/sessions/`，`/resume`、`rhine --continue` 可容错恢复（坏行跳过、不成对工具调用丢组、超窗先压缩、超 24h 插时间跨度提醒）；Agent Loop 自然停止后异步调一次 LLM 把值得记的内容沉淀为四类笔记（用户偏好/纠正反馈/项目知识/参考资料，用户级与项目级分开存），索引每次注入、正文按需读取；多实例并发由锁文件防护（原子创建、非阻塞退让、过期自愈）。其下 C8 的 **上下文管理（两层压缩）** 仍在——每次 API 请求前，先用「锚点 + 增量」近似估算当前历史 token 用量；**第一层**零成本地把过大的工具结果存盘、历史里只留预览与路径占位；若估算仍逼近窗口上限，**第二层**调一次 LLM 把较早的消息压成结构化摘要、近期原文保留，并补一条「要细节请重读文件、勿照摘要脑补」的边界消息。全程幂等、fail-safe，连续摘要失败 3 次熔断，用户原始消息永不被改写；`/context` 查看用量、`/compact` 手动压缩，底部状态栏常驻用量指示。其下 C7 的 MCP 客户端仍在：启动时按两层配置连接外部 MCP Server（本地子进程走 stdio、远程走 Streamable HTTP），发现其工具并包装成已有的 `Tool` 接口注册进工具中心，对 Agent Loop / 权限系统 / TUI 完全无感。每个工具执行前仍由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具（含 MCP 远端工具）、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 语言
 中文回答
@@ -17,6 +17,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 ## 当前能力
 
+- **斜杠命令系统**（c10）：独立 `commands/` 层（对标 permission/context/memory：纯逻辑 + 单点接入，不依赖 Textual）。`CommandSpec` 单一注册来源登记规范名/别名/描述/用法/类型/参数提示/隐藏标记/处理函数；命令分**本地直执行**（`/help`·`/mcp`·`/context`·`/compact`·`/memory`，绕过 Agent；`/compact` 的专用摘要调用是明确例外）、**界面状态**（`/think`·`/plan`·`/perm`·`/resume`·`/clear`·`/exit`）、**提示词**（`/init`，展开静态内置提示词交给 Agent，界面/存档回放显示原命令）三类；处理函数只面向 `CommandController` 协议（RhineApp 实现），可用 Fake 替身独立测试。解析大小写不敏感（casefold）、参数只按首空白切分不做 shell 分词；未知命令本地提示不进 AI；启动早期 `build_builtin_registry()` 原子注册，名称/别名冲突（含仅大小写不同）抛 `CommandRegistrationError` 以退出码 1 fail-fast（先于 Provider/MCP/会话锁创建）。别名：`/h`→`/help`、`/ctx`→`/context`、`/continue`→`/resume`、`/permissions`·`/allowed-tools`→`/perm`、`/reset`·`/new`→`/clear`、`/quit`→`/exit`。Tab 补全（单候选直补、多候选稳定排序菜单、参数区不拦截）、菜单回车执行高亮项、完整命中命令字段高亮（Textual `Input.highlighter` 公开扩展点）、状态栏 `[DEFAULT]`（dim）/`[PLAN]`（加粗青色）模式标记。
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；`read_file` 对大文件强制范围读取，`glob_files` / `grep_content` 会逐文件应用 `Read(...)` deny 过滤。
@@ -35,8 +36,9 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 当前核心分层如下，上层尽量不感知下层具体实现，通过抽象接口和事件流解耦：
 
-- **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费 AgentEvent 并逐块渲染；`widgets.py` 提供 HistoryView / InputBar / StatusBar / 工具行 / diff / 确认、澄清和会话选择面板（`SessionPanel`），以及历史回放（`build_replay_items` 纯函数 + `HistoryView.render_history` 清屏批量重画，回放工具行用简化静态行、不复用带计时器的 `ToolCallWidget`）。
-- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、解析斜杠命令（含 `/perm` 切换权限模式、`/mcp` 查看 MCP 状态、`/context` 查看上下文用量、`/compact` 手动压缩、c9 的 `/memory` 记忆报告、`/resume` 会话恢复、`/init` 生成 RHINE.md）、管理思考模式和 Plan Mode、构建权限引擎并封装 ask（四态人工确认）/澄清/计划审批回调；构建权限引擎后会把 `Read(...)` 路径过滤器注入 `glob_files` / `grep_content`，避免只读搜索工具绕过文件级 deny；持有 `MCPManager` 引用仅用于 `/mcp` 与状态栏（`mcp_status_line`），MCP 工具本身已注册进 registry、与此引用解耦；仅在工具模式下构造 `ContextManager`（c8），把它作为参数传入 `agent.run` 实现每轮请求前的两层压缩，并暴露 `context_status_line` 给状态栏、`/context`·`/compact` 命令分支（`/compact` 走事件流在 Worker 线程执行，因摘要 LLM 调用会阻塞、不能卡 UI 主线程），`clear()` 时调 `reset()` 复位压缩状态。c9 接入：构造 `MemoryManager`（所有 Provider）并调 `startup`（可带 `--continue` 的 resume_latest），把用户级 memory 目录注册进只读白名单；`_run()` 把 RHINE.md 与记忆索引填进 `build_default_prompt` 两参数、把一次性 pending 提醒并入 dynamic、把 `record_message` 作为 recorder 传给 `agent.run`；事件流经 `_wrap_events` 包装（FINISHED=COMPLETED 时触发异步笔记钩子）；`/resume` 无参返回 `SessionListRequest`（handle_input 的第三种返回类型，TUI 据此弹会话选择面板），带 key 走 `_resume_stream` 事件流（载入成功先产 `HISTORY` 事件携带**压缩前**历史快照供 TUI 回放，再 `context_manager.reset()` + `before_request` 补压缩；面板选中后 TUI 以 `/resume <session_id>` 复用同一路径）；`clear()` 时调 `memory_manager.on_clear()` 开新档。
+- **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费 AgentEvent 并逐块渲染；c10 起实现命令层的 `CommandController` 协议（`tools_enabled` / `show_user_input` / `show_message` / `send_user_message` / `switch_mode` / `query_report` / `refresh_status` / `clear_conversation` / `compact_context` / `resume_session` / `exit_application`），输入提交唯一入口是 `dispatcher.dispatch(text, self)`，Manager 三类返回值（str / SessionListRequest / 事件迭代器）经 `_consume_manager_result` 统一消费（迭代器走后台 Worker）；SessionPanel 选中后直调 `resume_session(session_id)`，不再拼接 `/resume <id>` 文本。`widgets.py` 提供 HistoryView / InputBar（接收注册表、装 `CommandHighlighter` 高亮完整命中的命令字段、命令字段内 Tab post `CommandCompletionRequested`）/ StatusBar（`compose_status_text` 纯函数组装，`[DEFAULT]`/`[PLAN]` 模式标记）/ CommandPanel（构造时注入注册表、`show_for` 用 `registry.complete` 动态取候选）/ 工具行 / diff / 确认、澄清和会话选择面板（`SessionPanel`），以及历史回放（`build_replay_items` 纯函数——user 消息优先展示非空 `display_content`——+ `HistoryView.render_history` 清屏批量重画，回放工具行用简化静态行、不复用带计时器的 `ToolCallWidget`）。
+- **Commands 层**（`rhinecode/commands/`，c10）— 斜杠命令注册与分发，五个模块下层不感知上层：`models.py` 枚举（`CommandType`/`InputKind`/`DispatchKind`/`ModeTarget`/`ReportTarget`）、冻结数据类（`CommandSpec`/`ParsedInput`/`CommandInvocation`/`DispatchResult`/`CompletionItem`）与 `CommandController` 协议（不导入 Textual/Conversation/Provider）；`parser.py` 纯函数 `parse_input`（空输入/普通消息/斜杠分类 + 首空白一次切分，不做 shell 分词）；`registry.py` `CommandRegistry`（casefold 索引、原子 `register_many`、名称/别名/大小写冲突校验抛 `CommandRegistrationError`、`resolve`/`complete`/`render_help`，隐藏命令可执行不可发现）；`dispatcher.py` `CommandDispatcher`（分流、统一回显恰好一次、未知命令 `/help` 引导、必需参数校验、处理异常转本地错误不降级发 AI）；`builtins.py` 12 条内置命令 + 别名 + 静态 `INIT_PROMPT`（`/help` 闭包捕获注册表；`build_builtin_registry()` 无导入副作用）。依赖方向：commands ← tui/app ← `__main__`；conversation/memory/context/provider 不反向依赖 commands。
+- **协调层**（`rhinecode/conversation.py`）— `ConversationManager` 是 TUI 与 Agent / Provider 之间的中转点，维护对话历史、管理思考模式和 Plan Mode、构建权限引擎并封装 ask（四态人工确认）/澄清/计划审批回调。c10 起**不再解析斜杠文本**（旧 `handle_input` 已删除），改为暴露领域方法：`submit_user_message(content, display_content=None)`（普通消息与提示词命令共用入口，追加历史+存档+返回事件流）、`cycle_thinking()`/`toggle_plan()`/`cycle_permission()`（模式切换返回结果文本）、`mcp_report()`/`context_report()`/`memory_report()`（只读报告）、`manual_compact()`（事件流或能力限制提示）、`resume(key=None)`（无参返回 `SessionListRequest`、带 key 走 `_resume_stream` 事件流——载入成功先产 `HISTORY` 事件携带**压缩前**历史快照供 TUI 回放，再 `context_manager.reset()` + `before_request` 补压缩）、`clear()`（返回确认文本；调 `memory_manager.on_clear()` 开新档）与只读 `tools_enabled`。构建权限引擎后会把 `Read(...)` 路径过滤器注入 `glob_files` / `grep_content`，避免只读搜索工具绕过文件级 deny；持有 `MCPManager` 引用仅用于报告与状态栏（`mcp_status_line`），MCP 工具本身已注册进 registry、与此引用解耦；仅在工具模式下构造 `ContextManager`（c8），把它作为参数传入 `agent.run` 实现每轮请求前的两层压缩，并暴露 `context_status_line` 给状态栏（`manual_compact` 走事件流在 Worker 线程执行，因摘要 LLM 调用会阻塞、不能卡 UI 主线程）。c9 接入：构造 `MemoryManager`（所有 Provider）并调 `startup`（可带 `--continue` 的 resume_latest），把用户级 memory 目录注册进只读白名单；`_run()` 把 RHINE.md 与记忆索引填进 `build_default_prompt` 两参数、把一次性 pending 提醒并入 dynamic、把 `record_message` 作为 recorder 传给 `agent.run`；事件流经 `_wrap_events` 包装（FINISHED=COMPLETED 时触发异步笔记钩子）。
 - **Agent 层**（`rhinecode/agent/`）— `loop.py` 实现 ReAct 循环，并在 `_execute` 单点接入权限决策预扫，还在每轮请求前单点调用 `context_manager.before_request`（两层压缩，产出 `NOTICE` 事件）、拿到 usage 后 `record_usage` 更新估算锚点（`context_manager` 为 None 时整段跳过，保持 c8 之前行为）；`events.py` 定义 AgentEvent（含 c8 的 `NOTICE` 系统提示事件、c9 的 `HISTORY` 历史快照事件——会话恢复成功后携带压缩前消息列表供 TUI 整体回放）、停止原因和四态确认决策；`collector.py` 收集流式正文、思考与工具调用；`plan_tools.py` 支撑 Plan Mode 特殊工具；`prompt/` 负责结构化系统提示、环境信息与动态 reminder。
 - **Permission 层**（`rhinecode/permission/`）— 五层防御权限系统，纯逻辑、与 TUI/Provider 解耦：`models.py` 数据结构与枚举；`matching.py` 命令/路径匹配与命令拆分；`blacklist.py` 危险命令黑名单；`rules.py` deny 优先求值；`config.py` 三层 YAML 加载/容错/回写；`adapter.py` 把工具调用规范化为权限请求（收口工具知识）；`engine.py` 的 `PermissionEngine.decide` 组装四层管线。
 - **MCP 层**（`rhinecode/mcp/`）— MCP 客户端，五层从下到上、下层不感知上层：`config.py` 两层 `mcp.yaml` 加载/`${VAR}` 展开/容错；`auto_config.py` 负责 URL/NPM MCP 名称解析、候选置信度、`npx.cmd` 平台默认值和 `mcp.yaml` 安全写入；`jsonrpc.py` JSON-RPC 2.0 消息构造/分类/id 生成（纯数据，无 I/O）；`transport.py` `Transport` 抽象 + `StdioTransport`（子进程 + 后台 reader 线程按 id 派发，另有 stderr drain 线程保留最近错误日志）+ `HttpTransport`（Streamable HTTP + SSE，同步阻塞），并在 Windows 下解析裸命令到 `.cmd/.exe/.bat`；`client.py` `MCPClient` 封装 `initialize/list_tools/call_tool` 三步；`tool_adapter.py` `MCPTool(Tool)` + 安全注册名规范化 + `CallToolResult→ToolResult` 转换；`manager.py` `MCPManager` 编排多 Server 的连接缓存/单点隔离/生命周期/状态汇总，并支持按 server 精确 `reload_server`、清理旧工具和旧连接。同步线程模型（不引入 asyncio）以契合现有 Textual Worker 同步执行模型。在 `__main__.py` 启动时 `connect_all` 注册工具、`finally` 里 `close_all` 回收。
@@ -58,13 +60,14 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 新增 MCP Server：优先让 Agent 使用内置工具自动完成，而不是直接手写 YAML。流程是先调用只读的 `mcp_resolve_server` 解析用户输入（URL 直接生成 HTTP 配置；自然语言名称/包名优先走 NPM registry），向用户说明来源、写入位置和将启动的外部命令后，再调用非只读的 `mcp_add_server` 写入 `~/.rhinecode/mcp.yaml` 或 `<项目根>/.rhinecode/mcp.yaml` 并触发单 Server 重载；未明确范围时默认项目级。手动声明仍支持：stdio 填 `command/args/env`，http 填 `url/headers`，值支持 `${VAR}`。若要新增**传输方式**（stdio/HTTP 之外），在 `mcp/transport.py` 继承 `Transport` 实现 `start/request/notify/close`，再到 `manager.py` 的 `_build_transport` 加分支即可，`client.py` 以上无感。
 
-新增斜杠命令：必须**成对维护**两处，缺一会出现「命令能用但补全列表看不到」或反之——① 在 `conversation.py` 的 `handle_input` 加分支实现命令逻辑；② 在 `tui/widgets.py` 的 `CommandPanel.COMMANDS` 注册表追加 `(命令文本, 简要描述)`，输入 `/` 才会在补全面板列出。若命令带选项面板/回调（如确认四态），还需同步 `tui/app.py` 的事件处理与回调注入。
+新增斜杠命令（c10 起单一注册，旧的「逻辑 + 补全列表」双维护规则已废除）：在 `commands/builtins.py` 的 `build_builtin_registry()` 登记一条 `CommandSpec`（规范名/别名/描述/用法/类型/参数提示）并实现处理函数（只做「参数解释 + `CommandController` 调用」，需要新领域能力时在 `conversation.py` 加领域方法、`tui/app.py` 的控制器方法里接线），再补一组 `tests/test_command_builtins.py` 测试即可——补全菜单、`/help` 帮助、输入高亮都自动读取注册表，无需再改 `CommandPanel`、状态刷新白名单或任何清单。需要刷新状态栏的命令在处理函数里显式调 `controller.refresh_status()`。若命令带选项面板/回调（如确认四态），仍需同步 `tui/app.py` 的事件处理与回调注入。
 
 > 「成对维护点」备忘（改一处常需同步另一处，避免遗漏）：
 > - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）
 > - 新增 MCP 传输方式 → `mcp/transport.py`（`Transport` 子类）+ `mcp/manager.py` `_build_transport`（按 `kind` 分支）
-> - 新增斜杠命令 → `conversation.py`（逻辑）+ `tui/widgets.py` `CommandPanel.COMMANDS`（补全列表）+（若改了状态栏可见状态）`tui/app.py` 提交处理里 `if text in (...)` 的状态栏刷新白名单
-> - 新增状态栏展示字段 → `tui/widgets.py` `StatusBar.update_status`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）+ 触发刷新的命令需在上面那个白名单里
+> - 新增斜杠命令 → 只需 `commands/builtins.py` 登记一条 `CommandSpec` + 处理函数 + 测试（c10 单一注册来源；补全/帮助/高亮自动生效）
+> - 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
+> - 新增状态栏展示字段 → `tui/widgets.py` `compose_status_text`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
 > - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
 > - 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
 > - 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
@@ -79,19 +82,22 @@ rhine --continue                          # 启动时恢复最近一次会话，
 python -m rhinecode --config config.yaml  # 未安装/开发调试时的等价入口（需在源码目录）
 ```
 
-运行时斜杠命令：
+运行时斜杠命令（c10 起大小写不敏感、支持别名与 Tab 补全；未知命令不进 AI、只提示 `/help`）：
 
+- `/help`（别名 `/h`）：按稳定顺序列出全部非隐藏命令的规范名、别名、描述、用法、类型与参数提示（c10）。
 - `/think`：在 off / high / max 间循环切换思考模式（Anthropic / DeepSeek 生效）。
 - `/plan`：切换 Plan Mode，先规划、澄清和审批，再执行（DeepSeek 工具模式生效）。
-- `/perm`：在 默认 / 严格 / 放行 间循环切换权限模式，只影响「规则未命中」的灰色地带兜底（DeepSeek 工具模式生效）。
+- `/perm`（别名 `/permissions`、`/allowed-tools`）：在 默认 / 严格 / 放行 间循环切换权限模式，只影响「规则未命中」的灰色地带兜底（DeepSeek 工具模式生效）。
 - `/mcp`：查看各 MCP Server 的连接状态、传输类型、注册工具数与失败原因（纯只读，不改状态）。
-- `/context`：查看当前上下文近似用量（估算 token / 窗口上限 / 余量 / 已存盘工具结果数 / 是否熔断），纯只读（DeepSeek 工具模式生效）。
+- `/context`（别名 `/ctx`）：查看当前上下文近似用量（估算 token / 窗口上限 / 余量 / 已存盘工具结果数 / 是否熔断），纯只读（DeepSeek 工具模式生效）。
 - `/compact`：手动触发第二层 LLM 摘要压缩，无余量阈值——主动触发即尝试；历史尚无够旧的早段可摘要时如实回「无可摘要的早段」（DeepSeek 工具模式生效）。
-- `/resume`：无参弹出交互式会话选择面板（列出全部会话：编号/ID/标题/消息数/时间/锁标记，上下键选择、回车载入、Esc 退出；锁定项与当前会话置灰跳过）；`/resume <编号或ID>` 直接载入。载入成功后聊天区清空并回放该会话全部历史（用户消息/AI 回复/简化工具行），存档指针随之切换（被其它实例新鲜锁占用时拒绝且不清屏；载入后逼近窗口先跑一次 c8 压缩）。`rhine --continue` 启动恢复同样回放历史。所有 Provider 生效（c9）。
+- `/resume`（别名 `/continue`）：无参弹出交互式会话选择面板（列出全部会话：编号/ID/标题/消息数/时间/锁标记，上下键选择、回车载入、Esc 退出；锁定项与当前会话置灰跳过）；`/resume <编号或ID>` 直接载入。载入成功后聊天区清空并回放该会话全部历史（用户消息/AI 回复/简化工具行），存档指针随之切换（被其它实例新鲜锁占用时拒绝且不清屏；载入后逼近窗口先跑一次 c8 压缩）。`rhine --continue` 启动恢复同样回放历史。所有 Provider 生效（c9）。
 - `/memory`：查看记忆系统状态——RHINE.md 各层加载与 include 展开、两级笔记数量与索引超限标记、最近一次自动笔记更新结果、当前会话 ID 与已存档消息数、写锁状态。纯只读（c9）。
-- `/init`：用内置指令启动一次 Agent Loop，探索项目生成项目根 `RHINE.md`；已存在时不覆盖、只输出改进建议。写盘走完整权限管线（DeepSeek 工具模式生效，c9）。
-- `/clear`：清空当前对话历史（并复位上下文压缩的锚点/熔断/已存盘状态；会话存档开新档、旧档保留，c9）。
-- `/exit`：退出程序。
+- `/init`：用内置指令启动一次 Agent Loop，探索项目生成项目根 `RHINE.md`；已存在时不覆盖、只输出改进建议。写盘走完整权限管线（DeepSeek 工具模式生效，c9）。c10 双内容：界面与恢复回放显示 `/init`，模型历史与存档保留展开后的完整提示词（`Message.display_content`）。
+- `/clear`（别名 `/reset`、`/new`）：清空当前对话历史（并复位上下文压缩的锚点/熔断/已存盘状态；会话存档开新档、旧档保留，c9）。
+- `/exit`（别名 `/quit`）：退出程序。
+
+补全与高亮（c10）：输入 `/` 前缀实时弹候选（规范名与别名都参与、别名标注规范命令、隐藏命令不出现）；Tab 单候选直补（有参数提示的命令末尾留一个空格）、多候选弹稳定排序菜单；菜单可见时回车执行当前高亮项；光标进入参数区后 Tab 不拦截。输入框只在命令字段完整命中规范名或别名时以青色加粗高亮该字段，参数与未完成前缀保持普通样式。无参命令忽略多余参数（`/clear now` 仍清空）。
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
 
@@ -117,16 +123,16 @@ MCP Server 配置（c7，可选，从 `mcp.example.yaml` 复制或由 `mcp_add_s
 
 ## Spec 驱动开发
 
-开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c9/`。
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `docs/<章节>/` 下的 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c10/`。
 
-C9 文档描述记忆系统的需求、架构、任务与验收（RHINE.md 三层项目指令与 @include、JSONL 会话存档与容错恢复、四类自动笔记与索引注入、锁文件并发防护、`/resume`·`/memory`·`/init`·`--continue`）：
+C10 文档描述斜杠命令注册与分发的需求、架构、任务与验收（单一 `CommandSpec` 注册来源与启动冲突 fail-fast、解析/分流/别名/大小写不敏感、三类执行模式与 `CommandController` 界面边界、`/help`·Tab 补全·候选菜单·命令高亮、`/init` 双内容与会话恢复、`[DEFAULT]`/`[PLAN]` 状态栏标记）：
 
-- `docs/c9/spec.md`
-- `docs/c9/plan.md`
-- `docs/c9/task.md`
-- `docs/c9/checklist.md`
+- `docs/c10/spec.md`
+- `docs/c10/plan.md`
+- `docs/c10/task.md`
+- `docs/c10/checklist.md`
 
-C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
+C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 测试
 
@@ -143,7 +149,9 @@ MCP 客户端测试（`tests/test_mcp_*.py`、`tests/test_mcp_auto_config.py`、
 
 记忆系统测试（`tests/test_memory_*.py`，c9）：锁原语（原子互斥、释放重取、过期接管、touch 保鲜、父目录缺失 fail-safe）、RHINE.md 加载（三层顺序与来源标注、缺层跳过、include 展开/相对引用文件目录/5 层不展开/循环终止/越界拦截/围栏代码块保留/目标缺失容错、用户层边界）、笔记纯逻辑（frontmatter 往返、未知字段忽略、坏格式返 None、索引行格式、行数与字节双截断不产非法 UTF-8）、会话存档（ID 格式、惰性建档、行级 ts、载入往返含 tool_calls、坏行跳过、结尾/中间不成对丢组、孤儿 tool 丢弃、列表标题截断与锁标记、新鲜锁拒接管/过期锁接管后续写、过期清理跳过锁保护并清孤儿锁、/clear 开新档）、编排（假 provider 断言笔记请求 tools=None、落盘+索引重建+notify、目录锁被占跳过不等待、provider 异常静默记录且 in-flight 清除、in-flight 跳过本轮、高水位只发新增段、notes_enabled=False 不调 LLM、--continue 顺延被锁会话、resume 编号定位+时间跨度提醒取走即清、被锁会话拒绝恢复、/memory 报告字段、索引注入截断、`list_resume_sessions` 结构化列表/全量/编号缓存、`session_id` 属性）、沙箱白名单（注册目录可读、未注册工作区外仍拒、`..` 仍拒、read_file 可读白名单、引擎读放行写仍拒、原工作区语义不变）。真实 LLM 笔记质量与 TUI 端到端 6 场景留作手测（见 `docs/c9/checklist.md`）。
 
-/resume 交互化与历史回放测试（`tests/test_resume_replay.py`）：`build_replay_items` 纯函数（user/assistant/tool 配对、空 content assistant 跳过、缺结果防御兜底、结果首行截断、未知 role 跳过）、conversation 层分发（`/resume` 无参空档返回提示 / 有档返回 `SessionListRequest` / 全部锁定或仅当前会话返回提示、带参成功事件流首个为 `HISTORY` 且快照与存档一致、失败不产 `HISTORY`）。SessionPanel 面板交互与回放渲染的视觉效果留 TUI 手测。
+/resume 交互化与历史回放测试（`tests/test_resume_replay.py`）：`build_replay_items` 纯函数（user/assistant/tool 配对、空 content assistant 跳过、缺结果防御兜底、结果首行截断、未知 role 跳过、c10 双内容 user 优先展示非空 `display_content`）、conversation 层领域入口（`resume(None)` 空档返回提示 / 有档返回 `SessionListRequest` / 全部锁定或仅当前会话返回提示、`resume(key)` 成功事件流首个为 `HISTORY` 且快照与存档一致、失败不产 `HISTORY`）。SessionPanel 面板交互与回放渲染的视觉效果留 TUI 手测。
+
+斜杠命令系统测试（`tests/test_command_*.py`，c10）：解析器（空输入/普通消息/首位斜杠分类、正文斜杠不触发、首空白切分与 Tab/换行分隔符、参数外层去空白内部原样含引号/管道/反斜杠、命令字段保留大小写、裸 `/` 仍是斜杠输入）、注册表（规范名/别名/大小写不敏感解析、名称/名称·名称/别名·别名/别名·仅大小写·同命令重复别名五类冲突、`register_many` 原子性失败不留半成品、隐藏命令可执行不可发现、候选顺序稳定与别名标注、帮助含描述/用法/类型/参数提示）、分发器（空输入零副作用、普通消息回显→发送各一次、未知命令 `/help` 引导且不发 AI、别名与大写命中同一 spec、`CommandInvocation` 字段、必需参数缺失显示用法、处理异常单次本地错误不降级、失败后普通输入仍可用、重复分发确定性）、内置命令（12 条规范名与 8 别名映射、三类分类与批准表一致、Fake Controller 行为——报告/模式刷新/`/clear extra` 仍清空/`/resume`·`/continue` 参数透传/`/exit` 只调退出、`/init` 双内容与工具关闭提示、`/help` 别名等价）、启动接线（同一注册表实例注入 App、冲突退出码 1 且 Provider/工具/MCP/Manager/App 均未创建）、TUI（`CommandHighlighter` 完整命中才着色/参数不着色/正文斜杠不着色、`compose_status_text` 的 `[DEFAULT]`/`[PLAN]` 标记与其它字段保留、Pilot 键盘——Tab 单候选直补/带参数提示留空格/多候选稳定菜单/参数区 Tab 不改写/隐藏命令不进菜单仍可执行/菜单回车执行高亮项/未知命令本地提示/`/plan` 状态栏标记切换/`/init` 双内容提交/Esc 关菜单保输入，用 Fake Manager 不触真实 Provider）。旧 TUI 结构回归（`tests/test_tui_keybindings.py`）新增：静态 COMMANDS 已删、提交入口 dispatcher 单入口、命令字符串白名单已删、SessionPanel 直调 `resume_session`、控制器方法面完整。
 
 上下文管理测试（`tests/test_context_*.py`，用假 provider 断言摘要请求不带工具）：近似估算（无锚点全量、有锚点=锚点+增量、越界兜底）、第一层存盘（单结果 / 聚合挑大先存 / user 不动 / 幂等 / 写盘失败保留原文）、第二层纯逻辑（保留边界 snap 到 user 不拆 tool 对、草稿丢弃、重构结构与角色交替、转录渲染）、编排（摘要成功重构并失效锚点、连续失败熔断与复位、`manual_compact` 无阈值——小历史 noop「无可摘要」且不调模型 / 大历史无视余量直接摘要、`before_request` 先 offload 降估算、`status_line` 格式与高亮/熔断标记）。真实 LLM 摘要与 TUI 渲染的端到端 5 场景留作手测（见 `docs/c8/checklist.md`）。
 

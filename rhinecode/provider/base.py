@@ -42,14 +42,21 @@ class Message:
     - 工具执行结果：role="tool"，content 为结果文本，tool_call_id 指向对应的调用
 
     :param role: 发送方角色，取值 "user"（用户）/ "assistant"（AI）/ "tool"（工具结果）
-    :param content: 消息文本内容；assistant 发起工具调用时可为空字符串
+    :param content: 消息文本内容；assistant 发起工具调用时可为空字符串。
+                    模型实际接收的完整内容（语义历史），上下文估算/摘要/Provider 均只读它
     :param tool_calls: 仅 assistant 发起工具调用时存在，记录本轮发起的所有 ToolCall
     :param tool_call_id: 仅 role="tool" 时存在，标明该结果对应哪一次工具调用
+    :param display_content: 用户界面与历史回放优先显示的原始输入（c10 双内容模型，
+                            spec F25–F27）。仅提示词型命令需要设置（如 /init 时
+                            content 为展开后的完整提示词、display_content 为 "/init"）；
+                            普通消息为 None。各 Provider 序列化时显式挑选模型字段，
+                            本字段不会发送给模型 API
     """
     role: str
     content: str = ""
     tool_calls: Optional[list[ToolCall]] = None
     tool_call_id: Optional[str] = None
+    display_content: Optional[str] = None
 
 
 @dataclass

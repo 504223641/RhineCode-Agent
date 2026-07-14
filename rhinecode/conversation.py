@@ -3,18 +3,25 @@
 
 ConversationManager 是 TUI 层与下层之间的唯一协调者，职责包括：
 - 维护多轮对话的完整消息历史（history）
-- 解析并执行斜杠命令（/think、/clear、/exit、/plan）
 - 管理思考模式三档强度（off / high / max）
-- 管理 Plan Mode 开关与会话级「免确认」标志、当前运行的取消信号
+- 管理 Plan Mode 开关与权限模式、当前运行的取消信号
 - 把每条普通消息委托给 Agent（ReAct 循环引擎）执行，并把其事件流交给 TUI
 
 c4 变化：c3 的工具编排（写死的单轮往返 _stream/_execute 等）已整体迁入 agent.loop.Agent。
 本类不再亲自跑循环，只负责「协调 + 状态」：每条普通消息构造一次 Agent 运行，把回调与策略
 以参数/闭包注入 Agent，返回 Agent 产出的 AgentEvent 事件流。
 
-TUI 层调用 handle_input() 获取结果，结果类型决定后续行为：
-- str：斜杠命令的反馈文本，直接作为系统提示显示
+c10 变化：斜杠命令的解析与分发整体迁出到 rhinecode/commands/ 命令层——
+本类**不再解析任何斜杠文本**（旧 handle_input 已删除），改为暴露一组不依赖
+命令字符串的领域方法（submit_user_message / cycle_thinking / toggle_plan /
+cycle_permission / mcp_report / context_report / memory_report /
+manual_compact / resume / clear），由 RhineApp（CommandController 实现）调用。
+依赖方向：commands → tui/app → 本类；本类不导入 commands 包（plan 依赖固定）。
+
+领域方法返回值类型决定 TUI 后续行为：
+- str：本地反馈文本，直接作为系统提示显示
 - Iterator[AgentEvent]：Agent 循环的事件流，由 TUI 的 Worker 消费并逐个渲染
+- SessionListRequest：请求 TUI 弹出会话选择面板（仅 resume 无参时）
 """
 
 import threading
@@ -33,7 +40,6 @@ from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
-from rhinecode.agent.prompt.texts import INIT_PROMPT
 from rhinecode.agent.events import (
     AgentEvent,
     AgentEventType,
@@ -65,9 +71,9 @@ class SessionListRequest:
     """
     「请 TUI 弹出会话选择面板」的分发信号（c9 /resume 交互化）。
 
-    handle_input("/resume") 无参时返回本类型（而非文本列表），TUI 据此显示
+    resume(None)（/resume 无参）时返回本类型（而非文本列表），TUI 据此显示
     SessionPanel 让用户上下键选择。放在 conversation 层而非 agent/events.py：
-    它是「TUI ↔ 协调层」的命令分发结果，不是 Agent 循环产出的事件。
+    它是「TUI ↔ 协调层」的领域结果，不是 Agent 循环产出的事件。
 
     :param sessions: 全部会话信息（含锁定项与当前会话，是否 disabled 由面板决定）
     :param current_id: 当前会话 ID（面板据此标注「（当前）」并禁用该项）
@@ -221,20 +227,28 @@ class ConversationManager:
             return None
         return self._engine.mode.value
 
-    def clear(self) -> None:
+    @property
+    def tools_enabled(self) -> bool:
+        """当前 Provider 是否具备工具能力（DeepSeek 工具模式，c10 供控制器只读）。"""
+        return self._tools_enabled
+
+    def clear(self) -> str:
         """
-        清空对话历史。
+        清空对话历史，返回兼容确认文本（c10 起由命令层展示，文案保持不变）。
 
         副作用：self.history 被重置为空列表，下次请求将不携带任何上下文；
         同时重置上下文压缩器的会话级状态（估算锚点、熔断计数、已存盘幂等集合，c8 F15）——
         历史清空后旧锚点与熔断态都不再适用，必须一并归零。
         c9：会话存档随之「开新档」——旧存档保留不动、后续消息写入新文件（F8），
         笔记高水位一并归零。
+
+        :returns: 确认文本「对话历史已清空」
         """
         self.history = []
         if self._context_manager is not None:
             self._context_manager.reset()
         self.memory_manager.on_clear()
+        return "对话历史已清空"
 
     def request_cancel(self) -> None:
         """
@@ -245,123 +259,119 @@ class ConversationManager:
         """
         self._cancel_event.set()
 
-    def handle_input(self, text: str) -> "str | Iterator[AgentEvent] | SessionListRequest":
+    # ------------------------------------------------------------------ #
+    # 领域方法（c10：命令解析已迁出到 commands 层，这里只做领域能力）
+    # ------------------------------------------------------------------ #
+    def submit_user_message(
+        self, content: str, display_content: Optional[str] = None
+    ) -> Iterator[AgentEvent]:
         """
-        处理用户输入，根据内容类型分发到不同处理路径。
+        提交一条用户消息并启动 Agent 循环（普通对话与提示词命令共用的唯一入口）。
 
-        处理规则：
-        - "/exit"  → 抛出 SystemExit，由 TUI 层捕获后调用 app.exit()
-        - "/clear" → 清空 history，返回确认文本
-        - "/think" → 三态循环切换 thinking_effort（off→high→max→off）；不支持的 Provider 返回提示
-        - "/plan"  → 切换 Plan Mode；仅工具可用 Provider 生效，否则返回不支持提示
-        - "/perm"  → 三档循环切换权限模式（默认→严格→放行）；仅工具可用 Provider 生效（c6）
-        - "/memory" → 记忆系统只读报告（c9）
-        - "/resume" → 无参返回 SessionListRequest（TUI 弹会话选择面板）；
-                      带编号/ID 返回载入事件流（c9）
-        - "/init"  → 内置指令走 Agent Loop 生成 RHINE.md；仅工具可用 Provider 生效（c9）
-        - 其他     → 追加用户消息到 history（并写入会话存档），委托 Agent 跑循环，返回事件流
+        :param content: 模型实际接收的完整内容（语义历史）
+        :param display_content: 界面/回放优先显示的原始输入（c10 双内容，
+                                仅提示词命令如 /init 需要设置；普通消息为 None）
+        :returns: Agent 事件流（由 TUI Worker 消费）
 
-        :param text: 用户原始输入（含前后空白）
-        :returns: str（斜杠命令反馈）、Iterator[AgentEvent]（循环事件流）
-                  或 SessionListRequest（请求 TUI 弹出会话选择面板）
-        :raises SystemExit: 用户输入 "/exit" 时抛出
-
-        副作用：
-        - "/clear" 会清空 self.history
-        - "/think" 会修改 self.thinking_effort
-        - "/plan" 会修改 self.plan_mode
-        - 普通消息会向 self.history 追加用户消息（assistant/tool 消息由 Agent 在循环中追加）
+        副作用：向 self.history 追加用户消息并写入会话存档（c9 F6）；
+        不解析斜杠、不做界面回显（回显由命令分发器统一负责）。
         """
-        text = text.strip()
-
-        if text == "/exit":
-            raise SystemExit
-
-        if text == "/clear":
-            self.clear()
-            return "对话历史已清空"
-
-        if text == "/think":
-            # Anthropic 和 DeepSeek 均支持思考模式，OpenAI 原生协议不支持
-            if self._protocol not in ("anthropic", "deepseek"):
-                return "当前 Provider 不支持思考模式"
-            self.thinking_effort = self._EFFORT_CYCLE[self.thinking_effort]
-            label = self._EFFORT_LABEL[self.thinking_effort]
-            return f"思考模式：{label}"
-
-        if text == "/plan":
-            # Plan Mode 依赖工具能力，仅在工具可用的 Provider（DeepSeek + 注册中心）下生效
-            if not self._tools_enabled:
-                return "当前 Provider 不支持计划模式"
-            self.plan_mode = not self.plan_mode
-            return "计划模式：开启" if self.plan_mode else "计划模式：关闭"
-
-        if text == "/perm":
-            # 权限模式三档循环切换（c6）；仅在工具可用的 Provider 下有意义（无工具则无可控对象）
-            if not self._tools_enabled:
-                return "当前 Provider 不支持权限模式"
-            self._engine.set_mode(self._PERM_CYCLE[self._engine.mode])
-            label = self._PERM_LABEL[self._engine.mode]
-            return f"权限模式：{label}"
-
-        if text == "/mcp":
-            # 展示 MCP 各 Server 的连接状态、工具数与失败原因（c7 F16）。
-            # 与 /perm 等不同，本命令纯只读、不改任何状态，也不受工具能力开关限制。
-            if self._mcp_manager is None:
-                return "未启用 MCP（未配置任何 MCP Server）"
-            return self._mcp_manager.status_report()
-
-        if text == "/context":
-            # 只读展示当前上下文用量（c8 F16）；纯读、不改状态，同步返回字符串即可
-            # （不涉及阻塞的 LLM 调用，故不必走 Worker）。
-            if not self._tools_enabled or self._context_manager is None:
-                return "当前 Provider 不支持上下文管理"
-            return self._context_manager.usage_report(self.history)
-
-        if text == "/compact":
-            # 手动触发重量压缩（c8 F14）。摘要是阻塞的 LLM 调用，若在此同步执行会卡死 UI 线程，
-            # 故返回事件流生成器交给 TUI 的后台 Worker 消费（与普通消息同一执行路径）。
-            if not self._tools_enabled or self._context_manager is None:
-                return "当前 Provider 不支持上下文管理"
-            return self._manual_compact()
-
-        if text == "/memory":
-            # 记忆系统只读报告（c9 F19）：纯读不改状态，同步返回即可。
-            return self.memory_manager.memory_report()
-
-        if text == "/resume" or text.startswith("/resume "):
-            # 会话恢复（c9 F9）。无参 → 返回结构化列表信号（TUI 弹交互式选择面板）；
-            # 带参 → 事件流走 Worker——载入后可能触发 C8 压缩（阻塞的摘要 LLM 调用），
-            # 不能卡 UI 主线程。面板选中后 TUI 会以 "/resume <session_id>" 重新进入带参分支，
-            # 两条路径共用 _resume_stream。
-            key = text[len("/resume"):].strip()
-            if not key:
-                infos = self.memory_manager.list_resume_sessions()
-                if not infos:
-                    return "没有可恢复的会话存档。"
-                current = self.memory_manager.session_id
-                # 全部条目都不可选（只有当前会话 / 均被其它实例锁定）时不弹面板，
-                # 直接如实反馈——弹一个没有可选项的面板只会让用户困惑。
-                if all(i.session_id == current or i.locked for i in infos):
-                    return "没有可恢复的其它会话（仅有当前会话或均被其它实例占用）。"
-                return SessionListRequest(sessions=infos, current_id=current)
-            return self._resume_stream(key)
-
-        if text == "/init":
-            # /init（c9 F25）：把内置指令作为一条普通 user 消息交给 Agent Loop——
-            # 探索用只读工具、写 RHINE.md 走 write_file 的完整权限管线（人在回路确认）。
-            if not self._tools_enabled:
-                return "当前 Provider 不支持 /init（需要 DeepSeek 工具模式）"
-            init_msg = Message(role="user", content=INIT_PROMPT)
-            self.history.append(init_msg)
-            self.memory_manager.record_message(init_msg)
-            return self._run()
-
-        # 普通消息：先追加到历史（并写入会话存档，c9 F6），再委托 Agent 跑循环
-        user_msg = Message(role="user", content=text)
+        user_msg = Message(role="user", content=content, display_content=display_content)
         self.history.append(user_msg)
         self.memory_manager.record_message(user_msg)
         return self._run()
+
+    def cycle_thinking(self) -> str:
+        """
+        三态循环切换思考模式（off → high → max → off）。
+
+        :returns: 供界面显示的结果文本；不支持的 Provider 返回原能力限制提示
+        """
+        # Anthropic 和 DeepSeek 均支持思考模式，OpenAI 原生协议不支持
+        if self._protocol not in ("anthropic", "deepseek"):
+            return "当前 Provider 不支持思考模式"
+        self.thinking_effort = self._EFFORT_CYCLE[self.thinking_effort]
+        label = self._EFFORT_LABEL[self.thinking_effort]
+        return f"思考模式：{label}"
+
+    def toggle_plan(self) -> str:
+        """
+        切换 Plan Mode 开关（仅工具可用 Provider 生效）。
+
+        :returns: 供界面显示的结果文本；不支持时保持关闭并返回原提示
+        """
+        # Plan Mode 依赖工具能力，仅在工具可用的 Provider（DeepSeek + 注册中心）下生效
+        if not self._tools_enabled:
+            return "当前 Provider 不支持计划模式"
+        self.plan_mode = not self.plan_mode
+        return "计划模式：开启" if self.plan_mode else "计划模式：关闭"
+
+    def cycle_permission(self) -> str:
+        """
+        三档循环切换权限模式（默认 → 严格 → 放行 → 默认，c6）。
+
+        :returns: 供界面显示的结果文本；工具不可用的 Provider 返回原提示
+        """
+        # 仅在工具可用的 Provider 下有意义（无工具则无可控对象）
+        if not self._tools_enabled:
+            return "当前 Provider 不支持权限模式"
+        self._engine.set_mode(self._PERM_CYCLE[self._engine.mode])
+        label = self._PERM_LABEL[self._engine.mode]
+        return f"权限模式：{label}"
+
+    def mcp_report(self) -> str:
+        """MCP 连接状态只读报告（c7 F16）：纯读不改状态。"""
+        if self._mcp_manager is None:
+            return "未启用 MCP（未配置任何 MCP Server）"
+        return self._mcp_manager.status_report()
+
+    def context_report(self) -> str:
+        """上下文用量只读报告（c8 F16）：纯读不改状态，不涉及阻塞的 LLM 调用。"""
+        if not self._tools_enabled or self._context_manager is None:
+            return "当前 Provider 不支持上下文管理"
+        return self._context_manager.usage_report(self.history)
+
+    def memory_report(self) -> str:
+        """记忆系统只读报告（c9 F19）：纯读不改状态。"""
+        return self.memory_manager.memory_report()
+
+    def manual_compact(self) -> "Iterator[AgentEvent] | str":
+        """
+        手动触发第二层上下文压缩（c8 F14）。
+
+        摘要是阻塞的 LLM 调用，若同步执行会卡死 UI 线程，故返回事件流生成器
+        交给 TUI 的后台 Worker 消费（与普通消息同一执行路径，spec F18）。
+
+        :returns: 事件流；工具不可用的 Provider 返回原能力限制提示文本
+        """
+        if not self._tools_enabled or self._context_manager is None:
+            return "当前 Provider 不支持上下文管理"
+        return self._manual_compact()
+
+    def resume(self, key: Optional[str] = None) -> "SessionListRequest | Iterator[AgentEvent] | str":
+        """
+        会话恢复（c9 F9）。
+
+        - key 为 None（/resume 无参）：返回 SessionListRequest（TUI 弹交互式选择面板）；
+          无存档或全部不可选时返回原提示文本。
+        - key 非 None（编号或 ID）：返回载入事件流走 Worker——载入后可能触发 C8 压缩
+          （阻塞的摘要 LLM 调用），不能卡 UI 主线程。面板选中后 TUI 直接以
+          session_id 调本方法（c10 起不再伪造 "/resume <id>" 文本），两条路径共用
+          _resume_stream。
+
+        :param key: 会话编号或完整 ID；None 表示请求列表
+        """
+        if key is None:
+            infos = self.memory_manager.list_resume_sessions()
+            if not infos:
+                return "没有可恢复的会话存档。"
+            current = self.memory_manager.session_id
+            # 全部条目都不可选（只有当前会话 / 均被其它实例锁定）时不弹面板，
+            # 直接如实反馈——弹一个没有可选项的面板只会让用户困惑。
+            if all(i.session_id == current or i.locked for i in infos):
+                return "没有可恢复的其它会话（仅有当前会话或均被其它实例占用）。"
+            return SessionListRequest(sessions=infos, current_id=current)
+        return self._resume_stream(key)
 
     def _manual_compact(self) -> Iterator[AgentEvent]:
         """

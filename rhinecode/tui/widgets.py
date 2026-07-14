@@ -15,9 +15,11 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 """
 
 from time import monotonic
+from typing import Optional
 
 from rich.cells import cell_len
 from rich.console import Group as RichGroup
+from rich.highlighter import Highlighter
 from rich.markup import escape
 from rich.markdown import Markdown as RichMarkdown
 from rich.segment import Segment
@@ -25,12 +27,14 @@ from rich.style import Style
 from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.events import Key
 from textual.widgets import Static, Input, OptionList
 from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
 from rhinecode.agent.events import ClarifyOption
+from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 
@@ -85,7 +89,9 @@ def build_replay_items(messages) -> "list[tuple]":
     1. 第一趟收集 {tool_call_id: 工具结果文本} 映射——载入历史已经过 SessionStore 的
        _drop_unpaired 严格配对清理，但仍用 dict.get 防御性兜底（缺结果时展示占位）；
     2. 第二趟按原始顺序产出渲染项：
-       - role="user"      → ("user", content)
+       - role="user"      → ("user", 显示文本)：优先取非空 display_content
+                            （c10 双内容——/init 等提示词命令回放时只显示原命令），
+                            缺失或为空回退 content
        - role="assistant" → content 非空先产出 ("assistant", content)；
                             随后每个 tool_call 产出 ("tool", tool_call, 结果首行截断)。
                             content 为空且无 tool_calls 的消息整体跳过（不渲染空 Rhine 行）
@@ -106,7 +112,10 @@ def build_replay_items(messages) -> "list[tuple]":
     items: list[tuple] = []
     for msg in messages:
         if msg.role == "user":
-            items.append(("user", msg.content))
+            # 双内容（c10 F26）：display_content 非空时优先展示（提示词命令原文），
+            # 旧消息 / 普通消息（None 或空串）回退完整 content。
+            display = getattr(msg, "display_content", None)
+            items.append(("user", display if display else msg.content))
         elif msg.role == "assistant":
             if msg.content:
                 items.append(("assistant", msg.content))
@@ -510,56 +519,90 @@ class HistoryView(ScrollableContainer):
         self.scroll_end(animate=False)
 
 
+class CommandHighlighter(Highlighter):
+    """
+    输入框命令字段高亮器（c10 T36，spec F24）。
+
+    通过 Textual `Input` 的公开 `highlighter` 扩展点安装（不覆写私有渲染实现）。
+    规则：
+    - 只检查输入开头到第一个空白之前的字段；
+    - 仅当完整字段能被注册表解析（规范名或别名、大小写不敏感）时，为该字段
+      施加命令强调样式；参数与后续空白保持普通样式；
+    - 未完整命中的前缀（如 "/res"）不高亮，避免让用户误以为命令有效；
+    - 正文内的斜杠（不在输入开头）不高亮；
+    - 不改变用户输入的显示文本（大小写形式可命中，显示仍保留原文）。
+    """
+
+    # 命令字段的强调样式：与主题青色一致的加粗，与普通输入文字明显区分。
+    COMMAND_STYLE = "bold #7AEEFF"
+
+    def __init__(self, registry: CommandRegistry) -> None:
+        self._registry = registry
+
+    def highlight(self, text: RichText) -> None:
+        """
+        rich Highlighter 协议：原地为 text 施加样式（不改变字符内容）。
+
+        :param text: 输入框当前内容的 rich Text 对象
+        """
+        plain = text.plain
+        if not plain.startswith("/"):
+            return
+        # 命令字段 = 开头到第一个空白之前；无空白时整段都是命令字段
+        end = next((i for i, ch in enumerate(plain) if ch.isspace()), len(plain))
+        token = plain[:end]
+        # 只有完整命中注册表（规范名或别名）才着色（spec F24）
+        if self._registry.resolve(token) is not None:
+            text.stylize(self.COMMAND_STYLE, 0, end)
+
+
 class CommandPanel(OptionList):
     """
-    斜杠命令提示面板。
+    斜杠命令提示面板（c10 起从注册表动态取候选，不再维护静态 COMMANDS 列表）。
 
     继承自 Textual OptionList，内置 Up/Down 键盘导航和 Enter 选中能力。
-    默认 display:none 不占布局空间；当用户输入以 "/" 开头时由 App 层调用
-    show_for() 使其出现，并根据已输入内容进行前缀过滤。
+    默认 display:none 不占布局空间；当用户输入以 "/" 开头且光标位于命令字段时
+    由 App 层调用 show_for() 使其出现，候选来自 CommandRegistry.complete()：
+    - 同时匹配规范名与别名（大小写不敏感），别名候选额外标注其规范命令；
+    - 隐藏命令及其别名不出现（spec F20）；
+    - 候选顺序稳定：注册顺序 + 每命令规范名先于别名（spec F22）。
 
-    选中某条命令后，App 层监听 OptionList.OptionSelected 事件，
-    将命令文本填入 InputBar 并自动提交。
-
-    COMMANDS 是所有内置命令的注册表，新增命令只需在此列表追加即可，
-    无需修改其他代码。
+    选中某条候选后，App 层监听 OptionList.OptionSelected 事件，
+    将候选文本填入 InputBar 并自动提交（或经提交入口直接分发）。
     """
 
     # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
     DEFAULT_CSS = "CommandPanel { display: none; }"
 
-    # 命令注册表：(命令文本, 简要描述)
-    COMMANDS: list[tuple[str, str]] = [
-        ("/think", "循环切换思考模式：关闭 → 高效 → 最强（Anthropic/DeepSeek 支持）"),
-        ("/plan",  "切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）"),
-        ("/perm",  "循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）"),
-        ("/mcp",   "查看 MCP 服务连接状态（Server / 工具 / 失败原因）"),
-        ("/context", "查看当前上下文用量（估算 token / 余量 / 已存盘数）"),
-        ("/compact", "压缩上下文：LLM 摘要早前对话，保留近期原文"),
-        ("/resume", "恢复历史会话：无参打开选择面板，带编号/ID 直接载入"),
-        ("/memory", "查看记忆系统状态（RHINE.md / 笔记 / 会话存档 / 锁）"),
-        ("/init",  "分析项目并生成 RHINE.md 项目指令文件（DeepSeek 工具模式）"),
-        ("/clear", "清空当前对话历史"),
-        ("/exit",  "退出 RhineCode"),
-    ]
+    def __init__(self, registry: CommandRegistry, **kwargs) -> None:
+        """
+        :param registry: 命令注册表（与分发器、输入高亮器共享同一实例，spec F3）
+        """
+        super().__init__(**kwargs)
+        self._registry = registry
 
     def show_for(self, prefix: str) -> None:
         """
-        根据用户已输入的前缀过滤命令并刷新 OptionList，有匹配则显示面板，无匹配则隐藏。
+        用注册表候选刷新 OptionList：有匹配则显示面板，零候选则隐藏。
 
-        每次调用会先清空现有选项再重新填充，避免残留上次的过滤结果。
-        Option 的 id 设置为命令文本本身，方便 OptionSelected 事件中直接取用。
+        每次调用先清空现有选项再重建，避免残留上次的过滤结果；
+        重建后把首个候选设为高亮，供「菜单可见时按 Enter 执行当前高亮项」
+        （spec F23）。Option 的 id 即候选文本（规范名或别名）。
 
-        :param prefix: 用户当前输入内容（如 "/"、"/th"、"/clear"）
+        :param prefix: 用户当前输入的命令字段前缀（如 "/"、"/co"、"/ctx"）
         """
-        matched = [(cmd, desc) for cmd, desc in self.COMMANDS if cmd.startswith(prefix)]
+        items = self._registry.complete(prefix)
         self.clear_options()
-        if not matched:
+        if not items:
             self.display = False
             return
-        for cmd, desc in matched:
-            self.add_option(Option(f"{cmd}  [dim]{desc}[/dim]", id=cmd))
+        for item in items:
+            self.add_option(
+                Option(f"{item.value}  [dim]{escape(item.description)}[/dim]", id=item.value)
+            )
         self.display = True
+        # 首个候选默认高亮：Enter 即执行（与确认面板的顺手体验一致）
+        self.highlighted = 0
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
@@ -572,6 +615,13 @@ class InputBar(Input):
 
     继承自 Textual Input，拦截内置的 Submitted 事件，在内容非空时
     发出自定义的 InputSubmitted 消息，并自动清空输入框，为下次输入做准备。
+
+    c10 增强：
+    - 构造时接收 CommandRegistry，经 Textual `Input` 公开的 `highlighter`
+      参数安装 CommandHighlighter——完整命中的命令字段着色，参数保持普通样式；
+    - 值以 "/" 开头且光标仍处于命令字段时拦截 Tab，post CommandCompletionRequested
+      交给 App 做单候选补全/多候选菜单；已进入参数区或普通文本时不拦截，
+      保留 Textual 的正常 Tab 行为（焦点切换）。
 
     使用自定义消息而非直接调用方法，是为了保持 Widget 间的松耦合：
     InputBar 不需要持有 App 或其他组件的引用。
@@ -586,6 +636,69 @@ class InputBar(Input):
         def __init__(self, text: str) -> None:
             super().__init__()
             self.text = text
+
+    class CommandCompletionRequested(TextualMessage):
+        """
+        用户在命令字段按 Tab 请求补全时发出（c10 T39）。
+
+        :param prefix: 当前输入的命令字段前缀（含开头 "/"，如 "/co"）
+        """
+        def __init__(self, prefix: str) -> None:
+            super().__init__()
+            self.prefix = prefix
+
+    def __init__(self, registry: "Optional[CommandRegistry]" = None, **kwargs) -> None:
+        """
+        :param registry: 命令注册表；非 None 时安装命令字段高亮器（公开扩展点，
+                         不覆写 Textual 私有渲染方法）
+        :param kwargs: 透传给 Textual Input（placeholder 等）
+        """
+        if registry is not None:
+            kwargs.setdefault("highlighter", CommandHighlighter(registry))
+        super().__init__(**kwargs)
+
+    def _command_field_end(self) -> int:
+        """返回命令字段的结束位置（开头到第一个空白之前；无空白即整段长度）。"""
+        return next((i for i, ch in enumerate(self.value) if ch.isspace()), len(self.value))
+
+    def on_key(self, event: Key) -> None:
+        """
+        拦截命令字段内的 Tab：post 补全请求并阻止默认焦点切换（c10 T39）。
+
+        拦截条件：值以 "/" 开头，且光标位置不超过命令字段末尾（仍在命令字段内）。
+        参数区（第一个空白之后）或普通文本的 Tab 不拦截，Textual 默认行为保留。
+        """
+        if event.key != "tab":
+            return
+        if not self.value.startswith("/"):
+            return
+        end = self._command_field_end()
+        if self.cursor_position > end:
+            return  # 已进入参数区：不做命令补全
+        event.stop()
+        event.prevent_default()
+        self.post_message(self.CommandCompletionRequested(self.value[:end]))
+
+    def apply_completion(self, value: str, trailing_space: bool = False) -> None:
+        """
+        用候选文本替换命令字段并把光标移到命令字段末尾（供 App 单候选补全调用）。
+
+        只替换第一个空白之前的命令字段，参数区内容原样保留（spec：/resume 12
+        按 Tab 不改动 12）。
+
+        :param value: 替换后的完整命令（如 "/compact"）
+        :param trailing_space: True 且原输入无参数时在末尾补一个空格
+                               （候选命令有参数提示时，方便用户继续输入参数）
+        """
+        end = self._command_field_end()
+        rest = self.value[end:]
+        if rest:
+            self.value = value + rest
+            self.cursor_position = len(value)
+        else:
+            suffix = " " if trailing_space else ""
+            self.value = value + suffix
+            self.cursor_position = len(self.value)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """
@@ -602,13 +715,71 @@ class InputBar(Input):
             self.value = ""
 
 
+# 模式标记样式（c10 F29/F30）：
+# - [DEFAULT] 用 dim（中性、低强调），深浅色主题下都可读；
+# - [PLAN] 用加粗的醒目青色（与主题青一致但更饱和），两种主题下均与 DEFAULT 明显区分。
+# N9 可访问性：模式不只靠颜色表达——文字本身就是 [DEFAULT]/[PLAN]，忽略样式也能区分。
+_MODE_DEFAULT_MARKUP = "[dim]\\[DEFAULT][/dim]"
+_MODE_PLAN_MARKUP = "[bold #00D7D7]\\[PLAN][/bold #00D7D7]"
+
+
+def compose_status_text(
+    provider: str,
+    model: str,
+    thinking_effort: str,
+    plan_mode: bool = False,
+    permission_mode: "str | None" = None,
+    mcp_status: "str | None" = None,
+    context_status: "str | None" = None,
+    context_warn: bool = False,
+) -> str:
+    """
+    组装状态栏的 Content markup 文本（纯函数，c10 抽出便于单测）。
+
+    显示格式：\\[protocol] model | 思考模式：X | [DEFAULT]/[PLAN] | 权限模式：X | MCP：… | 上下文：…
+    c10 起旧的「计划模式：开/关」文字替换为醒目的模式标记（spec F29–F30）。
+
+    :returns: 可交给 Static(markup=True) 渲染的 markup 字符串
+    """
+    _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
+    state = _LABEL.get(thinking_effort, thinking_effort)
+    # Static(markup=True) 走 Textual 的 Content markup：`[xxx]` 会被当成样式标签解析。
+    # 这里 `[provider]`、`[DEFAULT]`、`[PLAN]` 的方括号是想当「字面量」显示的，必须转义
+    # 开口的 `[`（写成 `\[`），否则会被解析成无效样式标签而整段消失（项目已知坑）。
+    mode_seg = _MODE_PLAN_MARKUP if plan_mode else _MODE_DEFAULT_MARKUP
+    text = (
+        f" \\[{escape(str(provider))}] {escape(str(model))} | "
+        f"思考模式：{escape(str(state))} | {mode_seg}"
+    )
+    if permission_mode is not None:
+        _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
+        plabel = _PERM.get(permission_mode, permission_mode)
+        seg = f"权限模式：{escape(str(plabel))}"
+        # 放行档影响安全（灰色地带默认放行），用橘色（与确认面板同色）醒目提示。
+        if permission_mode == "permissive":
+            seg = f"[#FFA500]{seg}[/#FFA500]"
+        text += f" | {seg}"
+    # MCP 段（c7）：仅在启用且有 Server 时展示；文本可能含字面 `[`，统一 escape 兜底。
+    if mcp_status is not None:
+        text += f" | {escape(str(mcp_status))}"
+    # 上下文段（c8）：仅在有 ContextManager 时展示。接近上限/熔断时橘色高亮——
+    # 与 permissive、确认面板同色，语义都是「需要用户留意」。注意先 escape 文本再包裹
+    # 颜色标签（颜色标签本身不能被转义，否则会被当字面量显示）。
+    if context_status is not None:
+        seg = escape(str(context_status))
+        if context_warn:
+            seg = f"[#FFA500]{seg}[/#FFA500]"
+        text += f" | {seg}"
+    return text + " "
+
+
 class StatusBar(Static):
     """
     底部状态栏，实时展示当前会话的关键状态信息。
 
-    显示格式：[protocol] model | 思考模式：X | 计划模式：开/关 | 权限模式：X | MCP：… | 上下文：19% · 12.3K/64K
-    /think、/plan、/perm、/clear 命令执行后（以及每轮流式结束时），App 层会调用
-    update_status() 刷新显示。
+    显示格式：[protocol] model | 思考模式：X | [DEFAULT]/[PLAN] | 权限模式：X | MCP：… | 上下文：…
+    模式命令执行后（以及每轮流式结束时），App 层会调用 update_status() 刷新显示；
+    c10 起刷新由命令处理函数经控制器显式触发，不再依赖命令字符串白名单。
     """
 
     def update_status(
@@ -623,51 +794,30 @@ class StatusBar(Static):
         context_warn: bool = False,
     ) -> None:
         """
-        刷新状态栏显示内容。
+        刷新状态栏显示内容（文本组装见 compose_status_text 纯函数）。
 
         :param provider: Provider 协议名（anthropic / openai / deepseek）
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
-        :param plan_mode: 是否处于 Plan Mode（c4 新增，显示「计划模式：开/关」）
+        :param plan_mode: 是否处于 Plan Mode（c10 起显示 [DEFAULT] / [PLAN] 标记）
         :param permission_mode: 权限模式取值（"strict"/"default"/"permissive"）；c6 新增。
                                 为 None（工具不可用的 Provider）时不展示该段，避免误导。
-                                放行档以橘色高亮，提醒用户当前处于「灰色地带默认放行」的状态。
-        :param mcp_status: MCP 连接状态摘要（如「MCP：已连接 2/3 · 工具 11」）；c7 新增。
-                           为 None（未启用 MCP / 无 Server）时不展示该段。
-        :param context_status: 上下文用量摘要（如「上下文：19% · 12.3K/64K」）；c8 新增。
-                               为 None（工具不可用的 Provider / 无 ContextManager）时不展示该段。
+        :param mcp_status: MCP 连接状态摘要；为 None（未启用 MCP）时不展示该段。
+        :param context_status: 上下文用量摘要；为 None（无 ContextManager）时不展示该段。
         :param context_warn: 上下文是否接近上限或已熔断；为真时该段橘色高亮预警。
         """
-        _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
-        state = _LABEL.get(thinking_effort, thinking_effort)
-        plan_state = "开" if plan_mode else "关"
-        # Static(markup=True) 走 Textual 的 Content markup：`[xxx]` 会被当成样式标签解析。
-        # 这里 `[provider]` 的方括号是想当「字面量」显示的，必须转义开口的 `[`（写成 `\[`），
-        # 否则像 `[deepseek]` 会被解析成无效样式标签而整段消失（历史遗留显示 bug）。
-        text = (
-            f" \\[{escape(str(provider))}] {escape(str(model))} | "
-            f"思考模式：{escape(str(state))} | 计划模式：{escape(plan_state)}"
+        self.update(
+            compose_status_text(
+                provider,
+                model,
+                thinking_effort,
+                plan_mode,
+                permission_mode,
+                mcp_status,
+                context_status,
+                context_warn,
+            )
         )
-        if permission_mode is not None:
-            _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
-            plabel = _PERM.get(permission_mode, permission_mode)
-            seg = f"权限模式：{escape(str(plabel))}"
-            # 放行档影响安全（灰色地带默认放行），用橘色（与确认面板同色）醒目提示。
-            if permission_mode == "permissive":
-                seg = f"[#FFA500]{seg}[/#FFA500]"
-            text += f" | {seg}"
-        # MCP 段（c7）：仅在启用且有 Server 时展示；文本可能含字面 `[`，统一 escape 兜底。
-        if mcp_status is not None:
-            text += f" | {escape(str(mcp_status))}"
-        # 上下文段（c8）：仅在有 ContextManager 时展示。接近上限/熔断时橘色高亮——
-        # 与 permissive、确认面板同色，语义都是「需要用户留意」。注意先 escape 文本再包裹
-        # 颜色标签（颜色标签本身不能被转义，否则会被当字面量显示）。
-        if context_status is not None:
-            seg = escape(str(context_status))
-            if context_warn:
-                seg = f"[#FFA500]{seg}[/#FFA500]"
-            text += f" | {seg}"
-        self.update(text + " ")
 
 
 class ConfirmPanel(OptionList):

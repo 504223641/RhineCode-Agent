@@ -98,6 +98,68 @@ class SessionStoreTest(unittest.TestCase):
         result = self.store.load("20260101-000000-bbbb")
         self.assertEqual(len(result.messages), 1)
 
+    # ------------------------------------------------------------------ #
+    # 双内容 display_content（c10 T27 / F26–F27）
+    # ------------------------------------------------------------------ #
+    def test_display_content_roundtrip(self) -> None:
+        """带 display_content 的消息追加/载入往返：JSONL 同时保存两种内容。"""
+        sid = self.store.start_new()
+        self.store.append(
+            Message(role="user", content="展开后的完整初始化提示词……", display_content="/init")
+        )
+        line = (self.dir / f"{sid}.jsonl").read_text(encoding="utf-8").splitlines()[0]
+        data = json.loads(line)
+        self.assertEqual(data["content"], "展开后的完整初始化提示词……")
+        self.assertEqual(data["display_content"], "/init")
+        result = self.store.load(sid)
+        self.assertEqual(result.messages[0].content, "展开后的完整初始化提示词……")
+        self.assertEqual(result.messages[0].display_content, "/init")
+
+    def test_plain_message_omits_display_field(self) -> None:
+        """普通消息（display_content=None）不写该字段，行格式与旧版一致。"""
+        sid = self.store.start_new()
+        self.store.append(Message(role="user", content="普通消息"))
+        data = json.loads((self.dir / f"{sid}.jsonl").read_text(encoding="utf-8"))
+        self.assertNotIn("display_content", data)
+
+    def test_legacy_archive_without_display_field(self) -> None:
+        """旧 JSONL 无 display_content 字段仍可载入，回退 None（C49）。"""
+        self._write_archive("20260101-000000-lgcy", [
+            json.dumps({"role": "user", "content": "旧格式消息"}),
+        ])
+        result = self.store.load("20260101-000000-lgcy")
+        self.assertIsNone(result.messages[0].display_content)
+        self.assertEqual(result.messages[0].content, "旧格式消息")
+
+    def test_invalid_display_field_falls_back_to_none(self) -> None:
+        """非法类型（数字/对象/null）的 display_content 统一回退 None。"""
+        self._write_archive("20260101-000000-badd", [
+            json.dumps({"role": "user", "content": "a", "display_content": 123}),
+            json.dumps({"role": "user", "content": "b", "display_content": None}),
+            json.dumps({"role": "user", "content": "c", "display_content": {"x": 1}}),
+        ])
+        result = self.store.load("20260101-000000-badd")
+        self.assertEqual(len(result.messages), 3)
+        for msg in result.messages:
+            self.assertIsNone(msg.display_content)
+
+    def test_title_prefers_display_content(self) -> None:
+        """会话标题优先显示原命令；普通会话仍用 content（C50）。"""
+        self._write_archive("20260101-000000-init", [
+            json.dumps({
+                "ts": "2026-01-01T10:00:00",
+                "role": "user",
+                "content": "很长很长的展开提示词" * 10,
+                "display_content": "/init",
+            }),
+        ])
+        self._write_archive("20260102-000000-norm", [
+            json.dumps({"ts": "2026-01-02T10:00:00", "role": "user", "content": "普通标题"}),
+        ])
+        infos = {i.session_id: i for i in self.store.list_sessions()}
+        self.assertEqual(infos["20260101-000000-init"].title, "/init")
+        self.assertEqual(infos["20260102-000000-norm"].title, "普通标题")
+
     def test_unpaired_tail_group_dropped(self) -> None:
         """结尾「有 tool_calls 无结果」：该组丢弃、之前的消息保留。"""
         self._write_archive("20260101-000000-cccc", [

@@ -4,10 +4,13 @@
 覆盖两块纯逻辑/协调层行为：
 1. build_replay_items —— 「历史消息 → 回放渲染项」的纯函数转换
    （user/assistant/tool 配对、空 assistant 跳过、缺结果兜底、首行截断）；
-2. ConversationManager 的 /resume 分发 —— 无参返回 SessionListRequest（弹面板信号）
-   或提示字符串（空档/全锁定）；带参事件流成功时含 HISTORY 快照、失败时不含。
+2. ConversationManager 的 resume 领域入口（c10 起命令解析在 commands 层，
+   本文件直接调 resume(None) / resume(key)）—— 无参返回 SessionListRequest
+   （弹面板信号）或提示字符串（空档/全锁定）；带参事件流成功时含 HISTORY 快照、
+   失败时不含。
 
-TUI 面板（SessionPanel）与真实渲染留 TUI 手测（见 docs/c9/checklist.md 的交互场景）。
+说明：/continue 等别名不在 Manager 层测试——别名归一化由命令层负责，
+见 tests/test_command_builtins.py。TUI 面板（SessionPanel）与真实渲染留 TUI 手测。
 """
 
 import json
@@ -69,6 +72,23 @@ class BuildReplayItemsTest(unittest.TestCase):
     def test_unknown_role_skipped(self) -> None:
         self.assertEqual(build_replay_items([Message(role="system", content="x")]), [])
 
+    def test_user_display_content_preferred(self) -> None:
+        """c10 双内容：user 消息优先展示 display_content（提示词命令回放只显示原命令）。"""
+        items = build_replay_items(
+            [Message(role="user", content="展开后的完整初始化提示词……", display_content="/init")]
+        )
+        self.assertEqual(items, [("user", "/init")])
+
+    def test_user_display_content_missing_or_empty_falls_back(self) -> None:
+        """旧消息（None）与空显示字段回退完整 content。"""
+        items = build_replay_items(
+            [
+                Message(role="user", content="旧消息"),
+                Message(role="user", content="空显示", display_content=""),
+            ]
+        )
+        self.assertEqual(items, [("user", "旧消息"), ("user", "空显示")])
+
     def test_first_line_truncated(self) -> None:
         long_line = "字" * 100
         self.assertEqual(_first_line_truncated(long_line), "字" * 80 + "…")
@@ -125,7 +145,7 @@ class ConversationResumeTest(unittest.TestCase):
 
     def test_resume_no_archives_returns_str(self) -> None:
         manager = self._manager()
-        result = manager.handle_input("/resume")
+        result = manager.resume(None)
         self.assertIsInstance(result, str)
         self.assertIn("没有可恢复的会话存档", result)
 
@@ -133,7 +153,7 @@ class ConversationResumeTest(unittest.TestCase):
         self._write_archive("20260101-000000-aaaa", ["旧对话"], "2026-01-01")
         self._write_archive("20260102-000000-bbbb", ["新对话"], "2026-01-02")
         manager = self._manager()
-        result = manager.handle_input("/resume")
+        result = manager.resume(None)
         self.assertIsInstance(result, SessionListRequest)
         self.assertEqual(
             [i.session_id for i in result.sessions],
@@ -149,7 +169,7 @@ class ConversationResumeTest(unittest.TestCase):
             Path(".rhinecode") / "sessions" / "20260101-000000-aaaa.lock", 600
         )
         manager = self._manager()
-        result = manager.handle_input("/resume")
+        result = manager.resume(None)
         self.assertIsInstance(result, str)
         self.assertIn("没有可恢复的其它会话", result)
 
@@ -157,7 +177,7 @@ class ConversationResumeTest(unittest.TestCase):
         """带参载入成功：事件流首个为 HISTORY 且快照与存档一致，随后 NOTICE + FINISHED。"""
         self._write_archive("20260101-000000-aaaa", ["第一句", "第二句"], "2026-01-01")
         manager = self._manager()
-        events = list(manager.handle_input("/resume 20260101-000000-aaaa"))
+        events = list(manager.resume("20260101-000000-aaaa"))
 
         history_events = [e for e in events if e.type == AgentEventType.HISTORY]
         self.assertEqual(len(history_events), 1)
@@ -171,7 +191,7 @@ class ConversationResumeTest(unittest.TestCase):
     def test_resume_stream_failure_no_history_event(self) -> None:
         """带参载入失败（找不到会话）：不产 HISTORY（TUI 不清屏），仅 NOTICE 反馈。"""
         manager = self._manager()
-        events = list(manager.handle_input("/resume 不存在的ID"))
+        events = list(manager.resume("不存在的ID"))
         self.assertFalse(any(e.type == AgentEventType.HISTORY for e in events))
         notices = [e for e in events if e.type == AgentEventType.NOTICE]
         self.assertTrue(any("找不到会话" in e.message for e in notices))
