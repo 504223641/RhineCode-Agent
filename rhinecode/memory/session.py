@@ -187,12 +187,14 @@ class SessionStore:
     # ------------------------------------------------------------------ #
     # 扫描列表（F7）
     # ------------------------------------------------------------------ #
-    def list_sessions(self, limit: int = LIST_LIMIT) -> list[SessionInfo]:
+    def list_sessions(self, limit: Optional[int] = LIST_LIMIT) -> list[SessionInfo]:
         """
         扫描目录得到最近会话列表（按最后时间倒序）。
 
         全部信息现场从 JSONL 推导（F7 无 meta 文件）：标题取首条 role=user 行的
         content 截断；last_time 取末行 ts、无 ts 回退 mtime。坏文件整个跳过。
+
+        :param limit: 返回条数上限；None 表示不限（TUI 会话面板取全量用）
 
         副作用：只读文件系统。
         """

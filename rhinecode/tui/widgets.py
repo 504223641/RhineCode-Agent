@@ -31,6 +31,7 @@ from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
 from rhinecode.agent.events import ClarifyOption
+from rhinecode.memory.session import SessionInfo
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 
 
@@ -59,6 +60,61 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     if len(summary) > max_len:
         summary = summary[:max_len] + "…"
     return escape(summary)
+
+
+# 回放时工具结果摘要的最大展示长度（取首行再截断，避免长结果撑爆历史区）
+_REPLAY_RESULT_MAX_CHARS = 80
+
+
+def _first_line_truncated(text: str, max_chars: int = _REPLAY_RESULT_MAX_CHARS) -> str:
+    """取文本首行并按长度截断，用于回放场景的工具结果摘要（与运行时摘要口径一致）。"""
+    line = (text or "").strip().split("\n", 1)[0]
+    if len(line) > max_chars:
+        line = line[:max_chars] + "…"
+    return line
+
+
+def build_replay_items(messages) -> "list[tuple]":
+    """
+    把一段历史消息（provider.base.Message 列表）转换为回放渲染项序列（纯函数，可单测）。
+
+    /resume 载入会话后，TUI 需要把整段历史画回聊天区。本函数负责「消息 → 渲染项」的
+    纯逻辑转换，不做任何 UI 操作，由 HistoryView.render_history 消费。
+
+    执行流程：
+    1. 第一趟收集 {tool_call_id: 工具结果文本} 映射——载入历史已经过 SessionStore 的
+       _drop_unpaired 严格配对清理，但仍用 dict.get 防御性兜底（缺结果时展示占位）；
+    2. 第二趟按原始顺序产出渲染项：
+       - role="user"      → ("user", content)
+       - role="assistant" → content 非空先产出 ("assistant", content)；
+                            随后每个 tool_call 产出 ("tool", tool_call, 结果首行截断)。
+                            content 为空且无 tool_calls 的消息整体跳过（不渲染空 Rhine 行）
+       - role="tool"      → 跳过（结果已并入所属 assistant 的 tool 项）
+       - 其它 role        → 防御性跳过
+
+    已知降级：会话存档不含思考（thinking）内容，回放不出现 💭 块。
+
+    :param messages: 历史消息列表（元素为 provider.base.Message）
+    :returns: 渲染项列表，元素为 ("user", str) / ("assistant", str) / ("tool", ToolCall, str)
+    """
+    # 第一趟：tool_call_id → 结果文本（后到覆盖先到，正常历史中 id 唯一）
+    results: dict = {}
+    for msg in messages:
+        if msg.role == "tool" and msg.tool_call_id:
+            results[msg.tool_call_id] = msg.content
+    # 第二趟：按序产出渲染项
+    items: list[tuple] = []
+    for msg in messages:
+        if msg.role == "user":
+            items.append(("user", msg.content))
+        elif msg.role == "assistant":
+            if msg.content:
+                items.append(("assistant", msg.content))
+            for tc in msg.tool_calls or []:
+                summary = _first_line_truncated(results.get(tc.id, "（无结果）"))
+                items.append(("tool", tc, summary))
+        # role="tool" 与未知 role：跳过
+    return items
 
 
 # diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
@@ -387,6 +443,72 @@ class HistoryView(ScrollableContainer):
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
         self.query_one("#history-messages", Vertical).remove_children()
 
+    # ------------------------------------------------------------------ #
+    # 会话历史回放（c9 /resume 交互化）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_assistant_widget(content: str) -> Static:
+        """
+        构造一条「完整 AI 回复」的静态组件（回放场景，非流式）。
+
+        渲染形态与流式的 update_ai_widget 一致：青绿色 "Rhine" 前缀 + Markdown 正文，
+        区别只是内容一次到位、无需占位-更新两步。
+        """
+        label = RichText("Rhine ", style="bold #CCFF99")
+        return Static(RichGroup(label, RichMarkdown(content)))
+
+    @staticmethod
+    def _build_tool_record_widget(tool_call, result_summary: str) -> Static:
+        """
+        构造一条「历史工具调用记录」的简化静态行（回放场景）。
+
+        两行式：绿色 "● 标签(参数摘要)" + 灰色 "⎿ 结果首行摘要"。
+        刻意**不复用 ToolCallWidget**：它的 on_mount 会启动每秒计时器并重绘「执行中」
+        状态——回放时 finish() 与挂载的时序无保证，终态会被 on_mount 覆盖且定时器
+        永不停止（泄漏）。历史记录也没有耗时数据，简化行语义更贴切。
+
+        :param tool_call: provider.base.ToolCall（提供工具名与参数）
+        :param result_summary: 已截断的结果摘要（build_replay_items 产出）
+        """
+        label = escape(_TOOL_LABELS.get(tool_call.name, tool_call.name))
+        # 标题行走 markup（label 与 summarize_args 的产出都已 escape，安全）；
+        # 分支行用 RichText 纯文本拼接——结果摘要来自工具输出原文，可能含 "["，
+        # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
+        header = f"[{ToolCallWidget._COLOR_OK}]● {label}({summarize_args(tool_call.arguments)})[/]"
+        branch = RichText(f"  ⎿  {result_summary}", style=ToolCallWidget._COLOR_BRANCH)
+        return Static(RichGroup(RichText.from_markup(header), branch))
+
+    def render_history(self, messages) -> None:
+        """
+        清空聊天区并整体回放一段历史消息（/resume 载入、--continue 启动恢复）。
+
+        必须在主线程调用（Worker 侧经 call_from_thread 转入），清空与重画在同一次
+        调用内完成，对用户呈现为原子切换。性能考虑：先把全部消息构造成组件列表，
+        一次 mount(*widgets) 批量挂载、末尾只滚动一次——逐条挂载+滚动会触发 N 次布局，
+        长会话下明显卡顿。
+
+        :param messages: 恢复出来的历史消息列表（provider.base.Message）
+
+        副作用：移除聊天区现有全部组件并挂载回放组件。
+        """
+        container = self.query_one("#history-messages", Vertical)
+        container.remove_children()
+        widgets: list[Static] = []
+        for item in build_replay_items(messages):
+            kind = item[0]
+            if kind == "user":
+                widgets.append(
+                    Static(f"[bold #99FFFF]◈[/bold #99FFFF] {escape(item[1])}", markup=True)
+                )
+            elif kind == "assistant":
+                widgets.append(self._build_assistant_widget(item[1]))
+            elif kind == "tool":
+                widgets.append(self._build_tool_record_widget(item[1], item[2]))
+        if widgets:
+            container.mount(*widgets)
+        self.scroll_end(animate=False)
+
 
 class CommandPanel(OptionList):
     """
@@ -414,7 +536,7 @@ class CommandPanel(OptionList):
         ("/mcp",   "查看 MCP 服务连接状态（Server / 工具 / 失败原因）"),
         ("/context", "查看当前上下文用量（估算 token / 余量 / 已存盘数）"),
         ("/compact", "压缩上下文：LLM 摘要早前对话，保留近期原文"),
-        ("/resume", "恢复历史会话：无参列出最近会话，带编号/ID 载入"),
+        ("/resume", "恢复历史会话：无参打开选择面板，带编号/ID 直接载入"),
         ("/memory", "查看记忆系统状态（RHINE.md / 笔记 / 会话存档 / 锁）"),
         ("/init",  "分析项目并生成 RHINE.md 项目指令文件（DeepSeek 工具模式）"),
         ("/clear", "清空当前对话历史"),
@@ -724,4 +846,91 @@ class ClarifyPanel(OptionList):
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为用户取消澄清。"""
+        self.post_message(self.Cancelled())
+
+
+class SessionPanel(OptionList):
+    """
+    /resume 的交互式会话选择面板（c9 交互化）。
+
+    用户输入 /resume（无参）后，App 用本面板列出全部历史会话：出现在输入框上方，
+    方向键上下选择、回车载入、Esc 退出，不遮挡历史区（与确认/澄清面板同款交互）。
+    展示期间 App 会把焦点移到本面板，直接复用 OptionList 原生的上/下/回车导航。
+
+    条目呈现规则：
+    - 每个会话一行紧凑显示：编号、锁标记、会话 ID、（当前）标记、时间、消息数、标题；
+      单行可让全部条目一屏尽收（两行式在会话多时必然滚动、扫读效率减半）。
+    - 被其它实例锁定的会话（🔒）与当前会话（（当前））设为 disabled——OptionList
+      导航自动跳过，从源头避免「选中后才报错」的挫败感。注意这只是 UX 优化：
+      列表展示与实际载入之间存在锁竞态窗口，真正的锁检查仍在 resume_into → attach，
+      竞态失败会以 NOTICE 反馈且不清屏。
+
+    结果如何回传：用户选中某会话时由 OptionList 原生发出 OptionList.OptionSelected，
+    option.id 即完整 session_id（App 据此直接以 "/resume <session_id>" 走带参载入路径，
+    绕过编号解析）；按 Esc 发出本类的 Cancelled 消息（App 关闭面板、界面原样保留）。
+    """
+
+    # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
+    DEFAULT_CSS = "SessionPanel { display: none; }"
+
+    class Cancelled(TextualMessage):
+        """用户按 Esc 退出会话选择时发出，由 App 关闭面板（不做任何载入）。"""
+        pass
+
+    BINDINGS = [
+        # Esc 退出：发出 Cancelled 消息交给 App 处理（界面原样保留）
+        Binding("escape", "cancel", "取消", show=False),
+    ]
+
+    def show_for(self, infos: list[SessionInfo], current_id: str) -> None:
+        """
+        填充会话列表并显示面板。
+
+        先清空旧选项再重建，避免残留上次列表。结构为：
+        - 一个 disabled 青色表头（操作提示，不可选）
+        - 每个会话一行：可恢复项 id=session_id 可选；锁定项/当前会话 disabled
+
+        :param infos: 全部会话信息（MemoryManager.list_resume_sessions 产出，已按时间倒序）
+        :param current_id: 当前会话 ID（用于标注「（当前）」并禁用）
+
+        副作用：修改 OptionList 选项并使面板可见、重置高亮到第一个可选项。
+        """
+        self.clear_options()
+        self.add_option(
+            Option(
+                "[#7AEEFF]📂 选择要恢复的会话（↑↓ 选择，回车载入，Esc 取消）[/#7AEEFF]",
+                disabled=True,
+            )
+        )
+        first_selectable: "int | None" = None
+        for i, info in enumerate(infos, start=1):
+            when = info.last_time.strftime("%Y-%m-%d %H:%M") if info.last_time else "未知时间"
+            is_current = info.session_id == current_id
+            locked = info.locked and not is_current
+            # session_id / title 都可能含 "["（title 来自用户消息原文），必须 escape，
+            # 否则被 Textual markup 当标签吞掉（项目已知坑，见 CLAUDE.md 成对维护点备忘）
+            line = (
+                f"{i}. {'🔒 ' if locked else ''}{escape(info.session_id)}"
+                f"{'（当前）' if is_current else ''} · {when} · "
+                f"{info.message_count} 条 · [dim]{escape(info.title)}[/dim]"
+            )
+            option_index = self.option_count  # 加入前的位置即本行索引
+            # 锁定/当前会话 disabled：导航自动跳过；可恢复项 id 携带完整 session_id
+            self.add_option(
+                Option(line, id=None if (locked or is_current) else info.session_id,
+                       disabled=locked or is_current)
+            )
+            if first_selectable is None and not (locked or is_current):
+                first_selectable = option_index
+        self.display = True
+        # 默认高亮第一个可选会话（最近的可恢复会话，回车即载入）
+        if first_selectable is not None:
+            self.highlighted = first_selectable
+
+    def hide(self) -> None:
+        """隐藏面板并收回布局空间。"""
+        self.display = False
+
+    def action_cancel(self) -> None:
+        """Esc 绑定：发出 Cancelled 消息，由 App 关闭面板。"""
         self.post_message(self.Cancelled())

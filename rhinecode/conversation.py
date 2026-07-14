@@ -18,6 +18,7 @@ TUI 层调用 handle_input() 获取结果，结果类型决定后续行为：
 """
 
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -29,6 +30,7 @@ from rhinecode.tools.path_guard import workspace_root, register_read_root
 from rhinecode.mcp.manager import MCPManager
 from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
+from rhinecode.memory.session import SessionInfo
 from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.prompt.texts import INIT_PROMPT
@@ -56,6 +58,23 @@ ConfirmCallback = Callable[[ToolCall, Tool, DecisionResult], ConfirmDecision]
 ClarifyCallback = Callable[[str, list[ClarifyOption]], Optional[str]]
 # 计划审批回调：给定计划文本，返回用户是否批准开始执行。
 ApprovePlanCallback = Callable[[str], bool]
+
+
+@dataclass
+class SessionListRequest:
+    """
+    「请 TUI 弹出会话选择面板」的分发信号（c9 /resume 交互化）。
+
+    handle_input("/resume") 无参时返回本类型（而非文本列表），TUI 据此显示
+    SessionPanel 让用户上下键选择。放在 conversation 层而非 agent/events.py：
+    它是「TUI ↔ 协调层」的命令分发结果，不是 Agent 循环产出的事件。
+
+    :param sessions: 全部会话信息（含锁定项与当前会话，是否 disabled 由面板决定）
+    :param current_id: 当前会话 ID（面板据此标注「（当前）」并禁用该项）
+    """
+
+    sessions: list[SessionInfo]
+    current_id: str
 
 
 class ConversationManager:
@@ -226,7 +245,7 @@ class ConversationManager:
         """
         self._cancel_event.set()
 
-    def handle_input(self, text: str) -> "str | Iterator[AgentEvent]":
+    def handle_input(self, text: str) -> "str | Iterator[AgentEvent] | SessionListRequest":
         """
         处理用户输入，根据内容类型分发到不同处理路径。
 
@@ -237,12 +256,14 @@ class ConversationManager:
         - "/plan"  → 切换 Plan Mode；仅工具可用 Provider 生效，否则返回不支持提示
         - "/perm"  → 三档循环切换权限模式（默认→严格→放行）；仅工具可用 Provider 生效（c6）
         - "/memory" → 记忆系统只读报告（c9）
-        - "/resume" → 无参列出最近会话；带编号/ID 返回载入事件流（c9）
+        - "/resume" → 无参返回 SessionListRequest（TUI 弹会话选择面板）；
+                      带编号/ID 返回载入事件流（c9）
         - "/init"  → 内置指令走 Agent Loop 生成 RHINE.md；仅工具可用 Provider 生效（c9）
         - 其他     → 追加用户消息到 history（并写入会话存档），委托 Agent 跑循环，返回事件流
 
         :param text: 用户原始输入（含前后空白）
-        :returns: str（斜杠命令反馈）或 Iterator[AgentEvent]（循环事件流）
+        :returns: str（斜杠命令反馈）、Iterator[AgentEvent]（循环事件流）
+                  或 SessionListRequest（请求 TUI 弹出会话选择面板）
         :raises SystemExit: 用户输入 "/exit" 时抛出
 
         副作用：
@@ -309,11 +330,21 @@ class ConversationManager:
             return self.memory_manager.memory_report()
 
         if text == "/resume" or text.startswith("/resume "):
-            # 会话恢复（c9 F9）。无参 → 同步返回列表；带参 → 事件流走 Worker——
-            # 载入后可能触发 C8 压缩（阻塞的摘要 LLM 调用），不能卡 UI 主线程。
+            # 会话恢复（c9 F9）。无参 → 返回结构化列表信号（TUI 弹交互式选择面板）；
+            # 带参 → 事件流走 Worker——载入后可能触发 C8 压缩（阻塞的摘要 LLM 调用），
+            # 不能卡 UI 主线程。面板选中后 TUI 会以 "/resume <session_id>" 重新进入带参分支，
+            # 两条路径共用 _resume_stream。
             key = text[len("/resume"):].strip()
             if not key:
-                return self.memory_manager.resume_list()
+                infos = self.memory_manager.list_resume_sessions()
+                if not infos:
+                    return "没有可恢复的会话存档。"
+                current = self.memory_manager.session_id
+                # 全部条目都不可选（只有当前会话 / 均被其它实例锁定）时不弹面板，
+                # 直接如实反馈——弹一个没有可选项的面板只会让用户困惑。
+                if all(i.session_id == current or i.locked for i in infos):
+                    return "没有可恢复的其它会话（仅有当前会话或均被其它实例占用）。"
+                return SessionListRequest(sessions=infos, current_id=current)
             return self._resume_stream(key)
 
         if text == "/init":
@@ -354,16 +385,24 @@ class ConversationManager:
 
         步骤：
         1. memory_manager.resume_into：锁检查 → 接管 → 容错载入 → 原地替换 history；
-        2. 成功且有上下文压缩器时：先 reset()（旧估算锚点对应旧历史，换历史不复位会
+        2. 成功时先产出 HISTORY 事件携带**压缩前**的历史快照——TUI 收到后清屏整体回放。
+           快照必须取在下一步 before_request 之前：第二层压缩会把早段消息替换为摘要占位，
+           而用户要回看的是原始对话（浅拷贝即可，压缩用 history[:] 整体重构、不改旧元素）；
+        3. 成功且有上下文压缩器时：先 reset()（旧估算锚点对应旧历史，换历史不复位会
            严重低估用量，c9 plan 技术决策），再跑一次 before_request——载入的历史若已
            逼近窗口上限就地压一次（F11③），不逼近则无动作；
-        3. 结果以 NOTICE 反馈，FINISHED(COMPLETED) 收尾。
+        4. 结果以 NOTICE 反馈（回放后追加在底部，充当成功反馈），FINISHED(COMPLETED) 收尾。
 
-        :returns: 事件流（NOTICE 若干 + FINISHED）
+        失败路径（找不到 / 当前会话 / 被锁）不产 HISTORY 事件，TUI 不清屏、只显示 NOTICE。
+
+        :returns: 事件流（成功：HISTORY + NOTICE 若干 + FINISHED；失败：NOTICE + FINISHED）
 
         副作用：可能切换会话锁、改写 self.history、发起摘要 LLM 调用。
         """
         ok, message = self.memory_manager.resume_into(key, self.history)
+        if ok:
+            # 浅拷贝快照：防止后续 before_request 对 history 的原地重构影响回放内容
+            yield AgentEvent(type=AgentEventType.HISTORY, messages=list(self.history))
         if ok and self._context_manager is not None:
             self._context_manager.reset()
             for notice in self._context_manager.before_request(self.history):

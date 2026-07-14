@@ -25,10 +25,11 @@ from textual.events import Key
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
-from rhinecode.conversation import ConversationManager
+from rhinecode.conversation import ConversationManager, SessionListRequest
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
 from rhinecode.tui.widgets import (
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
+    SessionPanel,
 )
 
 
@@ -41,6 +42,7 @@ class RhineApp(App):
     - CommandPanel：斜杠命令提示面板，默认隐藏，输入 "/" 时弹出
     - ConfirmPanel：有副作用工具执行前确认 / 计划执行审批的内联面板，默认隐藏
     - ClarifyPanel：Plan Mode 需求澄清的内联面板，默认隐藏
+    - SessionPanel：/resume 会话选择的内联面板，默认隐藏（c9 交互化）
     - InputBar：固定 3 行高（含边框），用户在此输入
     - StatusBar：固定 1 行，展示 Provider / 模型 / 思考模式 / 计划模式
     """
@@ -88,6 +90,16 @@ class RhineApp(App):
         padding: 0 1;
         background: $boost;
     }
+    /* /resume 会话选择面板：青色分隔线；显示全部会话，超出 15 行由 OptionList 自滚 */
+    SessionPanel {
+        height: auto;
+        max-height: 15;
+        display: none;
+        border: none;
+        border-top: tall #7AEEFF 80%;
+        padding: 0 1;
+        background: $boost;
+    }
     InputBar {
         height: 3;
         border: solid #7AEEFF 60%;
@@ -117,6 +129,9 @@ class RhineApp(App):
         self._clarify_options: list = []
         # 单轮运行锁：避免多个 Worker 同时修改同一份 conversation history。
         self._stream_active = False
+        # /resume 会话选择面板是否正在展示（c9 交互化）：
+        # 展示期间输入框被禁用，此标志作为各输入路径的一致性兜底守卫。
+        self._session_panel_active = False
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板。"""
@@ -124,6 +139,7 @@ class RhineApp(App):
         yield CommandPanel()
         yield ConfirmPanel()
         yield ClarifyPanel()
+        yield SessionPanel()
         yield InputBar(placeholder="输入消息，/ 查看命令，运行中按 Esc 取消，Ctrl+Q 退出")
         yield StatusBar()
 
@@ -143,6 +159,10 @@ class RhineApp(App):
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
         # 2. 笔记通知回调：笔记线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；
         # 3. 会话锁心跳：每 2 分钟 touch 一次，保证「进程活着锁就新鲜」（过期阈值 10 分钟）。
+        # --continue 启动恢复对齐（c9 交互化）：若启动时已恢复出历史（history 非空），
+        # 先把整段历史回放到聊天区，再显示启动提示——与 /resume 面板载入后的体验一致。
+        if self._manager.history:
+            self.query_one(HistoryView).render_history(self._manager.history)
         if self._manager.startup_notice:
             self.query_one(HistoryView).append_system(self._manager.startup_notice)
         self._manager.memory_manager.notify = self._notify_memory
@@ -186,10 +206,14 @@ class RhineApp(App):
         """
         监听输入框内容变化，控制命令提示面板的显示与过滤。
 
-        输入以 "/" 开头时显示并过滤命令面板，否则隐藏。交互进行中或流式运行中不处理，
-        避免与确认/澄清面板或运行状态交错。
+        输入以 "/" 开头时显示并过滤命令面板，否则隐藏。交互进行中、流式运行中
+        或会话选择面板展示中不处理，避免与其它面板或运行状态交错。
         """
-        if self._pending_interaction is not None or self._stream_active:
+        if (
+            self._pending_interaction is not None
+            or self._stream_active
+            or self._session_panel_active
+        ):
             return
         panel = self.query_one(CommandPanel)
         if event.value.startswith("/"):
@@ -202,12 +226,14 @@ class RhineApp(App):
         处理特殊按键：运行中取消、命令面板导航。
 
         优先级：
-        1. 有交互待决（确认/澄清/审批）→ 交给被聚焦的面板自身的 Esc 绑定处理，这里不拦截。
+        1. 有交互待决（确认/澄清/审批）或会话选择面板展示中 → 交给被聚焦的面板自身的
+           Esc 绑定与 OptionList 原生导航处理，这里不拦截。
         2. 流式运行中 → Esc 触发取消当前 Agent 循环（spec F9）。
         3. 命令面板可见 → Up/Down 移动高亮、Esc 隐藏（焦点始终保持在 InputBar）。
         """
-        # 1. 交互待决：让面板自己处理（它们各有 escape 绑定），不在此拦截
-        if self._pending_interaction is not None:
+        # 1. 交互待决 / 会话选择面板展示中：让面板自己处理（它们各有 escape 绑定，
+        #    上下键与回车由获得焦点的 OptionList 原生消化），不在此拦截
+        if self._pending_interaction is not None or self._session_panel_active:
             return
 
         # 2. 运行中按 Esc 取消循环
@@ -240,10 +266,15 @@ class RhineApp(App):
         2. 隐藏命令面板，显示用户消息到历史区。
         3. 调用 ConversationManager.handle_input() 分发：
            - str：斜杠命令反馈（/clear 清屏、/think 与 /plan 刷新状态栏）。
+           - SessionListRequest：/resume 无参 → 弹出会话选择面板（c9 交互化）。
            - Iterator：Agent 事件流，启动 Worker 在后台消费并渲染。
         """
-        # 交互进行中 / 流式运行中：忽略普通输入提交
-        if self._pending_interaction is not None or self._stream_active:
+        # 交互进行中 / 流式运行中 / 会话选择面板展示中：忽略普通输入提交
+        if (
+            self._pending_interaction is not None
+            or self._stream_active
+            or self._session_panel_active
+        ):
             return
         panel = self.query_one(CommandPanel)
 
@@ -270,6 +301,11 @@ class RhineApp(App):
             # /clear 会重置上下文用量（ctx.reset() 后估算归零），也要立即反映到状态栏。
             if text in ("/think", "/plan", "/perm", "/clear"):
                 self._refresh_status()
+        elif isinstance(result, SessionListRequest):
+            # /resume 无参：弹出交互式会话选择面板（c9 交互化）。
+            # 选中后由 on_option_list_option_selected 的 SessionPanel 分支
+            # 以 "/resume <session_id>" 重新进入带参载入路径。
+            self._show_session_panel(result)
         else:
             # 普通消息：后台线程消费 Agent 事件流；同一时间只允许一轮，避免并发写 history。
             self._set_streaming(True)
@@ -306,6 +342,38 @@ class RhineApp(App):
             self.query_one(InputBar).focus()
 
     # ------------------------------------------------------------------ #
+    # /resume 会话选择面板（c9 交互化）
+    # ------------------------------------------------------------------ #
+    def _show_session_panel(self, request: SessionListRequest) -> None:
+        """
+        在主线程展示会话选择面板并移焦。
+
+        与澄清面板同款处理：禁用输入框阻止用户点回输入框打字；焦点移到面板后，
+        上下键/回车由 OptionList 原生消化，Esc 由面板自身绑定发 Cancelled。
+        本交互由主线程发起（用户输入命令的直接结果），没有 Worker 在阻塞等待，
+        因此**不需要** _interact 的 threading.Event 机制。
+
+        :param request: handle_input("/resume") 返回的会话列表信号
+        """
+        self.query_one(CommandPanel).hide()
+        self.query_one(InputBar).disabled = True
+        self._session_panel_active = True
+        panel = self.query_one(SessionPanel)
+        panel.show_for(request.sessions, request.current_id)
+        panel.focus()
+
+    def _close_session_panel(self) -> None:
+        """关闭会话选择面板：隐藏、恢复输入框可用并还焦。"""
+        self._session_panel_active = False
+        self.query_one(SessionPanel).hide()
+        self.query_one(InputBar).disabled = False
+        self.query_one(InputBar).focus()
+
+    def on_session_panel_cancelled(self, event: SessionPanel.Cancelled) -> None:
+        """会话选择面板按 Esc 退出：关闭面板，不做任何载入，界面原样保留。"""
+        self._close_session_panel()
+
+    # ------------------------------------------------------------------ #
     # Agent 事件流消费
     # ------------------------------------------------------------------ #
     def _do_stream(self, gen) -> None:
@@ -321,6 +389,7 @@ class RhineApp(App):
         - TOOL_RESULT：工具行定色（绿/红）+ 摘要
         - FINISHED：按结束原因追加系统行（自然完成不打扰）
         - ERROR：红色错误行
+        - HISTORY：会话恢复成功（c9）——清空聊天区并整体回放携带的历史快照
 
         :param gen: ConversationManager._run() 返回的 AgentEvent 生成器
         """
@@ -402,6 +471,14 @@ class RhineApp(App):
                 elif etype == AgentEventType.NOTICE:
                     # 系统级提示（c8：上下文压缩发生等），以系统行展示，不影响正文/工具渲染。
                     self.call_from_thread(history_view.append_system, event.message)
+
+                elif etype == AgentEventType.HISTORY:
+                    # 会话恢复成功（c9 /resume 交互化）：清屏并整体回放历史快照。
+                    # 只发起一次 call_from_thread——清空与重画在主线程一次调用内原子完成；
+                    # 同时重置本 Worker 的文本/工具占位引用（旧引用指向已被移除的组件）。
+                    reset_text_widgets()
+                    tool_widgets.clear()
+                    self.call_from_thread(history_view.render_history, event.messages)
         finally:
             self.call_from_thread(self._set_streaming, False)
             # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；
@@ -557,11 +634,26 @@ class RhineApp(App):
 
     def on_option_list_option_selected(self, event) -> None:
         """
-        处理确认/审批/澄清面板的选择（回车/点击）。
+        处理确认/审批/澄清/会话选择面板的选择（回车/点击）。
 
         按「当前待决交互的种类」+「事件来源面板」分别把 option.id 解析为对应结果。
         命令面板从不取得焦点、不会触发此消息，故无需额外区分。
+
+        注意：SessionPanel 分支必须放在 `box is None` 守卫**之前**——会话选择不走
+        _pending_interaction 机制（主线程发起、无 Worker 阻塞等待），守卫会把它拦掉。
         """
+        if isinstance(event.option_list, SessionPanel):
+            event.stop()
+            session_id = event.option.id
+            self._close_session_panel()
+            # 复用 handle_input 的带参 /resume 路径（与手输同一条代码路径）：
+            # option.id 携带完整 session_id，_resolve_key 按精确 ID 匹配必中。
+            # 载入可能触发 C8 压缩（阻塞的摘要 LLM 调用），必须走后台 Worker。
+            result = self._manager.handle_input(f"/resume {session_id}")
+            self._set_streaming(True)
+            self.call_after_refresh(self._start_stream_worker, result)
+            return
+
         box = self._pending_interaction
         if box is None:
             return

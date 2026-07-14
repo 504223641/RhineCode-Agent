@@ -402,9 +402,37 @@ class MemoryManager:
     # ------------------------------------------------------------------ #
     # /resume（F9/F11/F12/F23）
     # ------------------------------------------------------------------ #
+    @property
+    def session_id(self) -> str:
+        """
+        当前会话 ID（只读）。
+
+        暴露给上层（TUI 会话选择面板）标注「（当前）」条目用，
+        避免上层直接穿透 self._session 访问内部实现。
+        """
+        return self._session.session_id
+
+    def list_resume_sessions(self) -> list[SessionInfo]:
+        """
+        返回结构化的可恢复会话列表（TUI 交互式选择面板的数据源）。
+
+        与文本版 resume_list 的差异：
+        - 不限条数（limit=None 取全量），面板可滚动展示全部历史会话；
+        - 返回 SessionInfo 列表而非渲染文本，由面板自行决定展示与 disabled 逻辑。
+
+        副作用：同步写 self._last_list 编号缓存——保证用户看完面板按 Esc 退出后，
+        手输 `/resume <编号>` 时 _resolve_key 解析到的编号与面板展示一致。
+        """
+        infos = self._session.list_sessions(limit=None)
+        self._last_list = infos
+        return infos
+
     def resume_list(self) -> str:
         """
         /resume 无参：渲染最近会话列表（编号供 `/resume <编号>` 使用）。
+
+        注：TUI 已改用 list_resume_sessions 的结构化面板，本方法保留给
+        测试与非 TUI 场景（文本版只展示最近 10 条，与 c9 原行为一致）。
 
         副作用：缓存本次列表（编号 → 会话的映射在下次列表刷新前保持稳定）。
         """

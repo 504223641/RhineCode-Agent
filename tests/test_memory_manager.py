@@ -234,6 +234,51 @@ class StartupResumeTest(ManagerTestBase):
         self.assertFalse(ok)
         self.assertIn("另一个 RhineCode 实例", msg)
 
+    def test_list_resume_sessions_structured(self) -> None:
+        """结构化列表：按时间倒序、locked 标记、标题正确（c9 /resume 交互化）。"""
+        self._write_archive("20260101-000000-aaaa", ["旧对话"], "2026-01-01")
+        self._write_archive("20260102-000000-bbbb", ["新对话"], "2026-01-02")
+        d = self.project / ".rhinecode" / "sessions"
+        lockfile.try_acquire(d / "20260101-000000-aaaa.lock", 600)  # 模拟另一实例锁住旧会话
+
+        mgr = self._manager()
+        mgr.startup(resume_latest=False, history=[])
+        infos = mgr.list_resume_sessions()
+
+        self.assertEqual(
+            [i.session_id for i in infos],
+            ["20260102-000000-bbbb", "20260101-000000-aaaa"],
+        )
+        self.assertFalse(infos[0].locked)
+        self.assertTrue(infos[1].locked)
+        self.assertEqual(infos[0].title, "新对话")
+
+    def test_list_resume_sessions_no_limit(self) -> None:
+        """面板列表取全量（超过文本版的 10 条上限）。"""
+        for i in range(12):
+            self._write_archive(f"202601{i + 1:02d}-000000-a{i:03x}", [f"对话{i}"], f"2026-01-{i + 1:02d}")
+        mgr = self._manager()
+        mgr.startup(resume_latest=False, history=[])
+        self.assertEqual(len(mgr.list_resume_sessions()), 12)
+
+    def test_list_resume_sessions_builds_number_cache(self) -> None:
+        """结构化列表同样建立编号缓存：看完面板 Esc 后手输 /resume <编号> 仍可解析。"""
+        self._write_archive("20260101-000000-aaaa", ["很久以前的对话"], "2026-01-01")
+        mgr = self._manager()
+        mgr.startup(resume_latest=False, history=[])
+        mgr.list_resume_sessions()  # 与 resume_list 一样写 _last_list
+        history: list[Message] = []
+        ok, msg = mgr.resume_into("1", history)
+        self.assertTrue(ok, msg)
+        self.assertEqual(history[0].content, "很久以前的对话")
+
+    def test_session_id_property(self) -> None:
+        """session_id 只读属性暴露当前会话 ID（供面板标注「（当前）」）。"""
+        mgr = self._manager()
+        mgr.startup(resume_latest=False, history=[])
+        # 会话 ID 形如 YYYYMMDD-HHMMSS-xxxx
+        self.assertRegex(mgr.session_id, r"^\d{8}-\d{6}-[0-9a-z]{4}$")
+
 
 class ObservabilityTest(ManagerTestBase):
     """memory_report / memory_index / custom_instructions（T11 步骤 8–9）。"""
