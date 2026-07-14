@@ -2,7 +2,7 @@
 
 ## 项目结构与模块组织
 
-RhineCode 是一个 Python 3.11+ 项目，主包位于 `rhinecode/`。核心目录按职责划分：`agent/` 负责 Agent Loop 与提示词组装，`provider/` 负责模型后端适配，`tools/` 放置内置工具，`permission/` 实现权限引擎，`mcp/` 实现 MCP 客户端能力，`tui/` 负责 Textual 终端界面。测试位于 `tests/`，复用测试辅助代码放在 `tests/fixtures/`。阶段性规格文档位于 `docs/c*/`，通常包含 `spec.md`、`plan.md`、`task.md` 和 `checklist.md`。根目录的 `config.example.yaml`、`mcp.example.yaml`、`permissions.example.yaml` 用作配置模板。
+RhineCode 是一个 Python 3.11+ 项目，主包位于 `rhinecode/`。核心目录按职责划分：`agent/` 负责 Agent Loop 与提示词组装，`provider/` 负责模型后端适配，`tools/` 放置内置工具，`permission/` 实现权限引擎，`mcp/` 实现 MCP 客户端能力，`context/` 实现上下文两层压缩，`memory/` 实现记忆系统（RHINE.md 项目指令、会话存档/恢复、自动笔记、锁文件），`tui/` 负责 Textual 终端界面。测试位于 `tests/`，复用测试辅助代码放在 `tests/fixtures/`。阶段性规格文档位于 `docs/c*/`，通常包含 `spec.md`、`plan.md`、`task.md` 和 `checklist.md`。根目录的 `config.example.yaml`、`mcp.example.yaml`、`permissions.example.yaml` 用作配置模板。
 
 ## 构建、测试与开发命令
 
@@ -29,4 +29,4 @@ RhineCode 是一个 Python 3.11+ 项目，主包位于 `rhinecode/`。核心目�
 
 ## 安全与配置提示
 
-不要提交真实密钥。`config.yaml`、`.rhinecode_debug.log`、构建产物、虚拟环境以及 `**/.rhinecode/*.local.yaml` 已被刻意忽略。共享默认配置请使用示例 YAML 文件；MCP 配置中的敏感值应通过 `${API_KEY}` 这类环境变量引用。
+不要提交真实密钥。`config.yaml`、`.rhinecode_debug.log`、构建产物、虚拟环境、`**/.rhinecode/*.local.yaml` 以及含对话原文的 `.rhinecode/sessions/`、`.rhinecode/memory/`、`.rhinecode/context/` 已被刻意忽略。共享默认配置请使用示例 YAML 文件；MCP 配置中的敏感值应通过 `${API_KEY}` 这类环境变量引用。
