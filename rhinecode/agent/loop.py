@@ -142,6 +142,7 @@ class Agent:
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
         context_manager: "Optional[ContextManager]" = None,
+        recorder: Optional[Callable[[Message], None]] = None,
     ) -> Iterator[AgentEvent]:
         """
         跑一次完整的 ReAct 循环，逐个产出 AgentEvent。
@@ -161,6 +162,10 @@ class Agent:
         :param context_manager: 上下文压缩器（c8）；为 None（非 DeepSeek 工具模式）时不压缩，
                                 行为与 c8 之前完全一致。非 None 时每轮请求前跑两层压缩、
                                 每轮拿到 usage 后更新估算锚点。
+        :param recorder: 消息记录回调（c9 会话存档）：循环每向 history 追加一条消息
+                         （assistant / tool 结果）就同步调用一次，用于 JSONL 追加写。
+                         为 None 时不记录，行为与 c9 之前完全一致。回调内部 fail-safe，
+                         这里再包一层 try 保证记录失败绝不影响循环（N2）。
         :returns: AgentEvent 迭代器；末尾必为一个 FINISHED 事件
 
         副作用：向 history 追加消息；通过 provider 发起多次网络请求；通过回调与用户交互；
@@ -168,6 +173,15 @@ class Agent:
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
+
+        def _record(msg: Message) -> None:
+            """把新追加进 history 的消息交给会话存档回调（c9）；失败静默不影响循环。"""
+            if recorder is None:
+                return
+            try:
+                recorder(msg)
+            except Exception:
+                pass
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             # 安全点 1：进入新一轮前检查取消
@@ -240,12 +254,16 @@ class Agent:
             # 停止条件：模型本轮不要工具 → 自然完成（也是纯对话/无工具的正常路径，F14）
             if not tool_calls:
                 if text:
-                    history.append(Message(role="assistant", content=text))
+                    final_msg = Message(role="assistant", content=text)
+                    history.append(final_msg)
+                    _record(final_msg)
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
                 return
 
             # 有工具调用：先把 assistant(含 tool_calls) 追加历史（N5）
-            history.append(Message(role="assistant", content=text, tool_calls=tool_calls))
+            assistant_msg = Message(role="assistant", content=text, tool_calls=tool_calls)
+            history.append(assistant_msg)
+            _record(assistant_msg)
 
             # ---------- 执行工具并回灌 ----------
             results: dict[str, ToolResult] = {}
@@ -260,7 +278,9 @@ class Agent:
             for tc in tool_calls:
                 res = results.get(tc.id)
                 output = res.output if res is not None else "工具未产生结果"
-                history.append(Message(role="tool", tool_call_id=tc.id, content=output))
+                tool_msg = Message(role="tool", tool_call_id=tc.id, content=output)
+                history.append(tool_msg)
+                _record(tool_msg)
 
             # 计划获批 → 本轮后续迭代进入执行阶段
             if ctx.approved:

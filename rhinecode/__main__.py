@@ -52,6 +52,14 @@ def main() -> None:
         default=None,
         help="配置文件路径（缺省使用 ~/.rhinecode/config.yaml）",
     )
+    # --continue（c9 F10）：启动时恢复最近的未锁定会话。dest 必须显式指定——
+    # `continue` 是 Python 关键字，argparse 默认派生的 args.continue 会语法错误。
+    parser.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="启动时恢复最近一次会话，接着上次继续",
+    )
     args = parser.parse_args()
 
     # 决定实际配置路径：显式 --config 优先，否则用用户级全局配置。
@@ -118,13 +126,23 @@ def main() -> None:
     registry.register(MCPAddServerTool(mcp_manager, registry))
     mcp_manager.connect_all(mcp_configs, registry, extra_errors=mcp_errors)
 
-    # 依次构建各层组件，层间通过依赖注入解耦
-    manager = ConversationManager(provider, cfg, registry, mcp_manager=mcp_manager)
+    # 依次构建各层组件，层间通过依赖注入解耦。
+    # resume_latest 透传 --continue：协调层构造时经 MemoryManager 恢复最近会话（c9）。
+    manager = ConversationManager(
+        provider, cfg, registry, mcp_manager=mcp_manager,
+        resume_latest=args.continue_session,
+    )
     app = RhineApp(manager, cfg)
-    # try/finally 保证无论正常退出还是异常，都统一回收 MCP 连接与 stdio 子进程（spec F12/AC11）。
+    # try/finally 保证无论正常退出还是异常，都统一回收资源：
+    # MCP 连接与 stdio 子进程（c7）、会话锁（c9，不释放会短暂挡住其它实例接管，
+    # 直到锁过期自愈）。两者各自 try 住，互不影响。
     try:
         app.run()
     finally:
+        try:
+            manager.memory_manager.close()
+        except Exception:
+            pass
         mcp_manager.close_all()
 
 

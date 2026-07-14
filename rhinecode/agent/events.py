@@ -36,6 +36,7 @@ class AgentEventType(str, Enum):
     FINISHED = "finished"    # 循环结束（携带结束原因）
     ERROR = "error"          # 发生错误（携带可读描述）
     NOTICE = "notice"        # 系统级提示（c8：上下文压缩发生等），载荷在 message
+    HISTORY = "history"      # 会话恢复成功后携带完整历史快照（c9 /resume 回放），载荷在 messages
 
 
 class StopReason(str, Enum):
@@ -129,6 +130,8 @@ class AgentEvent:
     - FINISHED：stop_reason 为结束原因，message 为可选补充说明
     - ERROR：message 为可读错误描述
     - NOTICE：message 为系统级提示文本（如「已摘要早前 N 条消息」），仅展示、不参与决策
+    - HISTORY：messages 为恢复出来的完整历史消息快照（provider.Message 列表），
+      供 TUI 清屏后整体回放；快照取自 c8 压缩改写之前，保证回放的是原始对话
 
     :param type: 事件类型
     :param text: TEXT/THINKING 的增量文本
@@ -138,6 +141,8 @@ class AgentEvent:
     :param iteration: PROGRESS 携带的当前迭代序号
     :param stop_reason: FINISHED 携带的结束原因
     :param message: ERROR 的错误描述 / FINISHED 的补充说明
+    :param messages: HISTORY 携带的历史消息快照（元素为 provider.base.Message，
+                     标 Optional[list] 以免事件层对 provider 增加新的强依赖面）
     """
 
     type: AgentEventType
@@ -148,3 +153,4 @@ class AgentEvent:
     iteration: int = 0
     stop_reason: Optional[StopReason] = None
     message: str = ""
+    messages: Optional[list] = None

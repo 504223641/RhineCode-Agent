@@ -6,7 +6,7 @@
 """
 
 from rhinecode.tools.base import Tool, ToolResult, human_size
-from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
+from rhinecode.tools.path_guard import PathGuardError, resolve_readable
 
 MAX_READ_BYTES = 1024 * 1024
 MAX_RANGE_LINES = 2000
@@ -63,8 +63,9 @@ class ReadFileTool(Tool):
             if not path:
                 return ToolResult(ok=False, output="缺少必填参数 path", summary="缺少参数 path")
 
-            # 只读工具不经过确认，因此必须先把路径钉死在项目工作目录内。
-            abs_path = resolve_in_workspace(path)
+            # 只读工具不经过确认，因此必须先把路径钉死在项目工作目录内；
+            # c9 起额外放行「只读白名单」目录（当前仅用户级记忆目录），写类工具不受影响。
+            abs_path = resolve_readable(path)
 
             if not abs_path.exists():
                 return ToolResult(ok=False, output=f"文件不存在: {path}", summary="文件不存在")

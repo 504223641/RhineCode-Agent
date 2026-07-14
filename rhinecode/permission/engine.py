@@ -23,7 +23,7 @@ from rhinecode.permission.models import (
     Rule,
 )
 from rhinecode.permission.rules import RuleSet
-from rhinecode.tools.path_guard import is_within_workspace
+from rhinecode.tools.path_guard import is_readable_path, is_within_workspace
 
 
 class PermissionEngine:
@@ -84,7 +84,14 @@ class PermissionEngine:
                 return DecisionResult(Decision.DENY, Layer.BLACKLIST, "命中危险命令黑名单：" + reason)
 
         # ② 沙箱：仅路径/glob 类；越界即拒。复用 path_guard 的边界判定。
-        if request.kind in ("read_path", "write_path", "glob"):
+        # read 类走「工作区 ∪ 只读白名单」（c9 放行用户级记忆目录的只读访问，F18）；
+        # write / glob 类仍严格限定工作区内，白名单对它们完全不可见（N6③）。
+        if request.kind == "read_path":
+            if not is_readable_path(request.specifier):
+                return DecisionResult(
+                    Decision.DENY, Layer.SANDBOX, f"路径越界，超出项目工作目录：{request.specifier}"
+                )
+        elif request.kind in ("write_path", "glob"):
             if not is_within_workspace(request.specifier):
                 return DecisionResult(
                     Decision.DENY, Layer.SANDBOX, f"路径越界，超出项目工作目录：{request.specifier}"
