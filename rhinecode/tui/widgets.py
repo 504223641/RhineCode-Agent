@@ -563,9 +563,10 @@ class CommandPanel(OptionList):
     继承自 Textual OptionList，内置 Up/Down 键盘导航和 Enter 选中能力。
     默认 display:none 不占布局空间；当用户输入以 "/" 开头且光标位于命令字段时
     由 App 层调用 show_for() 使其出现，候选来自 CommandRegistry.complete()：
-    - 同时匹配规范名与别名（大小写不敏感），别名候选额外标注其规范命令；
-    - 隐藏命令及其别名不出现（spec F20）；
-    - 候选顺序稳定：注册顺序 + 每命令规范名先于别名（spec F22）。
+    - 只匹配规范名（大小写不敏感），别名不参与候选——别名仍可直接输入执行、
+      /help 仍列出（2026-07 变更，见 docs/c10/checklist.md C36）；
+    - 隐藏命令不出现（spec F20）；
+    - 候选顺序稳定：按命令注册顺序排列。
 
     选中某条候选后，App 层监听 OptionList.OptionSelected 事件，
     将候选文本填入 InputBar 并自动提交（或经提交入口直接分发）。
