@@ -148,23 +148,24 @@ class RegistryResolveCompleteTests(unittest.TestCase):
         self.assertNotIn("/secret", registry.render_help())
         self.assertEqual(registry.complete("/sec"), ())
 
-    def test_completion_order_and_alias_flags(self) -> None:
-        """候选按注册顺序、每命令先规范名后别名；别名标注规范命令（spec F21/F22）。"""
+    def test_completion_canonical_only(self) -> None:
+        """候选按注册顺序只含规范名；别名不出现在补全候选中。"""
         registry = self._registry()
         items = registry.complete("/c")
         self.assertEqual(
             [item.value for item in items],
-            ["/context", "/ctx", "/compact", "/continue"],
+            ["/context", "/compact"],
         )
-        ctx_alias = items[1]
-        self.assertTrue(ctx_alias.is_alias)
-        self.assertEqual(ctx_alias.canonical_name, "/context")
-        self.assertIn("/context", ctx_alias.description)
-        self.assertFalse(items[0].is_alias)
+        # 别名前缀（/ctx、/continue 独有的部分）不再产生候选
+        self.assertEqual(registry.complete("/ctx"), ())
+        self.assertEqual(registry.complete("/conti"), ())
+        # 候选自身即规范名
+        self.assertEqual(items[0].canonical_name, "/context")
+        self.assertEqual(items[0].description, "查看上下文用量")
 
     def test_completion_case_insensitive(self) -> None:
         items = self._registry().complete("/C")
-        self.assertEqual(len(items), 4)
+        self.assertEqual(len(items), 2)
 
     def test_completion_deterministic(self) -> None:
         """相同注册内容与输入重复补全，候选顺序一致（spec N3/C20）。"""

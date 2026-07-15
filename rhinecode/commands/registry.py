@@ -145,11 +145,12 @@ class CommandRegistry:
     # ------------------------------------------------------------------ #
     def complete(self, prefix: str) -> tuple[CompletionItem, ...]:
         """
-        返回匹配 prefix 的补全候选，同时匹配可见命令的规范名与别名（spec F21）。
+        返回匹配 prefix 的补全候选，只匹配可见命令的**规范名**。
 
-        候选顺序稳定（spec F22/N3）：按命令注册顺序排列；每条命令先规范名、
-        后按声明顺序排列别名。别名作为独立候选出现并标注其规范命令（plan 4.5）。
-        隐藏命令及其全部别名不参与候选（spec F20）。
+        别名不参与补全候选（避免菜单被别名撑大），但不影响别名的其它能力：
+        仍可经 resolve 解析执行、完整命中时仍高亮、/help 仍列出别名。
+        候选顺序稳定（spec N3）：按命令注册顺序排列；隐藏命令不参与候选
+        （spec F20）。
 
         :param prefix: 用户已输入的命令字段前缀（如 "/co"）；匹配大小写不敏感
         """
@@ -164,19 +165,8 @@ class CommandRegistry:
                         value=spec.name,
                         canonical_name=spec.name,
                         description=spec.description,
-                        is_alias=False,
                     )
                 )
-            for alias in spec.aliases:
-                if alias.casefold().startswith(key):
-                    items.append(
-                        CompletionItem(
-                            value=alias,
-                            canonical_name=spec.name,
-                            description=f"{spec.name} 的别名",
-                            is_alias=True,
-                        )
-                    )
         return tuple(items)
 
     def render_help(self) -> str:

@@ -155,18 +155,18 @@ class DispatchResult:
 @dataclass(frozen=True)
 class CompletionItem:
     """
-    一个补全候选（plan 4.5）：别名作为独立候选出现并标注其规范命令。
+    一个补全候选：只有可见命令的规范名参与补全，别名不出现在候选中
+    （别名仍可解析执行、完整命中仍高亮、/help 仍展示）。
 
-    :param value: 候选文本（规范名或别名本身，如 "/ctx"）
-    :param canonical_name: 所属命令的规范名（如 "/context"）
-    :param description: 展示描述——规范名用命令描述，别名用「X 的别名」标注
-    :param is_alias: 该候选是否为别名
+    :param value: 候选文本（规范名，如 "/context"）
+    :param canonical_name: 所属命令的规范名；当前恒等于 value，保留该字段是
+        因为 Tab 单候选直补时 App 层用它 resolve 出 spec 判断是否补尾随空格
+    :param description: 展示描述（命令描述）
     """
 
     value: str
     canonical_name: str
     description: str
-    is_alias: bool
 
 
 class CommandController(Protocol):

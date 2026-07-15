@@ -97,7 +97,7 @@ python -m rhinecode --config config.yaml  # 未安装/开发调试时的等价�
 - `/clear`（别名 `/reset`、`/new`）：清空当前对话历史（并复位上下文压缩的锚点/熔断/已存盘状态；会话存档开新档、旧档保留，c9）。
 - `/exit`（别名 `/quit`）：退出程序。
 
-补全与高亮（c10）：输入 `/` 前缀实时弹候选（规范名与别名都参与、别名标注规范命令、隐藏命令不出现）；Tab 单候选直补（有参数提示的命令末尾留一个空格）、多候选弹稳定排序菜单；菜单可见时回车执行当前高亮项；光标进入参数区后 Tab 不拦截。输入框只在命令字段完整命中规范名或别名时以青色加粗高亮该字段，参数与未完成前缀保持普通样式。无参命令忽略多余参数（`/clear now` 仍清空）。
+补全与高亮（c10）：输入 `/` 前缀实时弹候选（只显示规范名，别名不参与补全——仍可直接输入执行、完整命中仍高亮、`/help` 可见；隐藏命令不出现）；Tab 单候选直补（有参数提示的命令末尾留一个空格）、多候选弹稳定排序菜单；菜单可见时回车执行当前高亮项；光标进入参数区后 Tab 不拦截。输入框只在命令字段完整命中规范名或别名时以青色加粗高亮该字段，参数与未完成前缀保持普通样式。无参命令忽略多余参数（`/clear now` 仍清空）。
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
 
@@ -151,7 +151,7 @@ MCP 客户端测试（`tests/test_mcp_*.py`、`tests/test_mcp_auto_config.py`、
 
 /resume 交互化与历史回放测试（`tests/test_resume_replay.py`）：`build_replay_items` 纯函数（user/assistant/tool 配对、空 content assistant 跳过、缺结果防御兜底、结果首行截断、未知 role 跳过、c10 双内容 user 优先展示非空 `display_content`）、conversation 层领域入口（`resume(None)` 空档返回提示 / 有档返回 `SessionListRequest` / 全部锁定或仅当前会话返回提示、`resume(key)` 成功事件流首个为 `HISTORY` 且快照与存档一致、失败不产 `HISTORY`）。SessionPanel 面板交互与回放渲染的视觉效果留 TUI 手测。
 
-斜杠命令系统测试（`tests/test_command_*.py`，c10）：解析器（空输入/普通消息/首位斜杠分类、正文斜杠不触发、首空白切分与 Tab/换行分隔符、参数外层去空白内部原样含引号/管道/反斜杠、命令字段保留大小写、裸 `/` 仍是斜杠输入）、注册表（规范名/别名/大小写不敏感解析、名称/名称·名称/别名·别名/别名·仅大小写·同命令重复别名五类冲突、`register_many` 原子性失败不留半成品、隐藏命令可执行不可发现、候选顺序稳定与别名标注、帮助含描述/用法/类型/参数提示）、分发器（空输入零副作用、普通消息回显→发送各一次、未知命令 `/help` 引导且不发 AI、别名与大写命中同一 spec、`CommandInvocation` 字段、必需参数缺失显示用法、处理异常单次本地错误不降级、失败后普通输入仍可用、重复分发确定性）、内置命令（12 条规范名与 8 别名映射、三类分类与批准表一致、Fake Controller 行为——报告/模式刷新/`/clear extra` 仍清空/`/resume`·`/continue` 参数透传/`/exit` 只调退出、`/init` 双内容与工具关闭提示、`/help` 别名等价）、启动接线（同一注册表实例注入 App、冲突退出码 1 且 Provider/工具/MCP/Manager/App 均未创建）、TUI（`CommandHighlighter` 完整命中才着色/参数不着色/正文斜杠不着色、`compose_status_text` 的 `[DEFAULT]`/`[PLAN]` 标记与其它字段保留、Pilot 键盘——Tab 单候选直补/带参数提示留空格/多候选稳定菜单/参数区 Tab 不改写/隐藏命令不进菜单仍可执行/菜单回车执行高亮项/未知命令本地提示/`/plan` 状态栏标记切换/`/init` 双内容提交/Esc 关菜单保输入，用 Fake Manager 不触真实 Provider）。旧 TUI 结构回归（`tests/test_tui_keybindings.py`）新增：静态 COMMANDS 已删、提交入口 dispatcher 单入口、命令字符串白名单已删、SessionPanel 直调 `resume_session`、控制器方法面完整。
+斜杠命令系统测试（`tests/test_command_*.py`，c10）：解析器（空输入/普通消息/首位斜杠分类、正文斜杠不触发、首空白切分与 Tab/换行分隔符、参数外层去空白内部原样含引号/管道/反斜杠、命令字段保留大小写、裸 `/` 仍是斜杠输入）、注册表（规范名/别名/大小写不敏感解析、名称/名称·名称/别名·别名/别名·仅大小写·同命令重复别名五类冲突、`register_many` 原子性失败不留半成品、隐藏命令可执行不可发现、候选顺序稳定且只含规范名（别名不参与补全）、帮助含描述/用法/类型/参数提示）、分发器（空输入零副作用、普通消息回显→发送各一次、未知命令 `/help` 引导且不发 AI、别名与大写命中同一 spec、`CommandInvocation` 字段、必需参数缺失显示用法、处理异常单次本地错误不降级、失败后普通输入仍可用、重复分发确定性）、内置命令（12 条规范名与 8 别名映射、三类分类与批准表一致、Fake Controller 行为——报告/模式刷新/`/clear extra` 仍清空/`/resume`·`/continue` 参数透传/`/exit` 只调退出、`/init` 双内容与工具关闭提示、`/help` 别名等价）、启动接线（同一注册表实例注入 App、冲突退出码 1 且 Provider/工具/MCP/Manager/App 均未创建）、TUI（`CommandHighlighter` 完整命中才着色/参数不着色/正文斜杠不着色、`compose_status_text` 的 `[DEFAULT]`/`[PLAN]` 标记与其它字段保留、Pilot 键盘——Tab 单候选直补/别名前缀补为规范名/带参数提示留空格/多候选稳定菜单/参数区 Tab 不改写/隐藏命令不进菜单仍可执行/菜单回车执行高亮项/未知命令本地提示/`/plan` 状态栏标记切换/`/init` 双内容提交/Esc 关菜单保输入，用 Fake Manager 不触真实 Provider）。旧 TUI 结构回归（`tests/test_tui_keybindings.py`）新增：静态 COMMANDS 已删、提交入口 dispatcher 单入口、命令字符串白名单已删、SessionPanel 直调 `resume_session`、控制器方法面完整。
 
 上下文管理测试（`tests/test_context_*.py`，用假 provider 断言摘要请求不带工具）：近似估算（无锚点全量、有锚点=锚点+增量、越界兜底）、第一层存盘（单结果 / 聚合挑大先存 / user 不动 / 幂等 / 写盘失败保留原文）、第二层纯逻辑（保留边界 snap 到 user 不拆 tool 对、草稿丢弃、重构结构与角色交替、转录渲染）、编排（摘要成功重构并失效锚点、连续失败熔断与复位、`manual_compact` 无阈值——小历史 noop「无可摘要」且不调模型 / 大历史无视余量直接摘要、`before_request` 先 offload 降估算、`status_line` 格式与高亮/熔断标记）。真实 LLM 摘要与 TUI 渲染的端到端 5 场景留作手测（见 `docs/c8/checklist.md`）。
 

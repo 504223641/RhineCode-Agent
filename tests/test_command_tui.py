@@ -238,12 +238,21 @@ class CompletionInteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_multi_candidate_tab_opens_stable_menu(self) -> None:
         app, _ = _make_app()
         async with app.run_test() as pilot:
-            await pilot.press(*"/cont")
+            await pilot.press(*"/c")
             await pilot.press("tab")
             panel = app.query_one(CommandPanel)
             self.assertTrue(panel.display)
+            # 候选只含规范名（别名 /ctx、/continue 不出现），顺序为注册顺序
             ids = [panel.get_option_at_index(i).id for i in range(panel.option_count)]
-            self.assertEqual(ids, ["/context", "/continue"])
+            self.assertEqual(ids, ["/context", "/compact", "/clear"])
+
+    async def test_alias_prefix_tab_completes_canonical_only(self) -> None:
+        """别名不参与补全：/cont 只剩规范名 /context 一个候选，Tab 直补。"""
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press(*"/cont")
+            await pilot.press("tab")
+            self.assertEqual(app.query_one(InputBar).value, "/context")
 
     async def test_tab_in_argument_area_untouched(self) -> None:
         app, _ = _make_app()
@@ -287,12 +296,13 @@ class ExecutionInteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_enter_executes_highlighted_candidate(self) -> None:
         app, manager = _make_app()
         async with app.run_test() as pilot:
-            await pilot.press(*"/cont")  # 菜单出现：/context 与 /continue
-            await pilot.press("down")    # 高亮移到 /continue
+            await pilot.press(*"/c")   # 菜单出现：/context、/compact、/clear
+            await pilot.press("down")  # 高亮移到 /compact
+            await pilot.press("down")  # 高亮移到 /clear
             await pilot.press("enter")
             await pilot.pause()
-            # 执行的是高亮候选（/continue → /resume 行为），而非把前缀发给 Agent
-            self.assertEqual(manager.resumed, [None])
+            # 执行的是高亮候选（/clear 行为），而非把前缀发给 Agent
+            self.assertEqual(manager.cleared, 1)
             self.assertEqual(manager.submitted, [])
 
     async def test_unknown_command_local_hint_only(self) -> None:
