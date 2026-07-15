@@ -234,7 +234,11 @@ class SessionStore:
                     if isinstance(ts, str):
                         last_ts = ts
                     if not title and data.get("role") == "user":
-                        content = str(data.get("content", "")).strip().replace("\n", " ")
+                        # 标题优先用显示内容（c10 F26）：/init 等提示词命令的会话
+                        # 在列表里显示原命令而非展开后的长提示词；缺失或空则回退 content。
+                        display = data.get("display_content")
+                        raw = display if isinstance(display, str) and display.strip() else data.get("content", "")
+                        content = str(raw).strip().replace("\n", " ")
                         title = content[:TITLE_MAX_CHARS]
             last_time = _parse_ts(last_ts)
             if last_time is None:
@@ -369,6 +373,10 @@ def _serialize(msg: Message) -> dict:
         ]
     if msg.tool_call_id:
         data["tool_call_id"] = msg.tool_call_id
+    # 双内容（c10 F27）：仅提示词型命令设置 display_content，非 None 才写入——
+    # 普通消息的存档行保持与旧格式逐字节一致（向后兼容零迁移）。
+    if msg.display_content is not None:
+        data["display_content"] = msg.display_content
     return data
 
 
@@ -410,9 +418,20 @@ def _deserialize_line(line: str) -> "tuple[Optional[Message], Optional[str]]":
     if not isinstance(tool_call_id, str):
         tool_call_id = None
 
+    # 双内容（c10 F27）：缺失 / null / 非法类型统一回退 None（旧档兼容，无需迁移）。
+    display_content = data.get("display_content")
+    if not isinstance(display_content, str):
+        display_content = None
+
     ts = data.get("ts")
     return (
-        Message(role=role, content=content, tool_calls=tool_calls, tool_call_id=tool_call_id),
+        Message(
+            role=role,
+            content=content,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            display_content=display_content,
+        ),
         ts if isinstance(ts, str) else None,
     )
 

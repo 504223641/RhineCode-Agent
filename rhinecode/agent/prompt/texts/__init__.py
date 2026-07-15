@@ -20,7 +20,10 @@ from rhinecode.agent.prompt.texts.tone import TONE
 from rhinecode.agent.prompt.texts.text_output import TEXT_OUTPUT
 from rhinecode.agent.prompt.texts.plan import PLAN_FULL, PLAN_BRIEF
 from rhinecode.agent.prompt.texts.environment import ENVIRONMENT_TEMPLATE
-from rhinecode.agent.prompt.texts.init import INIT_PROMPT
+
+# 注：/init 的内置提示词（原 texts/init.py 的 INIT_PROMPT）已随 c10 命令层
+# 迁至 rhinecode/commands/builtins.py——它是命令的静态预设提示词（spec F28），
+# 归属命令层而非系统提示文案。
 
 __all__ = [
     "IDENTITY",
@@ -33,5 +36,4 @@ __all__ = [
     "PLAN_FULL",
     "PLAN_BRIEF",
     "ENVIRONMENT_TEMPLATE",
-    "INIT_PROMPT",
 ]

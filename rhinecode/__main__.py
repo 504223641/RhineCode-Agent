@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
+from rhinecode.commands import CommandRegistrationError, build_builtin_registry
 from rhinecode.provider.factory import create_provider
 from rhinecode.conversation import ConversationManager
 from rhinecode.tools.registry import ToolRegistry
@@ -105,6 +106,15 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # 构建命令注册表（c10 T53）：必须在 Provider / 工具注册中心 / MCP 连接等昂贵资源
+    # 之前完成——命令名/别名冲突属于代码级配置错误，fail-fast 在此拦下（退出码 1），
+    # 此时尚未创建网络连接、MCP 子进程或会话锁，启动失败干净利落（spec F2/N4）。
+    try:
+        command_registry = build_builtin_registry()
+    except CommandRegistrationError as e:
+        print(f"命令注册冲突：{e}", file=sys.stderr)
+        sys.exit(1)
+
     # 根据配置创建模型 Provider。
     try:
         provider = create_provider(cfg)
@@ -114,25 +124,26 @@ def main() -> None:
 
     # 构建工具注册中心（含 6 个核心工具），注入协调层以启用工具能力。
     # 工具仅在 DeepSeek 协议下实际生效，其余协议下协调层会自动忽略（见 ConversationManager）。
-    registry = ToolRegistry.default()
+    # 命名为 tool_registry 与上面的 command_registry 明确区分（两者互不相干）。
+    tool_registry = ToolRegistry.default()
 
-    # 加载 MCP 配置并连接外部 Server，把发现到的远端工具注册进同一个 registry（c7）。
+    # 加载 MCP 配置并连接外部 Server，把发现到的远端工具注册进同一个 tool_registry（c7）。
     # connect_all 逐 Server 隔离：单个失败只跳过、不影响内置工具与启动（spec F13）；
     # 无 mcp.yaml 时 configs 为空、无任何 MCP 工具，行为与 c6 完全一致。
     mcp_configs, mcp_errors = mcp_config.load_all()
     mcp_manager = MCPManager()
     # mcp_add_server 需要同时写配置、重载目标 server、更新 registry，因此必须在 MCPManager
     # 创建后注入运行时依赖；只读的 mcp_resolve_server 已在 ToolRegistry.default() 中注册。
-    registry.register(MCPAddServerTool(mcp_manager, registry))
-    mcp_manager.connect_all(mcp_configs, registry, extra_errors=mcp_errors)
+    tool_registry.register(MCPAddServerTool(mcp_manager, tool_registry))
+    mcp_manager.connect_all(mcp_configs, tool_registry, extra_errors=mcp_errors)
 
     # 依次构建各层组件，层间通过依赖注入解耦。
     # resume_latest 透传 --continue：协调层构造时经 MemoryManager 恢复最近会话（c9）。
     manager = ConversationManager(
-        provider, cfg, registry, mcp_manager=mcp_manager,
+        provider, cfg, tool_registry, mcp_manager=mcp_manager,
         resume_latest=args.continue_session,
     )
-    app = RhineApp(manager, cfg)
+    app = RhineApp(manager, cfg, command_registry)
     # try/finally 保证无论正常退出还是异常，都统一回收资源：
     # MCP 连接与 stdio 子进程（c7）、会话锁（c9，不释放会短暂挡住其它实例接管，
     # 直到锁过期自愈）。两者各自 try 住，互不影响。
