@@ -2,12 +2,15 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C9 阶段能力：在 C8 上下文管理、C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **记忆系统（项目指令 · 会话存档 · 自动笔记）**——三层 RHINE.md 项目指令（用户级 → 项目 `.rhinecode` → 项目根拼接，支持 `@include` 展开）与两级记忆索引在处理首个请求前注入系统提示；每条消息即时以 JSONL 追加写入 `<项目根>/.rhinecode/sessions/`，`/resume` 弹出交互式会话选择面板（上下键选择、回车载入、Esc 退出），载入后聊天区清空并回放该会话的全部历史，相当于完整切换 session，`rhine --continue` 启动时恢复最近会话并同样回放；Agent Loop 自然停止后异步调一次 LLM 把值得记的内容沉淀为四类笔记（用户偏好 / 纠正反馈 / 项目知识 / 参考资料），索引每次注入、正文按需读取；多实例并发由锁文件防护（原子创建、非阻塞退让、过期自愈）。
+当前版本以 DeepSeek Provider 为主实现了 C11 阶段能力：在 C10 斜杠命令系统、C9 记忆系统、C8 上下文管理、C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **Skill 系统**——把反复输入的提示词封装成带 YAML frontmatter 的独立 Markdown 文件，三级存放（项目 > 用户 > 内置）同名覆盖；**两阶段加载**让启动时只注入「名字 + 一句话说明」，模型判断要用时再调 `load_skill` 工具把完整 SOP 拉进上下文；**两种执行模式**——共享模式留在主对话，独立模式开一条子对话跑完只回流结论；`allowed_tools` 白名单收窄可见工具以提升模型选对工具的准确率；每个 Skill 自动注册成斜杠短命令，`/skills reload` 热更新；内置 commit / review / test 三个样板。
+
+在此之下，C10 的 **斜杠命令注册与分发系统** 仍在（单一注册中心统一管理执行/帮助/补全/高亮，大小写不敏感、别名、未知命令不进 AI）。C9 的 **记忆系统（项目指令 · 会话存档 · 自动笔记）** 也仍在——三层 RHINE.md 项目指令（用户级 → 项目 `.rhinecode` → 项目根拼接，支持 `@include` 展开）与两级记忆索引在处理首个请求前注入系统提示；每条消息即时以 JSONL 追加写入 `<项目根>/.rhinecode/sessions/`，`/resume` 弹出交互式会话选择面板（上下键选择、回车载入、Esc 退出），载入后聊天区清空并回放该会话的全部历史，相当于完整切换 session，`rhine --continue` 启动时恢复最近会话并同样回放；Agent Loop 自然停止后异步调一次 LLM 把值得记的内容沉淀为四类笔记（用户偏好 / 纠正反馈 / 项目知识 / 参考资料），索引每次注入、正文按需读取；多实例并发由锁文件防护（原子创建、非阻塞退让、过期自愈）。
 
 在此之下，C8 的 **上下文管理（两层压缩）** 仍在——让对话累积再多也不会因超出上下文窗口而瘫掉：每次 API 请求前，先用「锚点 + 增量」近似估算历史 token 用量；**第一层**零成本地把过大的工具结果存盘、历史只留预览与路径；若仍逼近窗口上限，**第二层**调一次 LLM 把较早的消息压成结构化摘要、近期原文保留。全程幂等、fail-safe，连续摘要失败 3 次熔断，用户原始消息永不被改写。C7 的 **MCP（Model Context Protocol）客户端** 也仍在：启动时按配置连接外部 MCP Server（本地子进程走 stdio、远程走 Streamable HTTP），发现其工具并包装成 RhineCode 已有的 `Tool` 接口注册进工具中心，对 Agent Loop、权限系统、TUI 完全无感。每个工具执行前仍由代码（而非模型/prompt）计算「放行 / 拒绝 / 问用户」，被拒不终止循环、把结构化原因回灌模型。模型可以在一次用户请求中循环读取项目、搜索代码、执行工具（含 MCP 远端工具）、回灌结果并继续下一轮，直到自然完成或命中停止条件。Anthropic / OpenAI Provider 保持纯对话能力，但同样享受 RHINE.md 项目指令注入与会话存档/恢复。
 
 ## 功能
 
+- **Skill 系统**：把可复用的 AI 操作封装成 Markdown 文件（YAML frontmatter + SOP 正文），三级存放同名覆盖；启动只注入名字与说明、用时由 `load_skill` 按需加载完整指令；共享模式留在主对话、独立模式开子对话只回流结论；`allowed_tools` 收窄可见工具、`$ARGUMENTS` 承接用户参数；自动注册 `/<name>` 短命令并进 Tab 补全，`/skills` 管理、`/skills reload` 热更新；内置 commit / review / test 三个样板。
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
@@ -121,7 +124,9 @@ C10 起所有斜杠命令由**单一命令注册中心**统一管理：执行、
 | `/resume` | `/continue` | 界面 | 无参弹出交互式会话选择面板（上下键选择、回车载入、Esc 退出，锁定/当前会话置灰跳过）；`/resume <编号或ID>` 直接载入。载入后聊天区清空并回放该会话全部历史，后续消息追加进该会话（所有 Provider 生效） |
 | `/memory` | — | 本地 | 查看记忆系统状态：RHINE.md 各层加载、两级笔记数量与索引、最近笔记更新结果、当前会话与写锁状态，只读（所有 Provider 生效） |
 | `/init` | — | 提示词 | 让 Agent 探索项目并生成项目根 `RHINE.md`；已存在时不覆盖、只输出改进建议，写盘走完整权限管线（DeepSeek 工具模式生效）。界面与恢复回放只显示 `/init`，模型收到完整内置提示词 |
-| `/clear` | `/reset`、`/new` | 界面 | 清空当前对话历史（并复位上下文压缩状态；会话存档开新档、旧档保留） |
+| `/skills` | — | 本地 | 管理 Skill：无参列出全部、`prompt` 查看实际注入内容、`reload` 热更新、`off [名字]` 卸载、`run <名字> [参数]` 执行 |
+| `/<skill名>` | — | 提示词 | 每个 Skill 自动注册的短命令（如 `/commit`、`/review`）；与内置命令重名时跳过注册，改用 `/skills run <名字>` |
+| `/clear` | `/reset`、`/new` | 界面 | 清空当前对话历史（并复位上下文压缩状态；会话存档开新档、旧档保留；一并卸载已激活 Skill） |
 | `/exit` | `/quit` | 界面 | 退出程序 |
 
 三种类型的含义：**本地**命令直接执行固定逻辑、不进入 Agent Loop（`/compact` 的专用摘要调用是明确例外）；**界面**命令改变会话或界面状态、同样不进入 Agent；**提示词**命令把内置预设提示词作为用户请求交给 AI。本地与界面命令不消耗对话 Token、不写入模型历史。无参数命令会忽略多余参数（`/clear now` 仍执行清空）。
@@ -338,6 +343,10 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 - MCP 远端 Server 是外部程序、不可信：MCP 工具一律视为非只读，默认模式下每次调用都经人在回路确认；stdio 子进程的行为不受路径沙箱约束（与 `run_command` 同属已知边界）；`mcp.yaml` 的 `env`/`headers` 可能含密钥，勿提交真实值。
 - 上下文管理的存盘文件（`.rhinecode/context/`）与会话存档（`.rhinecode/sessions/`）都含工具结果和对话原文（可能包括被读过的敏感文件片段），已加入 `.gitignore`，勿提交。
 - 记忆系统的笔记写盘是内部可信写盘（不经工具权限管线），但写入路径由代码锁死：LLM 只产出 JSON 动作，文件名过白名单校验，物理上出不了两个 memory 目录；笔记与摘要 LLM 请求均强制禁用工具。
+- Skill 正文是「发给模型的文本」，可以指挥模型读写文件、执行命令。**项目级 Skill 随代码仓库分发**，因此每次启动都会提示「发现 N 个项目级 Skill」（刻意不做「只提示一次」的持久化，否则 `git pull` 新增的会被静默吞掉）；评审 `.rhinecode/skills/` 应与评审代码同等对待。
+- Skill **拿不到任何权限豁免**：它指挥的每个工具调用照样过五层管线，正文里写「直接执行 rm -rf /」也只会在黑名单层被拦下。
+- `allowed_tools` **不是安全边界**，而是「提升模型选对工具准确率」的收窄手段——它会因 MCP 未连接而剪枝、因剔空而降级为不收窄、因任一 Skill 未声明而整体塌缩。要限制模型能做什么，请用 `permissions.yaml` 的 deny 规则。
+- 用户级与内置 Skill 目录经路径沙箱的**只读白名单**放行（目录型 Skill 的随附资源在工作区外，模型需按清单读取），只对读类判定生效，写入与 glob/grep 搜索面完全不动。
 
 ## 项目结构
 
@@ -345,7 +354,7 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 rhinecode/
 ├── __main__.py          # CLI 入口
 ├── config.py            # YAML 配置加载与校验
-├── conversation.py      # 对话管理、斜杠命令、权限引擎构建、Agent 回调封装、上下文/记忆接线
+├── conversation.py      # 对话管理、领域方法、权限引擎构建、Agent 回调封装、上下文/记忆/Skill 接线
 ├── agent/
 │   ├── events.py        # AgentEvent / StopReason / ConfirmDecision 等事件类型
 │   ├── collector.py     # StreamCollector 双路收集
@@ -376,6 +385,21 @@ rhinecode/
 │   ├── notes.py         # 笔记 frontmatter 解析 / 渲染 / 索引重建与截断
 │   ├── note_updater.py  # 笔记 LLM 的 Prompt 与 JSON 响应解析（文件名白名单）
 │   └── manager.py       # MemoryManager：启动 / 注入 / 存档 / 异步笔记 / resume 编排
+├── skills/              # Skill 系统（c11，纯逻辑 + 单点接入）
+│   ├── models.py        # 枚举 / frozen 数据类 / 常量 / builtin_skills_dir
+│   ├── parser.py        # 单份文本 → SkillSpec（纯函数，不碰文件系统）
+│   ├── discovery.py     # 三层扫描 + 层内去重 + 跨层整份覆盖
+│   ├── render.py        # 全部「给模型看的文本」：清单/参数替换/正文/资源清单
+│   ├── validation.py    # 白名单两段校验与空集降级（纯函数）
+│   ├── manager.py       # SkillManager：状态与副作用编排（四段式加锁纪律）
+│   └── builtin/         # 随包分发的样板：commit.md / review.md / test.md
+├── commands/            # 斜杠命令注册与分发（c10）
+│   ├── models.py        # 枚举 / CommandSpec / CommandController 协议
+│   ├── parser.py        # 输入分类与首空白切分（纯函数）
+│   ├── registry.py      # CommandRegistry：索引 / 冲突校验 / 补全 / 帮助
+│   ├── dispatcher.py    # CommandDispatcher：分流、回显、未知命令引导
+│   ├── skill_commands.py # SkillCommandInfo → CommandSpec（c11）
+│   └── builtins.py      # 13 条内置命令 + 别名 + INIT_PROMPT
 ├── context/             # 上下文两层压缩（c8，纯逻辑 + 单点接入）
 │   ├── models.py        # CompactionNotice / ContextStats 数据类
 │   ├── estimate.py      # 近似估算纯函数（锚点 + 增量）
@@ -393,6 +417,8 @@ rhinecode/
 │   ├── diff.py          # 结构化 diff 构造
 │   ├── registry.py      # 工具注册中心
 │   ├── mcp_config.py    # mcp_resolve_server / mcp_add_server 内置工具
+│   ├── policy.py        # ToolPolicy：每轮工具集收窄策略（agent 与 skills 的共同下层）
+│   ├── load_skill.py    # load_skill 系统级工具（两阶段加载的第二阶段）
 │   ├── path_guard.py    # 项目工作目录路径守卫（沙箱层复用）
 │   ├── read_file.py
 │   ├── write_file.py
@@ -420,30 +446,33 @@ MCP 客户端部分覆盖两层配置合并与 `${VAR}` 展开、JSON-RPC 消息
 
 记忆系统部分覆盖锁原语（原子互斥 / 释放重取 / 过期接管 / touch 保鲜）、RHINE.md 三层加载与 @include 展开（嵌套上限 / 防环 / 越界拦截 / 围栏代码块保留）、笔记纯逻辑（frontmatter 往返 / 索引截断）、会话存档（惰性建档 / 容错载入丢组 / 列表与锁标记 / 过期清理）、MemoryManager 编排（笔记请求禁用工具 / 锁被占跳过 / 高水位增量 / --continue 顺延被锁会话）、`/resume` 交互化（结构化列表与编号缓存 / `build_replay_items` 回放转换 / 无参返回面板信号 / 载入成功事件流携带历史快照、失败不清屏）（`tests/test_memory_*.py`、`tests/test_resume_replay.py`）。面板交互与回放渲染的视觉效果留作 TUI 手测。
 
+Skill 系统部分覆盖解析（六字段与缺省 / 名字规则与保留词 / YAML 布尔裸词提示 / 各类失败原因）、三层扫描（两种形态 / 整份覆盖不合并 / 层内字典序去重 / 坏文件不阻断）、渲染（清单不含正文 / `$ARGUMENTS` 替换 / 两种降级可区分 / 字节截断不产生非法 UTF-8）、白名单两段校验与降级、编排（幂等激活 / 工具策略四分支与运行期自愈 / 热更新 / **跨线程死锁护栏**）、`load_skill` 工具（权限判定为 ALLOW / 三态输出）、循环策略（`dynamic` 与 `tool_policy` 每轮求值 / **跨轮端到端：第 1 轮激活、第 2 轮才看得到 SOP**）、命令层（闭包绑定 / 重名跳过不留幽灵索引 / `/skills` 五形态）、独立模式（主历史恰好两条配对消息 / 五种停止原因 / 不拆散工具配对 / 只跑第一层压缩）、沙箱（读面扩大而写与搜索面不动 / 走真实 `/resume` 验证激活态清空）、TUI（状态栏 Skill 段 / 短命令补全与执行 / 提交守卫可见提示）、启动接线（笔误退出码 1 且未起子进程 / 三类白名单分支 / 重名短命令跳过）（`tests/test_skill_*.py`，11 个文件 210 条）。真实 LLM 下的 Skill 执行质量与 TUI 端到端场景留作手测。
+
 ## 当前阶段文档
 
-C9 的规格、实现计划、任务拆解和验收清单位于：
+C11 的规格、实现计划、任务拆解和验收清单位于：
 
-- `docs/c9/spec.md`
-- `docs/c9/plan.md`
-- `docs/c9/task.md`
-- `docs/c9/checklist.md`
+- `docs/c11/spec.md`
+- `docs/c11/plan.md`
+- `docs/c11/task.md`
+- `docs/c11/checklist.md`
 
-这些文档描述记忆系统的需求、架构、任务与验收（RHINE.md 三层项目指令与 @include、JSONL 会话存档与容错恢复、四类自动笔记与索引注入、锁文件并发防护、`/resume`·`/memory`·`/init`·`--continue`）。C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
+这些文档描述 Skill 系统的需求、架构、任务与验收（frontmatter 定义与三级存放、两阶段加载与提示槽位、共享/独立两种执行模式、工具白名单两段校验与降级、短命令注册与热更新、`/skills` 五形态、激活态清空语义与加锁不变量、安全边界）。C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 后续补齐项
 
 以下问题已在工程审查中确认，但不属于当前阶段开发范围，后续章节再统一设计和实现：
 
-1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
-2. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。
-3. `write_file` / `edit_file` 的文件系统级原子写入。
-4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
-5. 权限系统后续项：网络请求限制、资源配额、审计日志。
-6. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
-7. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
-8. 上下文管理后续项：精确 tokenizer（当前仅近似估算）、摘要策略的质量/机器学习优化、存盘文件的清理与生命周期、除窗口大小外其它阈值的可配置化、跨会话摘要持久化。
-9. 记忆系统后续项：向量数据库/RAG 语义检索、团队记忆同步/跨机器共享、跨实例实时一致性、笔记自动清理与遗忘机制、各阈值可配置化、存档格式版本迁移与加密存储。
+1. Skill 系统：市场分发与版本管理、嵌套激活、参数 schema、模板引擎、并行执行、跨会话保持激活态、文件监听式自动热更新；另有一项实现层遗留——`/skills reload` 不重新注册斜杠短命令，新增 Skill 的短命令要重启才出现。
+2. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
+3. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。
+4. `write_file` / `edit_file` 的文件系统级原子写入。
+5. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
+6. 权限系统后续项：网络请求限制、资源配额、审计日志。
+7. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
+8. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
+9. 上下文管理后续项：精确 tokenizer（当前仅近似估算）、摘要策略的质量/机器学习优化、存盘文件的清理与生命周期、除窗口大小外其它阈值的可配置化、跨会话摘要持久化。
+10. 记忆系统后续项：向量数据库/RAG 语义检索、团队记忆同步/跨机器共享、跨实例实时一致性、笔记自动清理与遗忘机制、各阈值可配置化、存档格式版本迁移与加密存储。
 
 ## 扩展新 Provider
 
