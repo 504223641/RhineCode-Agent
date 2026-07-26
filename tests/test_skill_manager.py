@@ -481,6 +481,33 @@ class ReportTest(ManagerTestBase):
         report = m.prompt_report(ALL_TOOLS)
         self.assertIn("未收窄", report)
 
+    def test_prompt_report_lists_only_tools_actually_injected(self) -> None:
+        """
+        可见工具集只列**真的会发给模型**的工具（AC26：所见即实际注入）。
+
+        `policy.exempt` 里除 `load_skill` 外还有 `ask_user` / `present_plan`，
+        但这两个不在注册中心里——它们由 `_schema_for` 在过滤之后经
+        `plan_schemas()` 单独拼接，且只在 Plan Mode 的规划阶段拼。
+        直接把 exempt 全列出来会在普通模式下多报两个模型压根看不到的工具，
+        让这份「排查为什么模型没按 Skill 做」的报告本身变成误导来源。
+        """
+        _write(self.user_skills / "a.md",
+               _skill_text("a", allowed_tools="[read_file]"))
+        m = self._manager()
+        m.activate("a", "")
+
+        # 只看工具清单那一行：该段落还有一句说明 Plan Mode 附加工具的注脚，
+        # 那句里天然含 ask_user / present_plan 字样，混进来会让断言失去意义。
+        section = m.prompt_report(ALL_TOOLS).split("【当前可见工具集】", 1)[1]
+        listed = next(line for line in section.splitlines() if line.strip())
+
+        self.assertIn("read_file", listed)
+        self.assertIn(LOAD_SKILL_TOOL, listed)
+        self.assertNotIn("ask_user", listed)
+        self.assertNotIn("present_plan", listed)
+        # 未声明的普通工具当然也不该出现。
+        self.assertNotIn("write_file", listed)
+
     def test_degrade_shows_in_report_with_distinct_wording(self) -> None:
         """两种降级在报告里措辞不同（AC13）。"""
         from rhinecode.skills.models import BODY_MAX_LINES

@@ -642,6 +642,15 @@ class SkillManager:
             lines.extend(["", "警告："])
             lines.extend(f"- {w}" for w in warnings)
 
+        # 项目级 Skill 的信任模型告知（spec N8）。**从启动打印挪到了这里**：
+        # 启动时 `print()` 发生在 Textual 接管屏幕之前，内容被 alternate screen
+        # 盖住，用户直到退出程序才在终端里看到它——等于没提示。放在 `/skills`
+        # 里，用户查看 Skill 状态时必定看到，且 catalog 每次 reload 都重算，
+        # 仍然没有「确认过就不再提示」的持久化状态（新增的 Skill 不会被吞掉）。
+        notice = self.project_skill_notice()
+        if notice:
+            lines.extend(["", notice])
+
         return "\n".join(lines)
 
     def prompt_report(self, registered: frozenset[str]) -> str:
@@ -671,8 +680,18 @@ class SkillManager:
         if policy.allowed is None:
             lines.append("未收窄（全部已注册工具对模型可见）")
         else:
-            visible = sorted(policy.allowed | policy.exempt)
+            # **必须与注册中心取交集**：`policy.exempt` 里除了 `load_skill`，
+            # 还有 `ask_user` / `present_plan` 两个 Plan Mode 专用工具，而它们
+            # 根本不在注册中心里——`_schema_for` 是在过滤之后才由 `plan_schemas()`
+            # 单独拼上去的，且**只在规划阶段拼**。不取交集的话，普通模式下这份
+            # 报告会多报两个模型其实看不到的工具，违背本报告「所见即实际注入」
+            # 的唯一职责（AC26），排查问题时反而误导。
+            visible = sorted((policy.allowed | policy.exempt) & set(registered))
             lines.append("、".join(visible))
+            lines.append(
+                "（Plan Mode 的规划阶段还会另外附加 ask_user / present_plan，"
+                "它们不受白名单约束）"
+            )
 
         return "\n".join(lines)
 

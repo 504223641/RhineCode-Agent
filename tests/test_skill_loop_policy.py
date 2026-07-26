@@ -166,6 +166,73 @@ class ToolPolicyFilterTest(unittest.TestCase):
         )
         self.assertIn("load_skill", _tool_names(provider.calls[0]))
 
+    def test_call_to_narrowed_out_tool_is_refused_not_executed(self) -> None:
+        """
+        模型硬调一个**本轮没发给它**的工具 → 不执行，回灌结构化原因。
+
+        这不是假想情况：实测 DeepSeek 在只收到 4 个工具 schema 的情况下，
+        凭训练先验造出了一次 `edit_file` 调用，连参数名都猜对了，于是一个
+        白名单只含读文件的 Skill 把源码给改了。照常执行等于 allowed_tools
+        白声明——收窄了「发什么」却不管「收到什么」。
+
+        判据是行为：工具的 execute 没被调用，且结果里说明了当前可用工具。
+        """
+        executed: list[str] = []
+
+        class SpyTool(FakeTool):
+            def execute(self, args):
+                executed.append(self.name)
+                return ToolResult(ok=True, output="ok")
+
+        registry = ToolRegistry()
+        registry.register(SpyTool("read_file"))
+        registry.register(SpyTool("write_file", read_only=False))
+        registry.register(SpyTool("load_skill"))
+
+        provider = RecordingProvider([_tool_round("write_file"), _text_round()])
+        policy = ToolPolicy(
+            allowed=frozenset({"read_file"}),
+            exempt=frozenset({"load_skill"}),
+            excluded=frozenset(),
+        )
+        events = _run(
+            Agent(provider, registry),
+            provider,
+            options=RunOptions(tool_policy=lambda: policy),
+        )
+
+        self.assertEqual(executed, [])
+        outputs = [
+            e.tool_result.output
+            for e in events
+            if e.type is AgentEventType.TOOL_RESULT and e.tool_result is not None
+        ]
+        self.assertTrue(outputs)
+        self.assertIn("write_file", outputs[0])
+        self.assertIn("不在当前 Skill 声明的工具集内", outputs[0])
+        # 必须告诉模型现在能用什么，否则它只能继续瞎试
+        self.assertIn("read_file", outputs[0])
+        # 反面：不能把 ask_user / present_plan 这类不在注册中心的工具列给它
+        self.assertNotIn("ask_user", outputs[0])
+        # 循环不终止：拒绝之后仍继续下一轮
+        self.assertEqual(len(provider.calls), 2)
+
+    def test_call_is_executed_normally_when_no_policy(self) -> None:
+        """无收窄策略时一切照旧执行（零回归）。"""
+        executed: list[str] = []
+
+        class SpyTool(FakeTool):
+            def execute(self, args):
+                executed.append(self.name)
+                return ToolResult(ok=True, output="ok")
+
+        registry = ToolRegistry()
+        registry.register(SpyTool("write_file", read_only=False))
+        provider = RecordingProvider([_tool_round("write_file"), _text_round()])
+        _run(Agent(provider, registry), provider)
+
+        self.assertEqual(executed, ["write_file"])
+
     def test_excluded_beats_exempt(self) -> None:
         """
         excluded 优先级高于 exempt（AC23）。

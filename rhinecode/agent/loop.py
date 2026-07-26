@@ -171,6 +171,28 @@ class Agent:
             return True
         return name in policy.allowed
 
+    def _visible_names(self, policy: Optional[ToolPolicy]) -> str:
+        """
+        列出本轮实际可见的工具名，用于「工具不可用」的回灌文案。
+
+        :param policy: 本轮收窄策略
+        :returns: 顿号分隔的工具名；无注册中心时给一句兜底说明
+
+        与注册中心取交集而不是直接摊开 `policy.allowed | policy.exempt`：
+        后者含 `ask_user` / `present_plan` 这两个不在注册中心、只在 Plan Mode
+        规划阶段才拼接的特殊工具，列给模型只会误导它去调一个当前不存在的东西。
+
+        副作用：无。
+        """
+        if self._registry is None:
+            return "（当前没有可用工具）"
+        names = set(self._registry.names())
+        if policy is not None and policy.allowed is not None:
+            names &= policy.allowed | policy.exempt
+        if policy is not None:
+            names -= policy.excluded
+        return "、".join(sorted(names)) if names else "（当前没有可用工具）"
+
     def _schema_for(
         self,
         plan_mode: bool,
@@ -383,7 +405,7 @@ class Agent:
             yield from self._execute(
                 tool_calls, results, ctx,
                 engine, ask, clarify, approve_plan,
-                cancel_event,
+                cancel_event, policy,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -446,6 +468,7 @@ class Agent:
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
+        policy: Optional[ToolPolicy] = None,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -476,6 +499,8 @@ class Agent:
         """
         special: list[ToolCall] = []
         readonly: list[tuple[ToolCall, Tool]] = []
+        # 被本轮工具收窄挡下的调用（工具真实存在，只是没发给模型）。
+        out_of_scope: list[ToolCall] = []
         # 串行桶元素：(调用, 工具或None, 决策或None)。
         # tool=None → 未知工具；decision=None → 参数解析失败（两者都不进引擎）。
         serial: list[tuple[ToolCall, Optional[Tool], Optional[DecisionResult]]] = []
@@ -491,6 +516,16 @@ class Agent:
                 serial.append((tc, None, None))
                 ctx.unknown_count += 1
                 continue
+            # 工具存在，但**本轮没发给模型**（被 Skill 白名单收窄掉了）。
+            # 模型仍可能凭训练先验硬造出这样一次调用——实测 DeepSeek 就在
+            # 只发了 4 个工具的情况下调出了 `edit_file`，参数名还全对，于是
+            # 一个「只读审阅」的窄白名单 Skill 动手改了代码。照常执行等于
+            # 让 allowed_tools「提升选对工具准确率」的作用彻底失效，
+            # 故这里拒绝并回灌结构化原因，让模型改用可见工具（不终止循环）。
+            if not self._visible(tc.name, policy):
+                out_of_scope.append(tc)
+                ctx.unknown_count += 1
+                continue
             ctx.known_count += 1
             if not isinstance(tc.arguments, dict):
                 # 参数解析失败或非对象 JSON：不进引擎，留待串行路径产出结构化错误。
@@ -502,6 +537,22 @@ class Agent:
                 readonly.append((tc, tool))
             else:
                 serial.append((tc, tool, decision))
+
+        # 被工具收窄挡下的：不执行，回灌结构化原因并告知可用工具
+        for tc in out_of_scope:
+            yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+            res = ToolResult(
+                ok=False,
+                output=(
+                    f"[工具不可用] {tc.name} 不在当前 Skill 声明的工具集内，"
+                    f"本轮未提供给你，因此没有执行。\n"
+                    f"当前可用工具：{self._visible_names(policy)}。\n"
+                    f"请改用其中之一；若确实必须用 {tc.name}，请说明理由让用户决定。"
+                ),
+                summary="不在当前工具集内",
+            )
+            results[tc.id] = res
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 只读且放行：并发
         if readonly:

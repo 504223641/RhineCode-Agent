@@ -68,6 +68,15 @@ class SkillStartupTest(unittest.TestCase):
         self._ws.cleanup()
         self._home.cleanup()
 
+    def _skill_report(self) -> str:
+        """
+        取本次启动注入 ConversationManager 的那个 SkillManager 的 `/skills` 报告。
+
+        启动阶段的状态信息（短命令冲突 / 白名单警告 / 项目级 Skill 告知）
+        统一由这份报告承载，不再打印到 stderr，故断言也从 stderr 移到这里。
+        """
+        return self.captured["conversation_kwargs"]["skill_manager"].report()
+
     def _write_skill(self, name: str, **extra) -> None:
         lines = [f"name: {name}", "description: 说明"]
         lines.extend(f"{k}: {v}" for k, v in extra.items())
@@ -145,12 +154,19 @@ class SkillStartupTest(unittest.TestCase):
         self.assertNotIn("conversation_kwargs", self.captured)
 
     def test_exempt_tool_names_start_normally_with_notice(self) -> None:
-        """白名单含 ask_user / load_skill → 正常启动，只给「声明无效果」提示。"""
+        """
+        白名单含 ask_user / load_skill → 正常启动，只给「声明无效果」提示。
+
+        提示走 `/skills` 报告而**不是**启动 stderr：启动阶段的 print 发生在
+        Textual 接管屏幕之前，会被 alternate screen 盖住，用户要等退出程序
+        才看得到。这里一并断言 stderr 为空，锁死这个渠道选择。
+        """
         self._write_skill("ex", allowed_tools="[ask_user, load_skill, read_file]")
         code, err = self._run_main()
 
         self.assertIsNone(code)
-        self.assertIn("没有效果", err)
+        self.assertEqual(err, "")
+        self.assertIn("没有效果", self._skill_report())
         self.app.run.assert_called_once()
 
     def test_whitelisting_load_skill_does_not_kill_startup(self) -> None:
@@ -165,7 +181,7 @@ class SkillStartupTest(unittest.TestCase):
         self._write_skill("ls", allowed_tools="[load_skill]")
         code, err = self._run_main()
         self.assertIsNone(code, f"不该退出，stderr={err}")
-        self.assertIn("没有效果", err)
+        self.assertIn("没有效果", self._skill_report())
 
     def test_single_underscore_mcp_builtin_is_not_a_typo(self) -> None:
         """
@@ -188,7 +204,8 @@ class SkillStartupTest(unittest.TestCase):
         code, err = self._run_main()
 
         self.assertIsNone(code)
-        self.assertIn("未连接", err)
+        self.assertEqual(err, "")
+        self.assertIn("未连接", self._skill_report())
         sm = self.captured["conversation_kwargs"]["skill_manager"]
         self.assertEqual(sm.get("m").allowed_tools, ("read_file",))
 
@@ -204,8 +221,9 @@ class SkillStartupTest(unittest.TestCase):
         code, err = self._run_main()
 
         self.assertIsNone(code)
-        self.assertIn("/clear", err)
-        self.assertIn("/skills run clear", err)
+        self.assertEqual(err, "")
+        # 「短命令被占用、改走 /skills run」的替代入口提示由 /skills 报告承载。
+        self.assertIn("/skills run clear", self._skill_report())
 
         registry = self.captured["command_registry"]
         self.assertFalse(registry.has_skill_command("clear"))
@@ -229,23 +247,27 @@ class SkillStartupTest(unittest.TestCase):
 
     def test_project_skill_notice_printed_every_startup(self) -> None:
         """
-        含项目级 Skill → 每次启动都提示，**不做「只提示一次」的持久化**。
+        含项目级 Skill → **每次启动的 `/skills` 报告里都有**信任提示，
+        不做「只提示一次」的持久化。
 
         项目级 Skill 来自代码仓库，git pull 后可能凭空多出几个；
         有状态的话新增时状态不失效，新来的就被静默吞掉了。
+        零状态语义与提示渠道无关——换到 `/skills` 之后这条依然必须成立。
         """
         self._write_skill("proj")
-        _, err1 = self._run_main()
-        self.assertIn("项目级 Skill", err1)
-        self.assertIn("proj", err1)
+        self._run_main()
+        report1 = self._skill_report()
+        self.assertIn("项目级 Skill", report1)
+        self.assertIn("proj", report1)
 
         self.app = MagicMock()
-        _, err2 = self._run_main()
-        self.assertIn("项目级 Skill", err2)
+        self._run_main()
+        self.assertIn("项目级 Skill", self._skill_report())
 
     def test_no_project_skill_no_notice(self) -> None:
         _, err = self._run_main()
         self.assertNotIn("项目级 Skill", err)
+        self.assertNotIn("项目级 Skill", self._skill_report())
 
     # ---- 接线本身 ----
 

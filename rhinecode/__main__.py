@@ -183,22 +183,18 @@ def main() -> None:
     # ── Skill 系统第二阶段（c11 T58）：MCP 剪枝 + 短命令注册 ──
     # 此刻远端工具已经注册进 tool_registry，可以判断哪些 mcp__ 白名单项有效了。
     skill_manager.bind_tools(registered=tool_registry.names())
-    skipped_skill_commands = command_registry.replace_skill_commands(
+    command_registry.replace_skill_commands(
         build_skill_command_specs(skill_manager.command_infos())
     )
-    for spec in skipped_skill_commands:
-        # 与内置命令重名 → 短命令没注册，但 Skill 本身仍可用（走 /skills run）。
-        # 必须明说，否则用户会以为 Skill 坏了。
-        print(
-            f"提示：Skill 的短命令 {spec.name} 与已有命令冲突，未注册；"
-            f"请用 /skills run {spec.name.lstrip('/')} 执行它。",
-            file=sys.stderr,
-        )
-    for warning in skill_manager.runtime_warnings():
-        print(f"提示：{warning}", file=sys.stderr)
-    project_notice = skill_manager.project_skill_notice()
-    if project_notice:
-        print(project_notice, file=sys.stderr)
+    # 注意：这里**刻意不打印**「短命令冲突 / 白名单警告 / 发现项目级 Skill」这三类
+    # 状态信息。启动阶段的 print 发生在 Textual 接管屏幕之前，会被 alternate screen
+    # 整个盖住，用户要等到退出程序才在终端里看见——那时早已失去意义。
+    # 三类信息全部改由 `/skills` 报告承载（见 SkillManager.report）：
+    # - 短命令冲突 → 每条 Skill 那行显示「需用 /skills run <name>」
+    # - 白名单警告 → 报告末尾的「警告：」段
+    # - 项目级 Skill 告知 → 报告末尾的信任提示段
+    # 唯一仍然直接打印的是上面那段白名单笔误 fail-fast：它发生在 App 启动之前
+    # 且要以退出码 1 终止进程，除了 stderr 没有别的输出渠道。
 
     # 依次构建各层组件，层间通过依赖注入解耦。
     # resume_latest 透传 --continue：协调层构造时经 MemoryManager 恢复最近会话（c9）。
