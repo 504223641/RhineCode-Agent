@@ -20,10 +20,16 @@ from pathlib import Path
 
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
 from rhinecode.commands import CommandRegistrationError, build_builtin_registry
+from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.provider.factory import create_provider
 from rhinecode.conversation import ConversationManager
+from rhinecode.skills.manager import SkillManager
+from rhinecode.skills.models import builtin_skills_dir
+from rhinecode.skills.validation import format_fatal_message
 from rhinecode.tools.registry import ToolRegistry
+from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
+from rhinecode.tools.path_guard import workspace_root
 from rhinecode.permission import config as perm_config
 from rhinecode.mcp import config as mcp_config
 from rhinecode.mcp.manager import MCPManager
@@ -135,13 +141,71 @@ def main() -> None:
     # mcp_add_server 需要同时写配置、重载目标 server、更新 registry，因此必须在 MCPManager
     # 创建后注入运行时依赖；只读的 mcp_resolve_server 已在 ToolRegistry.default() 中注册。
     tool_registry.register(MCPAddServerTool(mcp_manager, tool_registry))
+
+    # ── Skill 系统第一阶段（c11 T57）：扫盘 + 白名单严格校验 ──
+    #
+    # **位置为什么卡在这个窄窗口里**（`MCPAddServerTool` 注册之后、
+    # `connect_all` 之前），两头都不能挪：
+    #
+    # 往前挪不行：`mcp_add_server` 是内置工具，但名字是**单**下划线 `mcp_`，
+    # 不匹配 `mcp__` 判别式，所以它会落进第一段的**严格**校验。而它比其它内置
+    # 工具晚注册（依赖 MCPManager 实例）。若把校验放在「核心工具注册完成」这个
+    # 看似自然的位置，一个白名单写了 `mcp_add_server` 的合法 Skill 会被误判成
+    # 笔误并硬终止启动。
+    #
+    # 往后挪不行：`connect_all` 会拉起 stdio 子进程、建立网络连接。此刻退出
+    # 干净利落，一个子进程都还没起，不会留下孤儿进程。
+    skill_manager = SkillManager(
+        workspace_root(),
+        Path.home() / ".rhinecode",
+        builtin_skills_dir(),
+        has_short_command=command_registry.has_skill_command,
+    )
+    # load_skill 在这里注册而不是在 ToolRegistry.default() 里：它依赖
+    # SkillManager 实例，且 tools/registry.py 若导入 tools/load_skill.py
+    # 会把 tools ↔ skills 的包级互依变成真环（见 tools/__init__.py 的说明）。
+    #
+    # **必须在算 known_tools 之前注册**：否则白名单里写了 `load_skill` 的
+    # Skill 会被第一段严格校验判成笔误，启动直接挂掉——而那是个完全合法的
+    # 声明（虽然没有效果，只会得到一条「可以删除」的提示）。
+    tool_registry.register(LoadSkillTool(skill_manager))
+
+    # known 的组成：注册中心当前全部工具名 ∪ Plan Mode 的两个特殊工具。
+    # 后两个不在注册中心里但确实可被模型调用，白名单写它们不算笔误。
+    known_tools = tool_registry.names() | {"ask_user", "present_plan"}
+    fatal_tool_names = skill_manager.startup(known_tools)
+    if fatal_tool_names:
+        print(format_fatal_message(fatal_tool_names), file=sys.stderr)
+        sys.exit(1)
+
     mcp_manager.connect_all(mcp_configs, tool_registry, extra_errors=mcp_errors)
+
+    # ── Skill 系统第二阶段（c11 T58）：MCP 剪枝 + 短命令注册 ──
+    # 此刻远端工具已经注册进 tool_registry，可以判断哪些 mcp__ 白名单项有效了。
+    skill_manager.bind_tools(registered=tool_registry.names())
+    skipped_skill_commands = command_registry.replace_skill_commands(
+        build_skill_command_specs(skill_manager.command_infos())
+    )
+    for spec in skipped_skill_commands:
+        # 与内置命令重名 → 短命令没注册，但 Skill 本身仍可用（走 /skills run）。
+        # 必须明说，否则用户会以为 Skill 坏了。
+        print(
+            f"提示：Skill 的短命令 {spec.name} 与已有命令冲突，未注册；"
+            f"请用 /skills run {spec.name.lstrip('/')} 执行它。",
+            file=sys.stderr,
+        )
+    for warning in skill_manager.runtime_warnings():
+        print(f"提示：{warning}", file=sys.stderr)
+    project_notice = skill_manager.project_skill_notice()
+    if project_notice:
+        print(project_notice, file=sys.stderr)
 
     # 依次构建各层组件，层间通过依赖注入解耦。
     # resume_latest 透传 --continue：协调层构造时经 MemoryManager 恢复最近会话（c9）。
     manager = ConversationManager(
         provider, cfg, tool_registry, mcp_manager=mcp_manager,
         resume_latest=args.continue_session,
+        skill_manager=skill_manager,
     )
     app = RhineApp(manager, cfg, command_registry)
     # try/finally 保证无论正常退出还是异常，都统一回收资源：

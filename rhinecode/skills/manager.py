@@ -546,6 +546,20 @@ class SkillManager:
             for s in self._catalog.skills
         )
 
+    def runtime_warnings(self) -> tuple[str, ...]:
+        """
+        启动/热更新累积的全部警告（供 `__main__` 在启动时打印）。
+
+        :returns: 警告文本元组
+
+        与 `report()` 里那段的区别只是「不带其它上下文」——启动时还没有 TUI，
+        只能往 stderr 打，需要一个干净的列表。
+
+        副作用：无。
+        """
+        with self._lock:
+            return tuple(self._runtime_warnings)
+
     def project_skill_notice(self) -> Optional[str]:
         """
         项目级 Skill 的启动提示（spec N8 的信任模型告知）。

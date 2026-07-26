@@ -17,6 +17,22 @@ import rhinecode.__main__ as entry
 from rhinecode.commands import CommandRegistrationError, CommandRegistry
 
 
+def _fake_skill_manager() -> MagicMock:
+    """
+    SkillManager 的假替身（c11）。
+
+    必须显式给出返回值：`startup()` 默认返回一个**真值** MagicMock，
+    而 `__main__` 把非空返回视为「白名单里有不存在的工具名」并 exit(1)——
+    不设的话本文件所有用例都会以退出码 1 结束，且报错完全指不到真正的原因。
+    """
+    sm = MagicMock()
+    sm.startup.return_value = []
+    sm.runtime_warnings.return_value = ()
+    sm.project_skill_notice.return_value = None
+    sm.command_infos.return_value = ()
+    return sm
+
+
 def _fake_config() -> MagicMock:
     """构造能通过占位符校验的假 Config。"""
     cfg = MagicMock()
@@ -39,6 +55,9 @@ class StartupWiringTests(unittest.TestCase):
             patch.object(entry.mcp_config, "load_all", return_value=({}, [])),
             patch.object(entry, "MCPManager") as mcp_cls,
             patch.object(entry, "MCPAddServerTool", return_value=MagicMock()),
+            patch.object(entry, "SkillManager", return_value=_fake_skill_manager()),
+            patch.object(entry, "LoadSkillTool", return_value=MagicMock()),
+            patch.object(entry, "build_skill_command_specs", return_value=[]),
             patch.object(entry, "ConversationManager", return_value=MagicMock()),
             patch.object(entry, "RhineApp", return_value=fake_app) as app_cls,
             patch("sys.argv", ["rhine", "--config", "fake.yaml"]),
