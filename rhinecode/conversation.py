@@ -41,7 +41,13 @@ from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.skills.manager import SkillManager
-from rhinecode.trace import NullRecorder, TraceRecorderProtocol
+from rhinecode.trace import (
+    NullRecorder,
+    TraceEventType,
+    TraceRecorderProtocol,
+    isolated_scope,
+)
+from rhinecode.trace.tracing_provider import TracingProvider
 from rhinecode.skills.models import (
     ActivationStatus,
     SKILL_MAX_ITERATIONS,
@@ -228,7 +234,7 @@ class ConversationManager:
         if registry is not None:
             self._install_path_filters(registry)
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
-        self._agent = Agent(provider, registry)
+        self._agent = Agent(provider, registry, recorder=self._recorder)
 
         # 上下文压缩器（c8）：仅在工具可用模式构造——压缩的主要对象是工具结果，
         # 且循环/工具只在该模式存在。长期持有，跨消息累积估算锚点与熔断状态。
@@ -240,6 +246,7 @@ class ConversationManager:
                 config.model,
                 config.context_window,
                 workspace_root() / ".rhinecode" / "context",
+                recorder=self._recorder,
             )
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
@@ -252,6 +259,7 @@ class ConversationManager:
             workspace_root(),
             user_dir,
             notes_enabled=self._tools_enabled,
+            recorder=self._recorder,
         )
         # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。
         # 注册本身无副作用（写类判定不受影响），无条件执行即可。
@@ -509,6 +517,16 @@ class ConversationManager:
             #
             # 载入**失败**时不清空：此时仍停留在原会话，激活态应当原样保持。
             self.skill_manager.clear_active()
+            # 历史恢复埋点（trace F16）。`origin` 区分两条来源：
+            # 这里是运行中的 `/resume`；另一条是启动时的 `--continue`
+            # （它在 ConversationManager 构造期间原地改写 history、一条事件都不产，
+            #  故由装配层单独补一条 origin="startup"，见 bootstrap.build_app）。
+            self._recorder.emit(
+                TraceEventType.HISTORY_RESTORED,
+                origin="resume_command",
+                message_count=len(self.history),
+                session_id=self.memory_manager.session_id,
+            )
             # 浅拷贝快照：防止后续 before_request 对 history 的原地重构影响回放内容
             yield AgentEvent(type=AgentEventType.HISTORY, messages=list(self.history))
         if ok and self._context_manager is not None:
@@ -709,6 +727,13 @@ class ConversationManager:
         if cached is not None:
             return cached
         provider = create_provider(dataclasses.replace(self._config, model=model))
+        # 旁路覆盖（trace spec F18）：这条 Provider 不经装配层，若不在这里包一层，
+        # 「Skill 指定了别的模型」的那些请求就完全不会出现在记录里——而那正是
+        # 最需要看清楚的场景之一（换了模型之后行为为什么变了）。
+        # 只在开启记录时包装，关闭时链路上不得有中间层（AC3）。
+        # 包装后再存进缓存，保证同名模型复用的是同一个包装实例（轮次计数才连续）。
+        if self._recorder.enabled:
+            provider = TracingProvider(provider, self._recorder, model)
         self._provider_cache[model] = provider
         return provider
 
@@ -788,54 +813,68 @@ class ConversationManager:
             return "\n\n".join(parts)
 
         # ── 5. 驱动子 Agent ──
-        sub_provider = (
-            self._provider_for(spec.model) if spec.model else self._provider
-        )
-        sub_agent = Agent(sub_provider, self._registry)
+        #
+        # 整段（构造子 Agent、跑完子循环）都包在独立作用域里（trace spec F2），
+        # 让子对话的模型请求、权限判定、工具执行、循环事件全部标成
+        # `isolated:<name>`，读 trace 时一眼就能把它和主对话分开。
+        #
+        # ① 正常路径为什么有效：生成器的函数体要到 Worker 线程首次 `next()` 时才
+        #    开始执行，`with` 的 `__enter__` 就发生在那时、在同一个线程上；
+        #    下面驱动子事件流的 for 循环也在生成器体内，所以整段都在作用域内；
+        #    生成器耗尽时 `__exit__` 复位。
+        # ② **为什么还需要 `_do_stream` 的兜底复位**：异常与「生成器被放弃」的路径下
+        #    `__exit__` 可能压根不跑（比如 TUI 退出竞态里 `call_from_thread` 抛
+        #    RuntimeError），而 Textual 复用池化线程，泄漏出去的 `isolated:<name>`
+        #    会污染后续复用该线程的主对话运行。见 `tui/app.py` 的 `_do_stream`。
+        with self._recorder.scope(isolated_scope(spec.name)):
+            sub_provider = (
+                self._provider_for(spec.model) if spec.model else self._provider
+            )
+            sub_agent = Agent(sub_provider, self._registry, recorder=self._recorder)
 
-        # 取消信号必须**重建**：`request_cancel()` 置的就是 `self._cancel_event`，
-        # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
-        self._cancel_event = threading.Event()
+            # 取消信号必须**重建**：`request_cancel()` 置的就是 `self._cancel_event`，
+            # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
+            self._cancel_event = threading.Event()
 
-        registry = self._registry
-        stop_reason = StopReason.COMPLETED
-        events = sub_agent.run(
-            sub_history,
-            self.thinking_effort,
-            self.plan_mode,          # 继承主对话的 Plan Mode
-            assembled.stable,
-            sub_dynamic,
-            spec.model or self._config.model,
-            None,                    # 子对话不写缓存调试日志
-            self._engine,
-            self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
-            self.clarify_callback,
-            self.approve_plan_callback,
-            self._cancel_event,
-            self._context_manager,
-            None,                    # recorder=None：子对话过程不写会话存档
-            options=RunOptions(
-                max_iterations=SKILL_MAX_ITERATIONS,
-                record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
-                allow_summary=False,  # 只跑 C8 第一层（F21）
-                tool_policy=(
-                    (lambda: self.skill_manager.isolated_policy(
-                        spec, registry.names()
-                    ))
-                    if registry is not None
-                    else None
+            registry = self._registry
+            stop_reason = StopReason.COMPLETED
+            events = sub_agent.run(
+                sub_history,
+                self.thinking_effort,
+                self.plan_mode,          # 继承主对话的 Plan Mode
+                assembled.stable,
+                sub_dynamic,
+                spec.model or self._config.model,
+                None,                    # 子对话不写缓存调试日志
+                self._engine,
+                self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
+                self.clarify_callback,
+                self.approve_plan_callback,
+                self._cancel_event,
+                self._context_manager,
+                None,                    # recorder=None：子对话过程不写会话存档
+                options=RunOptions(
+                    max_iterations=SKILL_MAX_ITERATIONS,
+                    record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
+                    allow_summary=False,  # 只跑 C8 第一层（F21）
+                    tool_policy=(
+                        (lambda: self.skill_manager.isolated_policy(
+                            spec, registry.names()
+                        ))
+                        if registry is not None
+                        else None
+                    ),
                 ),
-            ),
-        )
+            )
 
-        # ── 6. 转发子循环事件，但**拦下 FINISHED** ──
-        # 外层要自己收尾（先回流结论再产出 FINISHED），不能让子循环的 FINISHED
-        # 提前把 TUI 的流式状态收掉。
-        for event in events:
-            if event.type == AgentEventType.FINISHED:
-                stop_reason = event.stop_reason
-                continue
-            yield event
+            # ── 6. 转发子循环事件，但**拦下 FINISHED** ──
+            # 外层要自己收尾（先回流结论再产出 FINISHED），不能让子循环的 FINISHED
+            # 提前把 TUI 的流式状态收掉。
+            for event in events:
+                if event.type == AgentEventType.FINISHED:
+                    stop_reason = event.stop_reason
+                    continue
+                yield event
 
         # ── 7. 提取结论 ──
         conclusion: Optional[str] = None
