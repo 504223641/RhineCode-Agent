@@ -33,6 +33,7 @@ from rhinecode.commands import (
     ModeTarget,
     ReportTarget,
 )
+from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.conversation import ConversationManager, SessionListRequest
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
 from rhinecode.tui.widgets import (
@@ -338,8 +339,40 @@ class RhineApp(App):
         )
 
     def reload_skills(self) -> str:
-        """热更新 Skill 定义，返回报告文本（由命令层显示）。"""
-        return self._manager.reload_skills()
+        """
+        热更新 Skill 定义**并重新注册斜杠短命令**（c11 F26），返回报告文本。
+
+        分两步，顺序不能反：
+        1. 领域侧 `manager.reload_skills()` 重新扫盘、重跑白名单两段校验、
+           同步激活列表，产出可读报告；
+        2. 界面侧用**新的** `command_infos()` 整体替换注册表里的 Skill 短命令。
+
+        **为什么接在这里而不是 `conversation.py`**：短命令刷新需要
+        `CommandRegistry`，而协调层刻意不依赖 commands 包（依赖方向是
+        `commands ← tui/app ← __main__`）。而 `RhineApp` 本来就同时持有
+        注册表与 SkillManager，且已经导入 commands——这正是「领域能力放
+        conversation、接线放控制器方法」的既定模式，不需要新增任何回调或协议方法。
+
+        补全菜单与输入高亮**无需刷新**：`CommandPanel` 与 `CommandHighlighter`
+        持有的是注册表引用，每次按键现调 `complete()` / `resolve()`，
+        替换后下一次按键就是新结果。
+
+        副作用：重新扫盘；替换注册表的 Skill 短命令集合。
+        """
+        report = self._manager.reload_skills()
+
+        skipped = self._command_registry.replace_skill_commands(
+            build_skill_command_specs(self._manager.skill_manager.command_infos())
+        )
+        if skipped:
+            # 与启动时同一口径：短命令没注册不等于 Skill 不可用，
+            # 必须给出 /skills run 这个替代入口，否则用户会以为 Skill 坏了。
+            names = "、".join(s.name for s in skipped)
+            report += (
+                f"\n\n以下短命令与已有命令冲突、未注册：{names}"
+                f"\n请改用 /skills run <名字> 执行它们。"
+            )
+        return report
 
     def deactivate_skill(self, name: Optional[str]) -> str:
         """卸载已激活的 Skill；name 为 None 表示全部。返回结果文本。"""

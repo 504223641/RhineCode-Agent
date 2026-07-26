@@ -557,8 +557,11 @@ class ConversationManager:
         Plan Mode 特殊工具），否则热更新会用一套不同的标准去判定笔误。
 
         副作用：重新扫盘、替换 catalog、可能自动卸载已消失的 Skill。
-        注意本方法**不**刷新斜杠短命令注册表——那需要 `CommandRegistry`，
-        而本类刻意不依赖 commands 包（依赖方向固定）。短命令的热更新留待后续。
+
+        **本方法只管领域侧**，不刷新斜杠短命令注册表——那需要 `CommandRegistry`，
+        而本类刻意不依赖 commands 包（依赖方向 `commands ← tui/app ← __main__`）。
+        短命令的重新注册由控制器方法 `RhineApp.reload_skills()` 在调完本方法后
+        接上，它本来就同时持有注册表与 SkillManager。
         """
         registered = self._registry.names() if self._registry else frozenset()
         known = registered | {"ask_user", "present_plan"}

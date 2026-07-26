@@ -209,3 +209,133 @@ class SubmitGuardHintTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SkillCommandHotReloadTests(unittest.IsolatedAsyncioTestCase):
+    """
+    `/skills reload` 之后新增 Skill 的短命令立刻可用（c11 F26）。
+
+    用**真实** SkillManager + 真实 CommandRegistry 端到端验：
+    只断言「replace_skill_commands 被调过」证明不了「新命令真的能补全并执行」，
+    而后者才是这条链路存在的意义。
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self._home = tempfile.TemporaryDirectory()
+        self.skills_dir = Path(self._home.name) / "skills"
+        self.skills_dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._home.cleanup()
+
+    def _write(self, name: str) -> None:
+        (self.skills_dir / f"{name}.md").write_text(
+            f"---\nname: {name}\ndescription: {name} 的说明\n---\n正文\n",
+            encoding="utf-8",
+        )
+
+    def _real_skill_manager(self, registry):
+        from pathlib import Path
+        from rhinecode.skills.manager import SkillManager
+
+        sm = SkillManager(
+            project_root=None,
+            user_dir=Path(self._home.name),
+            builtin_dir=None,
+            has_short_command=registry.has_skill_command,
+        )
+        sm.startup(frozenset({"load_skill", "ask_user", "present_plan"}))
+        return sm
+
+    def _app_with_real_skills(self):
+        """把 FakeManager 的 skill_manager 换成真的，其余保持替身。"""
+        registry = build_builtin_registry()
+        app, manager = _make_app(registry=registry)
+        sm = self._real_skill_manager(registry)
+        # 模拟 __main__ 启动时的初次短命令注册，否则「启动时已有的 Skill」
+        # 其短命令根本没注册过，测不出「reload 后消失」。
+        registry.replace_skill_commands(
+            build_skill_command_specs(sm.command_infos())
+        )
+        manager.skill_manager = sm
+        # 领域方法改为委托真实 SkillManager，与生产实现同口径。
+        manager.reload_skills = lambda: (
+            sm.reload(frozenset({"load_skill", "ask_user", "present_plan"}), frozenset()),
+            "Skill 定义已重新加载。",
+        )[1]
+        manager.skill_status_segment = sm.status_segment
+        return app, manager, registry
+
+    async def test_new_skill_short_command_available_after_reload(self) -> None:
+        app, _, registry = self._app_with_real_skills()
+        async with app.run_test() as pilot:
+            # 启动时没有任何 Skill。
+            self.assertIsNone(registry.resolve("/fresh"))
+
+            # 模拟用户在外部新建了一个 Skill 文件。
+            self._write("fresh")
+
+            await pilot.press(*"/skills reload")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # ① 注册表里有了。
+            self.assertTrue(registry.has_skill_command("fresh"))
+            # ② 补全能补出来——CommandPanel 每次按键现调 registry.complete，
+            #    所以不需要刷新任何组件。
+            await pilot.press(*"/fre")
+            await pilot.press("tab")
+            self.assertEqual(app.query_one(InputBar).value, "/fresh ")
+
+    async def test_removed_skill_short_command_disappears(self) -> None:
+        """定义被删 → 短命令随之消失，不留一条会报错的僵尸命令。"""
+        self._write("gone")
+        app, _, registry = self._app_with_real_skills()
+        async with app.run_test() as pilot:
+            self.assertTrue(registry.has_skill_command("gone"))
+
+            (self.skills_dir / "gone.md").unlink()
+            await pilot.press(*"/skills reload")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertFalse(registry.has_skill_command("gone"))
+            self.assertIsNone(registry.resolve("/gone"))
+
+    async def test_conflicting_new_skill_reports_run_fallback(self) -> None:
+        """
+        新增的 Skill 与内置命令重名 → 短命令不注册，但报告里给出 /skills run 入口。
+
+        没有这句提示，用户会以为 Skill 根本没加载成功。
+        """
+        app, _, registry = self._app_with_real_skills()
+        async with app.run_test() as pilot:
+            self._write("clear")
+            await pilot.press(*"/skills reload")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            text = _history_text(app)
+            self.assertIn("/clear", text)
+            self.assertIn("/skills run", text)
+            # 内置 /clear 完好无损。
+            from rhinecode.commands.models import CommandType
+
+            self.assertIs(registry.resolve("/clear").command_type, CommandType.UI)
+
+    async def test_builtin_commands_survive_reload(self) -> None:
+        """热更新不得误伤内置命令。"""
+        app, _, registry = self._app_with_real_skills()
+        async with app.run_test() as pilot:
+            before = [s.name for s in registry.visible_commands()]
+            self._write("extra")
+            await pilot.press(*"/skills reload")
+            await pilot.press("enter")
+            await pilot.pause()
+            after = [s.name for s in registry.visible_commands()]
+            for name in before:
+                self.assertIn(name, after)
+            self.assertIn("/extra", after)

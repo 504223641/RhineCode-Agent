@@ -114,14 +114,19 @@ class FakeMemoryManager:
 
 
 class FakeSkillManager:
-    """SkillManager 的最小替身：只提供 App 会用到的两个接触点。"""
+    """SkillManager 的最小替身：只提供 App 会用到的几个接触点。"""
 
     def __init__(self) -> None:
         self.notify_activation = None
         self.active_count = 0
+        # c11：RhineApp.reload_skills 会拿它去重建 Skill 短命令。
+        self.infos: tuple = ()
 
     def status_segment(self):
         return f"Skill:{self.active_count}" if self.active_count else None
+
+    def command_infos(self):
+        return self.infos
 
 
 class FakeManager:
