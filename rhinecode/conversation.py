@@ -24,6 +24,7 @@ manual_compact / resume / clear），由 RhineApp（CommandController 实现）�
 - SessionListRequest：请求 TUI 弹出会话选择面板（仅 resume 无参时）
 """
 
+import dataclasses
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Callable, Iterator, Optional
 
 from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
+from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.tools.path_guard import workspace_root, register_read_root
@@ -38,7 +40,16 @@ from rhinecode.mcp.manager import MCPManager
 from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
-from rhinecode.agent.loop import Agent
+from rhinecode.skills.manager import SkillManager
+from rhinecode.skills.models import (
+    ActivationStatus,
+    SKILL_MAX_ITERATIONS,
+    SkillSpec,
+    builtin_skills_dir,
+)
+from rhinecode.skills.render import render_active_body, render_invocation_text
+from rhinecode.context.summarize import snap_back_to_user
+from rhinecode.agent.loop import Agent, RunOptions
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import (
     AgentEvent,
@@ -64,6 +75,37 @@ ConfirmCallback = Callable[[ToolCall, Tool, DecisionResult], ConfirmDecision]
 ClarifyCallback = Callable[[str, list[ClarifyOption]], Optional[str]]
 # 计划审批回调：给定计划文本，返回用户是否批准开始执行。
 ApprovePlanCallback = Callable[[str], bool]
+
+
+# 独立模式子对话「未产出结果」时，按停止原因给出的回流文案（c11）。
+# 每种原因都要能让用户一眼看出「为什么没结果」，而不是一句笼统的失败。
+_ISOLATED_FAILURE_TEXT = {
+    StopReason.USER_CANCELLED: "已取消，本次 Skill 未产出结果。",
+    StopReason.MAX_ITERATIONS: "达到子任务迭代上限，本次 Skill 未产出结果。",
+    StopReason.STREAM_ERROR: "模型请求出错（含上下文超限），本次 Skill 未产出结果。",
+    StopReason.UNKNOWN_TOOL: "连续调用未知工具已停止，本次 Skill 未产出结果。",
+    StopReason.PLAN_REJECTED: "计划未获批准，本次 Skill 未执行。",
+}
+
+
+def _degrade_notice(name: str, degrade) -> str:
+    """
+    激活时的降级警告文案（c11 F9 的「对用户可见」那一半）。
+
+    两种形态措辞必须不同——一个是「可能只做了一半」，一个是「完全没生效」，
+    用户的应对也不同（前者复查结果，后者先卸载别的 Skill 再重试）。
+    """
+    from rhinecode.skills.models import DegradeKind
+
+    if degrade is DegradeKind.TRUNCATED:
+        return (
+            f"Skill `{name}` 的正文被截断（超单体上限），"
+            f"可能只执行前半部分流程，请复查结果。"
+        )
+    return (
+        f"Skill `{name}` 未注入（已激活 Skill 正文合计超总量上限），本次不会生效。"
+        f"请先用 /skills off <名字> 卸载部分 Skill 后重试。"
+    )
 
 
 @dataclass
@@ -116,6 +158,7 @@ class ConversationManager:
         registry: Optional[ToolRegistry] = None,
         mcp_manager: "Optional[MCPManager]" = None,
         resume_latest: bool = False,
+        skill_manager: "Optional[SkillManager]" = None,
     ):
         """
         初始化对话管理器。
@@ -127,6 +170,18 @@ class ConversationManager:
         :param mcp_manager: MCP 连接管理器（c7）；为 None 时 /mcp 命令与状态栏 MCP 段不展示。
                             仅用于状态查询，工具已在启动时注册进 registry，不经此引用调用。
         :param resume_latest: True = `rhine --continue`：启动时恢复最近的未锁定会话（c9 F10）
+        :param skill_manager: Skill 编排者（c11）；由 `__main__` 在启动早期构造并注入。
+
+            **为 None 时用 `SkillManager.empty()` 兜底，协调层绝不自行扫盘造一个**，
+            三条理由：
+            1. 它拿不到 `has_short_command`——那需要 `CommandRegistry` 实例，
+               而本构造函数没有；
+            2. 自行构造会**扫盘**，等于给既有一整套测试引入读用户主目录的隐式 IO，
+               违背 spec N1「可在无终端无网络环境测试」；
+            3. 与 `mcp_manager` 的形态不一致（那个也是外部注入、None 时降级）。
+
+            用 Null Object 而不是到处 `if self.skill_manager is not None`：
+            各使用点无需散落判空，空实例的每个方法都返回「什么都没有」的安全值。
         """
         self._provider = provider
         self._config = config
@@ -183,6 +238,18 @@ class ConversationManager:
         # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。
         # 注册本身无副作用（写类判定不受影响），无条件执行即可。
         register_read_root(user_dir / "memory")
+
+        # Skill 编排者（c11）。缺省用 Null Object，见构造参数说明。
+        self.skill_manager: SkillManager = skill_manager or SkillManager.empty()
+        # 用户级与内置 Skill 目录加入**只读**白名单（N5）：目录型 Skill 的随附资源
+        # （模板、示例、参考文档）位于项目工作区之外，模型需要按资源清单读取它们。
+        # 与 c9 的 memory 目录同理——只对 read 类判定生效，写/搜索面完全不动。
+        register_read_root(user_dir / "skills")
+        register_read_root(builtin_skills_dir())
+
+        # 按模型名缓存的临时 Provider（c11 F22：独立模式 Skill 可指定模型）。
+        self._provider_cache: dict[str, BaseProvider] = {}
+
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
         self.startup_notice: Optional[str] = self.memory_manager.startup(
@@ -241,6 +308,8 @@ class ConversationManager:
         历史清空后旧锚点与熔断态都不再适用，必须一并归零。
         c9：会话存档随之「开新档」——旧存档保留不动、后续消息写入新文件（F8），
         笔记高水位一并归零。
+        c11：已激活的 Skill 一并卸载（F11）——激活态属于「当前这段对话」，
+        历史都清空了，还留着 SOP 注入与工具集收窄会让下一句话的行为莫名其妙。
 
         :returns: 确认文本「对话历史已清空」
         """
@@ -248,6 +317,7 @@ class ConversationManager:
         if self._context_manager is not None:
             self._context_manager.reset()
         self.memory_manager.on_clear()
+        self.skill_manager.clear_active()
         return "对话历史已清空"
 
     def request_cancel(self) -> None:
@@ -411,6 +481,16 @@ class ConversationManager:
         """
         ok, message = self.memory_manager.resume_into(key, self.history)
         if ok:
+            # c11 N4：切换会话必须清空 Skill 激活态，且要在产出 HISTORY 之前。
+            #
+            # 激活态是**进程内存**状态，而 /resume 换的是历史、不是进程。
+            # 不主动清空的话，用户在会话 A 激活的 Skill 会跟着进入会话 B 的上下文——
+            # 它的 SOP 正文继续每轮注入、白名单继续收窄工具集，而会话 B 的历史里
+            # 根本没有任何激活过它的痕迹。用户看着一段陌生的历史，模型却在按
+            # 另一段对话里定的规矩行事，这种状态几乎无法自查。
+            #
+            # 载入**失败**时不清空：此时仍停留在原会话，激活态应当原样保持。
+            self.skill_manager.clear_active()
             # 浅拷贝快照：防止后续 before_request 对 history 的原地重构影响回放内容
             yield AgentEvent(type=AgentEventType.HISTORY, messages=list(self.history))
         if ok and self._context_manager is not None:
@@ -447,65 +527,341 @@ class ConversationManager:
             return None
         return self._context_manager.status_line(self.history)
 
-    def _run(self) -> Iterator[AgentEvent]:
+    # ------------------------------------------------------------------ #
+    # Skill 领域方法（c11）
+    # ------------------------------------------------------------------ #
+    def skills_report(self) -> str:
+        """`/skills` 的只读状态报告。"""
+        return self.skill_manager.report()
+
+    def skills_prompt_report(self) -> str:
+        """`/skills prompt` 的只读注入内容报告。"""
+        registered = self._registry.names() if self._registry else frozenset()
+        return self.skill_manager.prompt_report(registered)
+
+    def skill_status_segment(self) -> Optional[str]:
+        """状态栏的 Skill 段（形如 `Skill:2`）；无激活时 None，状态栏随之隐藏该段。"""
+        return self.skill_manager.status_segment()
+
+    def deactivate_skill(self, name: Optional[str]) -> str:
+        """卸载已激活的 Skill；name 为 None 表示全部卸载。返回结果文本。"""
+        return self.skill_manager.deactivate(name)
+
+    def reload_skills(self) -> str:
         """
-        构造一次 Agent 运行并返回其事件流。
+        热更新 Skill 定义（`/skills reload`，spec F26/F27）。
 
-        步骤：
-        1. 重建取消信号（每次运行独立，避免上次的取消影响本次）。
-        2. 采集环境信息并拼装结构化系统提示，分出 stable（可缓存）与 dynamic（动态）两段（c5）。
-        3. 计算缓存调试日志路径（debug_log 关闭时为 None）。
-        4. 构造 ask 闭包：把 TUI 的四态确认回调封装成循环只需的 bool 接口，并在用户选
-           「本会话/永久放行」时把对应 allow 规则登记进引擎（会话级 / 写本地配置，c6 F6）。
-        5. 调用 Agent.run，注入历史、思考模式、Plan Mode、系统提示两段、日志路径、权限引擎、
-           四类回调与取消信号。
+        :returns: 可读的变更报告
 
-        :returns: Agent 产出的 AgentEvent 事件流
+        `known` 的口径与 `__main__` 启动时完全一致（注册中心当前名字 ∪ 两个
+        Plan Mode 特殊工具），否则热更新会用一套不同的标准去判定笔误。
 
-        副作用：重建 self._cancel_event；ask 闭包可能向引擎登记会话规则或写本地配置文件。
+        副作用：重新扫盘、替换 catalog、可能自动卸载已消失的 Skill。
+        注意本方法**不**刷新斜杠短命令注册表——那需要 `CommandRegistry`，
+        而本类刻意不依赖 commands 包（依赖方向固定）。短命令的热更新留待后续。
         """
-        self._cancel_event = threading.Event()
+        registered = self._registry.names() if self._registry else frozenset()
+        known = registered | {"ask_user", "present_plan"}
+        outcome = self.skill_manager.reload(known, registered)
 
-        # 结构化系统提示（c5）：以项目根为工作目录采集环境信息，拼装出稳定/动态两段。
-        # stable 逐轮不变 → 走 system 参数命中缓存；dynamic（环境信息）由循环注入 <system-reminder>。
-        # Plan Mode 的引导不再在此构造，改由循环按轮节奏注入（见 loop.run / reminders）。
+        lines = ["Skill 定义已重新加载。"]
+        if outcome.added:
+            lines.append(f"新增：{'、'.join(outcome.added)}")
+        if outcome.removed:
+            lines.append(f"移除：{'、'.join(outcome.removed)}")
+        if outcome.auto_deactivated:
+            lines.append(
+                f"已自动卸载（定义已消失）：{'、'.join(outcome.auto_deactivated)}"
+            )
+        if outcome.dropped_fatal:
+            lines.append(f"因白名单错误被丢弃：{'、'.join(outcome.dropped_fatal)}")
+        if not (outcome.added or outcome.removed or outcome.auto_deactivated):
+            lines.append("（Skill 列表无变化；已激活 Skill 的正文按最新定义生效）")
+        if outcome.errors:
+            lines.append("")
+            lines.append("加载失败：")
+            lines.extend(f"- {e.path}：{e.reason}" for e in outcome.errors)
+        if outcome.warnings:
+            lines.append("")
+            lines.append("警告：")
+            lines.extend(f"- {w}" for w in outcome.warnings)
+        return "\n".join(lines)
+
+    def run_skill(
+        self, name: str, arguments: str, display: str
+    ) -> "Iterator[AgentEvent] | str":
+        """
+        执行一个 Skill（c11 F18/F19/F24），两种模式走两条完全不同的路径。
+
+        :param name: Skill 名（不带斜杠）
+        :param arguments: 用户参数，原样保留
+        :param display: 用户敲的原始输入，作为 `Message.display_content`
+        :returns: 事件流（成功执行）或提示文本（找不到）
+
+        - **共享模式**：激活它，然后把一段自包含调用文本作为普通用户消息提交，
+          走完全正常的 Agent 路径。SOP 正文由系统提示的动态槽位注入。
+        - **独立模式**：开一条子对话跑完，只回流结论（见 `_run_isolated_skill`）。
+
+        副作用：修改激活列表；向主历史追加消息；发起 API 请求。
+        """
+        result = self.skill_manager.activate(name, arguments)
+
+        if result.status is ActivationStatus.NOT_FOUND:
+            available = (
+                "、".join(result.available_names)
+                if result.available_names
+                else "（当前没有任何可用 Skill）"
+            )
+            return f"没有名为 `{name}` 的 Skill。\n可用的 Skill：{available}"
+
+        spec = self.skill_manager.get(name)
+
+        if result.status is ActivationStatus.ISOLATED:
+            # 用户主动触发独立模式是合法的（只有**模型**不能自行发起）。
+            return self._wrap_events(
+                self._run_isolated_skill(spec, arguments, display)
+            )
+
+        # 共享模式：激活成功，把自包含文本作为一条普通用户消息提交。
+        events = self.submit_user_message(
+            render_invocation_text(spec, arguments), display_content=display
+        )
+        if result.degrade is not None:
+            # 降级必须让用户看见（F9）。在事件流最前面插一条 NOTICE——
+            # 这是「激活时给出警告」那一半（另一半是 /skills 报告里的标记）。
+            return self._prepend_notice(_degrade_notice(name, result.degrade), events)
+        return events
+
+    @staticmethod
+    def _prepend_notice(
+        message: str, events: Iterator[AgentEvent]
+    ) -> Iterator[AgentEvent]:
+        """在一个事件流最前面插一条 NOTICE，其余原样透传。"""
+        yield AgentEvent(type=AgentEventType.NOTICE, message=message)
+        yield from events
+
+    def _take_tail(self, history: list[Message], n: int) -> list[Message]:
+        """
+        取主历史尾部 n 条，并回退到最近的 user 边界（c11 F20）。
+
+        :param history: 主对话历史
+        :param n: 期望带入的条数
+        :returns: 尾部消息列表；不带入任何历史时为空列表
+
+        **实际带入条数可能多于 n**：为了不拆散 `assistant(tool_calls)` 与其配对的
+        `tool` 消息，边界会向前回退到最近的 user。F20 明确允许这一点——
+        多带几条完整消息，好过切出一段 API 会拒绝的残缺片段。
+
+        **找不到 user 边界时返回空列表，这与 C8 的语义相反**：
+        `snap_back_to_user` 返回 None 时，C8 的 `compute_retain_index` 取 0
+        表示「全部保留」（安全）；这里若也取 0，`history[0:]` 就是**整个主历史**——
+        用户写 `history_messages: 3`，实际却灌进几百条消息，既违背独立模式的目的，
+        又因子对话关闭了第二层摘要而当场撑爆窗口。所以这里必须取空列表。
+        """
+        if n <= 0 or not history:
+            return []
+        idx = max(0, len(history) - n)
+        boundary = snap_back_to_user(history, idx)
+        if boundary is None:
+            return []
+        return history[boundary:]
+
+    def _provider_for(self, model: str) -> BaseProvider:
+        """
+        取一个使用指定模型的 Provider（c11 F22，仅独立模式）。
+
+        :param model: 模型名
+        :returns: 该模型对应的 Provider 实例（同名复用同一个）
+
+        **这样实现的关键收益是不必改动 `BaseProvider.stream_chat` 的接口**——
+        若走「给 stream_chat 加一个 model 参数」的路子，三个 Provider 实现都要改。
+        而 `Config` 是 dataclass，`dataclasses.replace` 换掉 model 再走
+        `create_provider` 就能得到一个新 Provider，Provider 层一行不动。
+
+        缓存**有界**（上界 = 全部 Skill 声明的不同模型数，通常是个位数）、
+        **不关闭**——`BaseProvider` 本来就没有 `close()`，`__main__` 的 finally
+        只回收 MCP 连接与会话锁，这里与主 Provider 的处理同口径。
+
+        副作用：首次调用某模型时构造一个新 Provider（可能建立 HTTP 连接池）。
+        """
+        cached = self._provider_cache.get(model)
+        if cached is not None:
+            return cached
+        provider = create_provider(dataclasses.replace(self._config, model=model))
+        self._provider_cache[model] = provider
+        return provider
+
+    def _run_isolated_skill(
+        self, spec: SkillSpec, arguments: str, display: str
+    ) -> Iterator[AgentEvent]:
+        """
+        独立模式：开一条子对话跑完，只把结论回流主历史（c11 F19/F20/F21/F23）。
+
+        :param spec: 要执行的 Skill
+        :param arguments: 用户参数
+        :param display: 用户敲的原始输入
+        :returns: 事件流；主历史最终**恰好**新增两条配对消息（user + assistant）
+
+        为什么值得开一条子对话：一次代码审查可能读二十个文件、跑几条命令，
+        这些中间过程对主对话毫无价值，却会占掉大量上下文。子对话跑完只回流
+        一段结论，主历史干净、上下文预算也省下来了。
+
+        **子对话触达上下文上限时的兜底链路**（兑现 F21 的说明义务）：
+        子对话只跑 C8 第一层（工具结果存盘），不跑第二层摘要——它是短任务，
+        为它调一次摘要 LLM 不划算，且摘要用的锚点属于主历史、对它无意义。
+        万一仍然超窗：API 报错 → `chunk.type == "error"` → 循环产出 ERROR 事件
+        （TUI 渲染红色错误行）→ `FINISHED(STREAM_ERROR)` → 下面判为「未产出」
+        → 追加一条 NOTICE + 在主历史留一条说明。用户有两处可见反馈，
+        历史里也留下可追溯记录，不会「什么都没发生」。
+
+        副作用：向主历史追加两条消息并写会话存档；发起 API 请求；
+        重建 `self._cancel_event`；可能弹权限确认面板。
+        """
+        # ── 1. 自包含调用文本：主历史与子对话首条 user 消息**同源复用** ──
+        # 逐字一致很重要：几个月后回看主历史那条 user 消息，它描述的就是
+        # 子对话当时实际收到的任务陈述。
+        invocation = render_invocation_text(spec, arguments)
+
+        # ── 2. 主历史先记 user 消息 ──
+        user_msg = Message(
+            role="user", content=invocation, display_content=display
+        )
+        self.history.append(user_msg)
+        self.memory_manager.record_message(user_msg)
+
+        # ── 3. 子历史 = 尾部主历史 + 那条 user 消息 ──
+        # `self.history[:-1]` 排除刚追加的这条，避免它被算进「尾部 n 条」里重复。
+        # 末尾追加不可省：`history_messages: 0` 时子对话会完全没有用户轮，
+        # 模型收到一个只有系统提示、没有任务陈述的请求，根本不知道要做什么。
+        sub_history: list[Message] = self._take_tail(
+            self.history[:-1], spec.history_messages
+        )
+        sub_history.append(Message(role="user", content=invocation))
+
+        # ── 4. 子系统提示：stable 复用主对话，dynamic 只带这一个 Skill 的正文 ──
         project_root = str(workspace_root())
         env = collect_environment(self._config, project_root)
-        # c9：把 RHINE.md 拼接结果与记忆索引填进 110/130 槽位（两者都可能为空串，
-        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，笔记线程会话中途
-        # 更新后，下一条消息就能看到新索引。
         assembled = build_default_prompt(
             env,
             custom_instructions=self.memory_manager.custom_instructions(),
             memory_index=self.memory_manager.memory_index(),
+            skill_index="",   # 子对话不给清单——它不许再激活别的 Skill（F23）
+            active_skills="",
         )
-        # 一次性动态提醒（c9：恢复会话的时间跨度提醒）：并入本次 dynamic，取走即清，
-        # 不进持久历史、不被存档（它是「此刻的环境事实」）。
-        base_dynamic = assembled.dynamic
-        pending = self.memory_manager.consume_pending_notice()
+        sub_body, _degrade = render_active_body(spec, arguments)
+        env_text = assembled.dynamic
 
-        def dynamic_provider() -> str:
-            """
-            产出本轮 <system-reminder> 的动态内容（c11 起循环每轮调一次）。
+        # Plan Mode 继承时的衔接语。理由：子循环每轮会把 plan_toggle_instruction
+        # 与 dynamic() 合并进**同一条** <system-reminder>，于是「SOP 让你按步骤做」
+        # 与「Plan 让你先别动手」两段指令会互相拉扯。显式把它们串成一条流程，
+        # 模型才知道先规划后执行而不是二选一。
+        plan_bridge = (
+            "当前处于计划模式：请先依据上述 Skill 指令拟出执行计划并提交审批，"
+            "获批后再按该指令执行。"
+            if self.plan_mode
+            else ""
+        )
 
-            **`pending` 在闭包外取一次是刻意的**，不要「优化」成闭包内消费：
-            c9 的既有行为就是「取一次拼进字符串，循环每轮重新包一层」，
-            也就是同一次运行的每一轮都带着这条提醒。「取走即清」指的是
-            「本次运行消费掉、不带到下一条用户消息」，不是「只在第一轮出现」。
-            若改成闭包内 `consume_pending_notice()`，第 2 轮起它就变空了——
-            那是改变现状而不是保持现状。
-
-            段落顺序：环境信息 → 已激活 Skill → 一次性提醒。
-            """
-            parts = [p for p in (base_dynamic,) if p]
-            if pending:
-                parts.append(pending)
+        def sub_dynamic() -> str:
+            parts = [p for p in (env_text, sub_body, plan_bridge) if p]
             return "\n\n".join(parts)
-        # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
-        debug_log_path = (
-            str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
+
+        # ── 5. 驱动子 Agent ──
+        sub_provider = (
+            self._provider_for(spec.model) if spec.model else self._provider
+        )
+        sub_agent = Agent(sub_provider, self._registry)
+
+        # 取消信号必须**重建**：`request_cancel()` 置的就是 `self._cancel_event`，
+        # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
+        self._cancel_event = threading.Event()
+
+        registry = self._registry
+        stop_reason = StopReason.COMPLETED
+        events = sub_agent.run(
+            sub_history,
+            self.thinking_effort,
+            self.plan_mode,          # 继承主对话的 Plan Mode
+            assembled.stable,
+            sub_dynamic,
+            spec.model or self._config.model,
+            None,                    # 子对话不写缓存调试日志
+            self._engine,
+            self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
+            self.clarify_callback,
+            self.approve_plan_callback,
+            self._cancel_event,
+            self._context_manager,
+            None,                    # recorder=None：子对话过程不写会话存档
+            options=RunOptions(
+                max_iterations=SKILL_MAX_ITERATIONS,
+                record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
+                allow_summary=False,  # 只跑 C8 第一层（F21）
+                tool_policy=(
+                    (lambda: self.skill_manager.isolated_policy(
+                        spec, registry.names()
+                    ))
+                    if registry is not None
+                    else None
+                ),
+            ),
         )
 
+        # ── 6. 转发子循环事件，但**拦下 FINISHED** ──
+        # 外层要自己收尾（先回流结论再产出 FINISHED），不能让子循环的 FINISHED
+        # 提前把 TUI 的流式状态收掉。
+        for event in events:
+            if event.type == AgentEventType.FINISHED:
+                stop_reason = event.stop_reason
+                continue
+            yield event
+
+        # ── 7. 提取结论 ──
+        conclusion: Optional[str] = None
+        for msg in reversed(sub_history):
+            if msg.role == "assistant" and (msg.content or "").strip():
+                conclusion = msg.content.strip()
+                break
+
+        # `stop_reason != COMPLETED` 这个条件不可省：计划被拒时子历史的最后一条
+        # assistant 可能带着非空的前言正文（「我打算这样做：……」），只按
+        # 「找最后一条非空 assistant」会把那段前言当成结论回流，用户会以为
+        # Skill 执行完了。
+        failed = conclusion is None or stop_reason != StopReason.COMPLETED
+        if failed:
+            conclusion = _ISOLATED_FAILURE_TEXT.get(
+                stop_reason, "本次 Skill 未产出结果"
+            )
+
+        # ── 8. 结论回流主历史。至此主历史新增恰好两条配对消息 ──
+        assistant_msg = Message(role="assistant", content=conclusion)
+        self.history.append(assistant_msg)
+        self.memory_manager.record_message(assistant_msg)
+
+        # ── 9. 「未产出」时必须补一条 NOTICE ──
+        # 第 6 步拦下了全部 FINISHED，而 TUI 对 COMPLETED 的收尾行**不渲染任何东西**。
+        # 不补这条，用户按 Esc 取消后界面会完全没有反应，像是卡住了。
+        if failed:
+            yield AgentEvent(type=AgentEventType.NOTICE, message=conclusion)
+
+        # ── 10. 自然完成收尾：让 _wrap_events 触发 c9 的笔记钩子（F21）──
+        yield AgentEvent(
+            type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED
+        )
+
+    def _build_ask(self) -> "AskFn":
+        """
+        构造人在回路确认闭包（c11 T44 从 _run 内联提取，逻辑逐字不变）。
+
+        :returns: 循环所需的 `(ToolCall, Tool, DecisionResult) -> bool` 回调
+
+        **抽出来是为了让独立模式子对话复用同一份实现**。子对话同样要走完整
+        权限管线、同样可能弹四态确认面板；若各写一份，「本会话放行」的规则
+        登记与「永久放行」的落盘就会出现两套逻辑，用户在子对话里选的
+        「本会话放行」很可能对主对话不生效——那是极难察觉的不一致。
+
+        副作用：返回的闭包被调用时可能向引擎登记会话规则或写本地配置文件。
+        """
         def ask(tool_call: ToolCall, tool: Tool, decision: DecisionResult) -> bool:
             """
             人在回路确认（仅当决策为 ASK 时由循环调用，返回是否执行）。
@@ -544,6 +900,80 @@ class ConversationManager:
                 return True
             return False
 
+        return ask
+
+    def _run(self) -> Iterator[AgentEvent]:
+        """
+        构造一次 Agent 运行并返回其事件流。
+
+        步骤：
+        1. 重建取消信号（每次运行独立，避免上次的取消影响本次）。
+        2. 采集环境信息并拼装结构化系统提示，分出 stable（可缓存）与 dynamic（动态）两段（c5）。
+        3. 计算缓存调试日志路径（debug_log 关闭时为 None）。
+        4. 构造 ask 闭包：把 TUI 的四态确认回调封装成循环只需的 bool 接口，并在用户选
+           「本会话/永久放行」时把对应 allow 规则登记进引擎（会话级 / 写本地配置，c6 F6）。
+        5. 调用 Agent.run，注入历史、思考模式、Plan Mode、系统提示两段、日志路径、权限引擎、
+           四类回调与取消信号。
+
+        :returns: Agent 产出的 AgentEvent 事件流
+
+        副作用：重建 self._cancel_event；ask 闭包可能向引擎登记会话规则或写本地配置文件。
+        """
+        self._cancel_event = threading.Event()
+
+        # 结构化系统提示（c5）：以项目根为工作目录采集环境信息，拼装出稳定/动态两段。
+        # stable 逐轮不变 → 走 system 参数命中缓存；dynamic（环境信息）由循环注入 <system-reminder>。
+        # Plan Mode 的引导不再在此构造，改由循环按轮节奏注入（见 loop.run / reminders）。
+        project_root = str(workspace_root())
+        env = collect_environment(self._config, project_root)
+        # c9：把 RHINE.md 拼接结果与记忆索引填进 110/130 槽位（两者都可能为空串，
+        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，笔记线程会话中途
+        # 更新后，下一条消息就能看到新索引。
+        # c11：第一阶段 Skill 清单填进 140 稳定槽位（进前缀缓存）；
+        # 已激活正文不在这里填——它必须每轮重算，走下面 dynamic_provider 的动态通道。
+        assembled = build_default_prompt(
+            env,
+            custom_instructions=self.memory_manager.custom_instructions(),
+            memory_index=self.memory_manager.memory_index(),
+            skill_index=self.skill_manager.index_text(),
+            active_skills="",
+        )
+        # 一次性动态提醒（c9：恢复会话的时间跨度提醒）：并入本次 dynamic，取走即清，
+        # 不进持久历史、不被存档（它是「此刻的环境事实」）。
+        base_dynamic = assembled.dynamic
+        pending = self.memory_manager.consume_pending_notice()
+
+        def dynamic_provider() -> str:
+            """
+            产出本轮 <system-reminder> 的动态内容（c11 起循环每轮调一次）。
+
+            **`pending` 在闭包外取一次是刻意的**，不要「优化」成闭包内消费：
+            c9 的既有行为就是「取一次拼进字符串，循环每轮重新包一层」，
+            也就是同一次运行的每一轮都带着这条提醒。「取走即清」指的是
+            「本次运行消费掉、不带到下一条用户消息」，不是「只在第一轮出现」。
+            若改成闭包内 `consume_pending_notice()`，第 2 轮起它就变空了——
+            那是改变现状而不是保持现状。
+
+            段落顺序：环境信息 → 已激活 Skill → 一次性提醒（spec F9 要求
+            Skill 正文排在环境信息之后）。
+
+            已激活 Skill 的正文**每轮现取**（c11 改造点 1）：模型可能在上一轮
+            才调 `load_skill`，这一轮就该看见它的 SOP。
+            """
+            parts = [p for p in (base_dynamic,) if p]
+            active = self.skill_manager.active_text()
+            if active:
+                parts.append(active)
+            if pending:
+                parts.append(pending)
+            return "\n\n".join(parts)
+        # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
+        debug_log_path = (
+            str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
+        )
+
+        ask = self._build_ask()
+
         events = self._agent.run(
             self.history,
             self.thinking_effort,
@@ -559,8 +989,24 @@ class ConversationManager:
             self._cancel_event,
             self._context_manager,
             self.memory_manager.record_message,
+            options=RunOptions(tool_policy=self._main_tool_policy()),
         )
         return self._wrap_events(events)
+
+    def _main_tool_policy(self) -> "Optional[Callable[[], ToolPolicy]]":
+        """
+        构造主对话的工具收窄策略回调（c11 F14）。
+
+        :returns: 每轮被循环调用一次的回调；无工具模式返回 None（不收窄）
+
+        **注册中心的工具名在 lambda 体内现取，不在外面捕获快照**：
+        MCP 支持运行时 `reload_server`，会在会话中途增删工具。若在这里
+        `names = self._registry.names()` 捕获一次，之后 MCP 重载新增的工具
+        就永远进不了白名单交集——用户明明连上了新 Server，Skill 却看不见它的工具。
+        """
+        if self._registry is None:
+            return None
+        return lambda: self.skill_manager.tool_policy(self._registry.names())
 
     def _wrap_events(self, events: Iterator[AgentEvent]) -> Iterator[AgentEvent]:
         """
