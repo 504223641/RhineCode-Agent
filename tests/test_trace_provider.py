@@ -123,6 +123,42 @@ class TracingProviderTest(unittest.TestCase):
         list(p.stream_chat([Message(role="user", content="x")], tools=["not a dict", {}]))
         self.assertEqual(self.records()[0]["tool_names"], [])
 
+    def test_stream_aggregates_replace_per_chunk_events(self) -> None:
+        """
+        流式聚合指标：块数与首字延迟。
+
+        它们替代了「每个流式块记一条 agent_event」那种做法——手测实测那样会让
+        93% 的记录变成只含 `text_length: 2` 的噪音，而且反而算不出首字延迟
+        （得自己去减两条记录的时间戳）。
+        """
+        inner = FakeProvider(
+            [
+                StreamChunk(type="thinking", content="想"),
+                StreamChunk(type="text", content="你"),
+                StreamChunk(type="text", content="好"),
+                StreamChunk(type="text", content="呀"),
+                StreamChunk(type="done"),
+            ]
+        )
+        p = TracingProvider(inner, self.rec, model="m")
+        list(p.stream_chat([Message(role="user", content="hi")]))
+
+        resp = self.records()[1]
+        self.assertEqual(resp["text_chunks"], 3)
+        self.assertEqual(resp["thinking_chunks"], 1)
+        self.assertIsNotNone(resp["first_chunk_ms"])
+        self.assertGreaterEqual(resp["first_chunk_ms"], 0)
+        self.assertLessEqual(resp["first_chunk_ms"], resp["duration_ms"])
+
+    def test_no_chunks_leaves_first_chunk_none(self) -> None:
+        """一个字都没出（比如直接报错）时首字延迟为 None，而不是伪造一个 0。"""
+        inner = FakeProvider([StreamChunk(type="error", content="炸了")])
+        p = TracingProvider(inner, self.rec, model="m")
+        list(p.stream_chat([Message(role="user", content="hi")]))
+        resp = self.records()[1]
+        self.assertIsNone(resp["first_chunk_ms"])
+        self.assertEqual(resp["text_chunks"], 0)
+
     def test_tool_calls_recorded_in_response(self) -> None:
         inner = FakeProvider(
             [

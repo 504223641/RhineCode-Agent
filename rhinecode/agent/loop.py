@@ -174,7 +174,7 @@ class Agent:
         tc: ToolCall,
         res: ToolResult,
         outcome: str,
-        duration_ms: int = 0,
+        duration_ms: float = 0,
         is_concurrent: bool = False,
     ) -> None:
         """
@@ -183,7 +183,12 @@ class Agent:
         :param tc: 工具调用
         :param res: 执行结果（未执行的分支也有结构化结果）
         :param outcome: 六个 OUTCOME_* 之一，说明「为什么是这个结果」
-        :param duration_ms: 实际执行耗时；`outcome != executed` 时按约定记 0
+        :param duration_ms: 实际执行耗时（毫秒，**保留三位小数**）；
+            `outcome != executed` 时按约定记 0。
+            为什么不取整：读小文件常在 1 毫秒内完成，取整后一律显示 `0ms`，
+            与「计时压根没生效」无法区分（手测场景 1 里五条 read_file 全是 0ms，
+            当时确实要多看一眼才能确认不是 bug）。保留小数则显示 `0.412ms`，
+            一眼就知道是真的快
         :param is_concurrent: 是否走了只读并发桶
 
         走 `emit_lazy` 是因为负载里的 `output` 可能很大（一次 `read_file` 就是整份文件），
@@ -833,7 +838,7 @@ class Agent:
         parent_scope = self._safe_scope()
         # 各调用的实际执行耗时（毫秒），由包装函数在池线程里填、主线程读。
         # dict 的单键赋值在 CPython 下是原子的，且每个 tc.id 只被一个线程写一次。
-        durations: dict[str, int] = {}
+        durations: dict[str, float] = {}
 
         def _run(tool: Tool, tc: ToolCall):
             """池线程里的任务入口：绑定父作用域、计时，然后执行工具。"""
@@ -846,7 +851,7 @@ class Agent:
             finally:
                 # **不加 try/except 吞异常**：既有的 `future.result()` 兜底逻辑
                 # 不能变。埋点自身的异常由 recorder 内部兜住。
-                durations[tc.id] = int((time.monotonic() - t0) * 1000)
+                durations[tc.id] = round((time.monotonic() - t0) * 1000, 3)
 
         with ThreadPoolExecutor(max_workers=len(valid)) as executor:
             future_to_tc = {
@@ -939,6 +944,7 @@ class Agent:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res
         self._trace_tool(
-            tc, res, OUTCOME_EXECUTED, duration_ms=int((time.monotonic() - t0) * 1000)
+            tc, res, OUTCOME_EXECUTED,
+            duration_ms=round((time.monotonic() - t0) * 1000, 3),
         )
         yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)

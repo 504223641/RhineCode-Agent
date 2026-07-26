@@ -86,9 +86,15 @@ def _s_api_request(r: dict) -> str:
 def _s_api_response(r: dict) -> str:
     calls = r.get("tool_calls") or []
     err = f" · 流错误 {r['stream_error']}" if r.get("stream_error") else ""
+    # 首字延迟单独显示：它是流式体验最关键的指标（用户等了多久才看到第一个字），
+    # 而总耗时里混着「出字很慢」与「首字就慢」两种完全不同的问题。
+    first = r.get("first_chunk_ms")
+    ttfb = f" · 首字 {first}ms" if first is not None else ""
+    chunks = r.get("text_chunks")
+    density = f" · {chunks} 块" if chunks else ""
     return (
-        f"turn {r.get('turn')} · {r.get('duration_ms')}ms · 工具调用 {len(calls)} 个"
-        f"{err} · {_text_of(r.get('text'), 60)}"
+        f"turn {r.get('turn')} · {r.get('duration_ms')}ms{ttfb}{density}"
+        f" · 工具调用 {len(calls)} 个{err} · {_text_of(r.get('text'), 60)}"
     )
 
 

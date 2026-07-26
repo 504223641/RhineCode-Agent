@@ -721,13 +721,28 @@ class RhineApp(App):
             for event in gen:
                 etype = event.type
                 # 循环事件埋点（trace F15 + F17 字段白名单）。
+                #
+                # ⚠️ **TEXT / THINKING 两类刻意不记录**，这是 F17「同一份数据不重复
+                # 携带」裁决的必然延伸。它们是**逐块**产出的流式增量：一次几百字的
+                # 回答会切成好几百个块、每块一条事件，而按字段白名单剥掉正文之后，
+                # 每条剩下的全部信息只有 `text_length: 2`——信息量为零，却把整条
+                # 时间线淹掉。
+                #
+                # 实测（手测场景 3）：2096 条记录里 1944 条是这种噪音（93%），
+                # 一次 `api_request` 与它的 `api_response` 之间夹着 322 条，人没法读。
+                #
+                # 丢掉的那点信息由更有用的聚合形态承载：完整正文与思考在
+                # `api_response`（各一条）、界面上呈现的完整段落在 `ui_message`、
+                # 块数与首块延迟也在 `api_response`（见 tracing_provider）。
+                #
                 # ⚠️ 必须用**默认参数绑定** `e=event`：循环内直接写
                 # `lambda: agent_event_payload(event)` 捕获的是变量而不是当轮的值，
                 # 全部闭包最终都指向最后一个事件（Python 闭包按引用捕获）。
-                self._recorder.emit_lazy(
-                    TraceEventType.AGENT_EVENT,
-                    lambda e=event: agent_event_payload(e),
-                )
+                if etype not in (AgentEventType.TEXT, AgentEventType.THINKING):
+                    self._recorder.emit_lazy(
+                        TraceEventType.AGENT_EVENT,
+                        lambda e=event: agent_event_payload(e),
+                    )
 
                 if etype == AgentEventType.PROGRESS:
                     reset_text_widgets()

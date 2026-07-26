@@ -752,9 +752,54 @@ class AgentEventPayloadHookTest(TraceHookBase):
         self.assertNotIn("机密路径", blob)
         self.assertNotIn("read_file 输出", blob)
         self.assertNotIn("一段正文", blob)
-        # 但工具名与长度在
+        # 但工具名在
         self.assertIn("read_file", blob)
-        self.assertIn("text_length", blob)
+
+    def test_text_and_thinking_events_are_not_recorded(self) -> None:
+        """
+        TEXT / THINKING 两类**不产 agent_event**（F17 裁决的延伸）。
+
+        这是一条防回归线：手测实测过，逐块记录会让 93% 的时间线变成只含
+        `text_length: 2` 的噪音（2096 条里 1944 条），一次请求与响应之间夹着
+        322 条，人根本没法读。若哪天有人「顺手」把它加回来，本用例会红。
+
+        复刻 `_do_stream` 的过滤条件——界面层的 Pilot 覆盖在 test_command_tui。
+        """
+        from rhinecode.trace.models import agent_event_payload
+
+        registry = ToolRegistry()
+        registry.register(FakeTool("read_file"))
+        provider = ScriptedProvider(
+            [_tool_round("read_file", args={"path": "a"}), _text_round("一段很长的正文")]
+        )
+        events = self.run_loop(provider, registry)
+
+        for e in events:
+            if e.type in (AgentEventType.TEXT, AgentEventType.THINKING):
+                continue
+            self.rec.emit_lazy(T.AGENT_EVENT, lambda ev=e: agent_event_payload(ev))
+
+        kinds = [r["event_type"] for r in self.records(T.AGENT_EVENT)]
+        self.assertNotIn("text", kinds)
+        self.assertNotIn("thinking", kinds)
+        # 有信息量的那几类仍在
+        self.assertIn("tool_start", kinds)
+        self.assertIn("tool_result", kinds)
+        self.assertIn("finished", kinds)
+
+    def test_source_filters_text_events_at_the_hook(self) -> None:
+        """
+        过滤条件必须写在**埋点处**，而不是靠调用方自觉。
+
+        用源码断言而非行为断言，是因为界面层的 `_do_stream` 需要真实 Textual
+        运行时才能驱动；这条只确认那个 `if` 还在。
+        """
+        import inspect
+
+        from rhinecode.tui.app import RhineApp
+
+        src = inspect.getsource(RhineApp._do_stream)
+        self.assertIn("AgentEventType.TEXT, AgentEventType.THINKING", src)
 
 
 # ---------------------------------------------------------------------------

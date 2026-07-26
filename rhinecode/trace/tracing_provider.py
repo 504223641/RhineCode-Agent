@@ -106,6 +106,13 @@ class TracingProvider(BaseProvider):
         tool_calls: list[dict] = []
         usage: Any = None
         stream_error: Optional[str] = None
+        # 流式体验的两个可观测量。它们替代了「每个块记一条 agent_event」那种做法
+        # ——那样会产出几百条只含 `text_length: 2` 的噪音记录，而且反而算不出
+        # 首字延迟（要自己去减两条记录的时间戳）。这里聚合成两个数字：
+        # - first_chunk_ms：从发起请求到**第一个正文/思考块**到达的毫秒数，
+        #   即用户「等了多久才看到第一个字」，是流式体验最关键的指标；
+        # - chunk 计数：块的密度，配合总耗时可看出是稳定出字还是卡顿后爆发。
+        first_chunk_at: Optional[float] = None
 
         try:
             # 为什么必须显式 contextlib.closing：
@@ -125,8 +132,12 @@ class TracingProvider(BaseProvider):
             ) as stream:
                 for chunk in stream:
                     if chunk.type == "text":
+                        if first_chunk_at is None:
+                            first_chunk_at = time.monotonic()
                         text_parts.append(chunk.content)
                     elif chunk.type == "thinking":
+                        if first_chunk_at is None:
+                            first_chunk_at = time.monotonic()
                         thinking_parts.append(chunk.content)
                     elif chunk.type == "tool_call" and chunk.tool_call is not None:
                         tool_calls.append(
@@ -155,6 +166,14 @@ class TracingProvider(BaseProvider):
                     "tool_calls": tool_calls,
                     "usage": _usage_payload(usage),
                     "duration_ms": int((time.monotonic() - t0) * 1000),
+                    # 流式聚合指标（替代逐块的 agent_event，见 tui/app.py 的说明）
+                    "first_chunk_ms": (
+                        int((first_chunk_at - t0) * 1000)
+                        if first_chunk_at is not None
+                        else None
+                    ),
+                    "text_chunks": len(text_parts),
+                    "thinking_chunks": len(thinking_parts),
                     "stream_error": stream_error,
                 },
             )

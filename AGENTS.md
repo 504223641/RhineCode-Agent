@@ -66,7 +66,16 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 新增斜杠命令（c10 起单一注册，旧的「逻辑 + 补全列表」双维护规则已废除）：在 `commands/builtins.py` 的 `build_builtin_registry()` 登记一条 `CommandSpec`（规范名/别名/描述/用法/类型/参数提示）并实现处理函数（只做「参数解释 + `CommandController` 调用」，需要新领域能力时在 `conversation.py` 加领域方法、`tui/app.py` 的控制器方法里接线），再补一组 `tests/test_command_builtins.py` 测试即可——补全菜单、`/help` 帮助、输入高亮都自动读取注册表，无需再改 `CommandPanel`、状态刷新白名单或任何清单。需要刷新状态栏的命令在处理函数里显式调 `controller.refresh_status()`。若命令带选项面板/回调（如确认四态），仍需同步 `tui/app.py` 的事件处理与回调注入。
 
-新增 Skill（c11）：**不写代码**——在 `<项目根>/.rhinecode/skills/` 或 `~/.rhinecode/skills/` 放一个 `<name>.md`（或一个含 `SKILL.md` 的目录），frontmatter 写 `name`/`description` 两个必填项，按需加 `allowed_tools`/`mode`/`history_messages`/`model`，正文写 SOP 指令并用 `$ARGUMENTS` 承接用户参数。运行中 `/skills reload` 即可生效。新增**内置样板**才需要动代码：在 `rhinecode/skills/builtin/` 加 `.md`，`pyproject.toml` 的 package-data 已覆盖 `builtin/*.md` 无需再改，但要确认白名单里的工具名全部真实存在（否则启动 fail-fast）。
+新增 Skill（c11）：**不写代码**——在 `<项目根>/.rhinecode/skills/` 或 `~/.rhinecode/skills/` 放一个 `<name>.md`（或一个含 `SKILL.md` 的目录），frontmatter 写 `name`/`description` 两个必填项，按需加 `allowed_tools`/`mode`/`history_messages`/`model`，正文写 SOP 指令并用 `$ARGUMENTS` 承接用户参数。运行中 `/skills reload` 即可生效。
+
+> **实测教训（trace 手测场景 2 抓到的）**：声明只读白名单时，`read_file` 几乎总该配上
+> `glob_files`。只给 `read_file` 的话，模型面对「审阅 app 目录下的代码」这类任务
+> **没有任何办法发现目录里有哪些文件**——实测中它先 `read_file('app')` 得到
+> 「路径是目录而非文件」，转而调 `run_command('dir /s /b')` 被白名单挡下，
+> 于是开始盲猜文件名（`main.c`、`app.cpp`、`index.html`、`forms.py`、`views.py`、
+> `urls.py`……12 次猜、11 次失败），白烧了 8 轮 API 调用。
+> **收窄过度比不收窄更糟**：它不会报错，只会让模型退化成穷举，而这在界面上完全看不出来
+> （用户只看到「读了几个文件然后给了个回答」）。新增**内置样板**才需要动代码：在 `rhinecode/skills/builtin/` 加 `.md`，`pyproject.toml` 的 package-data 已覆盖 `builtin/*.md` 无需再改，但要确认白名单里的工具名全部真实存在（否则启动 fail-fast）。
 
 > 「成对维护点」备忘（改一处常需同步另一处，避免遗漏）：
 > - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）
