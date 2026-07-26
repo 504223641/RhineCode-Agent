@@ -166,8 +166,19 @@
    `current_scope()` 返回 `SCOPE_MAIN`；`next_turn` / `turn_total` 返回 `0`；`elapsed()` 返回 `0.0`。
 4. 类 docstring 说明为什么不做 `TraceRecorder` 的子类：二者无共享实现，
    继承会让 Null 对象持有一个永不使用的文件句柄。
+5. **`create_recorder(path: Path) -> TraceRecorderProtocol`**：构造 `TraceRecorder`，
+   捕获 `OSError`（含 `PermissionError` / `FileExistsError` / `NotADirectoryError`）
+   后**降级返回 `NullRecorder()`**，并往 stderr 打一行「已跳过行为记录：<原因>」。
+   docstring 写清为什么需要这个工厂：`TraceRecorder.__init__` 会 `mkdir` + `open`，
+   目标路径不可写时**必然抛异常**；而 spec AC22 明确把「目标目录不可写」列为三种
+   必须不阻断的失败情形之一。若让调用方直接构造，进程会带 traceback 崩在装配之前——
+   用户只是想开个日志，结果程序起不来。
+   注意 stderr 那行大概率会被 Textual 的 alternate screen 盖住（与 C11 启动期 print
+   的已知限制同源），故**主要可观测后果是「没有产出文件」**，那行只是给重定向 stderr
+   的场景兜底。
 
-**验证：** `NullRecorder().emit_lazy(T.API_REQUEST, lambda: 1/0)` 不抛异常（证明 factory 未被调用）。
+**验证：** `NullRecorder().emit_lazy(T.API_REQUEST, lambda: 1/0)` 不抛异常（证明 factory 未被调用）；
+`create_recorder(Path("CLAUDE.md/x.jsonl"))`（父路径是个文件）返回 `NullRecorder` 且不抛异常。
 
 ## T7: 包导出
 
@@ -237,7 +248,11 @@
 5. **死锁护栏**（AC5）：另起 daemon 线程在 emit 进行中读 `current_scope()` 与 `turn_total()`，
    用 `join(timeout=…)` 汇合，**用完成计数而非布尔标志**判定；
 6. `NullRecorder.emit_lazy` 不调用 factory；
-7. 作用域：`scope()` 嵌套与恢复、`bind_scope` 生效、未设置时回退 `main`。
+7. 作用域：`scope()` 嵌套与恢复、`bind_scope` 生效、未设置时回退 `main`；
+8. **构造降级**（AC22 的第三种情形）：`create_recorder` 传一个父路径是普通文件的路径
+   （如 `<tmp>/somefile/x.jsonl`），断言返回 `NullRecorder`、不抛异常、不产生文件。
+   注：该情形在 Windows 上抛 `FileExistsError`、在 POSIX 上抛 `NotADirectoryError`，
+   故捕获范围必须是 `OSError` 而非某个具体子类。
 
 **验证：** `python -m unittest tests.test_trace_recorder -v` 全绿；死锁护栏在超时内完成。
 
@@ -428,8 +443,11 @@
    `default=None`。注释写清三态语义与为什么必须有 `const`：
    不给 `const` 时「给了但无值」会拿到 `None`、与「未给」无法区分；
    写成普通选项则 `--trace` 后紧跟其它参数时会把它吞成路径。
-2. 按三态构造记录器：`None → NullRecorder()`；哨兵 → `TraceRecorder(default_trace_path(workspace_root()))`；
-   路径 → `TraceRecorder(Path(该路径))`。
+2. 按三态构造记录器，**后两态一律经 `create_recorder` 工厂**（T6 步骤 5），
+   不得直接 `TraceRecorder(...)`——目标路径不可写时构造会抛异常，直接构造会让进程
+   带 traceback 崩在装配之前，违反 spec AC22：
+   `None → NullRecorder()`；哨兵 → `create_recorder(default_trace_path(workspace_root()))`；
+   路径 → `create_recorder(Path(该路径))`。
 3. argparse、三类模板生成、配置加载、占位符拦截**原样不动**。
 4. 装配段改为 `result = build_app(cfg, resume_latest=args.continue_session, recorder=recorder)`。
 5. `except BootstrapError as e: print(e, file=sys.stderr); sys.exit(1)`——**不再自己拼前缀**。
