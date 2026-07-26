@@ -45,7 +45,13 @@ from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
 from rhinecode.permission import Decision, DecisionResult, PermissionEngine, to_request
-from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol, clip
+from rhinecode.trace import (
+    SCOPE_MAIN,
+    NullRecorder,
+    TraceEventType,
+    TraceRecorderProtocol,
+    clip,
+)
 
 # ── 工具执行的结局取值（trace）──
 # 埋 tool_execute 时用它区分「为什么这次调用是这个结果」。读 trace 时只看 ok=False
@@ -183,9 +189,9 @@ class Agent:
         走 `emit_lazy` 是因为负载里的 `output` 可能很大（一次 `read_file` 就是整份文件），
         关闭记录时不该白 `clip` 一遍（spec N1）。
 
-        副作用：产出一条 trace 事件；记录失败被 `emit_lazy` 内部吞掉，不影响循环。
+        副作用：产出一条 trace 事件；**任何异常都被吞掉**，不影响循环。
         """
-        self._recorder.emit_lazy(
+        self._safe_emit_lazy(
             TraceEventType.TOOL_EXECUTE,
             lambda: {
                 "tool": tc.name,
@@ -199,6 +205,45 @@ class Agent:
                 "outcome": outcome,
             },
         )
+
+    # 本层的四个「受保护漏斗」。
+    #
+    # 记录器**自己**已经保证 emit 不抛（见 recorder.py 的 try/except），所以这一层
+    # 看起来像是多余的保险。它存在的理由是本层的特殊性：Agent Loop 是**唯一会把
+    # 异常变成「工具结果」回灌给模型**的地方——只读并发桶里的异常会被
+    # `future.result()` 抓住并包成「工具执行异常: …」交给模型。于是「日志写不进去」
+    # 会伪装成「你的工具坏了」，模型开始绕路重试，一个纯观测设施变成了行为污染源
+    # （trace spec AC6 就是为这条风险设的护栏）。
+    #
+    # 把防护收在四个漏斗里（而不是在二十来个埋点处各写一次 try）：本文件的全部
+    # 埋点调用都只经这几个方法，一处加固即全层生效。
+    def _safe_emit(self, type, **payload) -> None:
+        """记一条事件，吞掉任何异常（含记录器实现本身抛错的情形）。"""
+        try:
+            self._recorder.emit(type, **payload)
+        except Exception:
+            pass
+
+    def _safe_emit_lazy(self, type, factory) -> None:
+        """记一条昂贵负载事件，吞掉任何异常。"""
+        try:
+            self._recorder.emit_lazy(type, factory)
+        except Exception:
+            pass
+
+    def _safe_scope(self) -> str:
+        """读当前作用域，失败时退回主作用域（不让观测把主流程带下水）。"""
+        try:
+            return self._recorder.current_scope()
+        except Exception:
+            return SCOPE_MAIN
+
+    def _safe_bind(self, name: str) -> None:
+        """绑定作用域，吞掉任何异常。**池线程入口必须用它。**"""
+        try:
+            self._recorder.bind_scope(name)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 工具集策略
@@ -605,7 +650,7 @@ class Agent:
             # 无副作用」的既有性质（`decide` 的 docstring 明写「副作用：无」）。
             # 把埋点塞进引擎会让那句话变成假话，而权限层是安全边界，它的可预测性
             # 比少写一行埋点重要。
-            self._recorder.emit(
+            self._safe_emit(
                 TraceEventType.PERMISSION_DECISION,
                 tool=tc.name,
                 tool_call_id=tc.id,
@@ -785,14 +830,16 @@ class Agent:
         # ——今天唯一的实例是 `load_skill` → `SkillManager.activate` → `skill_state`。
         # 本包装是纵深防御：兜住工具内部的埋点，并为将来在工具内部埋点留出正确语义。
         # `threading.local()` 不跨线程继承，不显式传就没有别的办法。
-        parent_scope = self._recorder.current_scope()
+        parent_scope = self._safe_scope()
         # 各调用的实际执行耗时（毫秒），由包装函数在池线程里填、主线程读。
         # dict 的单键赋值在 CPython 下是原子的，且每个 tc.id 只被一个线程写一次。
         durations: dict[str, int] = {}
 
         def _run(tool: Tool, tc: ToolCall):
             """池线程里的任务入口：绑定父作用域、计时，然后执行工具。"""
-            self._recorder.bind_scope(parent_scope)
+            # 用 _safe_bind 而不是直接 bind_scope：这里是**唯一**「异常会被
+            # future.result() 变成工具结果回灌模型」的位置，必须绝对安全。
+            self._safe_bind(parent_scope)
             t0 = time.monotonic()
             try:
                 return tool.execute(tc.arguments)
