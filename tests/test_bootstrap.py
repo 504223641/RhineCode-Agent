@@ -427,7 +427,14 @@ class SubprocessTest(unittest.TestCase):
         )
         first = json.loads(found.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(first["seq"], 1)
-        self.assertEqual(first["type"], "session_start")
+        # 首条**不一定**是 session_start：装配期的 bind_tools 会先产一条 skill_state
+        # （session_start 必须等 connect_all + bind_tools 完成才能记出完整快照）。
+        # 这里只断言「首行是一条格式合法的已登记事件」。
+        from rhinecode.trace.models import TraceEventType
+
+        self.assertIn(first["type"], {t.value for t in TraceEventType})
+        self.assertIn("scope", first)
+        self.assertIn("ts", first)
 
     def test_trace_flag_with_explicit_path(self) -> None:
         """AC23 形态二：`--trace <路径>` → 指定文件被创建且首行可解析。"""

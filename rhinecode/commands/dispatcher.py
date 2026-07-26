@@ -10,6 +10,7 @@
 """
 
 import logging
+from typing import Optional
 
 from rhinecode.commands.models import (
     CommandController,
@@ -20,6 +21,7 @@ from rhinecode.commands.models import (
 )
 from rhinecode.commands.parser import parse_input
 from rhinecode.commands.registry import CommandRegistry
+from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol, clip
 
 # 调试日志：命令处理异常时记录上下文（用户界面不输出堆栈，plan 8.6）。
 _logger = logging.getLogger(__name__)
@@ -31,9 +33,17 @@ class CommandDispatcher:
     dispatch 是用户提交输入的唯一入口。
     """
 
-    def __init__(self, registry: CommandRegistry) -> None:
-        """:param registry: 已完成内置命令注册的注册表（启动早期构建，plan 3）。"""
+    def __init__(
+        self,
+        registry: CommandRegistry,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
+    ) -> None:
+        """
+        :param registry: 已完成内置命令注册的注册表（启动早期构建，plan 3）。
+        :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
+        """
         self._registry = registry
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
 
     @property
     def registry(self) -> CommandRegistry:
@@ -63,6 +73,15 @@ class CommandDispatcher:
         if parsed.kind == InputKind.EMPTY:
             return DispatchResult(kind=DispatchKind.EMPTY)
 
+        # user_input 埋在**判定非 EMPTY 之后**（trace F12）：空输入是零副作用的
+        # （沿用 C10 spec F4——不回显、不发送、什么都不做），若在这之前埋点，
+        # 用户每敲一次回车都会在记录里留下一条空事件。
+        self._recorder.emit(
+            TraceEventType.USER_INPUT,
+            text=clip(parsed.raw_text),
+            kind=parsed.kind.value,
+        )
+
         if parsed.kind == InputKind.MESSAGE:
             # 普通消息：回显一次原文，然后进入现有对话路径（存档 → Agent → Worker）。
             content = parsed.raw_text.strip()
@@ -76,6 +95,12 @@ class CommandDispatcher:
 
         entry = self._registry.resolve_matched(parsed.command_token or "")
         if entry is None:
+            self._recorder.emit(
+                TraceEventType.COMMAND_DISPATCH,
+                command_token=parsed.command_token,
+                arguments=clip(parsed.arguments),
+                is_unknown=True,
+            )
             message = f"未知命令：{parsed.command_token}。输入 /help 查看可用命令。"
             controller.show_message(message)
             return DispatchResult(kind=DispatchKind.UNKNOWN, message=message)
@@ -87,6 +112,25 @@ class CommandDispatcher:
             matched_name=matched_name,
             arguments=parsed.arguments,
             spec=spec,
+        )
+
+        # command_dispatch 每次斜杠输入**恰好一条**，且必须在 handler 执行**之前** emit。
+        #
+        # ⚠️ 不要埋在末尾 `return DispatchResult(kind=COMMAND)` 处：那已经在
+        # `spec.handler(...)` 之后了，于是 `/skills` 这类 LOCAL 命令的 `ui_message`
+        # （handler 内部调 show_message 产生）序号会**小于**它自己的 command_dispatch，
+        # 读时间线时命令输出出现在命令分发之前，因果颠倒。
+        #
+        # 位置选在 invocation 构造完成之后、必需参数校验之前：这样缺参那条
+        # 提前 return 的路径也有分发记录（否则「我敲了命令但什么都没发生」查不到）。
+        self._recorder.emit(
+            TraceEventType.COMMAND_DISPATCH,
+            command=spec.name,
+            typed_name=invocation.typed_name,
+            matched_name=matched_name,
+            arguments=clip(invocation.arguments),
+            command_type=spec.command_type.value,
+            is_unknown=False,
         )
 
         # 必需参数校验（spec F14）：缺参时显示自身用法与参数提示，不调用处理函数。

@@ -232,6 +232,11 @@ def build_app(
 
     # ⑦ 装配期事件：必须在 connect_all + bind_tools **之后**产出，否则工具清单与
     # MCP 状态都还是半空的快照，读 trace 的人会以为「启动时就没连上」。
+    #
+    # 由此带来一个要知道的事实：`session_start` **不是记录文件里的第一条事件**——
+    # 上面 `bind_tools` 的 `skill_state` 会排在它前面。这是「快照必须完整」的
+    # 必然代价，不是 bug。读 trace 时把 `session_start` 当作「装配完成」的标记，
+    # 而不是「进程起点」。
     recorder.emit_lazy(
         TraceEventType.SESSION_START,
         lambda: {

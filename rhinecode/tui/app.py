@@ -36,10 +36,17 @@ from rhinecode.commands import (
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.conversation import ConversationManager, SessionListRequest
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
-from rhinecode.trace import NullRecorder, TraceRecorderProtocol
+from rhinecode.trace import (
+    NullRecorder,
+    SCOPE_MAIN,
+    TraceEventType,
+    TraceRecorderProtocol,
+    agent_event_payload,
+    clip,
+)
 from rhinecode.tui.widgets import (
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
-    SessionPanel,
+    SessionPanel, compose_status_text,
 )
 
 
@@ -146,7 +153,7 @@ class RhineApp(App):
         self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         # 命令层接线（c10）：单个分发器实例，提交入口的唯一分流点。
         self._command_registry = command_registry
-        self._dispatcher = CommandDispatcher(command_registry)
+        self._dispatcher = CommandDispatcher(command_registry, recorder=self._recorder)
         # 待决的用户交互（确认/澄清/审批）：None 表示当前无交互在进行；
         # 进行中时为 {"event": threading.Event, "result": Any, "kind": str}，
         # 由回调在 Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
@@ -243,18 +250,34 @@ class RhineApp(App):
         # 上下文用量（c8）：随对话增长实时变化，故每次刷新都重新取值；
         # 返回 (文本, 是否高亮) 或 None（工具不可用的 Provider）。
         ctx = self._manager.context_status_line()
-        self.query_one(StatusBar).update_status(
-            self._config.protocol,
-            self._config.model,
-            self._manager.thinking_effort,
-            self._manager.plan_mode,
-            self._manager.permission_mode_value,
+        # 九个值先组成**一份**参数组，再同时喂给 update_status 与纯函数
+        # compose_status_text（trace T44）。
+        #
+        # ⚠️ 不要在下面手抄第二份参数清单：`update_status` 与 `compose_status_text`
+        # 是同名九参数，抄一遍会让「新增状态栏字段」这个维护点从两处涨到三处，
+        # 而漏改的后果是记录里的状态栏文本与用户实际看到的不一致——最坏的一种
+        # 观测设施失效（它撒谎但不报错）。
+        status_args = dict(
+            provider=self._config.protocol,
+            model=self._config.model,
+            thinking_effort=self._manager.thinking_effort,
+            plan_mode=self._manager.plan_mode,
+            permission_mode=self._manager.permission_mode_value,
             # MCP 连接状态（c7）：启动后不变，随每次刷新一并带上即可。
-            self._manager.mcp_status_line(),
+            mcp_status=self._manager.mcp_status_line(),
             context_status=ctx[0] if ctx else None,
             context_warn=bool(ctx and ctx[1]),
             # 已激活 Skill 数（c11）：无激活时为 None，状态栏隐藏该段。
             skill_status=self._manager.skill_status_segment(),
+        )
+        self.query_one(StatusBar).update_status(**status_args)
+        # 为什么记「组装后的文本」而不是九个散字段（trace F15）：用户真正看到的
+        # 那行文本是 compose_status_text 在 update_status 内部拼出来的，只记字段
+        # 的话「文本快照」这个承诺不成立（比如某个字段的渲染分支写错了，
+        # 记录里看不出来）。compose_status_text 是纯函数、零副作用，多调一次没成本。
+        self._recorder.emit_lazy(
+            TraceEventType.STATUS_BAR,
+            lambda: {"text": clip(compose_status_text(**status_args))},
         )
 
     # ------------------------------------------------------------------ #
@@ -265,12 +288,31 @@ class RhineApp(App):
         """当前 Provider 是否具备工具能力（委托 Manager，供 /init 等命令判断）。"""
         return self._manager.tools_enabled
 
+    def _trace_ui_message(self, source: str, text: str) -> None:
+        """
+        记一条 `ui_message` 事件。
+
+        :param source: 来源（user_echo / system / error / assistant）
+        :param text: **markup 转义之前的原始文本**（trace F15）
+
+        为什么记转义前：界面为了不让字面 `[` 被 Textual 当标签吞掉，会做 `\[` 转义
+        （见状态栏与历史区的既有做法）。记转义后的文本，读 trace 的人看到的是
+        `\[provider]` 这种带反斜杠的怪东西，而那不是用户看到的内容也不是程序
+        产生的内容，两头都对不上。
+        """
+        self._recorder.emit_lazy(
+            TraceEventType.UI_MESSAGE,
+            lambda: {"source": source, "text": clip(text)},
+        )
+
     def show_user_input(self, text: str) -> None:
         """聊天区回显一次用户输入（仅显示，不写入模型历史；由分发器统一调用）。"""
+        self._trace_ui_message("user_echo", text)
         self.query_one(HistoryView).append_user(text)
 
     def show_message(self, text: str) -> None:
         """显示本地命令结果或错误（系统行）。"""
+        self._trace_ui_message("system", text)
         self.query_one(HistoryView).append_system(text)
 
     def send_user_message(self, content: str, display_content: Optional[str] = None) -> None:
@@ -615,6 +657,17 @@ class RhineApp(App):
 
     def on_session_panel_cancelled(self, event: SessionPanel.Cancelled) -> None:
         """会话选择面板按 Esc 退出：关闭面板，不做任何载入，界面原样保留。"""
+        # 会话选择面板走的不是 _interact 那条路（主线程发起、无 Worker 阻塞等待），
+        # 所以在**两个互斥的结算处**各埋一条：这里是取消，另一处是选中。
+        # ⚠️ 不要在 `_show_session_panel` 也埋——那会让一次会话选择产出两条，
+        # 与「四类面板各产出一条」不符（trace AC16）。
+        self._recorder.emit(
+            TraceEventType.INTERACTION,
+            kind="session",
+            display="",
+            source="human",
+            result="cancelled",
+        )
         self._close_session_panel()
 
     # ------------------------------------------------------------------ #
@@ -648,6 +701,17 @@ class RhineApp(App):
         def reset_text_widgets() -> None:
             """重置正文/思考占位，使后续文本另起新组件（轮次切换或工具执行后调用）。"""
             nonlocal thinking_widget, thinking_chunks, response_widget, response_chunks
+            # 界面消息埋点（trace F15）：本轮 AI 正文在这里收尾——重置占位之前
+            # 把已累积的内容记一条。记的是**已在界面上呈现的完整一段**，
+            # 而不是逐块增量（那会产出几百条碎片事件）。
+            if response_chunks:
+                self._recorder.emit_lazy(
+                    TraceEventType.UI_MESSAGE,
+                    lambda text="".join(response_chunks): {
+                        "source": "assistant",
+                        "text": clip(text),
+                    },
+                )
             thinking_widget = None
             thinking_chunks = []
             response_widget = None
@@ -656,14 +720,22 @@ class RhineApp(App):
         try:
             for event in gen:
                 etype = event.type
+                # 循环事件埋点（trace F15 + F17 字段白名单）。
+                # ⚠️ 必须用**默认参数绑定** `e=event`：循环内直接写
+                # `lambda: agent_event_payload(event)` 捕获的是变量而不是当轮的值，
+                # 全部闭包最终都指向最后一个事件（Python 闭包按引用捕获）。
+                self._recorder.emit_lazy(
+                    TraceEventType.AGENT_EVENT,
+                    lambda e=event: agent_event_payload(e),
+                )
 
                 if etype == AgentEventType.PROGRESS:
                     reset_text_widgets()
                     # 第 2 轮起显示一行进度提示，标示循环在自主推进
                     if event.iteration >= 2:
-                        self.call_from_thread(
-                            history_view.append_system, f"🔄 第 {event.iteration} 轮"
-                        )
+                        line = f"🔄 第 {event.iteration} 轮"
+                        self._trace_ui_message("system", line)
+                        self.call_from_thread(history_view.append_system, line)
 
                 elif etype == AgentEventType.THINKING:
                     if thinking_widget is None:
@@ -707,13 +779,16 @@ class RhineApp(App):
                 elif etype == AgentEventType.FINISHED:
                     line = self._finish_line(event.stop_reason, event.message)
                     if line:
+                        self._trace_ui_message("system", line)
                         self.call_from_thread(history_view.append_system, line)
 
                 elif etype == AgentEventType.ERROR:
+                    self._trace_ui_message("error", event.message)
                     self.call_from_thread(history_view.append_error, event.message)
 
                 elif etype == AgentEventType.NOTICE:
                     # 系统级提示（c8：上下文压缩发生等），以系统行展示，不影响正文/工具渲染。
+                    self._trace_ui_message("system", event.message)
                     self.call_from_thread(history_view.append_system, event.message)
 
                 elif etype == AgentEventType.HISTORY:
@@ -724,6 +799,21 @@ class RhineApp(App):
                     tool_widgets.clear()
                     self.call_from_thread(history_view.render_history, event.messages)
         finally:
+            # **作用域泄漏的唯一可靠防护**，必须是 finally 的第一行（trace T42）。
+            #
+            # 为什么必需：Textual 的 thread worker 用**默认线程池**
+            # （`Worker._run_threaded` 末行是 `run_in_executor(None, ...)`），
+            # 线程会被复用。而本方法的循环体几乎全是 `call_from_thread`，
+            # 应用退出竞态下它会抛 `RuntimeError`（`_notify_memory` 与
+            # `_notify_skill_activation` 两处既有代码为此包了 try/except，
+            # 说明这不是理论风险）；此时生成器被放弃，
+            # `_run_isolated_skill` 里 `with recorder.scope(...)` 的 `__exit__`
+            # 可能压根不跑。一次泄漏的 `isolated:<name>` 会污染后续复用该线程的
+            # 主对话运行——概率性、极难复现。
+            #
+            # 为什么放在**首行**：它后面的 `call_from_thread` 自己也可能抛，
+            # 放在后面就等于「出错时不复位」，防护形同虚设。
+            self._recorder.bind_scope(SCOPE_MAIN)
             self.call_from_thread(self._set_streaming, False)
             # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；
             # 收尾时刷新状态栏，让新工具数量或失败信息立即反映到界面上。
@@ -775,7 +865,7 @@ class RhineApp(App):
     # ------------------------------------------------------------------ #
     # 三类用户交互回调（均在 Worker 线程被调用，阻塞等待主线程选择）
     # ------------------------------------------------------------------ #
-    def _interact(self, kind: str, show_fn, default):
+    def _interact(self, kind: str, show_fn, default, display: str = ""):
         """
         统一的「阻塞式询问主线程」机制（确认/澄清/审批共用）。
 
@@ -786,6 +876,8 @@ class RhineApp(App):
         :param kind: 交互种类标识（"confirm"/"clarify"/"approve"），用于结算时映射结果
         :param show_fn: 在主线程展示面板的无参函数
         :param default: 未明确选择（如异常路径）时的默认结果
+        :param display: 面板展示内容的摘要，仅用于 trace 埋点。**必须由调用方传入**——
+                        展示内容全被闭进 `show_fn` 里，本方法拿不到（trace T45）
         :returns: 用户选择的结果
         """
         box = {"event": threading.Event(), "result": default, "kind": kind}
@@ -794,7 +886,20 @@ class RhineApp(App):
         self._busy_hint_shown = False
         self.call_from_thread(show_fn)
         box["event"].wait()
-        return box["result"]
+        result = box["result"]
+        # 交互埋点（trace F14）：埋在**阻塞等待返回之后**（即结算时刻），
+        # 一次交互恰好一条。埋在弹出时会记不到 result，而「用户选了什么」
+        # 正是这条事件的全部价值。
+        self._recorder.emit_lazy(
+            TraceEventType.INTERACTION,
+            lambda: {
+                "kind": kind,
+                "display": clip(display),
+                "source": "human",
+                "result": getattr(result, "value", result),
+            },
+        )
+        return result
 
     def _confirm_tool(self, tool_call, tool, decision) -> ConfirmDecision:
         """
@@ -808,6 +913,7 @@ class RhineApp(App):
             "confirm",
             lambda: self._show_confirm_panel(tool_call, tool, decision),
             ConfirmDecision.DENY,
+            display=f"{tool_call.name} {tool_call.arguments}｜{decision.reason}",
         )
 
     def _clarify(self, question, options):
@@ -817,6 +923,7 @@ class RhineApp(App):
             "clarify",
             lambda: self._show_clarify_panel(question, options),
             None,
+            display=f"{question}｜候选：{[o.summary for o in options]}",
         )
 
     def _approve_plan(self, plan: str) -> bool:
@@ -825,6 +932,7 @@ class RhineApp(App):
             "approve",
             lambda: self._show_approve_panel(plan),
             False,
+            display=plan,
         )
 
     def _show_confirm_panel(self, tool_call, tool, decision) -> None:
@@ -891,6 +999,14 @@ class RhineApp(App):
         if isinstance(event.option_list, SessionPanel):
             event.stop()
             session_id = event.option.id
+            # 选中分支的交互埋点（与上面的 Esc 取消分支互斥，合起来一次交互一条）
+            self._recorder.emit(
+                TraceEventType.INTERACTION,
+                kind="session",
+                display=str(session_id),
+                source="human",
+                result="selected",
+            )
             self._close_session_panel()
             # 直接复用恢复控制器（c10 T48）：与 /resume <id> 命令同一领域入口，
             # 不再伪造用户没有手输的 "/resume <session_id>" 文本（也不回显它）。
