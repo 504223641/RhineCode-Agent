@@ -9,5 +9,26 @@ Skill 系统包（c11）。
 **纯逻辑 + 单点接入**——不导入 Textual 与 Provider SDK，可在无终端无网络的
 测试进程中独立验证（spec N1）。
 
-导出留待 T27 补齐（届时 SkillManager 才存在）。
+包内六模块严格单向依赖：
+models → parser → discovery → render → validation → manager。
 """
+
+from rhinecode.skills.models import (
+    ActivationStatus,
+    SkillCommandInfo,
+    SkillMode,
+    SkillSource,
+    SkillSpec,
+    builtin_skills_dir,
+)
+from rhinecode.skills.manager import SkillManager
+
+__all__ = [
+    "SkillManager",
+    "SkillMode",
+    "SkillSource",
+    "SkillSpec",
+    "SkillCommandInfo",
+    "ActivationStatus",
+    "builtin_skills_dir",
+]
