@@ -96,7 +96,9 @@ class ContextManager:
     # ------------------------------------------------------------------ #
     # 自动路径：每次请求前
     # ------------------------------------------------------------------ #
-    def before_request(self, history: list[Message]) -> list[CompactionNotice]:
+    def before_request(
+        self, history: list[Message], allow_summary: bool = True
+    ) -> list[CompactionNotice]:
         """
         每次 API 请求前执行：先第一层 offload，再按自动余量判断是否第二层摘要（F3）。
 
@@ -104,14 +106,33 @@ class ContextManager:
         从而减轻第二层的触发压力（AC3）。
 
         :param history: 当前对话历史（可能被原地修改：offload 改写内容 / 摘要重构列表）
+        :param allow_summary: 是否允许第二层 LLM 摘要（c11 F21）。
+            Skill 独立模式的子对话传 False——它只跑零成本的第一层。
         :returns: 本次发生的压缩动作通知列表（可能为空）
 
         副作用：可能写盘、原地修改 history、发起摘要 LLM 调用。
         """
         notices = self._offloader.run(history)
-        if not self._circuit_broken and self._estimate(history) > self.window - self.auto_margin:
+        # allow_summary 必须放在 and 链的**最前面**短路（c11 T34）：
+        # _estimate 依赖的锚点对应的是**主历史**（record_usage 记的是主对话的
+        # prompt_tokens 与主历史条数），而子对话传进来的是另一条短历史；
+        # 拿主历史的锚点去估算它会得到一个毫无意义的值。放在最前面短路，
+        # 可以保证 _estimate 在子对话路径上根本不会被调用。
+        if (
+            allow_summary
+            and not self._circuit_broken
+            and self._estimate(history) > self.window - self.auto_margin
+        ):
             notices.append(self._do_summary(history))
         return notices
+
+    # 关于子对话共享同一个 ContextManager 实例的两项已评估结论（c11）：
+    #
+    # 1. `_offloader` 的幂等集合共享**无害**。它的幂等键是 `tool_call_id`，
+    #    那是 API 生成的全局唯一 id，主对话与子对话的工具调用不会撞键。
+    # 2. `_consecutive_failures` 熔断计数**不会被污染**。子对话恒不摘要
+    #    （allow_summary=False），根本走不到 `_do_summary`，也就不可能给
+    #    主对话的熔断计数加一。
 
     def record_usage(self, usage, sent_len: int) -> None:
         """

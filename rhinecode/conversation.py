@@ -481,10 +481,26 @@ class ConversationManager:
         )
         # 一次性动态提醒（c9：恢复会话的时间跨度提醒）：并入本次 dynamic，取走即清，
         # 不进持久历史、不被存档（它是「此刻的环境事实」）。
-        dynamic = assembled.dynamic
+        base_dynamic = assembled.dynamic
         pending = self.memory_manager.consume_pending_notice()
-        if pending:
-            dynamic = f"{dynamic}\n\n{pending}" if dynamic else pending
+
+        def dynamic_provider() -> str:
+            """
+            产出本轮 <system-reminder> 的动态内容（c11 起循环每轮调一次）。
+
+            **`pending` 在闭包外取一次是刻意的**，不要「优化」成闭包内消费：
+            c9 的既有行为就是「取一次拼进字符串，循环每轮重新包一层」，
+            也就是同一次运行的每一轮都带着这条提醒。「取走即清」指的是
+            「本次运行消费掉、不带到下一条用户消息」，不是「只在第一轮出现」。
+            若改成闭包内 `consume_pending_notice()`，第 2 轮起它就变空了——
+            那是改变现状而不是保持现状。
+
+            段落顺序：环境信息 → 已激活 Skill → 一次性提醒。
+            """
+            parts = [p for p in (base_dynamic,) if p]
+            if pending:
+                parts.append(pending)
+            return "\n\n".join(parts)
         # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
         debug_log_path = (
             str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
@@ -533,7 +549,7 @@ class ConversationManager:
             self.thinking_effort,
             self.plan_mode,
             assembled.stable,
-            dynamic,
+            dynamic_provider,
             self._config.model,
             debug_log_path,
             self._engine,

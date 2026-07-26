@@ -91,6 +91,8 @@ def build_default_prompt(
     env: EnvironmentInfo,
     custom_instructions: str = "",
     memory_index: str = "",
+    skill_index: str = "",
+    active_skills: str = "",
 ) -> AssembledPrompt:
     """
     构造 RhineCode 默认系统提示：7 固定模块 + 环境信息 + 可选槽位（c5 预留、c9 填充）。
@@ -107,10 +109,23 @@ def build_default_prompt(
     进 stable 尾部可被 DeepSeek 前缀缓存命中，索引变化也只失效它自己那段尾部缓存
     （c9 plan 技术决策）。传空串时槽位照旧整体跳过，输出与 c8 完全一致。
 
+    c11 起再填两个 Skill 槽位，二者**分属不同通道**，这是两阶段加载在提示层的体现：
+    - skill_index（「可用 Skill 清单」，priority 140，**cacheable=True → 稳定通道**）：
+      只有名字与一句话说明，会话内基本不变（仅 `/skills reload` 后变化），
+      进稳定通道可被前缀缓存命中。排在最末使热更新只失效它自己那段（见 optional_slots）。
+    - active_skills（「已激活 Skill」，priority 120，**cacheable=False → 动态通道**）：
+      已激活 Skill 的完整 SOP 正文。它必须每轮重发——模型可能在循环中途才激活
+      某个 Skill，而稳定通道的内容在一次 `run()` 里是固定的，装不下这种变化。
+
+    两者传空串时槽位照旧整体跳过，输出与 c10 逐字节一致（spec N3 零回归）。
+
     :param env: 已采集的环境信息，其 render() 作为环境模块的内容
     :param custom_instructions: 「自定义指令」槽位内容（c9：RHINE.md 拼接结果），空串跳过
     :param memory_index: 「长期记忆」槽位内容（c9：记忆索引），空串跳过
-    :returns: AssembledPrompt(stable=固定模块+两个记忆槽位, dynamic=环境信息)
+    :param skill_index: 「可用 Skill 清单」槽位内容（c11：第一阶段清单），空串跳过
+    :param active_skills: 「已激活 Skill」槽位内容（c11：已激活 SOP 正文），空串跳过
+    :returns: AssembledPrompt(stable=固定模块+记忆槽位+Skill 清单,
+              dynamic=环境信息+已激活 Skill)
 
     副作用：无。
     """
@@ -127,9 +142,18 @@ def build_default_prompt(
     builder.add(
         PromptModule(name="长期记忆", priority=130, cacheable=True, content=memory_index)
     )
-    # 其余仍为空的预留槽（「已激活 Skill」等）：跳过 c9 已实际填充的两个，避免重复。
+    # c11 填充的两个 Skill 槽位。注意通道不同：清单进 stable（可缓存），
+    # 已激活正文进 dynamic（每轮重发，因为循环中途可能新增）。
+    builder.add(
+        PromptModule(name="可用 Skill 清单", priority=140, cacheable=True, content=skill_index)
+    )
+    builder.add(
+        PromptModule(name="已激活 Skill", priority=120, cacheable=False, content=active_skills)
+    )
+    # 其余仍为空的预留槽：跳过上面已实际填充的四个，避免重复添加空槽。
+    _FILLED = ("自定义指令", "长期记忆", "可用 Skill 清单", "已激活 Skill")
     for slot in optional_slots():
-        if slot.name in ("自定义指令", "长期记忆"):
+        if slot.name in _FILLED:
             continue
         builder.add(slot)
     return builder.build()

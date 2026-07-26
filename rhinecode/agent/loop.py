@@ -22,6 +22,7 @@ Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_ph
 
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 if TYPE_CHECKING:
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.policy import ToolPolicy
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.agent.collector import StreamCollector
 from rhinecode.agent.events import (
@@ -56,6 +58,41 @@ AskFn = Callable[[ToolCall, Tool, DecisionResult], bool]
 ClarifyFn = Callable[[str, list[ClarifyOption]], Optional[str]]
 # approve_plan：弹「是否开始执行」审批，返回是否批准
 ApprovePlanFn = Callable[[str], bool]
+
+
+@dataclass(frozen=True)
+class RunOptions:
+    """
+    `Agent.run` 的可选行为开关（c11 T30）。
+
+    **默认值即 C10 行为——不传这个参数等于零回归**，这是 spec N3 的实现保障：
+    既有的全部调用点都不传，行为一字不变。
+
+    存在的理由：`run()` 已经有 14 个参数，为独立模式子对话再加四个开关会失控。
+    打包成一个 frozen 数据类，新增开关时既有调用点无需改动。
+
+    :param max_iterations: 本次循环的迭代上限。独立模式子对话有**独立且更小**的
+        预算（spec N6）——子任务应当聚焦，不该让一个跑偏的 Skill 把主对话的
+        额度也一并耗光。
+    :param record_usage: 是否用本次 API 返回的 usage 更新 C8 的估算锚点。
+        子对话传 False：它跑的是另一条短历史，用它的 usage 去更新**主历史**的
+        锚点会让主历史的估算彻底失准。
+    :param allow_summary: 是否允许 C8 的第二层（LLM 摘要）。子对话传 False，
+        只跑零成本的第一层存盘（spec F21）。
+    :param tool_policy: 取本轮工具收窄策略的**回调**。
+
+        **必须是 callable 而不是一个值**：模型可能在第 N 轮调 `load_skill`
+        激活一个 Skill，第 N+1 轮的工具集就该按它的白名单收窄。若在 `run()`
+        调用前算一次、整轮不变，F14 的运行期自愈与 AC14 的逐轮断言都会失效——
+        这与下面 `dynamic` 参数改成 callable 是同一个理由。
+
+        为 None 时完全不收窄（C10 行为）。
+    """
+
+    max_iterations: int = MAX_ITERATIONS
+    record_usage: bool = True
+    allow_summary: bool = True
+    tool_policy: Optional[Callable[[], Optional[ToolPolicy]]] = None
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
@@ -106,23 +143,74 @@ class Agent:
     # ------------------------------------------------------------------ #
     # 工具集策略
     # ------------------------------------------------------------------ #
-    def _schema_for(self, plan_mode: bool, execution_phase: bool) -> Optional[list[dict]]:
+    @staticmethod
+    def _visible(name: str, policy: Optional[ToolPolicy]) -> bool:
+        """
+        判断某个工具在本轮是否对模型可见（c11 T31）。
+
+        :param name: 工具名
+        :param policy: 本轮策略；None 表示不收窄
+        :returns: 可见为 True
+
+        优先级 `excluded` > `exempt` > `allowed`，三级各有其不可调换的理由：
+        - `excluded` 最高：它是「无论如何都不许出现」（子对话禁用 `load_skill`），
+          若被 `exempt` 翻掉，子对话就能嵌套激活 Skill 了（违反 F23）；
+        - `exempt` 次之：`load_skill` 必须能穿透任何白名单，否则模型激活
+          第一个 Skill 后就再也加载不了第二个；
+        - `allowed` 最后：为 None 时不收窄。
+
+        副作用：无。
+        """
+        if policy is None:
+            return True
+        if name in policy.excluded:
+            return False
+        if name in policy.exempt:
+            return True
+        if policy.allowed is None:
+            return True
+        return name in policy.allowed
+
+    def _schema_for(
+        self,
+        plan_mode: bool,
+        execution_phase: bool,
+        policy: Optional[ToolPolicy] = None,
+    ) -> Optional[list[dict]]:
         """
         计算本轮要发给模型的工具 schema 列表。
 
         - 无注册中心 → None（纯对话，不带工具）
         - Plan Mode 且未获批执行（规划阶段）→ 只读工具 + ask_user/present_plan 特殊工具
         - 其余（普通模式，或 Plan Mode 已获批的执行阶段）→ 全部工具
+        - 无论哪种，都再按 `policy` 过滤一遍（c11 F14）
 
         :param plan_mode: 是否处于 Plan Mode
         :param execution_phase: Plan Mode 下是否已获批进入执行阶段
+        :param policy: 本轮 Skill 工具收窄策略；None 表示不收窄（C10 行为）
         :returns: 工具 schema 列表，或 None
+
+        **`plan_schemas()` 在过滤之后才拼接**，因此 `ask_user` / `present_plan`
+        天然不受白名单影响（spec F15）——它们是流程控制工具，与 Skill 声明的
+        业务能力无关。这样也就不必依赖 `policy.exempt` 里恰好含这两个名字，
+        少一处隐式耦合。
         """
         if self._registry is None:
             return None
-        if plan_mode and not execution_phase:
-            return self._registry.readonly_schemas() + plan_schemas()
-        return self._registry.schemas()
+
+        planning = plan_mode and not execution_phase
+        base = (
+            self._registry.readonly_schemas() if planning else self._registry.schemas()
+        )
+
+        if policy is not None:
+            base = [
+                s for s in base if self._visible(s["function"]["name"], policy)
+            ]
+
+        if planning:
+            base = base + plan_schemas()
+        return base
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -133,7 +221,7 @@ class Agent:
         thinking_effort: str,
         plan_mode: bool,
         stable: str,
-        dynamic: str,
+        dynamic: Callable[[], str],
         model: str,
         debug_log_path: Optional[str],
         engine: PermissionEngine,
@@ -143,6 +231,7 @@ class Agent:
         cancel_event: threading.Event,
         context_manager: "Optional[ContextManager]" = None,
         recorder: Optional[Callable[[Message], None]] = None,
+        options: "RunOptions" = RunOptions(),
     ) -> Iterator[AgentEvent]:
         """
         跑一次完整的 ReAct 循环，逐个产出 AgentEvent。
@@ -151,7 +240,16 @@ class Agent:
         :param thinking_effort: 思考模式强度（透传给 provider）
         :param plan_mode: 是否处于 Plan Mode
         :param stable: 稳定系统提示（可缓存通道）；逐轮以 system 参数传给 provider，内容不变以命中缓存
-        :param dynamic: 动态内容（环境信息等）；每轮与会话级开关提醒合并进 <system-reminder> 注入
+        :param dynamic: 取动态内容（环境信息、已激活 Skill 正文等）的**回调，每轮求值一次**；
+                        结果与会话级开关提醒合并进 <system-reminder> 注入。
+
+                        **为什么是回调而不是字符串**（c11 改造点 1）：
+                        C10 之前这里是个字符串，由协调层在收到用户消息时算一次，
+                        整个循环里 `loop` 只是每轮把同一个不可变字符串重新包一层。
+                        Skill 引入后这不成立了——模型可能在第 N 轮调 `load_skill`
+                        激活一个 Skill，它的 SOP 正文必须从第 N+1 轮起就出现在
+                        提醒里。若还是取值型，模型激活了 Skill 却在本次循环剩余的
+                        全部轮次里完全看不到指令，两阶段加载直接失效。
         :param model: 当前模型名，仅用于缓存调试日志记录
         :param debug_log_path: 缓存调试日志文件路径；为 None 表示关闭日志（c5 F10）
         :param engine: 权限决策引擎（c6）；每个工具执行前调 engine.decide 算放行/拒绝/问
@@ -166,6 +264,7 @@ class Agent:
                          （assistant / tool 结果）就同步调用一次，用于 JSONL 追加写。
                          为 None 时不记录，行为与 c9 之前完全一致。回调内部 fail-safe，
                          这里再包一层 try 保证记录失败绝不影响循环（N2）。
+        :param options: 可选行为开关（c11）。**默认值即 C10 行为，不传等于零回归**。
         :returns: AgentEvent 迭代器；末尾必为一个 FINISHED 事件
 
         副作用：向 history 追加消息；通过 provider 发起多次网络请求；通过回调与用户交互；
@@ -183,7 +282,7 @@ class Agent:
             except Exception:
                 pass
 
-        for iteration in range(1, MAX_ITERATIONS + 1):
+        for iteration in range(1, options.max_iterations + 1):
             # 安全点 1：进入新一轮前检查取消
             if cancel_event.is_set():
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.USER_CANCELLED)
@@ -196,10 +295,15 @@ class Agent:
             # 每条压缩动作都以 NOTICE 事件反馈给 TUI（F17）。context_manager 为 None 时整段跳过，
             # 保持 c8 之前的行为不变（N1 低侵入）。
             if context_manager is not None:
-                for notice in context_manager.before_request(history):
+                for notice in context_manager.before_request(
+                    history, allow_summary=options.allow_summary
+                ):
                     yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
 
-            tools = self._schema_for(plan_mode, execution_phase)
+            # 工具集收窄策略**每轮现取**（c11 F14）：模型可能上一轮才激活 Skill，
+            # 这一轮的工具集就该随之收窄；注册中心也可能因 MCP 重载增删了工具。
+            policy = options.tool_policy() if options.tool_policy is not None else None
+            tools = self._schema_for(plan_mode, execution_phase, policy)
 
             # 组装请求消息（c5 分通道）：
             # - 稳定系统提示走 stream_chat 的 system 参数（可缓存前缀），不进 messages；
@@ -210,7 +314,9 @@ class Agent:
             toggle = plan_toggle_instruction(
                 iteration, active=plan_mode and not execution_phase
             )
-            reminder = build_system_reminder(dynamic, toggle)
+            # dynamic 每轮求值一次（c11 改造点 1）：模型上一轮激活的 Skill，
+            # 其 SOP 正文要从这一轮起出现在提醒里。
+            reminder = build_system_reminder(dynamic(), toggle)
             # 记录本轮「纯历史消息条数」作为估算锚点长度（c8）：必须在 append reminder 之前、
             # 用 history 的长度而非 req_messages——reminder 是每轮临时拼的尾巴，不属于持久历史，
             # 而估算锚点覆盖的正是 usage 对应的这段纯历史。
@@ -239,7 +345,13 @@ class Agent:
 
             # 更新估算锚点（c8）：本轮 usage.prompt_tokens 是 API 亲口给出的精确输入 token 数，
             # 覆盖 sent_len 条纯历史消息；后续请求只需对锚点之后的新增消息做字符估算。
-            if context_manager is not None and collector.usage is not None:
+            # options.record_usage=False 时跳过（c11）：独立模式子对话跑的是另一条
+            # 短历史，用它的 usage 去更新**主历史**的锚点会让主历史估算彻底失准。
+            if (
+                options.record_usage
+                and context_manager is not None
+                and collector.usage is not None
+            ):
                 context_manager.record_usage(collector.usage, sent_len)
 
             # 停止条件：流出错
@@ -318,7 +430,7 @@ class Agent:
         yield AgentEvent(
             type=AgentEventType.FINISHED,
             stop_reason=StopReason.MAX_ITERATIONS,
-            message=f"已达到迭代上限（{MAX_ITERATIONS} 轮），自动停止。",
+            message=f"已达到迭代上限（{options.max_iterations} 轮），自动停止。",
         )
 
     # ------------------------------------------------------------------ #
