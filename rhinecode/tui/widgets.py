@@ -733,6 +733,7 @@ def compose_status_text(
     mcp_status: "str | None" = None,
     context_status: "str | None" = None,
     context_warn: bool = False,
+    skill_status: "str | None" = None,
 ) -> str:
     """
     组装状态栏的 Content markup 文本（纯函数，c10 抽出便于单测）。
@@ -771,6 +772,12 @@ def compose_status_text(
         if context_warn:
             seg = f"[#FFA500]{seg}[/#FFA500]"
         text += f" | {seg}"
+    # Skill 段（c11）：仅在有已激活 Skill 时展示（形如 `Skill:2`），
+    # 与 MCP 段「None 即隐藏」同构——没用 Skill 的用户状态栏与 c10 完全一致。
+    # 注意该文本刻意不含方括号（见 SkillManager.status_segment 的说明），
+    # 这里仍走 escape 兜底，与其它段口径一致。
+    if skill_status is not None:
+        text += f" | {escape(str(skill_status))}"
     return text + " "
 
 
@@ -793,6 +800,7 @@ class StatusBar(Static):
         mcp_status: "str | None" = None,
         context_status: "str | None" = None,
         context_warn: bool = False,
+        skill_status: "str | None" = None,
     ) -> None:
         """
         刷新状态栏显示内容（文本组装见 compose_status_text 纯函数）。
@@ -806,6 +814,7 @@ class StatusBar(Static):
         :param mcp_status: MCP 连接状态摘要；为 None（未启用 MCP）时不展示该段。
         :param context_status: 上下文用量摘要；为 None（无 ContextManager）时不展示该段。
         :param context_warn: 上下文是否接近上限或已熔断；为真时该段橘色高亮预警。
+        :param skill_status: 已激活 Skill 摘要（如 "Skill:2"）；为 None 时不展示该段（c11）。
         """
         self.update(
             compose_status_text(
@@ -817,6 +826,7 @@ class StatusBar(Static):
                 mcp_status,
                 context_status,
                 context_warn,
+                skill_status,
             )
         )
 

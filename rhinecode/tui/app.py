@@ -148,6 +148,9 @@ class RhineApp(App):
         self._clarify_options: list = []
         # 单轮运行锁：避免多个 Worker 同时修改同一份 conversation history。
         self._stream_active = False
+        # 「当前不能提交」提示是否已在本次忙碌期显示过（c11 T55）：
+        # 进入流式 / 每次新面板弹出时复位，避免用户连按回车刷屏。
+        self._busy_hint_shown = False
         # /resume 会话选择面板是否正在展示（c9 交互化）：
         # 展示期间输入框被禁用，此标志作为各输入路径的一致性兜底守卫。
         self._session_panel_active = False
@@ -190,8 +193,32 @@ class RhineApp(App):
         self._manager.memory_manager.notify = self._notify_memory
         self.set_interval(120, self._manager.memory_manager.touch_session_lock)
 
+        # Skill 激活通知（c11）：模型调 load_skill 成功后立刻刷新状态栏的
+        # Skill 段，让用户当下就看到激活数变化，而不用等本轮流式结束。
+        self._manager.skill_manager.notify_activation = self._notify_skill_activation
+
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
+
+    def _show_busy_hint(self, text: str) -> None:
+        """
+        显示一次「当前不能提交」的提示（c11 T55）。
+
+        :param text: 提示文本
+
+        **同一次忙碌期内只提示一次**。用户在等待时连按几次回车是很自然的，
+        每次都刷一行会把聊天区淹掉，反而看不见真正的内容。
+
+        复位规则写死三条：
+        1. 进入流式时复位一次；
+        2. 每次**新**面板弹出时复位一次；
+        3. 面板关闭时**不**复位——关闭后就不再拦截提交了，没有复位的必要，
+           而在关闭时复位反而会让「面板刚关、流式仍在跑」的窗口里多刷一行。
+        """
+        if self._busy_hint_shown:
+            return
+        self._busy_hint_shown = True
+        self.query_one(HistoryView).append_system(text)
 
     def _notify_memory(self, text: str) -> None:
         """
@@ -219,6 +246,8 @@ class RhineApp(App):
             self._manager.mcp_status_line(),
             context_status=ctx[0] if ctx else None,
             context_warn=bool(ctx and ctx[1]),
+            # 已激活 Skill 数（c11）：无激活时为 None，状态栏隐藏该段。
+            skill_status=self._manager.skill_status_segment(),
         )
 
     # ------------------------------------------------------------------ #
@@ -265,6 +294,10 @@ class RhineApp(App):
             return self._manager.context_report()
         if target == ReportTarget.MEMORY:
             return self._manager.memory_report()
+        if target == ReportTarget.SKILLS:
+            return self._manager.skills_report()
+        if target == ReportTarget.SKILLS_PROMPT:
+            return self._manager.skills_prompt_report()
         raise ValueError(f"未知的报告目标：{target!r}")
 
     def refresh_status(self) -> None:
@@ -290,6 +323,51 @@ class RhineApp(App):
     def exit_application(self) -> None:
         """退出应用（/exit 经此退出，不再依赖 SystemExit 穿透，c10）。"""
         self.exit()
+
+    # ---- Skill 控制器方法（c11）----
+
+    def run_skill(self, name: str, arguments: str, display: str) -> None:
+        """
+        执行一个 Skill（c11 F24）。
+
+        两种模式的返回值形态不同（共享模式返回主对话事件流、独立模式返回子对话
+        事件流、找不到时返回文本），全部交给 `_consume_manager_result` 统一消费。
+        """
+        self._consume_manager_result(
+            self._manager.run_skill(name, arguments, display)
+        )
+
+    def reload_skills(self) -> str:
+        """热更新 Skill 定义，返回报告文本（由命令层显示）。"""
+        return self._manager.reload_skills()
+
+    def deactivate_skill(self, name: Optional[str]) -> str:
+        """卸载已激活的 Skill；name 为 None 表示全部。返回结果文本。"""
+        return self._manager.deactivate_skill(name)
+
+    def _notify_skill_activation(self) -> None:
+        """
+        模型激活 Skill 后立刻刷新状态栏（c11 T53）。
+
+        本方法由 `SkillManager` 在**工作线程**里回调，因此必须 `call_from_thread`
+        跨回主线程更新界面。
+
+        **不能用裸 lambda 而要包 try/except**：`activate()` 跑在
+        `LoadSkillTool.execute()` 里，而它又在只读并发桶的 `ThreadPoolExecutor` 里；
+        `future.result()` 外层的 `except Exception` 会把这里抛出的任何异常
+        转成「工具执行异常」——于是应用退出竞态下一次本已成功的激活，
+        会被报告成工具失败回灌给模型，模型可能因此重试或放弃。
+
+        本回调的价值只在「激活当下立刻刷新」：`_do_stream` 的 finally 里已经
+        无条件刷一次状态栏，所以即使这里丢掉一次刷新也不会留下错误状态。
+
+        副作用：跨线程调度一次界面刷新。
+        """
+        try:
+            self.call_from_thread(self._refresh_status)
+        except Exception:
+            # 应用正在退出等边缘情况：刷新丢弃即可。
+            pass
 
     def _consume_manager_result(self, result) -> None:
         """
@@ -413,12 +491,21 @@ class RhineApp(App):
            未知命令提示与错误边界全部由分发器统一负责，App 不再区分具体命令名，
            也不再维护状态刷新白名单。
         """
-        # 交互进行中 / 流式运行中 / 会话选择面板展示中：忽略普通输入提交
-        if (
-            self._pending_interaction is not None
-            or self._stream_active
-            or self._session_panel_active
-        ):
+        # 交互进行中 / 流式运行中 / 会话选择面板展示中：拦下提交。
+        #
+        # c11 起前两种情形给出**可见提示**而不是静默 return——静默会让用户
+        # 以为界面卡死了（尤其在确认面板期间，输入框并没有被禁用）。
+        if self._pending_interaction is not None:
+            # 本分支**可达且最常见**：只有澄清面板会禁用 InputBar，
+            # 确认面板与计划审批面板期间用户点回输入框敲回车就会命中这里。
+            self._show_busy_hint("正在等待你的确认，请先在面板上做出选择。")
+            return
+        if self._stream_active:
+            self._show_busy_hint("正在运行中，可按 Esc 取消后再执行命令。")
+            return
+        if self._session_panel_active:
+            # 本分支实际不可达：`_show_session_panel` 已经把 InputBar 设为
+            # disabled，提交事件根本发不出来。保留裸 return 作为一致性兜底。
             return
         panel = self.query_one(CommandPanel)
 
@@ -453,6 +540,9 @@ class RhineApp(App):
         新一轮的并发提交由 on_input_bar_input_submitted 的 _stream_active 守卫拦截。
         """
         self._stream_active = active
+        if active:
+            # 进入流式：复位提示标志，本轮可以再提示一次。
+            self._busy_hint_shown = False
         if not active:
             self.query_one(InputBar).focus()
 
@@ -661,6 +751,8 @@ class RhineApp(App):
         """
         box = {"event": threading.Event(), "result": default, "kind": kind}
         self._pending_interaction = box
+        # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
+        self._busy_hint_shown = False
         self.call_from_thread(show_fn)
         box["event"].wait()
         return box["result"]
