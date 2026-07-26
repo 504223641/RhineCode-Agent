@@ -92,9 +92,21 @@ def _s_api_response(r: dict) -> str:
     )
 
 
+# 权限管线四个可命中层的中文名，与「五层防御」的心智模型对齐（第⑤层是人在回路，
+# 它不由 decide 返回、而是 ASK 判定后由界面承载，故不在此表）。
+# 读 trace 时最常问的问题就是「这次是被哪一层拦的」，直接显示序号与名字最省事。
+_LAYER_NAMES = {
+    "blacklist": "①黑名单",
+    "sandbox": "②沙箱",
+    "rule": "③规则",
+    "mode": "④模式",
+}
+
+
 def _s_permission_decision(r: dict) -> str:
+    layer = str(r.get("layer"))
     return (
-        f"{r.get('tool')} → {r.get('decision')}（第 {r.get('layer')} 层）"
+        f"{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"
     )
 
