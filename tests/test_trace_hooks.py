@@ -208,6 +208,60 @@ class PermissionHookTest(TraceHookBase):
         dec = self.records(T.PERMISSION_DECISION)[0]
         self.assertEqual(dec["decision"], "deny")
 
+    def test_per_file_filter_does_not_flood_the_timeline(self) -> None:
+        """
+        逐文件权限过滤器的**反向护栏**：它刻意不埋点，所以一次命中很多文件的搜索
+        只应留下**一条**权限决策事件，而不是数百条。
+
+        `engine.decide` 在生产代码里有两个调用点：`_execute` 里的工具放行判定
+        （埋了点），以及协调层注入给 `grep_content`/`glob_files` 的逐文件过滤器
+        （没埋点）。后者一次 grep 会触发几十上百次判定；如果哪天有人「顺手」把
+        埋点挪进 `engine.decide` 内部，整条时间线就会被这些判定淹掉——本用例
+        就是那道防线。
+        """
+        import os
+
+        from rhinecode.permission.models import Decision, PermissionRequest
+
+        for i in range(60):
+            (self.root / f"f{i}.py").write_text("needle here\n", encoding="utf-8")
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            registry = ToolRegistry.default()
+            engine = PermissionEngine(RuleSet([]), mode=PermissionMode.PERMISSIVE)
+
+            # 照搬 conversation._install_path_filters 的生产做法（经 set_path_filter 注入）
+            calls = [0]
+
+            def allow_read_path(rel_path: str) -> bool:
+                calls[0] += 1
+                req = PermissionRequest(
+                    tool_name="read_file",
+                    rule_name="Read",
+                    specifier=rel_path,
+                    kind="read_path",
+                    is_read_only=True,
+                    mode=engine.mode,
+                )
+                return engine.decide(req).decision != Decision.DENY
+
+            for name in ("grep_content", "glob_files"):
+                setter = getattr(registry.get(name), "set_path_filter", None)
+                if callable(setter):
+                    setter(allow_read_path)
+
+            provider = ScriptedProvider(
+                [_tool_round("grep_content", args={"pattern": "needle"}), _text_round()]
+            )
+            self.run_loop(provider, registry, engine=engine)
+        finally:
+            os.chdir(cwd)
+
+        self.assertGreaterEqual(calls[0], 60, "逐文件过滤器没被真正调用，本用例失去意义")
+        self.assertEqual(len(self.records(T.PERMISSION_DECISION)), 1)
+        self.assertEqual(len(self.records(T.TOOL_EXECUTE)), 1)
+
 
 class ToolOutcomeTest(TraceHookBase):
     """六种 outcome 各一条（T31 的八处写入点覆盖到六个语义）。"""

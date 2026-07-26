@@ -191,11 +191,14 @@ class ConversationManager:
 
             用 Null Object 而不是到处 `if self.skill_manager is not None`：
             各使用点无需散落判空，空实例的每个方法都返回「什么都没有」的安全值。
-        :param user_dir: 用户级目录（`~/.rhinecode` 的替身）。**缺省等于现状**——
+        :param user_dir: 用户级目录（`~/.rhinecode` 的替身）。**必须可选、缺省等于现状**——
                          为 None 时取 `Path.home() / ".rhinecode"`，行为与参数化之前
-                         逐字一致。给定时，用户级项目指令 / 笔记索引 / Skill 目录 /
-                         权限规则四类内容一并改从该目录读取，使装配层能在临时目录里
-                         跑一次完整装配而不读真实主目录（trace spec F23）。
+                         逐字一致。改成必选会把回归面从零推到五个测试文件
+                         （`test_review_fixes` / `test_resume_replay` / `test_skill_isolated` /
+                         `test_skill_sandbox` / `test_memory_*` 都直接构造本类且都不传它）。
+                         给定时，用户级项目指令 / 笔记索引 / Skill 目录 / 权限规则四类内容
+                         一并改从该目录读取，使装配层能在临时目录里跑一次完整装配而不读
+                         真实主目录（trace spec F23）。
         :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`——
                          **不传等于零回归**，全部埋点变成空调用。
         """

@@ -104,6 +104,34 @@ class TimelineTest(ReaderTestBase):
         self.assertIn("api_request", out)
 
 
+class ChineseEncodingTest(ReaderTestBase):
+    """
+    N8：中文不乱码，**从落盘到阅读器输出全程**。
+
+    本模块的立项理由之一就是一个中文编码 bug——落盘或读取环节把编码搞坏，
+    会直接毁掉这类问题的证据，而且失败形态是「看起来在正常工作」。
+    """
+
+    def test_written_and_read_back_intact(self) -> None:
+        text = "第一行中文\n第二行：符号 ①②③ 与 emoji 🐛"
+        self.path.write_text(
+            _line(1, "tool_execute", tool="read_file", ok=True, outcome="executed",
+                  summary="读了中文文件", output=text) + "\n",
+            encoding="utf-8",
+        )
+        # 严格 UTF-8 解码，编码坏了这里就抛
+        raw = self.path.read_bytes().decode("utf-8")
+        self.assertNotIn(chr(92) + "u", raw, "中文被转义成 \\uXXXX，人眼无法直接阅读")
+        self.assertIn("第一行中文", raw)
+
+        _, out, _ = self.run_reader()
+        self.assertIn("读了中文文件", out)
+
+    def test_detail_mode_prints_chinese_intact(self) -> None:
+        _, out, _ = self.run_reader("--seq", "2")
+        self.assertIn("帮我看看代码", out)
+
+
 class FilterTest(ReaderTestBase):
     def test_type_filter(self) -> None:
         _, out, _ = self.run_reader("--type", "api_request")
