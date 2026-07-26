@@ -66,6 +66,69 @@ def _handle_memory(invocation: CommandInvocation, controller: CommandController)
     controller.show_message(controller.query_report(ReportTarget.MEMORY))
 
 
+# `/skills` 的用法串，多个分支要用，抽出来避免各处写得不一致。
+_SKILLS_USAGE = "用法：/skills [reload | off [名字] | run <名字> [参数] | prompt]"
+
+
+def _handle_skills(invocation: CommandInvocation, controller: CommandController) -> None:
+    """
+    /skills：Skill 的列表 / 热更新 / 卸载 / 执行 / 查看注入（c11 F26/F31）。
+
+    五种形态：
+
+    | 输入 | 行为 |
+    |---|---|
+    | `/skills` | 只读报告：全部 Skill 及其来源、模式、激活状态、加载错误 |
+    | `/skills prompt` | 只读报告：当前**实际注入**了什么（清单 / 正文 / 可见工具集） |
+    | `/skills reload` | 热更新定义，刷新状态栏 |
+    | `/skills off [名字]` | 卸载指定或全部激活的 Skill，刷新状态栏 |
+    | `/skills run <名字> [参数]` | 执行指定 Skill（独立模式 Skill 的通用入口） |
+
+    子命令按**首个空白**切分（沿用 C10 的 `split(maxsplit=1)` 口径），
+    其后内容原样保留、不做 shell 分词。
+    """
+    raw = invocation.arguments.strip()
+
+    if not raw:
+        controller.show_message(controller.query_report(ReportTarget.SKILLS))
+        return
+
+    parts = raw.split(maxsplit=1)
+    sub = parts[0].casefold()
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if sub == "prompt":
+        controller.show_message(controller.query_report(ReportTarget.SKILLS_PROMPT))
+        return
+
+    if sub == "reload":
+        controller.show_message(controller.reload_skills())
+        # 热更新可能自动卸载消失的 Skill，激活数会变，状态栏要跟着刷新。
+        controller.refresh_status()
+        return
+
+    if sub == "off":
+        # `off` 之后 strip 非空即视为名字，内部不再切分——Skill 名按 F4 不含空白，
+        # 多词输入必然落到「未激活」分支，给出的提示也是对的。
+        name = rest.strip() or None
+        controller.show_message(controller.deactivate_skill(name))
+        controller.refresh_status()
+        return
+
+    if sub == "run":
+        if not rest.strip():
+            controller.show_message(f"请指定要执行的 Skill 名字。{_SKILLS_USAGE}")
+            return
+        run_parts = rest.strip().split(maxsplit=1)
+        name = run_parts[0]
+        # 参数原样保留（含内部多余空白），与 C10 的命令参数口径一致。
+        args = run_parts[1] if len(run_parts) > 1 else ""
+        controller.run_skill(name, args, invocation.raw_text.strip())
+        return
+
+    controller.show_message(f"未知子命令 `{parts[0]}`。{_SKILLS_USAGE}")
+
+
 # ---------------------------------------------------------------------- #
 # 模式处理函数（T16）
 # ---------------------------------------------------------------------- #
@@ -242,6 +305,15 @@ def build_builtin_registry() -> CommandRegistry:
                 usage="/init",
                 command_type=CommandType.PROMPT,
                 handler=_handle_init,
+            ),
+            CommandSpec(
+                name="/skills",
+                aliases=(),
+                description="管理 Skill：列表 / 热更新 / 卸载 / 执行 / 查看注入",
+                usage="/skills [reload|off [名字]|run <名字> [参数]|prompt]",
+                command_type=CommandType.LOCAL,
+                handler=_handle_skills,
+                argument_hint="[子命令]",
             ),
             CommandSpec(
                 name="/clear",

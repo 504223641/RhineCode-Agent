@@ -31,14 +31,35 @@ _TYPE_LABELS = {
 class CommandRegistry:
     """
     命令注册表。内部维护：
-    - self._specs：有序 CommandSpec 列表（注册顺序即帮助与候选顺序，spec F19/F22）；
+    - self._builtin_specs：内置命令，启动时一次性注册，此后不变；
+    - self._skill_specs：Skill 短命令（c11），可被 `replace_skill_commands` 整体替换；
+    - self._specs：上面两者的拼接（只读属性），注册顺序即帮助与候选顺序（spec F19/F22）；
     - self._index：casefold 索引键 → (CommandSpec, 实际标识)，其中「实际标识」是
       定义里的规范名或别名原文，用于构造 matched_name 与冲突信息。
+
+    **为什么把 specs 拆成两个列表**（c11 T37）：Skill 短命令要支持热更新
+    （`/skills reload` 后整批替换），而内置命令必须原样保留。
+    拆开后「替换 Skill 命令」就是替换一个列表，不需要在混合列表里做筛选删除。
     """
 
     def __init__(self) -> None:
-        self._specs: list[CommandSpec] = []
+        self._builtin_specs: list[CommandSpec] = []
+        self._skill_specs: list[CommandSpec] = []
         self._index: dict[str, tuple[CommandSpec, str]] = {}
+
+    @property
+    def _specs(self) -> list[CommandSpec]:
+        """
+        全部命令，内置在前、Skill 短命令在后。
+
+        拼接顺序即 `/help` 与补全候选的稳定顺序（符合 C10 N3 的顺序稳定要求）：
+        内置命令是用户最常用也最熟悉的，排在前面；Skill 短命令数量可变，排在后面。
+
+        **注意：本属性每次返回一个新列表。**对它 `append` 会写进临时对象随即被丢弃，
+        表面上什么都没发生——这是最难排查的失败形态（不报错、不生效）。
+        写入必须直接操作 `_builtin_specs` 或 `_skill_specs`。
+        """
+        return self._builtin_specs + self._skill_specs
 
     # ------------------------------------------------------------------ #
     # 注册与冲突校验（T6）
@@ -92,7 +113,7 @@ class CommandRegistry:
         staged = dict(self._index)
         self._stage(spec, staged)
         self._index = staged
-        self._specs.append(spec)
+        self._builtin_specs.append(spec)
 
     def register_many(self, specs: Iterable[CommandSpec]) -> None:
         """
@@ -110,7 +131,83 @@ class CommandRegistry:
             pending.append(spec)
         # 整批验证通过，一次性提交
         self._index = staged
-        self._specs.extend(pending)
+        self._builtin_specs.extend(pending)
+
+    # ------------------------------------------------------------------ #
+    # Skill 短命令的运行时替换（c11 T38，改造点 2）
+    # ------------------------------------------------------------------ #
+    def has_skill_command(self, name: str) -> bool:
+        """
+        判断某个 Skill 名是否**真的**注册成了斜杠短命令（c11 F7/F25）。
+
+        :param name: Skill 名（不带斜杠）
+        :returns: 已注册为 Skill 短命令时 True
+
+        **为什么不能用 `resolve(f"/{name}")`**：那会把内置命令也算进去。
+        考虑一个名叫 `context` 的 Skill——它与内置 `/context` 重名，短命令
+        **没有**被注册（F25 跳过冲突项）。此时 `resolve("/context")` 会命中
+        **内置**命令返回 True，于是给用户的入口提示变成「请执行 /context」，
+        而那条命令跑的是上下文用量报告，跟这个 Skill 毫无关系。
+
+        指向一个存在但错误的命令，比指向一个不存在的命令更糟——后者用户立刻
+        知道出问题了，前者会让用户以为 Skill 坏了。所以这里只查 `_skill_specs`。
+        """
+        target = f"/{name}".casefold()
+        return any(spec.name.casefold() == target for spec in self._skill_specs)
+
+    def replace_skill_commands(
+        self, specs: Iterable[CommandSpec]
+    ) -> list[CommandSpec]:
+        """
+        用给定的一批 Skill 短命令**整体替换**现有的（c11 F25/F26）。
+
+        :param specs: 新的 Skill 短命令列表
+        :returns: 因与既有命令冲突而**被跳过**的那些 spec，供上层打印警告
+
+        与 `register_many` 的语义差异，这也是不复用它的原因：
+        `register_many` 是「整批失败」——任一冲突则全批不注册。而这里要求
+        **冲突的那条跳过、其余照常注册**（F25：一个 Skill 与内置命令重名，
+        不该连累其它九个 Skill 都没有短命令）。
+
+        三步：
+        1. 从零重建暂存索引——先 stage 全部内置命令，等于把 Skill 命令清空；
+        2. 逐个 stage 新的 Skill 命令，成功则接受、冲突则跳过；
+        3. 全部处理完，一次性提交。
+
+        **第 2 步为什么必须用独立的临时字典 `probe`**：现有的 `_stage` 是
+        「边遍历边写入、遇冲突才抛、不回滚」。一个 spec 若有多个标识，
+        前几个已经写进去了、后一个才冲突，抛异常时前几个仍留在字典里——
+        那些索引项指向一个**不在 `_skill_specs` 中**的 spec，`resolve` 会
+        解析出一条实际不存在的命令。当前 Skill 短命令 `aliases=()` 只有一个
+        标识，问题暂时不显现，但这是个隐含不变量（见 `skill_commands.py`）。
+
+        **中途失败自动保持原状**：提交前不触碰任何实例字段（改造点 2 的原子性）。
+
+        副作用：替换 `_index` 与 `_skill_specs`。
+        """
+        # 第 1 步：从零重建，只含内置命令。
+        staged: dict[str, tuple[CommandSpec, str]] = {}
+        for spec in self._builtin_specs:
+            self._stage(spec, staged)
+
+        accepted: list[CommandSpec] = []
+        skipped: list[CommandSpec] = []
+
+        # 第 2 步：逐个试探。
+        for spec in specs:
+            probe = dict(staged)
+            try:
+                self._stage(spec, probe)
+            except CommandRegistrationError:
+                skipped.append(spec)
+                continue
+            staged = probe
+            accepted.append(spec)
+
+        # 第 3 步：一次性提交。
+        self._index = staged
+        self._skill_specs = accepted
+        return skipped
 
     # ------------------------------------------------------------------ #
     # 名称解析与可见命令（T7）

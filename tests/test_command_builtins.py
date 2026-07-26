@@ -30,6 +30,8 @@ EXPECTED_TABLE = {
     "/memory": (set(), CommandType.LOCAL),
     "/resume": ({"/continue"}, CommandType.UI),
     "/init": (set(), CommandType.PROMPT),
+    # c11 新增：Skill 管理命令，无别名、本地类型。
+    "/skills": (set(), CommandType.LOCAL),
     "/clear": ({"/reset", "/new"}, CommandType.UI),
     "/exit": ({"/quit"}, CommandType.UI),
 }
@@ -41,10 +43,17 @@ class BuiltinMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = build_builtin_registry()
 
-    def test_exactly_twelve_canonical_commands(self) -> None:
+    def test_exactly_thirteen_canonical_commands(self) -> None:
+        """
+        内置命令恰好十三条（C10 的十二条 + c11 新增的 /skills）。
+
+        这条 len 断言是「批准表」的护栏——它保证任何人新增命令时必须
+        显式更新 EXPECTED_TABLE 并同步这个数字，而不能悄悄加进去。
+        **绝不能因为它变红就删掉它**，那等于让护栏永久失效。
+        """
         names = [s.name for s in self.registry.visible_commands()]
         self.assertEqual(set(names), set(EXPECTED_TABLE))
-        self.assertEqual(len(names), 12)
+        self.assertEqual(len(names), 13)
 
     def test_alias_mapping(self) -> None:
         """全部首批别名映射正确（spec F10/AC5）。"""
@@ -79,13 +88,16 @@ class BuiltinMetadataTests(unittest.TestCase):
             self.assertTrue(spec.usage.strip(), spec.name)
 
     def test_argument_hints_and_requires_argument(self) -> None:
-        """仅 /resume 有参数提示；C10 全部内置命令 requires_argument=False。"""
+        """
+        /resume 与 /skills 各有其参数提示，其余为 None；
+        全部内置命令 requires_argument=False（参数缺失由各自处理函数给用法提示）。
+        """
+        expected_hints = {"/resume": "[编号或ID]", "/skills": "[子命令]"}
         for spec in self.registry.visible_commands():
             self.assertFalse(spec.requires_argument, spec.name)
-            if spec.name == "/resume":
-                self.assertEqual(spec.argument_hint, "[编号或ID]")
-            else:
-                self.assertIsNone(spec.argument_hint, spec.name)
+            self.assertEqual(
+                spec.argument_hint, expected_hints.get(spec.name), spec.name
+            )
 
 
 class BuiltinBehaviorTests(unittest.TestCase):

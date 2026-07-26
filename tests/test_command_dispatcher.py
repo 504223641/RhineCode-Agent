@@ -59,6 +59,19 @@ class FakeController:
     def exit_application(self) -> None:
         self.calls.append(("exit_application",))
 
+    # ---- c11 新增的三个控制器方法 ----
+
+    def run_skill(self, name: str, arguments: str, display: str) -> None:
+        self.calls.append(("run_skill", name, arguments, display))
+
+    def reload_skills(self) -> str:
+        self.calls.append(("reload_skills",))
+        return "reloaded"
+
+    def deactivate_skill(self, name) -> str:
+        self.calls.append(("deactivate_skill", name))
+        return f"off:{name}"
+
     def names(self) -> list[str]:
         return [c[0] for c in self.calls]
 
