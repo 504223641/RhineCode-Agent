@@ -24,3 +24,10 @@ rhine = "rhinecode.__main__:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rhinecode*"]
+
+# c11：把内置 Skill 样板打进分发包。
+# packages.find 只收集 .py，`.md` 不会自动进 wheel——不加这段的话
+# `pip install -e .`（开发模式直接读源码目录）一切正常，但真正 `pip install`
+# 之后 skills/builtin/ 会是空的，三个内置样板凭空消失，而且不报任何错。
+[tool.setuptools.package-data]
+"rhinecode.skills" = ["builtin/*.md"]
