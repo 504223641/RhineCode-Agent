@@ -69,6 +69,8 @@ from rhinecode.skills.validation import (
     prune_mcp_tool_names,
 )
 from rhinecode.tools.policy import ToolPolicy
+# trace 是只依赖标准库的叶子包，从 skills 依赖它不会形成环
+from rhinecode.trace import NullRecorder, TraceRecorderProtocol
 
 # 豁免工具白名单收窄的工具名（spec F8/F15）。
 # `load_skill` 若被白名单挡住，模型就再也没法加载其它 Skill 了；
@@ -106,6 +108,7 @@ class SkillManager:
         builtin_dir: Optional[Path],
         has_short_command: Callable[[str], bool],
         notify_activation: Optional[Callable[[], None]] = None,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
     ) -> None:
         """
         :param project_root: 项目根（扫描 `<root>/.rhinecode/skills`）
@@ -119,10 +122,15 @@ class SkillManager:
             这比指向一个不存在的命令更糟。
         :param notify_activation: 激活成功后的通知回调（TUI 用它立刻刷新状态栏）。
             可在构造后作为属性注入，与 c9 `memory_manager.notify` 同形态。
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
+            **不传等于零回归**。注意它必须排在 `notify_activation` **之后**——
+            插进既有位置参数之间会打断
+            `SkillManager(root, user_dir, builtin, has_short_command)` 这类调用方。
 
         本构造函数**不扫盘**——扫盘发生在 `startup()`。这样构造是廉价且无副作用的。
         """
         self._project_root = project_root
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         self._user_dir = user_dir
         self._builtin_dir = builtin_dir
         self._has_short_command = has_short_command

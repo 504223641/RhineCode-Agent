@@ -41,6 +41,7 @@ from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.skills.manager import SkillManager
+from rhinecode.trace import NullRecorder, TraceRecorderProtocol
 from rhinecode.skills.models import (
     ActivationStatus,
     SKILL_MAX_ITERATIONS,
@@ -159,6 +160,8 @@ class ConversationManager:
         mcp_manager: "Optional[MCPManager]" = None,
         resume_latest: bool = False,
         skill_manager: "Optional[SkillManager]" = None,
+        user_dir: Optional[Path] = None,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
     ):
         """
         初始化对话管理器。
@@ -182,8 +185,22 @@ class ConversationManager:
 
             用 Null Object 而不是到处 `if self.skill_manager is not None`：
             各使用点无需散落判空，空实例的每个方法都返回「什么都没有」的安全值。
+        :param user_dir: 用户级目录（`~/.rhinecode` 的替身）。**缺省等于现状**——
+                         为 None 时取 `Path.home() / ".rhinecode"`，行为与参数化之前
+                         逐字一致。给定时，用户级项目指令 / 笔记索引 / Skill 目录 /
+                         权限规则四类内容一并改从该目录读取，使装配层能在临时目录里
+                         跑一次完整装配而不读真实主目录（trace spec F23）。
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`——
+                         **不传等于零回归**，全部埋点变成空调用。
         """
         self._provider = provider
+        # 行为记录器：Null Object 兜底，各使用点无需判空（trace spec N1）
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
+        # 用户级目录：**必须在这里解析**，因为下面的 PermissionEngine.load 就要用它。
+        # （历史上这行赋值位于 PermissionEngine.load 之后、只服务 memory/skills，
+        #  参数化时若只改那一处，权限层拿不到 user_dir，「用户级权限规则不参与求值」
+        #  这条承诺会静默落空。）
+        self._user_dir: Path = user_dir if user_dir is not None else Path.home() / ".rhinecode"
         self._config = config
         # MCP 连接管理器：仅供 /mcp 命令与状态栏读取连接状态；工具走 registry，与此解耦。
         self._mcp_manager = mcp_manager
@@ -197,7 +214,7 @@ class ConversationManager:
         self.plan_mode: bool = False
         # 权限决策引擎（c6）：启动时加载三层 YAML 规则，持有权限模式与会话级规则。
         # 取代 c5 的「会话级一刀切免确认」标志——本会话放行改为按规则登记（见 _run 的 ask 闭包）。
-        self._engine: PermissionEngine = PermissionEngine.load()
+        self._engine: PermissionEngine = PermissionEngine.load(user_dir=self._user_dir)
         # 当前运行的取消信号；每次运行重建，置位即让循环尽快停止
         self._cancel_event: threading.Event = threading.Event()
 
@@ -227,7 +244,8 @@ class ConversationManager:
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
         # 工具能力；自动笔记由 notes_enabled 门控（仅工具模式，F21）。
-        user_dir = Path.home() / ".rhinecode"
+        # user_dir 已在构造函数开头解析成 self._user_dir（权限层要先用），此处直接复用
+        user_dir = self._user_dir
         self.memory_manager = MemoryManager(
             provider,
             config.model,

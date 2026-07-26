@@ -36,6 +36,7 @@ from rhinecode.commands import (
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.conversation import ConversationManager, SessionListRequest
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
+from rhinecode.trace import NullRecorder, TraceRecorderProtocol
 from rhinecode.tui.widgets import (
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
     SessionPanel,
@@ -127,6 +128,7 @@ class RhineApp(App):
         manager: ConversationManager,
         config: Config,
         command_registry: CommandRegistry,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
     ):
         """
         :param manager: 已初始化的对话管理器，持有 Provider / Agent 和对话历史
@@ -134,10 +136,14 @@ class RhineApp(App):
         :param command_registry: 启动早期构建的命令注册表（c10）。App 不自建注册表——
                                  同一实例同时注入分发器、命令面板与输入高亮器（spec F3），
                                  保证执行、补全与帮助共享同一份事实来源
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
+                         **不传等于零回归**，界面层的全部埋点变成空调用
         """
         super().__init__()
         self._manager = manager
         self._config = config
+        # 行为记录器：Null Object 兜底，界面各埋点无需判空（trace spec N1）
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         # 命令层接线（c10）：单个分发器实例，提交入口的唯一分流点。
         self._command_registry = command_registry
         self._dispatcher = CommandDispatcher(command_registry)

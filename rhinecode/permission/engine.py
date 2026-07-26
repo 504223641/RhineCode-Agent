@@ -13,6 +13,9 @@ decide(request)。decide 是纯判定——给定请求与当前状态即可复�
     ④ 模式兜底           仅副作用工具、③未命中：严格→DENY / 默认→ASK / 放行→ALLOW
 """
 
+from pathlib import Path
+from typing import Optional
+
 from rhinecode.permission import blacklist, config
 from rhinecode.permission.models import (
     Decision,
@@ -53,7 +56,11 @@ class PermissionEngine:
         self.load_errors: list[str] = load_errors or []
 
     @classmethod
-    def load(cls, mode: PermissionMode = PermissionMode.DEFAULT) -> "PermissionEngine":
+    def load(
+        cls,
+        mode: PermissionMode = PermissionMode.DEFAULT,
+        user_dir: Optional[Path] = None,
+    ) -> "PermissionEngine":
         """
         从三层 YAML 配置构建引擎（启动时调用）。
 
@@ -61,11 +68,14 @@ class PermissionEngine:
         由上层决定如何提示（fail-safe：即便配置有错也照常返回可用引擎，spec N1/F9）。
 
         :param mode: 启动权限模式
+        :param user_dir: 用户级目录，透传给 `config.load_all()`。**必须可选**——
+                         缺省等于现状（读真实主目录）。给定时用户级权限规则改从该目录读，
+                         使装配层能把整套用户级内容重定向到临时目录（trace spec F23）。
         :returns: 已加载规则的 PermissionEngine
 
         副作用：读取三层配置文件（若存在）。
         """
-        ruleset, errors = config.load_all()
+        ruleset, errors = config.load_all(user_dir)
         return cls(ruleset, mode=mode, load_errors=errors)
 
     def decide(self, request: PermissionRequest) -> DecisionResult:
