@@ -23,7 +23,10 @@ C11 这三条场景的判据是「**真实模型是否按 SOP 行事**」。脚�
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+import yaml
 
 from tests.e2e import seeding
 
@@ -244,4 +247,229 @@ def seed_whitelist_pair(workspace: Path, user_dir: Path) -> None:
             "mode": "shared",
         },
         "按用户要求自由地完成任务，可以使用任何可用工具。\n\n$ARGUMENTS",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 场景 6：启动 fail-fast（白名单里的内置工具名拼错）
+# ---------------------------------------------------------------------------
+# 这条场景**一次模型调用都不会发生**：装配在 Provider 之前就终止了。
+# 它同时要验的第二件事是「失败退出时没有留下孤儿子进程」——所以必须同场配一个
+# stdio MCP Server，好让「若校验窗口挪到 connect_all 之后」这个错误变得可观测。
+#
+# 拼错的名字取 `read_files`（真名是 `read_file`，多一个 s）：这是最容易犯、
+# 也最容易被眼睛滑过去的那种笔误，正是 fail-fast 想拦的形态。
+TYPO_TOOL_NAME = "read_files"
+
+
+def _write_mcp_stdio(workspace: Path) -> None:
+    """
+    在项目级写一份 `mcp.yaml`，声明一个 stdio MCP Server。
+
+    用仓库自带的 `tests/fixtures/mock_mcp_server.py` 当 Server——它是本地脚本，
+    不联网、不装包，起停都在毫秒级。用 `sys.executable` 而不是裸 `python`：
+    宿主可能跑在虚拟环境里，裸名字未必指向同一个解释器。
+    """
+    server_script = Path(__file__).resolve().parents[1] / "fixtures" / "mock_mcp_server.py"
+    payload = {
+        "mcpServers": {
+            "mock": {"command": sys.executable, "args": [str(server_script)]},
+        }
+    }
+    target = workspace / ".rhinecode" / "mcp.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+
+
+def seed_typo_whitelist(workspace: Path, user_dir: Path) -> None:
+    """
+    预置一个白名单里含笔误工具名的项目级 Skill + 一个 stdio MCP Server（场景 6）。
+
+    期望结果：装配抛 `BootstrapError`，宿主进 fatal 态并把成文文案经通道回报；
+    且**没有任何 mock_mcp_server.py 子进程被拉起**。
+    """
+    seeding.seed_files(workspace, {"note.txt": "一行内容\n"})
+    seeding.seed_project_skill(
+        workspace,
+        "broken",
+        {
+            "description": "白名单里有个拼错的工具名",
+            "mode": "shared",
+            "allowed_tools": [TYPO_TOOL_NAME, "glob_files"],
+        },
+        "随便做点什么。\n\n$ARGUMENTS",
+    )
+    _write_mcp_stdio(workspace)
+
+
+def seed_fixed_whitelist(workspace: Path, user_dir: Path) -> None:
+    """
+    与 `seed_typo_whitelist` **只差一个字母**的对照组：把 `read_files` 改对成
+    `read_file`，其余（含那个 stdio MCP Server）一模一样。
+
+    这是场景 6 的「改对后正常启动」那一半。两个预置刻意做成孪生，
+    是为了让「启动失败」与「启动成功」之间的唯一变量就是那个笔误。
+    """
+    seeding.seed_files(workspace, {"note.txt": "一行内容\n"})
+    seeding.seed_project_skill(
+        workspace,
+        "broken",
+        {
+            "description": "白名单里有个拼错的工具名",
+            "mode": "shared",
+            "allowed_tools": ["read_file", "glob_files"],
+        },
+        "随便做点什么。\n\n$ARGUMENTS",
+    )
+    _write_mcp_stdio(workspace)
+
+
+# ---------------------------------------------------------------------------
+# 场景 7 / 8：第三方内容可见性 与 短命令被内置占用
+# ---------------------------------------------------------------------------
+# 两条场景共用一份预置，因为它们要的东西恰好叠得起来：
+#
+#   - 场景 7 要「一个别人的仓库里带着项目级 Skill」→ 任意项目级 Skill 都行；
+#   - 场景 8 要「一个名字与内置命令重名的 Skill」→ `name: context`。
+#
+# 而 `context` 本身就是项目级的，所以它同时充当场景 7 的「第三方内容」。
+# 再加一个正常名字的 `houserules`，好让「发现 N 个项目级 Skill」的 N 不是 1
+# ——N=1 时数字对不对看不出来。
+
+
+def seed_thirdparty_repo(workspace: Path, user_dir: Path) -> None:
+    """
+    预置一个「别人的仓库」：含两个项目级 Skill，其中一个的名字与内置命令 `/context` 重名。
+
+    期望结果：启动时出现「发现 2 个项目级 Skill」提示 + 一条 `/context` 重名警告；
+    `/context` 仍是上下文报告；`/skills` 里两个都在；`/skills run context` 能执行。
+    """
+    seeding.seed_files(
+        workspace,
+        {
+            "README.md": "# 某个别人的仓库\n\n你刚 clone 下来。\n",
+            "main.py": "def main():\n    print('hello')\n",
+        },
+    )
+    # 与内置命令 `/context` 重名——短命令应被跳过注册，内置行为不受影响
+    seeding.seed_project_skill(
+        workspace,
+        "context",
+        {"description": "名字故意与内置命令重名", "mode": "shared"},
+        "请只回复一行：`重名 Skill 已执行`。不要调用任何工具。\n\n$ARGUMENTS",
+    )
+    seeding.seed_project_skill(
+        workspace,
+        "houserules",
+        {"description": "本仓库的编码约定", "mode": "shared"},
+        "按本仓库约定作答。\n\n$ARGUMENTS",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 场景 5：热更新
+# ---------------------------------------------------------------------------
+# 热更新的三步（新增 / 改正文 / 删除）要在**运行中**做，所以预置只负责给出起点，
+# 三步文件操作由驱动方在宿主活着的时候直接写工作区。
+#
+# 「改正文后行为随之改变」这一步需要一个**一眼可判**的行为差异，而不是让人去品
+# 「回答风格好像变了」。所以正文里放一条极其机械的指令：回复必须以某个标记开头。
+# 标记从 `【甲】` 换成 `【乙】`，模型跟没跟上一目了然。
+HOTRELOAD_MARK_A = "【甲】"
+HOTRELOAD_MARK_B = "【乙】"
+
+
+def hotreload_body(mark: str) -> str:
+    """生成热更新用的 Skill 正文；`mark` 是要求模型加在回复最前面的标记。"""
+    return (
+        f"回复时**必须**以 `{mark}` 这四个字符开头，然后再写正文。\n"
+        "不要调用任何工具，直接回答。\n\n$ARGUMENTS"
+    )
+
+
+def seed_hotreload_base(workspace: Path, user_dir: Path) -> None:
+    """
+    场景 5 的起点：一个普通小项目，**不预置任何自定义 Skill**。
+
+    第一步「运行中新建 Skill 文件」才有意义——如果文件一开始就在，
+    验的就成了「启动时能扫到」，那是场景 1 已经覆盖过的事。
+    """
+    seeding.seed_files(
+        workspace,
+        {
+            "app/__init__.py": "",
+            "app/main.py": "def main():\n    print('hello')\n",
+            "README.md": "# 热更新演示项目\n",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 场景 11：目录型 Skill 能力包
+# ---------------------------------------------------------------------------
+# 这条场景一箭双雕：
+#   ① 目录型 Skill 的资源清单与绝对路径确实注入了；
+#   ② **工作区外目录的只读放行确实生效**——用户级 Skill 目录不在项目内，
+#      沙箱若没放行，模型按清单去读那份参考文档就会被拒。
+#
+# 判据要可证伪，所以参考文档里写的规则必须是模型**不可能猜到**的：
+# 这里用一个随口编的内部命名约定（`rc_` 前缀 + 全大写 + `_V2` 后缀）。
+# 模型答对了，就只可能是真读到了那份文档。
+HOUSE_RULE_MARKER = "rc_"
+HOUSE_RULE_SUFFIX = "_V2"
+
+
+def seed_capability_pack(workspace: Path, user_dir: Path) -> None:
+    """
+    在**用户级**目录放一个目录型 Skill 能力包（场景 11）。
+
+    目录结构::
+
+        <user_dir>/skills/naming/
+            SKILL.md          ← 入口（frontmatter + SOP）
+            reference.md      ← 参考文档（规则的唯一出处）
+            template.py       ← 模板文件（只为让随附清单不止一条）
+
+    注意入口文件名必须是 `SKILL.md`（大写），这是目录型的识别标志。
+    """
+    seeding.seed_files(workspace, {"app/__init__.py": "", "app/main.py": "def main():\n    pass\n"})
+
+    pack = Path(user_dir) / "skills" / "naming"
+    pack.mkdir(parents=True, exist_ok=True)
+
+    # 入口：正文刻意**不写规则本身**，只说「去读 reference.md」。
+    # 规则若写在正文里，模型不读文档也能答对，这条场景就白验了。
+    (pack / "SKILL.md").write_text(
+        "---\n"
+        "name: naming\n"
+        "description: 按本组内部命名约定给出标识符名字\n"
+        "mode: shared\n"
+        "allowed_tools: [read_file, glob_files]\n"
+        "---\n\n"
+        "本组的命名约定写在随附的 `reference.md` 里，**你必须先把它读完**再作答。\n"
+        "约定的细节不在本文件中，凭印象作答一定是错的。\n\n"
+        "读完后，按其中的规则给出用户要的名字，并注明你依据的是哪一条。\n\n"
+        "$ARGUMENTS\n",
+        encoding="utf-8",
+    )
+
+    # 参考文档：规则的唯一出处，内容刻意反常识
+    (pack / "reference.md").write_text(
+        "# 内部命名约定（v2）\n\n"
+        "本组所有**模块级常量**一律按下面三条命名，三条缺一不可：\n\n"
+        f"1. 以 `{HOUSE_RULE_MARKER}` 前缀开头（小写，含下划线）；\n"
+        "2. 前缀之后的主体部分全部**大写**，词与词之间用下划线分隔；\n"
+        f"3. 以 `{HOUSE_RULE_SUFFIX}` 结尾。\n\n"
+        f"例：表示重试次数的常量应写作 `{HOUSE_RULE_MARKER}RETRY_COUNT{HOUSE_RULE_SUFFIX}`。\n\n"
+        "> 这三条是 v2 版约定，与 v1（全大写、无前后缀）不兼容，不要混用。\n",
+        encoding="utf-8",
+    )
+
+    # 模板文件：只为让随附资源清单不止一条，验证清单确实枚举了整个目录
+    (pack / "template.py").write_text(
+        '"""模块级常量模板。"""\n\n'
+        f"{HOUSE_RULE_MARKER}EXAMPLE_NAME{HOUSE_RULE_SUFFIX} = 0\n",
+        encoding="utf-8",
     )
