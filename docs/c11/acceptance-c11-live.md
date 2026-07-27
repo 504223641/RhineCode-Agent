@@ -24,16 +24,20 @@
 | 场景 | 判据 | 结果 |
 | --- | --- | --- |
 | 1 共享模式全流程 | 7/7 | ✅ |
-| 2 独立模式隔离 | — | 见下 |
+| 2 独立模式隔离 | 5/5 | ✅ |
 | 3 模型自主两阶段加载 | 5/5 | ✅ |
 | 4 白名单收窄可观测 | 6/6 | ✅ |
-| 5 热更新 | — | 见下 |
+| 5 热更新 | 3/3 | ✅ |
 | 6 启动 fail-fast | 5/5 | ✅ |
-| 7 第三方内容可见性 | — | 见下 |
-| 8 短命令被内置占用 | — | 见下 |
-| 9 运行中的输入反馈 | — | ⏸ P1a 驱动不了（见「未跑的场景及原因」） |
-| 10 Plan Mode 交互 | — | 见下 |
-| 11 目录型 Skill 能力包 | — | 见下 |
+| 7 第三方内容可见性 | 3/3 | ✅ |
+| 8 短命令被内置占用 | 3/3 | ✅ |
+| 9 运行中的输入反馈 | — | ⏸ P1a 结构上驱动不了（见文末） |
+| 10 Plan Mode 交互 | 3/3 | ✅ |
+| 11 目录型 Skill 能力包 | 3/3 | ✅ |
+
+**已跑 10 条 / 共 43 项判据全部通过**，未发现需要修改的产品缺陷。
+顺带产出三条别的结论：两处 checklist 措辞过时（已改）、一处已知工程项的
+真实观测样本、一处 P1a 自身的能力缺口（推给 P1b）。
 
 ---
 
@@ -385,6 +389,303 @@ seq=97  tool_execute  write_file · ok=True · outcome=executed
 
 ---
 
+## 场景 2：独立模式隔离
+
+预置：`seed_commit_repo`（有真实未提交改动的 git 仓库），跑内置的 `/review`。
+
+### ① 子对话的工具调用逐个出现在界面（进度可见）
+
+**机器判到了什么**：整场 6 轮、14 次工具执行，全部落在 `isolated:review` 作用域，
+且每一步都产出了界面消息：
+
+```
+ 7  isolated:review  agent_event   progress · iteration=1
+15  isolated:review  ui_message    [assistant] 我先获取工作区的改动范围。
+16  isolated:review  tool_execute  run_command · executed · ok=True · 退出码 0 · 输出 38 行
+23  isolated:review  ui_message    [system] 🔄 第 2 轮
+30  isolated:review  ui_message    [assistant] 有两个文件的未暂存改动，我来逐一读取完整上下文。
+…
+60  isolated:review  context_compaction  第一层存盘 3 个
+62  isolated:review  ui_message    [system] 📦 已把 3 个大型工具结果存盘，历史仅保留预览与路径。
+```
+
+**判断**：子对话的每一轮推进、每一段推理正文、每一次工具调用都渲染到了界面上
+——「进度可见」成立，不是跑完才吐一坨。顺带还验到了 spec 里那条
+「子对话参与 C8 第一层、不参与第二层」：seq=60 的存盘发生在 `isolated:review`
+作用域内，全场没有任何 `layer=summary` 的记录。通过。
+
+### ② 主作用域干净
+
+**机器判到了什么**：`main` 作用域在这一整场里只有 6 条事件——
+`user_input` / `ui_message(user_echo)` / `command_dispatch` 三条在前，
+`agent_event(finished)` / `ui_message(assistant 结论)` / `status_bar` 三条在后。
+**`main` 里的 `api_request` 与 `tool_execute` 均为 0 条。**
+
+**判断**：子对话完全不污染主作用域。通过。
+
+### ③ `/context` 没被撑大
+
+**机器判到了什么**：子对话读了 2 个文件、跑了 4 次 grep、2 次 glob、2 次 git 命令，
+其中 3 个结果大到触发了第一层存盘。跑完之后：
+
+```
+📊 上下文用量（近似估算）
+  估算 token：606
+  窗口上限：1000000
+  已存盘工具结果：3 个
+```
+
+**判断**：**606 token**——主上下文里只有那两条配对消息的体量，
+十几次工具往返一个字都没留下。这正是独立模式存在的理由。通过。
+
+### ④ 主历史恰好是那对配对消息
+
+**机器判到了什么**（直接读会话存档 JSONL，共 2 行）：
+
+```
+role=user       display_content=/review 审阅当前工作区的改动
+                content=执行 Skill /review（审查当前改动并只回流结论） 参数：审阅当前工作区的改动
+role=assistant  content=（1752 字符的审查结论）
+```
+
+**判断**：**恰好两条**，且 user 那条是「界面显示原始输入 / 模型历史存自包含文本」
+的双内容形态。通过。
+
+### ⑤ `/resume` 回放确认
+
+**机器判到了什么**：`/clear` 开新档后 `/resume`，面板列出
+
+```
+1. 20260728-062755-n846 · 2026-07-28 06:28 · 2 条 · [dim]/review 审阅当前工作区的改动[/dim]
+```
+
+选中载入后：
+
+```
+112  skill_state       清空激活态（移除 0）
+113  history_restored  resume_command · 2 条 · session 20260728-062755-n846
+```
+
+**判断**：存档里就是 2 条，标题取的是 `display_content`（用户原始输入）而非
+自包含文本。另外顺带看到 `/resume` 成功分支确实清空了激活态（C11 的 N4 要求）。通过。
+
+---
+
+## 场景 5：热更新
+
+在一个已经跑起来的宿主里做三步文件操作，**全程不重启**。
+
+### ① 新建文件 → reload → 立即可用
+
+**机器判到了什么**：
+
+```
+（写入 .rhinecode/skills/greet.md 之前）
+/greet 你好   →  未知命令：/greet。输入 /help 查看可用命令。      ← 先证明它本来不存在
+
+（写入之后）
+/skills reload  →  Skill 定义已重新加载。
+                   新增：greet
+/help           →  /greet — 打个招呼（热更新演示）
+                        类型：提示词 · 用法：/greet [参数] · 参数：[参数]
+/greet 介绍一下你自己  →  【甲】我是 Rhine，一个运行在终端里的 AI 编程助手…
+```
+
+**判断**：先跑一次「还不存在」再跑「已存在」，避免把「本来就有」误当成「热更新生效」。
+短命令进了注册表（`/help` 与 Tab 补全读的是同一份注册表；Tab 的按键路径本身有
+`tests/test_skill_tui.py` 的自动化护栏钉着）。执行结果带 `【甲】` 标记，
+说明正文确实被注入了。通过。
+
+> 正文里那句「回复必须以 `【甲】` 开头」是刻意设计的**机械判据**：
+> 让「行为有没有随正文改变」变成一个字符串比对，而不是去品「回答风格好像变了」。
+
+### ② 改正文 → reload → 已激活的正文换新，行为随之改变
+
+**机器判到了什么**（把标记从 `【甲】` 改成 `【乙】` 后 reload）：
+
+```
+/skills reload  →  Skill 定义已重新加载。
+                   （Skill 列表无变化；已激活 Skill 的正文按最新定义生效）
+
+/skills prompt  →  ===== Skill 指令开始：greet =====
+                   回复时**必须**以 `【乙】` 这四个字符开头，然后再写正文。
+                   不要调用任何工具，直接回答。
+
+                   介绍一下你自己          ← 沿用了**上一次**的参数
+                   ===== Skill 指令结束：greet =====
+
+（随后发一条普通消息）再说一句  →  【乙】好的，有什么需要帮忙的随时说。
+```
+
+**判断**：三件事同时成立——注入正文换成了新版、`$ARGUMENTS` 沿用最后一次的参数、
+模型的实际输出从 `【甲】` 变成 `【乙】`。这条同时覆盖了 checklist 第七节
+「沿用最后一次的参数完成占位符替换」那一项。通过。
+
+### ③ 删除文件 → reload → 自动卸载并提示
+
+**机器判到了什么**：
+
+```
+278  skill_state  reload · added=[] · removed=['greet'] · auto_deactivated=['greet'] · active=[]
+279  ui_message   Skill 定义已重新加载。
+                  移除：greet
+                  已自动卸载（定义已消失）：greet
+280  status_bar   … | 权限模式：默认                              ← Skill 段消失
+282  /greet 还在吗  →  未知命令：/greet。                          ← 短命令一并注销
+```
+
+**判断**：四样都对——移除、自动卸载、状态栏收段、短命令注销。
+最后一条尤其值得留意：短命令的注销证明 `replace_skill_commands` 是**整体替换**
+而不是只增不减。通过。
+
+---
+
+## 场景 10：Plan Mode 与独立模式的交互
+
+> ⚠️ **这条场景不能用内置的 `review` 跑**（实测踩过，checklist 已据此加注）。
+> `review` 是纯分析任务，模型看完 diff 直接给结论，**根本没有「计划」可提**，
+> 于是审批面板一次都不弹。这不是产品的问题，是场景设计的问题——
+> Plan Mode 的「先规划、再批准、后执行」只有在任务确实有副作用时才有意义。
+> 故新增 `seed_plan_skill`：一个**必须动手改代码**的独立模式 Skill。
+
+### ① 子对话先给出计划并弹审批面板
+
+**机器判到了什么**：
+
+```
+309  isolated:fixit  progress · iteration=1
+316  isolated:fixit  tool_execute  read_file · ok=True          ← 先调研
+322  isolated:fixit  api_response  turn 2 · 文件很短，结构清晰。下面是执行计划。
+323  isolated:fixit  agent_event   tool_start · tool_name=present_plan
+面板：📋 计划已就绪，是否开始执行？   选项 yes / no
+```
+
+**判断**：子对话继承了主对话的 Plan Mode（面板确实弹在 `isolated:fixit` 这一轮里），
+调研在前、`present_plan` 在后。通过。
+
+### ② 拒绝 → 主历史得到「计划未获批准」而非半截结论
+
+**机器判到了什么**（记录 + 会话存档双证）：
+
+```
+325  isolated:fixit  interaction   approve → False · ## 调研结论 …
+327  main            agent_event   notice · 计划未获批准，本次 Skill 未执行。
+328  main            ui_message    计划未获批准，本次 Skill 未执行。
+
+会话存档末两行：
+  role=user       display=/fixit 给 app/session.py 的 Session 类补一个 reset() 方法…
+  role=assistant  content=计划未获批准，本次 Skill 未执行。
+```
+
+**判断**：这一条是本场景的核心。子对话里模型已经写出了一大段「调研结论 + 计划」，
+界面上也显示了（seq=330），**但回流进主历史的不是那段文字，而是那句哨兵**。
+如果实现偷懒回流「最后一条非空 assistant 正文」，主历史里就会躺着一段
+看起来像结论、其实计划根本没被批准的文字——那是最坏的形态，因为它在
+`/resume` 之后完全看不出来。配对结构仍成立（恰好两条）。通过。
+
+### ③ 再跑一次并批准 → 正常执行并回流结论
+
+**机器判到了什么**：
+
+```
+面板 approve → yes
+面板 confirm → ⚠ 确认执行：edit_file(path=app/session.py, old_string=…, new_string=…)
+会话存档 assistant：**改动摘要**：在 `app/session.py:11-13` 为 `Session` 类新增了
+                    `reset()` 方法，将 `self.remaining` 重置为初始值 `30`…
+```
+
+文件确实被改了：
+
+```python
+    def reset(self) -> None:
+        """将会话剩余时间重置为初始值。"""
+        self.remaining = 30
+```
+
+**判断**：获批后进入执行阶段，写工具照常走第⑤层确认，结论正常回流，改动真的落盘。通过。
+
+---
+
+## 场景 11：目录型 Skill 能力包
+
+预置：`seed_capability_pack` —— 在**用户级**目录放一个目录型 Skill：
+
+```
+<user_dir>/skills/naming/
+    SKILL.md      ← 入口。正文刻意**不写规则本身**，只说「去读 reference.md」
+    reference.md  ← 规则的唯一出处
+    template.py   ← 模板，只为让随附清单不止一条
+```
+
+规则刻意做成**模型不可能猜到**的样子（`rc_` 小写前缀 + 主体全大写 + `_V2` 后缀）。
+模型若答对了，就只可能是真读到了那份文档——这是这条场景可证伪的关键。
+
+### ① 资源目录绝对路径与随附文件清单确实注入了
+
+**机器判到了什么**（`/skills prompt` 的激活正文段末尾）：
+
+```
+### 本 Skill 的随附资源
+
+资源目录：`C:\…\rhine_e2e_user_dww24g0y\skills\naming`
+
+可用文件（相对资源目录）：
+- reference.md
+- template.py
+
+注意：该目录在项目工作区之外，**不支持 glob/grep 枚举**，请按上述清单用绝对路径直接 read_file 读取。
+```
+
+**判断**：绝对路径、文件清单、以及「为什么不能 glob」的说明三样俱全。
+最后那句尤其重要——没有它，模型会先去 glob 一遍、失败、再猜，白烧轮次
+（CLAUDE.md 里记着的那条实测教训的同型问题）。通过。
+
+### ② 模型按清单读到了工作区外的文档，并据以作答
+
+**机器判到了什么**（两次 `read_file` 的参数，都是工作区外的绝对路径）：
+
+```
+{'path': 'C:\…\rhine_e2e_user_dww24g0y\skills\naming\reference.md'}
+{'path': 'C:\…\rhine_e2e_user_dww24g0y\skills\naming\template.py'}
+```
+
+最终回答：
+
+```
+根据 `reference.md` 的命名约定（v2），模块级常量的命名必须满足三条：
+1. 以 `rc_` 前缀开头
+2. 主体部分全部大写，词间用下划线分隔
+3. 以 `_V2` 结尾
+
+「最大重试次数」对应的英文是 `MAX_RETRY_COUNT`。
+组合起来，名字应为：  rc_MAX_RETRY_COUNT_V2
+
+**依据**：`reference.md` 第 5-7 行的三条规则，以及第 9 行的示例 `rc_RETRY_COUNT_V2`。
+```
+
+**判断**：`rc_MAX_RETRY_COUNT_V2` 三条规则全中，还引了行号。这个名字的形态
+（小写前缀 + 大写主体 + 版本后缀）**违反一切通行的 Python 命名习惯**，
+不可能是模型的先验偏好，只能来自那份文档。**工作区外目录的只读放行确实生效。**通过。
+
+### ③ 只读放行的边界没有被放宽（**反证**）
+
+上一条只证明了「能读到」，没证明「没读多」。所以补一条反证：
+让模型去读**同一个 `user_dir` 下、但在 `skills/` 之外**的一个文件。
+
+**机器判到了什么**：
+
+```
+permission_decision  read_file → deny（sandbox）
+                     路径越界，超出项目工作目录：C:\…\rhine_e2e_user_dww24g0y\.rhine-e2e-workspace
+tool_execute         read_file · denied_by_permission · ok=False
+```
+
+**判断**：白名单放行的是 **Skill 资源目录**，不是整个用户目录——
+差一层目录就被第②层沙箱拦下。与安全边界所述「只对 read 类判定生效、
+不扩大沙箱其它面」一致。通过。
+
+---
+
 ## 场景 6：启动 fail-fast
 
 预置一对**只差一个字母**的孪生工作区，唯一变量就是那个笔误：
@@ -552,11 +853,85 @@ tool_names 含 mcp__mock__echo / mcp__mock__boom  ← 远端工具已注册
 
 ---
 
+## 未跑的一条：场景 9（运行中的输入反馈）
+
+**原因是 P1a 自身的结构限制，不是产品问题。**
+
+这条场景要验的是「Agent 循环运行期间 / 确认面板挂着时提交输入 → 出现可见提示
+而非毫无反应」。可 `DriverCore.send` 的**前置检查就写死了「只有 idle 时才能提交」**：
+
+```python
+if state != SessionState.IDLE.value:
+    return protocol.err("busy", f"会话当前处于 {state} 态，只有 idle 时才能提交", …)
+```
+
+于是驱动器在忙碌态下**根本递不进去**那次提交，产品侧的守卫自然也就无从触发
+——被拦下的是驱动器自己的守卫，不是被测的那个。控制通道也没有通用的按键注入
+指令（只有 `answer --via keys`，且它只按上下键与回车），所以绕不过去。
+
+**处置**：
+- 该行为**已有自动化护栏**：`tests/test_skill_tui.py` 用 Pilot 直接驱动键盘，
+  覆盖了「流式期间提交有可见提示」「确认面板挂着时提交提示『正在等待你的确认』」
+  「同一次忙碌期只提示一次」三条；
+- **给 P1b 记一笔能力缺口**：控制通道可以加一条「强制提交」（绕过 idle 前置检查，
+  专用于触发产品侧守卫）。它是五处成对维护点的改动（`protocol` / `control` /
+  `host.dispatch` / `client` / 测试），属于要动协议契约的改动，不在本轮验收里顺手做。
+
+---
+
+## 一处已知工程项的真实观测样本（不是新缺陷）
+
+验场景 10 时，先用内置 `review` 试了一次（后来才换成 `fixit`），过程中撞见一件事，
+值得记下来：**Plan Mode 的规划阶段，模型调用了一个本轮没发给它的非只读工具，
+而它被执行了。**
+
+```
+turn 7  scope=isolated:review
+        tool_names = ['read_file', 'glob_files', 'grep_content', 'ask_user', 'present_plan']
+                                     ↑ run_command 不在其中（它 read_only=False，被规划阶段滤掉了）
+
+seq=136 tool_execute  run_command · outcome=executed · ok=True
+        args={'command': 'cd … && git diff -- app/auth.py'}
+```
+
+**为什么没被 `out_of_scope` 拦下**（读代码确认过，不是猜的）：两处过滤的口径不同——
+
+- `loop._schema_for()` 算「本轮发什么 schema」时，规划阶段用
+  `registry.readonly_schemas()`，非只读工具在这里被滤掉；
+- `loop._execute()` 的越界判据是 `self._visible(tc.name, policy)`，
+  只查 **Skill 白名单**（`review` 的白名单里恰好有 `run_command`），
+  **不查规划阶段的只读过滤**。
+
+所以这是 C11 的 `out_of_scope` 守卫**职责之外**的事，不是它漏了。
+
+**它属于已登记的「已知后续工程项」第 2 条**——
+「Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具」。
+本次的价值是把那条从**理论隐患**变成了**有物证的真实观测**：
+真实模型确实会在规划阶段夹带非只读工具，而且参数完全合法。
+
+**风险有多大**：这次夹带的恰好是 `git diff`（无副作用），但同一条路径上完全可能是
+`git checkout --` 或别的写命令。缓解在于**五层管线一层没少**：它照样在第④层判为
+「问用户」并弹出了确认面板，是驱动器替人选了放行。真人在这里会看到
+`⚠ 确认执行：run_command(command=…)` 并有机会拒绝。
+
+**处置**：不在本轮改（改它要重新设计规划阶段的强校验口径，属「大改」），
+只把这次观测补进已知工程项第 2 条作为佐证。
+
+---
+
 ## 本次验收没有发现需要修改的产品缺陷
 
-三条场景 18 项判据全部一次通过，没有出现「小修」或「大改」级别的问题。
-新增的只有测试设施侧的 `tests/e2e/c11_scenarios.py`（预置，无剧本）。
+十条场景 43 项判据全部通过，没有出现「小修」或「大改」级别的产品问题。
+产品代码**一行未动**；新增的只有测试设施侧的 `tests/e2e/c11_scenarios.py`
+（只有预置、没有剧本）与两处 checklist 措辞订正。
 
-**一处值得记在这里的收获**（不是缺陷）：场景 4 ③ 让「白名单外调用」这条
-从**假模型的确定性复现**升级成了**真实模型的自发复现**。P0 立项时那个
-「模型调用了本轮没发给它的工具」的动因，至此在两种模型上都有了物证。
+三条值得单独记住的收获：
+
+1. **场景 4 ③**：「白名单外调用」从**假模型的确定性复现**升级成了**真实模型的自发
+   复现**。P0 立项时那个「模型调用了本轮没发给它的工具」的动因，至此在两种模型上
+   都有了物证。
+2. **场景 7 / 8**：checklist 写的「启动有提示/警告」与实现不符，而**实现是对的那一边**
+   ——启动阶段的 `print` 会被 alternate screen 盖住，等于没提示。改的是 checklist。
+3. **场景 10**：用内置 `review` 验 Plan Mode 是**场景设计错误**——纯分析任务没有
+   「计划」可提，面板永远不弹。这类「场景本身构造不出被测状态」的失败，
+   和产品坏掉长得一模一样，值得在 checklist 里写死做法（已加注）。
