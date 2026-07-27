@@ -69,6 +69,8 @@ from rhinecode.skills.validation import (
     prune_mcp_tool_names,
 )
 from rhinecode.tools.policy import ToolPolicy
+# trace 是只依赖标准库的叶子包，从 skills 依赖它不会形成环
+from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol
 
 # 豁免工具白名单收窄的工具名（spec F8/F15）。
 # `load_skill` 若被白名单挡住，模型就再也没法加载其它 Skill 了；
@@ -106,6 +108,7 @@ class SkillManager:
         builtin_dir: Optional[Path],
         has_short_command: Callable[[str], bool],
         notify_activation: Optional[Callable[[], None]] = None,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
     ) -> None:
         """
         :param project_root: 项目根（扫描 `<root>/.rhinecode/skills`）
@@ -119,10 +122,15 @@ class SkillManager:
             这比指向一个不存在的命令更糟。
         :param notify_activation: 激活成功后的通知回调（TUI 用它立刻刷新状态栏）。
             可在构造后作为属性注入，与 c9 `memory_manager.notify` 同形态。
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
+            **不传等于零回归**。注意它必须排在 `notify_activation` **之后**——
+            插进既有位置参数之间会打断
+            `SkillManager(root, user_dir, builtin, has_short_command)` 这类调用方。
 
         本构造函数**不扫盘**——扫盘发生在 `startup()`。这样构造是廉价且无副作用的。
         """
         self._project_root = project_root
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         self._user_dir = user_dir
         self._builtin_dir = builtin_dir
         self._has_short_command = has_short_command
@@ -214,6 +222,14 @@ class SkillManager:
             )
             self._runtime_warnings.extend(warnings)
 
+        # 白名单的最终计算结果只在这里记一次（启动一次），不在每轮的 tool_policy 里记。
+        self._trace_state(
+            "bind_tools",
+            skills=[s.name for s in pruned],
+            allowed_tools={s.name: list(s.allowed_tools) for s in pruned if s.allowed_tools},
+            prune_warnings=list(warnings),
+        )
+
     def reload(
         self, known: frozenset[str], registered: frozenset[str]
     ) -> ReloadOutcome:
@@ -282,6 +298,16 @@ class SkillManager:
             # 正文的更新由 active_text() 每轮从 catalog 现取自动完成（F27），
             # 这里什么都不用做——这正是「ActiveSkill 不存正文」的收益。
 
+        self._trace_state(
+            "reload",
+            added=sorted(new_names - old_names),
+            removed=sorted(old_names - new_names),
+            auto_deactivated=sorted(auto_deactivated),
+            dropped_fatal=sorted(fatal_names),
+            warning_count=len(warnings),
+            active=self._active_snapshot(),
+        )
+
         return ReloadOutcome(
             added=tuple(sorted(new_names - old_names)),
             removed=tuple(sorted(old_names - new_names)),
@@ -290,6 +316,38 @@ class SkillManager:
             warnings=tuple(warnings),
             errors=new_catalog.errors,
         )
+
+    # ────────────────────── 行为记录埋点（trace）──────────────────────
+    #
+    # ⚠️ **全部 skill_state 埋点必须在 `self._lock` 临界区之外。**
+    # 这不是风格偏好，而是本模块的加锁不变量（见模块 docstring）：临界区内做回调
+    # → 回调走 Textual 的阻塞式 `call_from_thread` → 主线程醒来后要申请同一把锁
+    # → 双向等待、整个界面冻结。记录器的 emit 本身不回调，但把它放进临界区
+    # 就等于给「临界区内只做纯内存读写」这条不变量开了一个口子，下一个人照抄时
+    # 很容易把回调也塞进去。宁可结构上不给这个机会。
+    #
+    # **明确排除 `tool_policy()`**：它被 `RunOptions.tool_policy` 回调**每轮**调用，
+    # 埋进去会每轮刷一条 skill_state、把整条时间线淹掉。白名单的计算结果只在
+    # `bind_tools`（启动一次）记一次。
+
+    def _trace_state(self, action: str, **extra) -> None:
+        """
+        记一条 `skill_state` 事件。**只能在锁外调用。**
+
+        :param action: 动作名（activate / deactivate / clear_active / reload / bind_tools）
+        :param extra: 该动作特有的字段
+
+        副作用：产出一条 trace 事件；失败被 recorder 内部吞掉。
+        """
+        self._recorder.emit(
+            TraceEventType.SKILL_STATE,
+            action=action,
+            **extra,
+        )
+
+    def _active_snapshot(self) -> list[str]:
+        """当前激活列表的名字快照（顺序即注入顺序）。只读引用，不持锁。"""
+        return [a.name for a in list(self._active)]
 
     # ────────────────────────── 激活 ──────────────────────────
 
@@ -340,7 +398,14 @@ class SkillManager:
                 self._active.append(ActiveSkill(name=name, arguments=arguments))
             degrade = self._degrades.get(name)
 
-        # ── ④ 通知与返回（锁外）──
+        # ── ④ 埋点、通知与返回（锁外）──
+        self._trace_state(
+            "activate",
+            skill=name,
+            arguments=arguments,
+            degrade=degrade.value if degrade is not None else None,
+            active=self._active_snapshot(),
+        )
         # 回调失败绝不能影响激活结果：激活本身已经成功了，
         # 一次状态栏没刷新不值得把成功报告成失败（何况 _do_stream 的 finally
         # 里还会再刷一次）。
@@ -361,23 +426,41 @@ class SkillManager:
         :param name: 要卸载的名字；**None 表示全部卸载**
         :returns: 供界面显示的结果文本
 
-        副作用：修改 `_active` 与 `_degrades`。
+        副作用：修改 `_active` 与 `_degrades`；产出一条 skill_state 事件。
+
+        结构说明：本方法原先四个 `return` **全在 `with self._lock:` 内**。
+        为满足「埋点必须在锁外」的不变量，改成「锁内算出结果 → 出锁 → 埋点 → 返回」。
+        返回值语义一字未变。
         """
         with self._lock:
             if name is None:
                 count = len(self._active)
                 self._active.clear()
                 self._degrades.clear()
-                if count == 0:
-                    return "当前没有已激活的 Skill。"
-                return f"已卸载全部 {count} 个 Skill。"
+                removed = count
+                message = (
+                    "当前没有已激活的 Skill。"
+                    if count == 0
+                    else f"已卸载全部 {count} 个 Skill。"
+                )
+            else:
+                removed = 0
+                message = f"Skill `{name}` 当前未激活。"
+                for i, item in enumerate(self._active):
+                    if item.name == name:
+                        del self._active[i]
+                        self._degrades.pop(name, None)
+                        removed = 1
+                        message = f"已卸载 Skill `{name}`。"
+                        break
 
-            for i, item in enumerate(self._active):
-                if item.name == name:
-                    del self._active[i]
-                    self._degrades.pop(name, None)
-                    return f"已卸载 Skill `{name}`。"
-            return f"Skill `{name}` 当前未激活。"
+        self._trace_state(
+            "deactivate",
+            skill=name,
+            removed_count=removed,
+            active=self._active_snapshot(),
+        )
+        return message
 
     def clear_active(self) -> None:
         """
@@ -385,11 +468,17 @@ class SkillManager:
 
         与 `deactivate(None)` 的区别只在于不产出文本——调用方是流程而非用户命令。
 
-        副作用：清空 `_active` 与 `_degrades`。
+        副作用：清空 `_active` 与 `_degrades`；产出一条 skill_state 事件。
+
+        **本方法的埋点不可漏**：`/clear` 与 `/resume` 都调它清激活态，
+        而那正是 trace spec F16 要记的「激活列表变化」。
         """
         with self._lock:
+            count = len(self._active)
             self._active.clear()
             self._degrades.clear()
+
+        self._trace_state("clear_active", removed_count=count, active=[])
 
     # ────────────────────── 注入（每轮调用）──────────────────────
 

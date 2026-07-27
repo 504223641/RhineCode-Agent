@@ -89,11 +89,34 @@ class CommandWiringStructureTests(unittest.TestCase):
         self.assertIn("_session_panel_active", on_key)
 
     def test_session_panel_calls_resume_session_without_slash_text(self) -> None:
-        """SessionPanel 选中路径直调 resume_session，不拼接 "/resume ..." 文本。"""
+        """
+        SessionPanel 选中路径直调 resume_session，不拼接 "/resume ..." 文本。
+
+        P1a 起该调用下移了一层：选中分支只调 `_settle_session`，由它统一
+        埋点 + 关面板 + 载入（两条结算路径共用同一份实现）。断言随之跟到那一层，
+        「不伪造斜杠文本」这条要求本身一字未变。
+        """
         selected = self._method_source("on_option_list_option_selected")
-        self.assertIn("resume_session", selected)
-        self.assertNotIn('f"/resume', selected)
-        self.assertNotIn("'/resume", selected)
+        self.assertIn("_settle_session", selected, "选中路径必须走会话结算的唯一入口")
+        settle = self._method_source("_settle_session")
+        self.assertIn("resume_session", settle)
+        for source in (selected, settle):
+            self.assertNotIn('f"/resume', source)
+            self.assertNotIn("'/resume", source)
+
+    def test_settle_session_is_the_single_entry(self) -> None:
+        """
+        `_settle_session` 是会话面板结算的**唯一入口**，且带幂等守卫。
+
+        两条既有路径（选中 / Esc 取消）都必须经由它；缺了幂等守卫，
+        驱动设施退出时的强制结算会在没有面板时凭空多埋一条交互事件。
+        """
+        settle = self._method_source("_settle_session")
+        self.assertIn("_session_panel_active", settle, "第一行必须是幂等守卫")
+        self.assertIn("INTERACTION", settle, "埋点收拢在此")
+        self.assertIn("_close_session_panel", settle)
+        cancelled = self._method_source("on_session_panel_cancelled")
+        self.assertIn("_settle_session", cancelled)
 
     def test_app_implements_controller_surface(self) -> None:
         """CommandController 协议的关键能力在 App 上都有实现（C79 静态面）。"""

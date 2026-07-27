@@ -21,6 +21,7 @@ Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_ph
 """
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
@@ -44,6 +45,23 @@ from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
 from rhinecode.permission import Decision, DecisionResult, PermissionEngine, to_request
+from rhinecode.trace import (
+    SCOPE_MAIN,
+    NullRecorder,
+    TraceEventType,
+    TraceRecorderProtocol,
+    clip,
+)
+
+# ── 工具执行的结局取值（trace）──
+# 埋 tool_execute 时用它区分「为什么这次调用是这个结果」。读 trace 时只看 ok=False
+# 分不出「权限拒了」「用户拒了」「工具本身报错」，而这三者的排查方向完全不同。
+OUTCOME_EXECUTED = "executed"                    # 真的跑了（不论 ok 真假）
+OUTCOME_OUT_OF_SCOPE = "out_of_scope"            # 工具存在但本轮没发给模型（Skill 白名单）
+OUTCOME_UNKNOWN_TOOL = "unknown_tool"            # 注册中心里没有这个工具
+OUTCOME_INVALID_ARGUMENTS = "invalid_arguments"  # 模型生成的参数 JSON 非法
+OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
+OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
 MAX_ITERATIONS = 25
@@ -132,13 +150,105 @@ class Agent:
     会话级状态（如「免确认」）由上层封进 confirm 闭包，Plan Mode 开关由上层按消息传入。
     """
 
-    def __init__(self, provider: BaseProvider, registry: Optional[ToolRegistry]):
+    def __init__(
+        self,
+        provider: BaseProvider,
+        registry: Optional[ToolRegistry],
+        recorder: "Optional[TraceRecorderProtocol]" = None,
+    ):
         """
         :param provider: 已实例化的 Provider，负责实际 API 调用
         :param registry: 工具注册中心；为 None 时不向模型暴露任何工具（退化为纯对话循环）
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
+                         **不传等于零回归**——本类的全部埋点都变成空调用
         """
         self._provider = provider
         self._registry = registry
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
+
+    # ------------------------------------------------------------------ #
+    # 行为记录埋点（trace）
+    # ------------------------------------------------------------------ #
+    def _trace_tool(
+        self,
+        tc: ToolCall,
+        res: ToolResult,
+        outcome: str,
+        duration_ms: float = 0,
+        is_concurrent: bool = False,
+    ) -> None:
+        """
+        记一条 `tool_execute` 事件。八处 `results[tc.id]` 写入点共用本方法。
+
+        :param tc: 工具调用
+        :param res: 执行结果（未执行的分支也有结构化结果）
+        :param outcome: 六个 OUTCOME_* 之一，说明「为什么是这个结果」
+        :param duration_ms: 实际执行耗时（毫秒，**保留三位小数**）；
+            `outcome != executed` 时按约定记 0。
+            为什么不取整：读小文件常在 1 毫秒内完成，取整后一律显示 `0ms`，
+            与「计时压根没生效」无法区分（手测场景 1 里五条 read_file 全是 0ms，
+            当时确实要多看一眼才能确认不是 bug）。保留小数则显示 `0.412ms`，
+            一眼就知道是真的快
+        :param is_concurrent: 是否走了只读并发桶
+
+        走 `emit_lazy` 是因为负载里的 `output` 可能很大（一次 `read_file` 就是整份文件），
+        关闭记录时不该白 `clip` 一遍（spec N1）。
+
+        副作用：产出一条 trace 事件；**任何异常都被吞掉**，不影响循环。
+        """
+        self._safe_emit_lazy(
+            TraceEventType.TOOL_EXECUTE,
+            lambda: {
+                "tool": tc.name,
+                "tool_call_id": tc.id,
+                "arguments": clip(tc.arguments) if tc.arguments is not None else None,
+                "ok": res.ok,
+                "summary": res.summary,
+                "output": clip(res.output),
+                "duration_ms": duration_ms if outcome == OUTCOME_EXECUTED else 0,
+                "is_concurrent": is_concurrent,
+                "outcome": outcome,
+            },
+        )
+
+    # 本层的四个「受保护漏斗」。
+    #
+    # 记录器**自己**已经保证 emit 不抛（见 recorder.py 的 try/except），所以这一层
+    # 看起来像是多余的保险。它存在的理由是本层的特殊性：Agent Loop 是**唯一会把
+    # 异常变成「工具结果」回灌给模型**的地方——只读并发桶里的异常会被
+    # `future.result()` 抓住并包成「工具执行异常: …」交给模型。于是「日志写不进去」
+    # 会伪装成「你的工具坏了」，模型开始绕路重试，一个纯观测设施变成了行为污染源
+    # （trace spec AC6 就是为这条风险设的护栏）。
+    #
+    # 把防护收在四个漏斗里（而不是在二十来个埋点处各写一次 try）：本文件的全部
+    # 埋点调用都只经这几个方法，一处加固即全层生效。
+    def _safe_emit(self, type, **payload) -> None:
+        """记一条事件，吞掉任何异常（含记录器实现本身抛错的情形）。"""
+        try:
+            self._recorder.emit(type, **payload)
+        except Exception:
+            pass
+
+    def _safe_emit_lazy(self, type, factory) -> None:
+        """记一条昂贵负载事件，吞掉任何异常。"""
+        try:
+            self._recorder.emit_lazy(type, factory)
+        except Exception:
+            pass
+
+    def _safe_scope(self) -> str:
+        """读当前作用域，失败时退回主作用域（不让观测把主流程带下水）。"""
+        try:
+            return self._recorder.current_scope()
+        except Exception:
+            return SCOPE_MAIN
+
+    def _safe_bind(self, name: str) -> None:
+        """绑定作用域，吞掉任何异常。**池线程入口必须用它。**"""
+        try:
+            self._recorder.bind_scope(name)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 工具集策略
@@ -532,7 +642,30 @@ class Agent:
                 serial.append((tc, tool, None))
                 continue
             # 权限决策：规范化 → engine.decide。
-            decision = engine.decide(to_request(tool, tc.arguments, engine.mode))
+            request = to_request(tool, tc.arguments, engine.mode)
+            decision = engine.decide(request)
+            # 权限决策埋点（trace F14）。
+            #
+            # **为什么只埋这一处**：`engine.decide` 在生产代码里还有另一个调用点——
+            # 协调层注入给 `glob_files` / `grep_content` 的逐文件过滤器。一次 grep
+            # 会触发几百次判定，埋进去会把整条时间线淹掉；而且它判的是「这个文件
+            # 要不要出现在结果里」，不是「这次工具调用放不放行」，语义也不同。
+            #
+            # **为什么埋在调用点而不是引擎内部**：保持 `permission/` 包「纯判定、
+            # 无副作用」的既有性质（`decide` 的 docstring 明写「副作用：无」）。
+            # 把埋点塞进引擎会让那句话变成假话，而权限层是安全边界，它的可预测性
+            # 比少写一行埋点重要。
+            self._safe_emit(
+                TraceEventType.PERMISSION_DECISION,
+                tool=tc.name,
+                tool_call_id=tc.id,
+                kind=request.kind,
+                specifier=request.specifier,
+                is_read_only=request.is_read_only,
+                decision=decision.decision.value,
+                layer=decision.layer.value,
+                reason=decision.reason,
+            )
             if decision.decision == Decision.ALLOW and tool.read_only:
                 readonly.append((tc, tool))
             else:
@@ -552,6 +685,12 @@ class Agent:
                 summary="不在当前工具集内",
             )
             results[tc.id] = res
+            # ⚠️ **这条埋点的分量**：上面那段 `[工具不可用] … 当前可用工具：…` 原文，
+            # 是「模型调用了本轮没发给它的工具」这件事的**唯一物证**——
+            # 它既不在 `permission_decision` 里（压根没进引擎），
+            # 叠加 F17 的字段白名单后也不在 `agent_event` 里（那里只留工具名与 ok）。
+            # 漏埋这一条，本模块就查不出当初立项要查的那个问题。
+            self._trace_tool(tc, res, OUTCOME_OUT_OF_SCOPE)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 只读且放行：并发
@@ -559,6 +698,11 @@ class Agent:
             yield from self._run_readonly_concurrent(readonly, results)
 
         # 特殊工具：串行（需用户交互）
+        # 裁决（trace T31）：`_run_special`（ask_user / present_plan）内的两处
+        # `results[tc.id]` 写入点**刻意不产 `tool_execute`**。理由有二：
+        # ① 负载完全重叠——它们的输入输出由界面层的 `interaction` 事件承载，
+        #    重复携带违反 F17；② 它们语义上是「与用户交互」而不是「执行工具」，
+        #    混进 tool_execute 会让「工具跑了几次、多慢」这类统计失真。
         for tc in special:
             if cancel_event.is_set():
                 ctx.cancelled = True
@@ -676,15 +820,42 @@ class Agent:
             if not isinstance(tc.arguments, dict):
                 res = _invalid_args_result(tc)
                 results[tc.id] = res
+                self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS, is_concurrent=True)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         valid = [(tc, tool) for tc, tool in items if isinstance(tc.arguments, dict)]
         if not valid:
             return
 
+        # 提交任务**之前**捕获父作用域（trace T32）。
+        #
+        # 准确的理由（别写成「否则 tool_execute 会被记成 main」——那是错的）：
+        # 下面 `as_completed` 循环里的 `_trace_tool` 跑在**生成器所在的 Worker 线程**上，
+        # 作用域天然正确。真正跑在池线程里的埋点是 **`tool.execute` 内部产生的事件**
+        # ——今天唯一的实例是 `load_skill` → `SkillManager.activate` → `skill_state`。
+        # 本包装是纵深防御：兜住工具内部的埋点，并为将来在工具内部埋点留出正确语义。
+        # `threading.local()` 不跨线程继承，不显式传就没有别的办法。
+        parent_scope = self._safe_scope()
+        # 各调用的实际执行耗时（毫秒），由包装函数在池线程里填、主线程读。
+        # dict 的单键赋值在 CPython 下是原子的，且每个 tc.id 只被一个线程写一次。
+        durations: dict[str, float] = {}
+
+        def _run(tool: Tool, tc: ToolCall):
+            """池线程里的任务入口：绑定父作用域、计时，然后执行工具。"""
+            # 用 _safe_bind 而不是直接 bind_scope：这里是**唯一**「异常会被
+            # future.result() 变成工具结果回灌模型」的位置，必须绝对安全。
+            self._safe_bind(parent_scope)
+            t0 = time.monotonic()
+            try:
+                return tool.execute(tc.arguments)
+            finally:
+                # **不加 try/except 吞异常**：既有的 `future.result()` 兜底逻辑
+                # 不能变。埋点自身的异常由 recorder 内部兜住。
+                durations[tc.id] = round((time.monotonic() - t0) * 1000, 3)
+
         with ThreadPoolExecutor(max_workers=len(valid)) as executor:
             future_to_tc = {
-                executor.submit(tool.execute, tc.arguments): tc
+                executor.submit(_run, tool, tc): tc
                 for tc, tool in valid
             }
             for future in as_completed(future_to_tc):
@@ -694,6 +865,13 @@ class Agent:
                 except Exception as e:
                     res = ToolResult(ok=False, output=f"工具执行异常: {e}")
                 results[tc.id] = res
+                self._trace_tool(
+                    tc,
+                    res,
+                    OUTCOME_EXECUTED,
+                    duration_ms=durations.get(tc.id, 0),
+                    is_concurrent=True,
+                )
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
     def _run_one_serial(
@@ -722,6 +900,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = ToolResult(ok=False, output=f"未知工具: {tc.name}")
             results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_UNKNOWN_TOOL)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -730,6 +909,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = _invalid_args_result(tc)
             results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -741,6 +921,7 @@ class Agent:
                 summary="权限拒绝",
             )
             results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_DENIED_BY_PERMISSION)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -750,14 +931,20 @@ class Agent:
             if not approved:
                 res = ToolResult(ok=False, output="用户拒绝执行该工具。")
                 results[tc.id] = res
+                self._trace_tool(tc, res, OUTCOME_DENIED_BY_USER)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
                 return
 
         # 放行（ALLOW 或确认通过）：执行工具
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+        t0 = time.monotonic()
         try:
             res = tool.execute(tc.arguments)
         except Exception as e:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res
+        self._trace_tool(
+            tc, res, OUTCOME_EXECUTED,
+            duration_ms=round((time.monotonic() - t0) * 1000, 3),
+        )
         yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)

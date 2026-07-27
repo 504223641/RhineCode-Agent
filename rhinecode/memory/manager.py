@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from rhinecode.provider.base import BaseProvider, Message
+from rhinecode.trace import SCOPE_NOTES, NullRecorder, TraceRecorderProtocol
 from rhinecode.memory import lockfile
 from rhinecode.memory.instructions import LoadedInstructions, load_instructions
 from rhinecode.memory.session import SessionStore, SessionInfo
@@ -75,6 +76,7 @@ class MemoryManager:
         user_dir: Path,
         notes_enabled: bool,
         notify: Optional[Callable[[str], None]] = None,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
     ) -> None:
         """
         :param provider: Provider（笔记 LLM 调用复用 stream_chat）
@@ -83,7 +85,9 @@ class MemoryManager:
         :param user_dir: 用户级目录（~/.rhinecode）
         :param notes_enabled: 是否启用自动笔记（仅 DeepSeek 工具模式）
         :param notify: 界面通知回调（TUI 挂载后注入，线程安全由 TUI 侧保证）
+        :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
         """
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         self._provider = provider
         self._model = model
         self._project_root = project_root
@@ -280,6 +284,13 @@ class MemoryManager:
 
         副作用：一次 LLM 调用（tools=None）；memory 目录内写/删文件；notify 回调。
         """
+        # 笔记作用域绑定（trace F2）。本方法是 daemon 线程的目标函数，所以在函数体
+        # 第一行绑定一次就够——thread-local 天然把它与主对话线程隔开，不需要 `with`。
+        #
+        # ⚠️ **不要绑在 `on_natural_stop`**：那个方法跑在 Worker 线程上
+        # （由 `_wrap_events` 调用），绑在那里会把**主对话线程**永久标成 notes，
+        # 此后用户的每一条消息都会被记成笔记作用域。
+        self._recorder.bind_scope(SCOPE_NOTES)
         try:
             actions = self._decide_actions(new_msgs)
             if not actions:

@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import rhinecode.__main__ as entry
+import rhinecode.bootstrap as bootstrap
 from rhinecode.commands import build_builtin_registry
 from rhinecode.tools.registry import ToolRegistry
 
@@ -99,29 +100,33 @@ class SkillStartupTest(unittest.TestCase):
             m.memory_manager = MagicMock()
             return m
 
-        def fake_app(manager, config, command_registry):
+        def fake_app(manager, config, command_registry, **kwargs):
+            # **kwargs 是必须的：build_app 现在会额外传 recorder=（trace 设施）。
+            # 这不是弱化断言——该替身只做捕获，不校验参数。
             self.captured["command_registry"] = command_registry
             return self.app
 
         stderr = io.StringIO()
         code = None
         with (
+            # 装配用到的符号已随 build_app 迁到 bootstrap，故 patch 目标随之改到
+            # bootstrap；仍打在 entry 上的只有 load（配置加载没迁走）。
             patch.object(entry, "load", return_value=_fake_config()),
-            patch.object(entry, "create_provider", return_value=MagicMock()),
-            patch.object(entry.mcp_config, "load_all", return_value=({}, [])),
-            patch.object(entry, "MCPManager") as mcp_cls,
+            patch.object(bootstrap, "create_provider", return_value=MagicMock()),
+            patch.object(bootstrap.mcp_config, "load_all", return_value=({}, [])),
+            patch.object(bootstrap, "MCPManager") as mcp_cls,
             # 假的 MCPAddServerTool 必须有真实的 name：注册中心用 tool.name
             # 作键，MagicMock 的默认 name 是个 Mock 对象，会让
             # `mcp_add_server` 压根不在 known 里、被当成笔误。
             patch.object(
-                entry,
+                bootstrap,
                 "MCPAddServerTool",
                 return_value=_named_tool("mcp_add_server"),
             ),
-            patch.object(entry, "builtin_skills_dir", return_value=empty_builtin),
+            patch.object(bootstrap, "builtin_skills_dir", return_value=empty_builtin),
             patch.object(Path, "home", return_value=self.home),
-            patch.object(entry, "ConversationManager", side_effect=fake_conversation),
-            patch.object(entry, "RhineApp", side_effect=fake_app),
+            patch.object(bootstrap, "ConversationManager", side_effect=fake_conversation),
+            patch.object(bootstrap, "RhineApp", side_effect=fake_app),
             patch("sys.argv", ["rhine", "--config", "fake.yaml"]),
             redirect_stderr(stderr),
         ):

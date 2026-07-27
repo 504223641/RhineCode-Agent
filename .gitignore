@@ -31,3 +31,7 @@ TemText.txt
 **/.rhinecode/context/
 **/.rhinecode/sessions/
 **/.rhinecode/memory/
+# trace 行为记录（测试设施）：与会话存档同属敏感产物——里面有被读过的**文件内容**
+# 与命令输出，模型读过配置文件时还可能含**明文 API Key**。必须留在本机、勿外传。
+# `**/` 前缀与上面三行同口径，否则嵌套项目路径下失效。
+**/.rhinecode/traces/

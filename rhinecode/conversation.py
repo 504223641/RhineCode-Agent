@@ -41,6 +41,13 @@ from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.skills.manager import SkillManager
+from rhinecode.trace import (
+    NullRecorder,
+    TraceEventType,
+    TraceRecorderProtocol,
+    isolated_scope,
+)
+from rhinecode.trace.tracing_provider import TracingProvider
 from rhinecode.skills.models import (
     ActivationStatus,
     SKILL_MAX_ITERATIONS,
@@ -159,6 +166,9 @@ class ConversationManager:
         mcp_manager: "Optional[MCPManager]" = None,
         resume_latest: bool = False,
         skill_manager: "Optional[SkillManager]" = None,
+        user_dir: Optional[Path] = None,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
+        provider_factory: Optional[Callable[[Config], BaseProvider]] = None,
     ):
         """
         初始化对话管理器。
@@ -182,8 +192,41 @@ class ConversationManager:
 
             用 Null Object 而不是到处 `if self.skill_manager is not None`：
             各使用点无需散落判空，空实例的每个方法都返回「什么都没有」的安全值。
+        :param user_dir: 用户级目录（`~/.rhinecode` 的替身）。**必须可选、缺省等于现状**——
+                         为 None 时取 `Path.home() / ".rhinecode"`，行为与参数化之前
+                         逐字一致。改成必选会把回归面从零推到五个测试文件
+                         （`test_review_fixes` / `test_resume_replay` / `test_skill_isolated` /
+                         `test_skill_sandbox` / `test_memory_*` 都直接构造本类且都不传它）。
+                         给定时，用户级项目指令 / 笔记索引 / Skill 目录 / 权限规则四类内容
+                         一并改从该目录读取，使装配层能在临时目录里跑一次完整装配而不读
+                         真实主目录（trace spec F23）。
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`——
+                         **不传等于零回归**，全部埋点变成空调用。
+        :param provider_factory: 「怎么造一个模型客户端」的可替换实现，签名
+                         `(Config) -> BaseProvider`；缺省 `create_provider`（逐字等于现状）。
+
+                         **这是「换模型旁路」的注入点**：`_provider_for` 会在 Skill
+                         声明了 `model:` 时自己再造一个 Provider，那条路径完全绕开
+                         构造函数收到的 `provider` 参数。端到端驱动设施若只替换了
+                         `provider` 而没透传本参数，那条旁路会**静默连上真实网络**
+                         ——现象是「测试莫名其妙很慢、偶尔失败」，极难定位。
+                         （与 trace P0 的记录旁路是同一处：那次也是 `_provider_for`
+                         漏包 `TracingProvider` 导致换模型的请求整段不进记录。）
         """
         self._provider = provider
+        # 换模型旁路的工厂。**存 None 而不是在这里就 `or create_provider`**：
+        # 那样会把模块级的 `create_provider` 在**构造时**固化下来，而既有测试
+        # （`test_skill_isolated.py`）是在构造之后猴补 `conversation.create_provider`
+        # 模块属性来验证换模型行为的——固化会让那些猴补静默失效。
+        # 存 None、到 `_provider_for` 里再解析，两种用法就都成立。
+        self._provider_factory: Optional[Callable[[Config], BaseProvider]] = provider_factory
+        # 行为记录器：Null Object 兜底，各使用点无需判空（trace spec N1）
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
+        # 用户级目录：**必须在这里解析**，因为下面的 PermissionEngine.load 就要用它。
+        # （历史上这行赋值位于 PermissionEngine.load 之后、只服务 memory/skills，
+        #  参数化时若只改那一处，权限层拿不到 user_dir，「用户级权限规则不参与求值」
+        #  这条承诺会静默落空。）
+        self._user_dir: Path = user_dir if user_dir is not None else Path.home() / ".rhinecode"
         self._config = config
         # MCP 连接管理器：仅供 /mcp 命令与状态栏读取连接状态；工具走 registry，与此解耦。
         self._mcp_manager = mcp_manager
@@ -197,7 +240,7 @@ class ConversationManager:
         self.plan_mode: bool = False
         # 权限决策引擎（c6）：启动时加载三层 YAML 规则，持有权限模式与会话级规则。
         # 取代 c5 的「会话级一刀切免确认」标志——本会话放行改为按规则登记（见 _run 的 ask 闭包）。
-        self._engine: PermissionEngine = PermissionEngine.load()
+        self._engine: PermissionEngine = PermissionEngine.load(user_dir=self._user_dir)
         # 当前运行的取消信号；每次运行重建，置位即让循环尽快停止
         self._cancel_event: threading.Event = threading.Event()
 
@@ -211,7 +254,7 @@ class ConversationManager:
         if registry is not None:
             self._install_path_filters(registry)
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
-        self._agent = Agent(provider, registry)
+        self._agent = Agent(provider, registry, recorder=self._recorder)
 
         # 上下文压缩器（c8）：仅在工具可用模式构造——压缩的主要对象是工具结果，
         # 且循环/工具只在该模式存在。长期持有，跨消息累积估算锚点与熔断状态。
@@ -223,17 +266,20 @@ class ConversationManager:
                 config.model,
                 config.context_window,
                 workspace_root() / ".rhinecode" / "context",
+                recorder=self._recorder,
             )
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
         # 工具能力；自动笔记由 notes_enabled 门控（仅工具模式，F21）。
-        user_dir = Path.home() / ".rhinecode"
+        # user_dir 已在构造函数开头解析成 self._user_dir（权限层要先用），此处直接复用
+        user_dir = self._user_dir
         self.memory_manager = MemoryManager(
             provider,
             config.model,
             workspace_root(),
             user_dir,
             notes_enabled=self._tools_enabled,
+            recorder=self._recorder,
         )
         # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。
         # 注册本身无副作用（写类判定不受影响），无条件执行即可。
@@ -491,6 +537,16 @@ class ConversationManager:
             #
             # 载入**失败**时不清空：此时仍停留在原会话，激活态应当原样保持。
             self.skill_manager.clear_active()
+            # 历史恢复埋点（trace F16）。`origin` 区分两条来源：
+            # 这里是运行中的 `/resume`；另一条是启动时的 `--continue`
+            # （它在 ConversationManager 构造期间原地改写 history、一条事件都不产，
+            #  故由装配层单独补一条 origin="startup"，见 bootstrap.build_app）。
+            self._recorder.emit(
+                TraceEventType.HISTORY_RESTORED,
+                origin="resume_command",
+                message_count=len(self.history),
+                session_id=self.memory_manager.session_id,
+            )
             # 浅拷贝快照：防止后续 before_request 对 history 的原地重构影响回放内容
             yield AgentEvent(type=AgentEventType.HISTORY, messages=list(self.history))
         if ok and self._context_manager is not None:
@@ -690,7 +746,19 @@ class ConversationManager:
         cached = self._provider_cache.get(model)
         if cached is not None:
             return cached
-        provider = create_provider(dataclasses.replace(self._config, model=model))
+        # 走可注入的工厂而不是直接 `create_provider`：这样端到端驱动设施注入假模型时，
+        # 这条换模型旁路也一并被换掉（见构造函数 provider_factory 的说明）。
+        # **每次现取**（而不是构造时固化）：没注入时它就是当下的模块级
+        # `create_provider`，既有测试的猴补照常生效。
+        factory = self._provider_factory or create_provider
+        provider = factory(dataclasses.replace(self._config, model=model))
+        # 旁路覆盖（trace spec F18）：这条 Provider 不经装配层，若不在这里包一层，
+        # 「Skill 指定了别的模型」的那些请求就完全不会出现在记录里——而那正是
+        # 最需要看清楚的场景之一（换了模型之后行为为什么变了）。
+        # 只在开启记录时包装，关闭时链路上不得有中间层（AC3）。
+        # 包装后再存进缓存，保证同名模型复用的是同一个包装实例（轮次计数才连续）。
+        if self._recorder.enabled:
+            provider = TracingProvider(provider, self._recorder, model)
         self._provider_cache[model] = provider
         return provider
 
@@ -770,54 +838,68 @@ class ConversationManager:
             return "\n\n".join(parts)
 
         # ── 5. 驱动子 Agent ──
-        sub_provider = (
-            self._provider_for(spec.model) if spec.model else self._provider
-        )
-        sub_agent = Agent(sub_provider, self._registry)
+        #
+        # 整段（构造子 Agent、跑完子循环）都包在独立作用域里（trace spec F2），
+        # 让子对话的模型请求、权限判定、工具执行、循环事件全部标成
+        # `isolated:<name>`，读 trace 时一眼就能把它和主对话分开。
+        #
+        # ① 正常路径为什么有效：生成器的函数体要到 Worker 线程首次 `next()` 时才
+        #    开始执行，`with` 的 `__enter__` 就发生在那时、在同一个线程上；
+        #    下面驱动子事件流的 for 循环也在生成器体内，所以整段都在作用域内；
+        #    生成器耗尽时 `__exit__` 复位。
+        # ② **为什么还需要 `_do_stream` 的兜底复位**：异常与「生成器被放弃」的路径下
+        #    `__exit__` 可能压根不跑（比如 TUI 退出竞态里 `call_from_thread` 抛
+        #    RuntimeError），而 Textual 复用池化线程，泄漏出去的 `isolated:<name>`
+        #    会污染后续复用该线程的主对话运行。见 `tui/app.py` 的 `_do_stream`。
+        with self._recorder.scope(isolated_scope(spec.name)):
+            sub_provider = (
+                self._provider_for(spec.model) if spec.model else self._provider
+            )
+            sub_agent = Agent(sub_provider, self._registry, recorder=self._recorder)
 
-        # 取消信号必须**重建**：`request_cancel()` 置的就是 `self._cancel_event`，
-        # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
-        self._cancel_event = threading.Event()
+            # 取消信号必须**重建**：`request_cancel()` 置的就是 `self._cancel_event`，
+            # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
+            self._cancel_event = threading.Event()
 
-        registry = self._registry
-        stop_reason = StopReason.COMPLETED
-        events = sub_agent.run(
-            sub_history,
-            self.thinking_effort,
-            self.plan_mode,          # 继承主对话的 Plan Mode
-            assembled.stable,
-            sub_dynamic,
-            spec.model or self._config.model,
-            None,                    # 子对话不写缓存调试日志
-            self._engine,
-            self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
-            self.clarify_callback,
-            self.approve_plan_callback,
-            self._cancel_event,
-            self._context_manager,
-            None,                    # recorder=None：子对话过程不写会话存档
-            options=RunOptions(
-                max_iterations=SKILL_MAX_ITERATIONS,
-                record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
-                allow_summary=False,  # 只跑 C8 第一层（F21）
-                tool_policy=(
-                    (lambda: self.skill_manager.isolated_policy(
-                        spec, registry.names()
-                    ))
-                    if registry is not None
-                    else None
+            registry = self._registry
+            stop_reason = StopReason.COMPLETED
+            events = sub_agent.run(
+                sub_history,
+                self.thinking_effort,
+                self.plan_mode,          # 继承主对话的 Plan Mode
+                assembled.stable,
+                sub_dynamic,
+                spec.model or self._config.model,
+                None,                    # 子对话不写缓存调试日志
+                self._engine,
+                self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
+                self.clarify_callback,
+                self.approve_plan_callback,
+                self._cancel_event,
+                self._context_manager,
+                None,                    # recorder=None：子对话过程不写会话存档
+                options=RunOptions(
+                    max_iterations=SKILL_MAX_ITERATIONS,
+                    record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
+                    allow_summary=False,  # 只跑 C8 第一层（F21）
+                    tool_policy=(
+                        (lambda: self.skill_manager.isolated_policy(
+                            spec, registry.names()
+                        ))
+                        if registry is not None
+                        else None
+                    ),
                 ),
-            ),
-        )
+            )
 
-        # ── 6. 转发子循环事件，但**拦下 FINISHED** ──
-        # 外层要自己收尾（先回流结论再产出 FINISHED），不能让子循环的 FINISHED
-        # 提前把 TUI 的流式状态收掉。
-        for event in events:
-            if event.type == AgentEventType.FINISHED:
-                stop_reason = event.stop_reason
-                continue
-            yield event
+            # ── 6. 转发子循环事件，但**拦下 FINISHED** ──
+            # 外层要自己收尾（先回流结论再产出 FINISHED），不能让子循环的 FINISHED
+            # 提前把 TUI 的流式状态收掉。
+            for event in events:
+                if event.type == AgentEventType.FINISHED:
+                    stop_reason = event.stop_reason
+                    continue
+                yield event
 
         # ── 7. 提取结论 ──
         conclusion: Optional[str] = None

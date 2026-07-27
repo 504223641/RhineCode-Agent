@@ -50,8 +50,21 @@ _CONFIG_TEMPLATE = """\
 """
 
 
-def user_config_path() -> Path:
-    """用户级配置路径：~/.rhinecode/permissions.yaml（跨项目全局默认）。"""
+def user_config_path(user_dir: Optional[Path] = None) -> Path:
+    """
+    用户级配置路径：~/.rhinecode/permissions.yaml（跨项目全局默认）。
+
+    :param user_dir: 用户级目录。**必须可选**——缺省时保持原有的
+                     `Path.home() / ".rhinecode"` 取值，行为与参数化之前完全一致。
+                     给定时改用该目录，供装配层把整套用户级内容重定向到临时目录，
+                     使测试能在不污染真实主目录的前提下装配一次完整应用
+                     （trace spec F23）。
+    :returns: 权限配置文件的绝对路径
+
+    副作用：无（纯路径计算）。
+    """
+    if user_dir is not None:
+        return user_dir / _CONFIG_FILE
     return Path.home() / _CONFIG_DIR_NAME / _CONFIG_FILE
 
 
@@ -156,7 +169,7 @@ def _load_layer(path: Path, source: str) -> tuple[list[Rule], Optional[str]]:
     return rules, None
 
 
-def load_all() -> tuple[RuleSet, list[str]]:
+def load_all(user_dir: Optional[Path] = None) -> tuple[RuleSet, list[str]]:
     """
     加载三层配置并合并成一个 RuleSet。
 
@@ -164,6 +177,9 @@ def load_all() -> tuple[RuleSet, list[str]]:
     rules.py 以 deny 优先求值，层级不决定优先级）。任一层的加载错误收集进列表一并返回，
     供上层（ConversationManager）以系统提示展示，但不阻断启动（fail-safe）。
 
+    :param user_dir: 用户级目录，透传给 `user_config_path()`。**必须可选**——
+                     缺省等于现状（读真实主目录）。既有测试全部走
+                     `mock.patch(Path.home)` + 无参调用，改成必选会让它们成批失败。
     :returns: (合并后的 RuleSet, 错误信息列表)；无错误时列表为空
 
     副作用：读取文件系统上的三个配置文件（若存在）。
@@ -171,7 +187,7 @@ def load_all() -> tuple[RuleSet, list[str]]:
     all_rules: list[Rule] = []
     errors: list[str] = []
     for path, source in (
-        (user_config_path(), "user"),
+        (user_config_path(user_dir), "user"),
         (project_config_path(), "project"),
         (local_config_path(), "local"),
     ):
