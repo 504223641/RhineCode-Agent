@@ -517,3 +517,47 @@ P1b 是本轮的直接续作，在 P1a 交付并经真实驱动磨稳之后另�
 - **AC43**：中文与含字面方括号的文本在记录、观察数据与诊断输出中均正确
   （验证：让工具输出与界面消息含中文与字面方括号，断言三处均以 UTF-8 完整可读、
   且转义前原文与渲染文本可区分）。
+
+---
+
+## P1a 交付后 P1b 可直接复用的接缝（交付时补写）
+
+P1a 已经把下列东西做成了「换一个实现 / 加一条数据」就能扩展的形态，
+**P1b 不必重写，也不该另起一套**：
+
+| 接缝 | 位置 | P1b 怎么用 |
+| --- | --- | --- |
+| `Responder` 协议 | `tests/e2e/control.py` | 固定策略应答者与脚本预设应答者**只需换一个实现**（`source = "policy"`），`DriverCore` 一行不动。本轮的 `ExternalResponder` 是它的第一个实现 |
+| `--seed` 预置函数组 | `tests/e2e/seeding.py` + `tests/e2e/scripts.py` | 六个原子预置函数可自由组合；场景各写一个 `seed_xxx(workspace, user_dir)` 即可 |
+| `TraceView` 与十一项断言词汇 | `tests/e2e/assertions.py` | 场景断言直接调 `check_*` + `assert_check`，失败诊断（证据序号 + 邻域整行）已经内建 |
+| `sandbox` 的三步清理 | `tests/e2e/sandbox.py` | `create_workspace` / `assert_disposable` / `cleanup_workspace` / `force_rmtree` 四件套，Windows 上的只读位与句柄延迟都已处理 |
+| 宿主的 `--mode` 分支 | `tests/e2e/host.py` | 新增运行形态只需加一个分支；`--script` / `--seed` 的 `MOD:ATTR` 载入机制通用 |
+| `choice → 结算值` 映射表 | `tests/e2e/control.py` 的 `settlement_for` | 四类面板的三套标识（线上 choice / 产品 option.id / 结算值）已经对齐，策略应答者产出 `choice` 即可 |
+| 现成剧本库 | `tests/e2e/scripts.py` | 十个剧本覆盖确认 / 审批 / 澄清 / 会话 / 危险命令 / 流错误 / Skill 激活等形态，可直接引用或照着加 |
+
+## P1a 实际交付相对 plan 的偏离（**P1b 不要照着过期设计做**）
+
+1. **`ConversationManager` 的工厂改为延迟绑定**。plan 写的是构造时
+   `provider_factory or create_provider`；实际实现存 `None`、到 `_provider_for` 里再解析。
+   原因：构造时固化会让既有 `test_skill_isolated.py` 的模块属性猴补**静默失效**——
+   那才是真回归。P1b 若要再加注入点，沿用「存 None、用时现取」这个口径。
+
+2. **`AC10「耗时 < 1 秒」按字面执行做不到**。Windows 上操作系统自己就要约 2.03 秒
+   才把 `ConnectionRefusedError` 返回给用户态（实测裸 `socket.connect` 连测三次
+   2.032 / 2.031 / 2.016 秒，与本设施代码无关）。实际判据改为
+   「**不等满调用方给的超时**」：给 30 秒超时、断言远早于它返回且异常类型是连接被拒。
+
+3. **`test_zzz_no_global_leftovers` 只保证类内次序**。unittest 按字典序排类，
+   `CleanupTest` 排在最前，所以这条「全局无残留」的检查**实际上跑在大多数用例之前**。
+   它仍有价值（能抓住上一轮的残留），但真正的兜底是每条用例自己的 `addCleanup`。
+   P1b 若要一条可靠的「最后检查」，需要另做（如 `tearDownModule`）。
+
+4. **发现一处 P0 遗留的观测缺口，本轮未改产品代码**：
+   `ui_message` 的 AI 正文由 `tui/app.py` 的 `reset_text_widgets()` 在
+   「下一轮开始 / 工具开始 / 历史回放」三个时机收尾产出，因此
+   **一轮运行里最后一段 AI 正文不会产生 `ui_message` 事件**
+   （实测：跑完两轮对话，`ui_message` 里只有两条 `user_echo`，两段 AI 正文一条都没有）。
+   影响面是断言词汇③「界面消息含某文本」在「最后一句话」上不可用。
+   本轮的规避办法是改用 `api_response`（模型实际回了什么）。
+   **修法很小**（在事件流消费的 `finally` 里补一次 `reset_text_widgets()`），
+   但它属于 P0 的埋点范围、超出 P1a 约定的三处产品改动，故留给 P1b 或单独处理。
