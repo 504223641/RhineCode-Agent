@@ -8,7 +8,7 @@
 | 项 | 实际 |
 | --- | --- |
 | git | **有**，`git version 2.50.1.windows.1` |
-| 真实模式开关 | **未开**（`RHINE_E2E_LIVE` 未设）→ 真实模式 3 条报告为 **skipped**，即 AC41 |
+| 真实模式开关 | 跑全量时**未开**（`RHINE_E2E_LIVE` 未设）→ `test_e2e_live` 的 3 条报告为 **skipped**，即 AC41。场景 2 是经用户授权后**单独手工驱动**的（走 `--mode live --config <含有效 key 的配置>`），与全量测试的默认跳过互不影响 |
 | P1a 起点提交 SHA | `62e6e19`（「产品侧只动三处」的 diff 基线） |
 | 基线测试数 | **714**（`Ran 714 tests ... OK`） |
 
@@ -118,11 +118,12 @@
 
 ---
 
-## 场景验收（5/6 已由 Claude 实跑，1 条待用户授权）
+## 场景验收（**6/6 全部通过**，均由 Claude 实跑）
 
 > 起初把这 6 条全列为「用户亲自跑」，那是**误用了规矩**——「交互式验证由用户亲自跑」
 > 针对的是**必须人眼看渲染**的 TUI 验收，而 P1a 这套设施存在的全部意义恰恰是把
-> 这类交互场景变成可无人驱动的。真正需要用户拍板的只有场景 2（花钱、用真实凭据）。
+> 这类交互场景变成可无人驱动的。真正需要用户拍板的只有场景 2（花钱、用真实凭据），
+> 用户授权后已跑。
 
 ### ✅ 场景 1：完整闭环（已跑通）
 
@@ -131,10 +132,49 @@
 `observe` 得 `write_file · executed · ok=True` → **再 send 一次**（验「常驻」）→
 `quit`，零残留。
 
-### ⏸ 场景 2：真实模型（**待用户授权**）
+### ✅ 场景 2：真实模型（已跑通，用户授权后执行）
 
-需要 `RHINE_E2E_LIVE=1` 与有效 `api_key`——**会花钱、走网络、用你的真实凭据**，
-故不代跑。操作步骤见下方附录。
+`--mode live` 起宿主，向 DeepSeek（`deepseek-v4-flash`）发一条真实请求
+「在当前目录新建一个 hello.txt，内容写一行 hello，然后告诉我做完了」，
+面板由驱动器决策，**三条判据全中**：
+
+| 判据 | 实际 |
+| --- | --- |
+| 真实模型请求与响应 | **3 次往返，0 流错误**：turn1 1311ms、turn2 1108ms（首字 750ms · 20 块）、notes 891ms |
+| 至少一条工具执行成功 | `write_file · executed · ok=True`；**文件真的建出来了**（`hello.txt` 内容 `'hello'`） |
+| 面板决策来源标为 driver | `('confirm', 'allow', 'driver')` |
+
+模型的真实输出：**「已新建 `hello.txt` 并写入内容 `hello`，共 1 行。」**
+
+关键时间线（24 条事件、坏行 0）：
+
+```
+ 7  api_request          turn 1 · deepseek-v4-flash · 消息 2 条 · 工具 7 个
+ 9  api_response         turn 1 · 1311ms · 工具调用 1 个
+10  permission_decision  write_file → ask（④模式）· 默认模式：无规则命中，交由用户确认
+11  interaction          confirm → allow · write_file {'path': 'hello.txt', …}
+13  tool_execute         write_file · executed · ok=True · 新建 · 1 行 · 5 B
+17  api_request          turn 2 · 消息 4 条
+19  api_response         turn 2 · 1108ms · 首字 750ms · 20 块
+20  agent_event          finished · stop_reason=completed
+22  notes/api_request    turn 1 · 消息 1 条 · 工具 0 个      ← 自动笔记，作用域独立
+24  notes/api_response   turn 1 · 891ms
+```
+
+三点值得单独记下：
+
+1. **权限管线走的是真路子**——`permission_decision write_file → ask（④模式）`：
+   第④层兜底判「问用户」→ 弹面板 → 驱动器答 `once` → 才执行。**没有被绕过**。
+   这是「驱动器不扩大权限面」在真实模型下的正面证据。
+2. **`notes` 作用域出现了**（seq 22–24）：真实模式**保留自动笔记**，它与主对话
+   共用同一个 Provider 但作用域独立标注——正是 P0 当初坚持要区分四种作用域的理由，
+   在这里得到实证（若不区分，笔记那两次调用会污染主对话的轮次计数）。
+3. **`rhine-notes` 线程已收敛**（AC24 的 live 一半）：退出后该线程不在
+   `threading.enumerate()` 里，说明 `shutdown_on_main` 的 join 生效且没有超时。
+
+流式确实是流式：turn2 是 20 个块、首字 750ms。
+
+⚠️ **真实模式产物已按纪律删除**（含真实模型往返与工具输出原文）。
 
 ### ✅ 场景 3：代码版本标识（已跑通）
 
@@ -198,16 +238,3 @@ hinecode-e2e\host-6016.json（pid=6016）
 - **顺带的教训**：这套设施本身也**必须**遵守它为被测系统立下的规矩。
 
 ---
-
-## 附录：场景 2 的操作步骤（需用户授权后执行）
-
-```bash
-python -m tests.e2e.host --mode live --idle-timeout 600 &
-python -m tests.e2e.client send "在当前目录建一个 hello.txt 写一行 hello"
-python -m tests.e2e.client wait --timeout 180
-# 若停在 pending，看 status 的面板类型再 answer；重复直到 idle
-python -m tests.e2e.client observe --types api_request,tool_execute
-python -m tests.e2e.client quit
-```
-预期：出现真实模型请求与响应、至少一条工具执行成功、面板决策来源标为 `driver`。
-⚠️ **跑完请删除 live 产物**——它含真实模型往返与工具输出原文，可能含明文密钥。
