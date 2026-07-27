@@ -246,3 +246,144 @@ output  = 已激活 Skill `commit`，其完整指令已注入你的上下文，�
 > 相关的文件」与 §5「指出问题但不动手改」之下的一次**模型自主判断**，可以争论对错
 > （场景 1 的同一份预置下它选择了提交），但它不属于 C11 的功能判据：
 > Skill 系统的职责是把 SOP 送到模型面前，而不是替模型做取舍。
+
+---
+
+## 场景 4：白名单收窄可观测
+
+预置：`tests.e2e.c11_scenarios:seed_whitelist_pair` —— 一对形成对照的 Skill
+加一个可供审阅的小项目：
+
+- `audit`（**项目级**，`allowed_tools: [read_file, glob_files]`）——验「收窄真的发生」；
+- `freeform`（**用户级**，**不声明** `allowed_tools`）——验「任一 Skill 未声明则整体
+  塌缩为不收窄」。
+
+两个层级各放一个，顺带覆盖三级存放里的项目级与用户级。
+
+### ① 两层来源与第三方内容提示
+
+**机器判到了什么**（`/skills` 的 `ui_message`，以及启动时的 `skill_state`）：
+
+```
+- audit（项目级 · 共享）：只读审阅代码，产出审阅意见但不改任何文件      短命令 /audit
+- commit（内置 · 共享）…  - freeform（用户级 · 共享）…  - review（内置 · 独立）…  - test（内置 · 共享）…
+
+发现 1 个项目级 Skill（来自 …\.rhinecode\skills）：audit
+它们来自当前代码仓库，其指令可以指挥模型读写文件与执行命令，请确认它们可信。
+```
+
+启动快照 `skill_state(action=bind_tools)` 的 `allowed_tools` 映射里有
+`audit: [read_file, glob_files]`，而 **`freeform` 这个键根本不存在**
+（未声明白名单的 Skill 不进映射）。
+
+**判断**：来源层级标注正确，第三方内容提示按设计出现。通过。
+
+### ② 激活窄白名单 Skill 后，`/skills prompt` 显示工具集已收窄
+
+**机器判到了什么**（`/audit 审阅一下 app 目录下的代码` 之后的 `/skills prompt` 输出结尾）：
+
+```
+【当前可见工具集】
+
+glob_files、load_skill、read_file
+（Plan Mode 的规划阶段还会另外附加 ask_user / present_plan，它们不受白名单约束）
+```
+
+同期 `api_request` 的 `tool_names = ["read_file","glob_files","load_skill"]`，
+状态栏 `Skill:1`。
+
+**判断**：`/skills prompt` 报的可见工具集与**实际发出去的请求**逐个一致
+——这正是这条命令存在的意义（排查「为什么模型没按我的 Skill 做」时，
+报告与事实不符是最坏的情况）。7 个工具收窄到 2 个 + 系统级 `load_skill`。通过。
+
+### ③ 让模型写文件 —— **真实模型自发地越界了，并被拦下**
+
+**机器判到了什么**（发出「把你刚才的审阅意见写进 notes.md 文件里」之后）：
+
+```
+seq=56  api_request   turn=4  tool_names=['read_file','glob_files','load_skill']
+seq=61  tool_execute  write_file · ok=False · outcome=out_of_scope · duration=0ms
+        summary = 不在当前工具集内
+        output  = [工具不可用] write_file 不在当前 Skill 声明的工具集内，本轮未提供给你，
+                  因此没有执行。
+                  当前可用工具：glob_files、load_skill、read_file。
+                  请改用其中之一；若确实必须用 write_file，请说明理由让用户决定。
+```
+
+`notes.md` 事后仍是预置的 46 字节原文，**一个字都没变**。
+
+**判断**：这条值得单独说。P0 的场景 2 用**脚本化假模型**确定性地复现了「模型调用了
+本轮没发给它的工具」——那是整个 trace 项目的立项动因。这一次，**真实模型在没有任何
+诱导的情况下自发做了同一件事**：它手里明明只有三个工具的 schema，却凭空发出了一个
+带 2900 字符 `content` 的 `write_file` 调用。
+
+两件事因此同时得到确认：① 这个幻觉在真实模型上**确实会发生**，不是假模型编出来的
+稻草人；② 产品的兜底**真的兜住了**——`duration=0ms`、`ok=False`、文件未被改，
+而且回灌给模型的不是一句「未知工具」，是一段能让它自救的说明。通过。
+
+### ④ 模型据此如实说明并给出替代方案
+
+**机器判到了什么**（下一轮的 assistant 正文）：
+
+```
+当前 audit Skill 只开放了只读工具，不能直接写文件。不过我可以切换到 freeform 模式
+来完成写入，或者你也可以直接复制下面的内容创建 `notes.md`。
+…
+建议选方案一，你输入 `skill freeform 把审阅意见写入 notes.md` 即可。
+```
+
+**判断**：checklist 写的是「因看不到写工具而**改用其它方式或如实说明**」。
+模型两样都做了：如实说明了限制的来源（点名了 audit Skill），并给出两条可行路径。
+回灌文案设计得当——它没有把这当成故障，而是当成一条约束。通过。
+
+### ⑤ 再激活未声明白名单的 Skill → 工具集恢复全量
+
+**机器判到了什么**（`/freeform 把审阅意见写进 notes.md` 之后）：
+
+```
+seq=76  skill_state   activate freeform · active=['audit','freeform']
+seq=78  api_request   turn=6  tool_names=['read_file','write_file','edit_file',
+                                          'run_command','glob_files','grep_content','load_skill']
+seq=85  status_bar    … | Skill:2
+seq=97  tool_execute  write_file · ok=True · outcome=executed
+```
+
+随后 `/skills prompt` 的工具集一栏变成：
+
+```
+【当前可见工具集】
+
+未收窄（全部已注册工具对模型可见）
+```
+
+`notes.md` 从 46 字节变成 2967 字节。
+
+**判断**：`audit` **仍然激活着**（`active=['audit','freeform']`、状态栏 `Skill:2`），
+但只要有一个 Skill 未声明白名单，收窄就**整体塌缩**——这正是 C11 的既定语义，
+而且是在**激活后的第一轮请求**（turn 6）就生效的，没有滞后一轮。
+`/skills prompt` 的措辞也随之从工具名列表换成「未收窄」这句明确的话。通过。
+
+### ⑥ 恢复全量后写文件仍走确认面板
+
+**机器判到了什么**：`write_file` 执行前弹出了
+`⚠ 确认执行：write_file(path=notes.md, content=…) · 默认模式：无规则命中，交由用户确认`，
+应答放行后才 `ok=True`。
+
+**判断**：白名单放宽只影响「模型看得见什么」，不影响「允许做什么」——
+与安全边界里写的「`allowed_tools` 不是安全边界」完全一致。通过。
+
+> **顺带观察到的一处幂等行为**（不是判据，记录备查）：`/freeform` 短命令激活之后，
+> 模型自己又调了一次 `load_skill('freeform')`（seq=86）。记录显示第二次
+> `skill_state` 的 `active` 顺序不变、仍是 `['audit','freeform']`，
+> 与「重复激活幂等：位置不动、只更新参数」的设计一致。
+
+---
+
+## 本次验收没有发现需要修改的产品缺陷
+
+三条场景 18 项判据全部一次通过，没有出现「小修」或「大改」级别的问题。
+新增的只有测试设施侧的 `tests/e2e/c11_scenarios.py`（预置，无剧本）。
+
+**一处值得记在这里的收获**（不是缺陷）：场景 4 ③ 让「白名单外调用」这条
+从**假模型的确定性复现**升级成了**真实模型的自发复现**。P0 立项时那个
+「模型调用了本轮没发给它的工具」的动因，至此在两种模型上都有了物证。
