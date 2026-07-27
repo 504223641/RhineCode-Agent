@@ -20,11 +20,11 @@
 | 二 产品接缝 | 无新增测试文件（+1 条结构护栏进 `test_tui_keybindings`） | — | 全量此刻 **715**（714 + 1 护栏） |
 | 三 假模型 | `test_e2e_scripted` | 17 | 全绿 |
 | 四 断言层 | `test_e2e_assertions` | 24 | 全绿 |
-| 五 驱动内核 | `test_e2e_control` | 18 | 全绿（连跑 3 次稳定） |
+| 五 驱动内核 | `test_e2e_control` | 20 | 全绿（连跑 3 次稳定；含 2 条 `ui_message` 补齐的回归护栏） |
 | 六 宿主与客户端 | `test_e2e_host` | 26（含 1 条慢速专项 skip） | 全绿、零残留（连跑 2 次） |
 | 七 收尾 | `test_e2e_live` | 3（**默认全 skip**） | 符合 AC41 |
 
-**新增测试合计 133 条**（16+11+18+17+24+18+26+3 = 133，其中默认跳过 4 条）。
+**新增测试合计 135 条**（16+11+18+17+24+20+26+3 = 135，其中默认跳过 4 条）。
 
 **轮次预算实测**（N5）：`--max-turns 1` 起宿主，一轮对话后
 `"turns": 1, "turn_budget": 1`；再次 `send` 得
@@ -40,7 +40,7 @@
 | 控制台入口未新增 | `[project.scripts]` | 只有 `rhine` 一项 | ✅ |
 | 产品不反向依赖 tests | `grep "import tests" rhinecode/` | 无匹配 | ✅ |
 | `tools/__init__.py` 无导入 | AST body | 仅 1 个 docstring 节点、零 import | ✅ |
-| **产品侧只动三处** | `git diff --stat 62e6e19 HEAD -- rhinecode/` | `bootstrap.py` / `conversation.py` / `tui/app.py` 三个文件，+124 −29 | ✅ |
+| **产品侧改动范围** | `git diff --stat 62e6e19 HEAD -- rhinecode/` | 仍是 `bootstrap.py` / `conversation.py` / `tui/app.py` **三个文件**；其中 `tui/app.py` 除三处接缝外另含一处埋点补齐（见下节），故按「改动点」计为四处 | ✅ |
 
 【人读】四条不变量：**在**（`tests/e2e/control.py` 模块 docstring 顶部完整写下四条及各自违反后果，并在
 `_lock` 定义处、`snapshot`/`wait`、`send` 四段式、`answer` 复核四处放了呼应注释）。
@@ -54,7 +54,7 @@
 
 | 项 | 实际 |
 | --- | --- |
-| 测试总数 | 714 → **848**（既有 714 条**一条不少**，断言语义未弱化） |
+| 测试总数 | 714 → **850**（既有 714 条**一条不少**，断言语义未弱化） |
 | `compileall rhinecode tests` | **通过**，无错误 |
 | 新测试文件数 | **8**（`tests/test_e2e_*.py`） |
 | 新增第三方依赖 | **0**（只用标准库 + 项目已有的 `pyyaml`） |
@@ -83,17 +83,29 @@
 3. **`test_zzz_no_global_leftovers` 只保证类内次序**——unittest 按字典序排类，
    `CleanupTest` 实际排在最前。真正的兜底仍是每条用例自己的 `addCleanup`。
 
-## 发现但**未修**的一处 P0 遗留缺口
+## 已修：一处 P0 遗留的观测缺口（产品侧因此共动四处）
 
 `ui_message` 的 AI 正文由 `tui/app.py` 的 `reset_text_widgets()` 在「下一轮开始 /
-工具开始 / 历史回放」三个时机收尾产出，因此**一轮运行里最后一段 AI 正文不会产生
-`ui_message` 事件**（实测：跑完两轮对话，`ui_message` 里只有两条 `user_echo`，
-两段 AI 正文一条都没有）。
+工具开始 / 历史回放」三个时机收尾产出——**总是靠下一个动作给上一段正文收尾**。
+于是一轮运行里的**最后**一段正文永远等不到那个动作，一条 `ui_message` 都不产出
+（实测：跑完两轮对话，`ui_message` 里只有两条 `user_echo`，两段 AI 正文一条都没有）。
 
-- **影响**：断言词汇③「界面消息含某文本」在「最后一句话」上不可用。
-- **本轮规避**：改用 `api_response`（模型实际回了什么）。
-- **未修理由**：它属于 P0 的埋点范围，超出 P1a 约定的三处产品改动。修法很小
-  （在事件流消费的 `finally` 里补一次 `reset_text_widgets()`），**待定夺**。
+- **为什么值得修**：断言词汇③「界面消息含某文本」在「最后一句话」上完全不可用，
+  而**这个缺口在界面上看不出来**——界面显示得好好的，只是没被记下来。
+  正是本设施要抓的那类问题。
+- **修法**：在 `_do_stream` 的 `finally` 里补一次 `reset_text_widgets()`。
+  位置有两条约束：夹在 `bind_scope(SCOPE_MAIN)` **之后**（该段正文呈现在主界面上、
+  该记成 `main`，而独立模式子对话结束时线程作用域可能还是 `isolated:<name>`）、
+  两个 `call_from_thread` **之前**（它们在退出竞态下会抛 `RuntimeError`，
+  放后面等于「出错时不记录」）。
+- **验证**：同一场景重跑，两段 AI 正文均产出 `assistant` 的 `ui_message`。
+- **护栏**：`tests/test_e2e_control.py::FinalTextRecordedTest` 两条
+  （最后一段必须被记录 / 工具执行时不得重复记录），**经反证有效**——
+  临时注释掉修复后两条全红（`AssertionError: 1 != 2`）。
+
+> 因此产品侧最终改动为**四处**（`bootstrap.py` / `conversation.py` / `tui/app.py`
+> 的三处接缝 + `tui/app.py` 的这处埋点补齐），与 spec 原定的三处有一处偏离，
+> 已在 `spec.md` 末节登记。
 
 ## P1b 交接
 

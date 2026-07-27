@@ -702,6 +702,65 @@ class SessionPanelTest(DriverFixture):
             await core.shutdown_on_main("test")
 
 
+class FinalTextRecordedTest(DriverFixture):
+    """
+    **回归护栏**：一轮运行里**最后**一段 AI 正文必须产出 `ui_message` 事件。
+
+    背景（由 P1a 端到端驱动实测发现的 P0 埋点缺口）：
+    `_do_stream` 的 `reset_text_widgets()` 原本只在「下一轮开始 / 工具开始 /
+    历史回放」三个时机被调用，也就是**总靠下一个动作给上一段正文收尾**。
+    于是最后一段正文永远等不到那个动作，一条 `ui_message` 都不产出——
+    而那恰恰是用户看到的结论。修法是在 `_do_stream` 的 `finally` 里补一次调用。
+
+    这个缺口**在界面上完全看不出来**（界面显示得好好的，只是没被记下来），
+    所以必须由自动化钉死。
+
+    ⚠️ 本护栏放在这里而不是 `test_trace_hooks.py`，是因为它验的是 `_do_stream`
+    这条 TUI 层路径——那个文件直接驱动 Agent 循环，起不到真实 App。
+    """
+
+    async def test_last_assistant_text_produces_ui_message(self):
+        app, _ = self.assemble([[text("这是最后一句结论。"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "说句话")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            messages = self.view().of_type("ui_message")
+            assistant = [m for m in messages if m.get("source") == "assistant"]
+            self.assertTrue(
+                assistant,
+                "最后一段 AI 正文必须产出 assistant 的 ui_message；"
+                f"实际只有：{[(m.get('source'), m.get('text')) for m in messages]}",
+            )
+            joined = json.dumps([m.get("text") for m in assistant], ensure_ascii=False)
+            self.assertIn("这是最后一句结论", joined)
+            await core.shutdown_on_main("test")
+
+    async def test_no_duplicate_ui_message_when_tool_runs(self):
+        """
+        补完之后**不得重复**：工具执行时 `reset_text_widgets` 已经给前一段收过尾，
+        `finally` 那次只该处理它之后新累积的那段。
+        """
+        app, _ = self.assemble(CONFIRM_SCRIPT)
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "写个文件")
+            await asyncio.to_thread(core.wait, 30.0)
+            await asyncio.to_thread(core.answer, "once")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            texts = [
+                m.get("text")
+                for m in self.view().of_type("ui_message")
+                if m.get("source") == "assistant"
+            ]
+            # 剧本两轮各一段正文，恰好两条，且互不重复
+            self.assertEqual(len(texts), 2, f"应恰好两条，实际 {texts}")
+            self.assertEqual(len(set(map(str, texts))), 2, f"两条不得重复：{texts}")
+            await core.shutdown_on_main("test")
+
+
 class ObserveTest(DriverFixture):
     async def test_observe_returns_full_payload_and_cursor(self):
         app, _ = self.assemble([[text("你好，我读一下。"), done()]])
