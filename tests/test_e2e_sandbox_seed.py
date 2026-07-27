@@ -66,6 +66,57 @@ class DisposableCheckTest(unittest.TestCase):
         sandbox.assert_disposable(ws)
 
 
+class ForceRmtreeGuardTest(unittest.TestCase):
+    """
+    `force_rmtree` 的闸门护栏。
+
+    **背景是一次真实事故**：本函数最初「不做可丢弃校验」，调用方从 JSON 抽路径的
+    `sed` 因反斜杠失败、变量成了空串，于是它收到 `""`——`Path("")` 解析成 `"."`
+    即**当前工作目录**，`rmtree` 把整个代码仓库删光（靠远端仓库才恢复）。
+
+    教训不是「调用方要小心」而是**闸门不该有旁路**。下面每一条都对应那次事故里
+    本该拦住它的一环。
+    """
+
+    def test_empty_string_is_rejected(self):
+        """**引信本身**：空串 → `Path("")` → `"."` → 当前工作目录。"""
+        with self.assertRaises(NotDisposableError) as ctx:
+            sandbox.force_rmtree("")
+        self.assertIn("当前工作目录", str(ctx.exception))
+
+    def test_relative_path_is_rejected(self):
+        for candidate in (".", "..", "rhinecode", "./tests"):
+            with self.assertRaises(NotDisposableError):
+                sandbox.force_rmtree(candidate)
+
+    def test_repo_root_is_rejected(self):
+        # 绝对路径但不在临时目录下 —— 判据①拦下
+        with self.assertRaises(NotDisposableError) as ctx:
+            sandbox.force_rmtree(REPO_ROOT)
+        self.assertIn("判据①", str(ctx.exception))
+        self.assertTrue(REPO_ROOT.exists(), "仓库必须完好无损")
+
+    def test_temp_dir_without_marker_is_rejected(self):
+        # 在临时目录下但不是本设施造的 —— 判据②拦下
+        with tempfile.TemporaryDirectory(prefix="rhine_e2e_notours_") as raw:
+            with self.assertRaises(NotDisposableError) as ctx:
+                sandbox.force_rmtree(raw)
+            self.assertIn("判据②", str(ctx.exception))
+            self.assertTrue(Path(raw).exists(), "不该被删掉")
+
+    def test_real_sandbox_is_deleted(self):
+        # 正常路径仍然能删（闸门不能把正事挡住）
+        ws = sandbox.create_workspace()
+        seeding.seed_files(ws, {"a/b.txt": "x"})
+        sandbox.force_rmtree(ws)
+        self.assertFalse(ws.exists())
+
+    def test_missing_path_is_idempotent(self):
+        ws = sandbox.create_workspace()
+        sandbox.force_rmtree(ws)
+        sandbox.force_rmtree(ws)  # 第二次：已不存在，静默返回而不是抛错
+
+
 class CleanupOrderTest(unittest.TestCase):
     """清理三步：第②步（先 chdir 出来）不是保险，是必需。"""
 
@@ -96,7 +147,11 @@ class CleanupOrderTest(unittest.TestCase):
                 shutil.rmtree(ws)
         finally:
             os.chdir(previous)
-            sandbox.force_rmtree(ws)
+            # ⚠️ 这里**不能**用 `sandbox.force_rmtree`：上面那次直接 `rmtree` 会在
+            # 撞上 cwd 锁之前先把标记文件删掉，于是目录已经不满足「可丢弃」判据②，
+            # 闸门会（正确地）拒绝它。本用例是刻意把目录搞成半删状态的，
+            # 收尾只能用裸 `rmtree`——这是全项目**唯一**该这么写的地方。
+            shutil.rmtree(ws, ignore_errors=True)
 
     def test_cleanup_refuses_non_disposable(self):
         # 清理前永远先校验：传一个不可丢弃的路径必须抛错而不是开删

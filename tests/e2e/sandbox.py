@@ -142,7 +142,7 @@ def _clear_readonly(func, path, _exc_info) -> None:
 
 def force_rmtree(path: Union[str, Path]) -> None:
     """
-    尽力删掉一个目录，**供测试的兜底清理使用**（不做可丢弃校验、不切工作目录）。
+    尽力删掉一个**一次性沙箱目录**，供测试的兜底清理使用（不切工作目录）。
 
     ⚠️ **测试里凡是要 `rmtree` 一个沙箱目录，都必须走本函数，不要直接写
     `shutil.rmtree(path, ignore_errors=True)`。**
@@ -152,8 +152,38 @@ def force_rmtree(path: Union[str, Path]) -> None:
     这种残骸只在全量测试里出现（单跑那条用例时 git 的句柄早已释放），
     追起来极费劲：现象是「系统临时目录里莫名多出一个只剩 `.git` 的空壳」，
     而报错一个都没有。
+
+    :raises NotDisposableError: 目标不可丢弃。
+
+    ─────────────────────────────────────────────────────────────────
+    ⚠️⚠️ **本函数必须先过 `assert_disposable`，这条不可再被绕过** ⚠️⚠️
+    ─────────────────────────────────────────────────────────────────
+
+    本函数最初写成「不做可丢弃校验」的版本，理由是「路径都来自可信来源」。
+    **那个假设在一次真实事故里被证伪**：调用方从 JSON 里抽路径的 `sed` 因反斜杠
+    失败、变量成了空串，于是本函数收到 `""`——`Path("")` 解析成 `"."`，
+    也就是**当前工作目录**，`rmtree` 把整个代码仓库删了个精光
+    （靠远端仓库才恢复回来）。
+
+    教训不是「调用方要小心」，而是**闸门不该有旁路**：
+    `assert_disposable` 在模块 docstring 里被称为「`rmtree` 之前唯一的闸门」，
+    那就不能存在一个绕过它的公开函数。空串、相对路径、真实项目目录
+    现在一律在这里被挡下——代价是每次多两个 `stat`，与误删整个仓库不成比例。
     """
     path = Path(path)
+    # 闸门①：空串与相对路径直接拒绝。`Path("")` == `Path(".")`，
+    # 而 `"."` 是**当前工作目录**——这正是那次事故的引信。
+    if not str(path).strip() or not path.is_absolute():
+        raise NotDisposableError(
+            f"拒绝删除非绝对路径 {str(path)!r}。\n"
+            f"（空串与相对路径会解析成**当前工作目录**——曾因此误删整个代码仓库。）"
+        )
+    # 闸门②：完整的可丢弃校验（临时目录之下 + 含本设施标记文件）。
+    # 目标已经不存在时无需校验，直接返回即可（幂等）。
+    if not path.exists():
+        return
+    assert_disposable(path)
+
     for attempt in range(CLEANUP_ATTEMPTS):
         if not path.exists():
             return
