@@ -1,0 +1,158 @@
+# TUI 驱动器 P1a 验收报告
+
+> 对照 `docs/c11/trace/p1/checklist.md`。**记录的是实际结果与证据，不是预期结果**。
+> 手测项按项目既定规矩交给用户亲自跑，本报告只给分步操作与预期（见末节）。
+
+## 环境前置
+
+| 项 | 实际 |
+| --- | --- |
+| git | **有**，`git version 2.50.1.windows.1` |
+| 真实模式开关 | **未开**（`RHINE_E2E_LIVE` 未设）→ 真实模式 3 条报告为 **skipped**，即 AC41 |
+| P1a 起点提交 SHA | `62e6e19`（「产品侧只动三处」的 diff 基线） |
+| 基线测试数 | **714**（`Ran 714 tests ... OK`） |
+
+## 分段自动化
+
+| 段 | 文件 | 条数 | 结果 |
+| --- | --- | --- | --- |
+| 一 纯逻辑 | `test_e2e_protocol` / `test_e2e_discovery` / `test_e2e_sandbox_seed` | 16 / 11 / 18 | 全绿 |
+| 二 产品接缝 | 无新增测试文件（+1 条结构护栏进 `test_tui_keybindings`） | — | 全量此刻 **715**（714 + 1 护栏） |
+| 三 假模型 | `test_e2e_scripted` | 17 | 全绿 |
+| 四 断言层 | `test_e2e_assertions` | 24 | 全绿 |
+| 五 驱动内核 | `test_e2e_control` | 18 | 全绿（连跑 3 次稳定） |
+| 六 宿主与客户端 | `test_e2e_host` | 26（含 1 条慢速专项 skip） | 全绿、零残留（连跑 2 次） |
+| 七 收尾 | `test_e2e_live` | 3（**默认全 skip**） | 符合 AC41 |
+
+**新增测试合计 133 条**（16+11+18+17+24+18+26+3 = 133，其中默认跳过 4 条）。
+
+**轮次预算实测**（N5）：`--max-turns 1` 起宿主，一轮对话后
+`"turns": 1, "turn_budget": 1`；再次 `send` 得
+`[turn_budget] 已用 1 轮，触及预算 1。重启宿主或用 --max-turns 调大。`
+
+## 架构与集成
+
+| 检查 | 命令 | 实际输出 | 判定 |
+| --- | --- | --- | --- |
+| 客户端不依赖产品包 | AST 扫 `client.py` 的 import | `[]` | ✅ |
+| 两个包初始化文件为空 | AST body 长度 | `[0, 0]` | ✅ |
+| 驱动设施不随产品分发 | `find_packages(include=['rhinecode*'])` | `False` | ✅ |
+| 控制台入口未新增 | `[project.scripts]` | 只有 `rhine` 一项 | ✅ |
+| 产品不反向依赖 tests | `grep "import tests" rhinecode/` | 无匹配 | ✅ |
+| `tools/__init__.py` 无导入 | AST body | 仅 1 个 docstring 节点、零 import | ✅ |
+| **产品侧只动三处** | `git diff --stat 62e6e19 HEAD -- rhinecode/` | `bootstrap.py` / `conversation.py` / `tui/app.py` 三个文件，+124 −29 | ✅ |
+
+【人读】四条不变量：**在**（`tests/e2e/control.py` 模块 docstring 顶部完整写下四条及各自违反后果，并在
+`_lock` 定义处、`snapshot`/`wait`、`send` 四段式、`answer` 复核四处放了呼应注释）。
+
+【人读】关键注释：**6/6 到位**——`run_on_main` 的三条 `call_from_thread` 实测限制、
+`send` 的三行不可省、`shutdown_on_main` 的交织循环与 Python 3.11 `shutdown_default_executor`
+无超时、`extract_panel` 的 `display` 同名不同义、`settlement_for` 的三套标识、
+`bootstrap` 的 `exclude_tools` 窄窗口（与 C11 Skill 校验并列）。
+
+## 工程基线
+
+| 项 | 实际 |
+| --- | --- |
+| 测试总数 | 714 → **848**（既有 714 条**一条不少**，断言语义未弱化） |
+| `compileall rhinecode tests` | **通过**，无错误 |
+| 新测试文件数 | **8**（`tests/test_e2e_*.py`） |
+| 新增第三方依赖 | **0**（只用标准库 + 项目已有的 `pyyaml`） |
+| 残留检查 | 宿主进程 **0** / 临时工作区 **0** / 陈旧发布文件 **0** |
+
+## 开发过程中实测发现并修掉的缺陷
+
+全部属于「不报错但行为不对」——正是本设施存在的理由。
+
+| # | 缺陷 | 后果 | 处置 |
+| --- | --- | --- | --- |
+| 1 | venv shim 使 `Popen.pid ≠ 宿主 pid` | ① 名片永远匹配不上，每条用例超时；② `proc.kill()` 杀错进程 → **宿主全部泄漏**，二十几个常驻进程把机器拖到全部级联失败，而报错全指向「启动慢」这个假象 | 改按「名片是新出现的」判定 + 杀整棵进程树 |
+| 2 | 客户端 `recv` 漏累积 buffer | 读到 EOF 误报「宿主在处理本指令期间退出了」——**而宿主好好地活着** | 补 `buffer += chunk` |
+| 3 | 客户端 stdout 是 GBK | 打印含 `⚠` 的面板原文直接崩：**排障工具因打印排障信息而失败** | `force_utf8_output()` |
+| 4 | handler 用 `with conn` | 内部异常时连接先关，客户端只能读到 EOF 并报出错误的原因 | 改为「组装好响应再关」+ 异常留痕 |
+| 5 | 清理链三处 | ① `tearDown`/`addCleanup` 次序使 stderr 日志删不掉（一轮攒 44 个）；② 两个目录串在同一 `try` 里，工作区失败则用户目录被跳过；③ `rmtree` 撞上 git 的**只读** `.git/objects` 会「删一半」留下空壳且**一个错都不报** | 统一到 `sandbox.force_rmtree`（只读位处理 + 有界重试） |
+| 6 | `quit_host` 只等 shim 退出 | 真宿主还在跑自己的清理就被强杀，留下残骸 | 改为等名片消失（那是清理的最后一步） |
+
+## 相对 plan 的偏离（已写进 `spec.md` 末节）
+
+1. **`ConversationManager` 的工厂改延迟绑定**——plan 的写法会让既有
+   `test_skill_isolated.py` 的模块属性猴补静默失效，那才是真回归。
+2. **AC10「耗时 < 1 秒」按字面执行做不到**——Windows 上 OS 自己就要约 2.03 秒才返回
+   `ConnectionRefusedError`（裸 socket 连测三次 2.032 / 2.031 / 2.016 秒，与本设施无关）。
+   判据改为「不等满调用方给的超时」。
+3. **`test_zzz_no_global_leftovers` 只保证类内次序**——unittest 按字典序排类，
+   `CleanupTest` 实际排在最前。真正的兜底仍是每条用例自己的 `addCleanup`。
+
+## 发现但**未修**的一处 P0 遗留缺口
+
+`ui_message` 的 AI 正文由 `tui/app.py` 的 `reset_text_widgets()` 在「下一轮开始 /
+工具开始 / 历史回放」三个时机收尾产出，因此**一轮运行里最后一段 AI 正文不会产生
+`ui_message` 事件**（实测：跑完两轮对话，`ui_message` 里只有两条 `user_echo`，
+两段 AI 正文一条都没有）。
+
+- **影响**：断言词汇③「界面消息含某文本」在「最后一句话」上不可用。
+- **本轮规避**：改用 `api_response`（模型实际回了什么）。
+- **未修理由**：它属于 P0 的埋点范围，超出 P1a 约定的三处产品改动。修法很小
+  （在事件流消费的 `finally` 里补一次 `reset_text_widgets()`），**待定夺**。
+
+## P1b 交接
+
+- spec 末节「推后到 P1b 的内容」**完整在册**，且已补写「可直接复用的七个接缝」与
+  「P1a 相对 plan 的四处偏离」两小节。
+- 应答者接缝**可换实现**（F6）：`Responder` 协议 + `ExternalResponder` 是它的第一个实现，
+  P1b 只需加一个 `source = "policy"` 的实现，`DriverCore` 一行不动。
+
+---
+
+## 手测项（6 条，交给用户亲自跑）
+
+> 以下为分步操作与预期，**未代跑**（TUI/终端类验收由用户亲自执行）。
+
+### 场景 1：手工驱动一次完整闭环
+
+```bash
+python -m tests.e2e.host --mode scripted --script tests.e2e.scripts:CONFIRM_THEN_DONE &
+python -m tests.e2e.client status          # 预期 state=idle
+python -m tests.e2e.client send "写个文件"
+python -m tests.e2e.client wait --timeout 30    # 预期 terminal=pending
+python -m tests.e2e.client status          # 预期看到面板原文（含 [dim] 标记）与四个选项
+python -m tests.e2e.client answer once     # 预期 source=driver
+python -m tests.e2e.client wait --timeout 30    # 预期 terminal=idle
+python -m tests.e2e.client observe --types tool_execute   # 预期 write_file · executed
+python -m tests.e2e.client quit
+```
+
+### 场景 2：真实模型（需有效凭据）
+
+```bash
+python -m tests.e2e.host --mode live --idle-timeout 600 &
+python -m tests.e2e.client send "在当前目录建一个 hello.txt 写一行 hello"
+python -m tests.e2e.client wait --timeout 180
+# 若停在 pending，看 status 的面板类型再 answer；重复直到 idle
+python -m tests.e2e.client observe --types api_request,tool_execute
+python -m tests.e2e.client quit
+```
+预期：出现真实模型请求与响应、至少一条工具执行成功、面板决策来源标为 `driver`。
+⚠️ **跑完请删除 live 产物**——它含真实模型往返与工具输出原文，可能含明文密钥。
+
+### 场景 3：代码版本标识
+
+起宿主 → 记 `status` 的 `fingerprint` → `quit` → 改一个 `rhinecode/*.py` → 重启 →
+再记 `fingerprint`。预期：两者**不同**。
+
+### 场景 4：三种失败的提示原文
+
+- 强杀宿主后 `python -m tests.e2e.client status` → 预期「宿主已不在（名片 X，pid N）」+ 清理指引
+- `wait` 期间从另一个终端 `quit` → 预期「宿主在处理本指令期间退出了」
+- 同时起两个宿主后 `status` → 预期「有 2 个宿主，请用 --pid 指定」并列出各自 pid
+
+### 场景 5：挂着面板时退出
+
+驱动到弹出确认面板 → 直接 `quit`。
+预期：进程在数秒内退出（退出码 0），记录里有一条 `source == "driver_forced"` 的交互事件。
+
+### 场景 6：观察面四项
+
+跑一轮含正文 + 思考 + 工具调用的对话，`observe` 后确认：
+① 时间线可读 ② `ui_message` 有富文本正文 ③ `tool_execute` 有完整参数与输出
+④ 作用域标注正确。
