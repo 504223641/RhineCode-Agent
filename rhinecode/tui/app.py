@@ -21,7 +21,6 @@ RhineApp 是 TUI 层的核心，负责：
 import threading
 from typing import Optional
 
-from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.events import Key
 from textual.widgets import Static, Input
@@ -47,6 +46,17 @@ from rhinecode.trace import (
 from rhinecode.tui.widgets import (
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
     SessionPanel, compose_status_text,
+    # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
+    # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
+    # 「流式累积」意味着任何一帧都是在**任意位置**被截断的模型自由文本，
+    # 而 rich 的 escape 只转义「看起来像完整标签」的 `[...]`，认不出被截断的括号。
+    # 一旦漏过去，Textual 会在渲染时抛 MarkupError 并拆掉整个 app（详见
+    # widgets.escape 的注释与 tests/test_tui_markup_escape.py 的现场重演）。
+    #
+    # 说明边界：本处**未实测复现**过崩溃（触发形态较窄，见测试里那条
+    # 「两个未闭合括号」的用例）；换成安全版是因为输入性质相同——
+    # 任意模型文本 × 任意截断点，没有理由赌它撞不上。
+    escape,
 )
 
 

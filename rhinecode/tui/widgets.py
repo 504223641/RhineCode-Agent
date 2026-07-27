@@ -14,13 +14,13 @@ TUI 组件模块，定义四个自定义 Textual Widget。
   配合 call_from_thread 即可实现从 Worker 线程安全地驱动 UI 更新。
 """
 
+import re
 from time import monotonic
 from typing import Optional
 
 from rich.cells import cell_len
 from rich.console import Group as RichGroup
 from rich.highlighter import Highlighter
-from rich.markup import escape
 from rich.markdown import Markdown as RichMarkdown
 from rich.segment import Segment
 from rich.style import Style
@@ -37,6 +37,54 @@ from rhinecode.agent.events import ClarifyOption
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
+
+
+# 「把一段纯文本安全地嵌进 markup 字符串」的转义正则：匹配任意 `[` 及其前导反斜杠。
+#
+# ⚠️ **不要换回 `rich.markup.escape`**（这是一次真实崩溃的根因，见下）。
+# 它的正则是 `(\\*)(\[[a-z#/@][^[]*?])` —— **必须找到闭合的 `]` 才认为这是标签**，
+# 于是「括号被截断」的文本会被它整个放过：
+#
+#     summarize_args 把 `allowed_tools: [read_file, glob_files, ...]` 截成
+#     `allowed_tools: [read_file, glo…`  → `]` 没了 → rich 不转义 → `[` 原样留下
+#
+# 而 **Textual 的 Content markup 比 Rich 严格**：Rich 把落单的 `[` 当普通文本放过，
+# Textual 认定它是标签开头、去解析后面的内容当样式值，抛
+# `MarkupError: Expected markup value`。更糟的是它抛在 `OptionList.get_content_height`
+# 里——也就是**布局阶段的主线程**，不在 `show_for` 的调用栈上，没有任何 try/except
+# 兜得住，Textual 直接拆掉整个 app，程序退出。
+#
+# 触发条件很窄（某个值的前 30 字符里有 `[`、配对的 `]` 在 30 字符之外），
+# 所以它表现为「偶尔莫名其妙退出」，极难归因。
+#
+# 结论：这些位置嵌进去的都是**纯文本**（工具参数、路径、错误消息、决策原因），
+# 里面的每个 `[` 都是字面量、没有一个是标签，因此无条件全转义才是正确语义。
+_ESCAPE_BRACKET = re.compile(r"(\\*)(\[)")
+
+
+def escape(text: object) -> str:
+    """
+    把任意文本转义成「可安全嵌入 markup 字符串」的形式。
+
+    与 `rich.markup.escape` 的差别：**无条件转义每一个 `[`**，不要求它看起来像
+    一个完整标签。理由见上方 `_ESCAPE_BRACKET` 的注释——「像标签才转义」遇上
+    被截断的括号会漏掉，而漏掉的后果是整个应用崩溃退出。
+
+    行为上它是 `rich.markup.escape` 的**严格超集**：后者会转义的，这里全都会转义。
+
+    :param text: 任意对象，非字符串会先 `str()`
+    :returns: 转义后的字符串
+
+    副作用：无（纯函数）。
+    """
+    markup = str(text)
+    # 前导反斜杠要一并加倍，否则 `\[` 这种「本就转义过的输入」会被二次转义成
+    # 「字面反斜杠 + 标签」，语义反而错了。这一步与 rich 的做法一致。
+    markup = _ESCAPE_BRACKET.sub(lambda m: f"{m.group(1)}{m.group(1)}\\{m.group(2)}", markup)
+    # 结尾落单的反斜杠会把后续拼接进来的字符转义掉，补一个使其成为字面反斜杠。
+    if markup.endswith("\\") and not markup.endswith("\\\\"):
+        markup += "\\"
+    return markup
 
 
 def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
