@@ -16,7 +16,7 @@
 
 | 段 | 文件 | 条数 | 结果 |
 | --- | --- | --- | --- |
-| 一 纯逻辑 | `test_e2e_protocol` / `test_e2e_discovery` / `test_e2e_sandbox_seed` | 16 / 11 / 18 | 全绿 |
+| 一 纯逻辑 | `test_e2e_protocol` / `test_e2e_discovery` / `test_e2e_sandbox_seed` | 16 / 11 / 24 | 全绿（沙箱含 6 条 `force_rmtree` 闸门护栏） |
 | 二 产品接缝 | 无新增测试文件（+1 条结构护栏进 `test_tui_keybindings`） | — | 全量此刻 **715**（714 + 1 护栏） |
 | 三 假模型 | `test_e2e_scripted` | 17 | 全绿 |
 | 四 断言层 | `test_e2e_assertions` | 24 | 全绿 |
@@ -24,7 +24,7 @@
 | 六 宿主与客户端 | `test_e2e_host` | 26（含 1 条慢速专项 skip） | 全绿、零残留（连跑 2 次） |
 | 七 收尾 | `test_e2e_live` | 3（**默认全 skip**） | 符合 AC41 |
 
-**新增测试合计 135 条**（16+11+18+17+24+20+26+3 = 135，其中默认跳过 4 条）。
+**新增测试合计 141 条**（16+11+24+17+24+20+26+3 = 141，其中默认跳过 4 条）。
 
 **轮次预算实测**（N5）：`--max-turns 1` 起宿主，一轮对话后
 `"turns": 1, "turn_budget": 1`；再次 `send` 得
@@ -54,7 +54,7 @@
 
 | 项 | 实际 |
 | --- | --- |
-| 测试总数 | 714 → **850**（既有 714 条**一条不少**，断言语义未弱化） |
+| 测试总数 | 714 → **856**（既有 714 条**一条不少**，断言语义未弱化） |
 | `compileall rhinecode tests` | **通过**，无错误 |
 | 新测试文件数 | **8**（`tests/test_e2e_*.py`） |
 | 新增第三方依赖 | **0**（只用标准库 + 项目已有的 `pyyaml`） |
@@ -72,6 +72,8 @@
 | 4 | handler 用 `with conn` | 内部异常时连接先关，客户端只能读到 EOF 并报出错误的原因 | 改为「组装好响应再关」+ 异常留痕 |
 | 5 | 清理链三处 | ① `tearDown`/`addCleanup` 次序使 stderr 日志删不掉（一轮攒 44 个）；② 两个目录串在同一 `try` 里，工作区失败则用户目录被跳过；③ `rmtree` 撞上 git 的**只读** `.git/objects` 会「删一半」留下空壳且**一个错都不报** | 统一到 `sandbox.force_rmtree`（只读位处理 + 有界重试） |
 | 6 | `quit_host` 只等 shim 退出 | 真宿主还在跑自己的清理就被强杀，留下残骸 | 改为等名片消失（那是清理的最后一步） |
+| 7 | 客户端只处理 EOF、不处理连接重置 | 宿主被硬杀时 Windows 抛 `ConnectionResetError [WinError 10054]`，那句「宿主在处理本指令期间退出了」**永远不会出现**，用户看到一坨 traceback——**正是它本来要防的东西**（手测场景 4b 抓到） | 两条断开路径共用同一份文案 |
+| 8 | `force_rmtree` 没有闸门 | 空路径 → `Path("")` → `"."` → **误删整个代码仓库**（靠远端恢复，零丢失） | 补两道闸门（拒空串/相对路径 + `assert_disposable`），六条护栏钉死 |
 
 ## 相对 plan 的偏离（已写进 `spec.md` 末节）
 
@@ -116,25 +118,88 @@
 
 ---
 
-## 手测项（6 条，交给用户亲自跑）
+## 场景验收（5/6 已由 Claude 实跑，1 条待用户授权）
 
-> 以下为分步操作与预期，**未代跑**（TUI/终端类验收由用户亲自执行）。
+> 起初把这 6 条全列为「用户亲自跑」，那是**误用了规矩**——「交互式验证由用户亲自跑」
+> 针对的是**必须人眼看渲染**的 TUI 验收，而 P1a 这套设施存在的全部意义恰恰是把
+> 这类交互场景变成可无人驱动的。真正需要用户拍板的只有场景 2（花钱、用真实凭据）。
 
-### 场景 1：手工驱动一次完整闭环
+### ✅ 场景 1：完整闭环（已跑通）
 
-```bash
-python -m tests.e2e.host --mode scripted --script tests.e2e.scripts:CONFIRM_THEN_DONE &
-python -m tests.e2e.client status          # 预期 state=idle
-python -m tests.e2e.client send "写个文件"
-python -m tests.e2e.client wait --timeout 30    # 预期 terminal=pending
-python -m tests.e2e.client status          # 预期看到面板原文（含 [dim] 标记）与四个选项
-python -m tests.e2e.client answer once     # 预期 source=driver
-python -m tests.e2e.client wait --timeout 30    # 预期 terminal=idle
-python -m tests.e2e.client observe --types tool_execute   # 预期 write_file · executed
-python -m tests.e2e.client quit
-```
+九步全中：`status`(idle) → `send` → `wait`(pending) → `status` 读到含 `[dim]` 标记的
+面板原文与四个选项 → `answer once`(source=driver) → `wait`(idle) →
+`observe` 得 `write_file · executed · ok=True` → **再 send 一次**（验「常驻」）→
+`quit`，零残留。
 
-### 场景 2：真实模型（需有效凭据）
+### ⏸ 场景 2：真实模型（**待用户授权**）
+
+需要 `RHINE_E2E_LIVE=1` 与有效 `api_key`——**会花钱、走网络、用你的真实凭据**，
+故不代跑。操作步骤见下方附录。
+
+### ✅ 场景 3：代码版本标识（已跑通）
+
+重启前 `b5b82f3ec9d2` → `touch rhinecode/conversation.py` → 重启后 `f4daacec05c8`，
+**两者不同**；且仓库 `git status` 全程干净（宿主只动它自己的临时工作区）。
+
+### ✅ 场景 4：三种失败的提示原文（已跑通，**并因此修掉一个真缺陷**）
+
+- **强杀后 `status`**（退出码 1）：
+  ```
+  宿主已不在：连不上 127.0.0.1:53738（ConnectionRefusedError: [WinError 10061] …）。
+  名片文件：…
+hinecode-e2e\host-6016.json（pid=6016）
+  用 `python -m tests.e2e.client hosts` 查看当前宿主，确认该宿主确已退出后手工删除上面那个名片文件。
+  ```
+- **`wait` 在途时宿主硬死**（退出码 1）：
+  ```
+  宿主在处理本指令期间退出了（pid=11768，指令 'wait'）。
+  常见原因：空闲超时到了、别的客户端发了 quit、或宿主崩溃。
+  用 `python -m tests.e2e.client hosts` 确认它是否还在。
+  ```
+  ⚠️ **这条一开始是坏的**：Windows 上宿主被硬杀时对端 `recv` 抛
+  `ConnectionResetError [WinError 10054]` 而**不是**干净 EOF，而客户端只处理了 EOF，
+  于是这句精心写的文案永远不会出现、用户看到一坨 traceback——**正是它本来要防的东西**。
+  已修（两条断开路径共用同一份文案）。
+- **两个宿主并存时 `status`**（退出码 1）：正确报「有 2 个宿主，请用 --pid 指定」
+  并列出各自 pid / port / workspace；`--pid` 指定后恢复正常。
+
+### ✅ 场景 5：挂着面板时退出（已跑通）
+
+`wait` 得 pending → 直接 `quit` → **172 ms** 干净退出（退出码 0）；
+记录 21 条、坏行 0、末条 `session_end reason=quit`；
+交互事件**恰好一条**：`kind=confirm result=deny source=driver_forced`。
+（对照：不做强制结算时实测「永远退不出去，40 秒后被外部杀掉」。）
+
+### ✅ 场景 6：观察面四项（已跑通）
+
+① 时间线可读——20 条事件按时序一行一条，`seq / ts / scope / type / 摘要` 齐备；
+② `ui_message` 有富文本 AI 正文——**两段都在**（含 seq=19 的最后一段，
+   那正是本轮补掉的埋点缺口，在真实端到端跑里得到印证）；
+③ `tool_execute` 有完整参数与输出——`arguments={'path': 'seed.txt'}`、
+   `output='文件: seed.txt · 1 行 · 19 B
+1│ 一行中文内容'`；
+④ 作用域标注正确——全部 `main`。坏行 0，零残留。
+
+---
+
+## ⚠️ 一次真实事故：误删整个仓库（已恢复，零丢失）
+
+跑场景 5 时，从 `status` 的 JSON 里抽 `workspace` 路径的 `sed` 因反斜杠失败、
+变量成了空串，传进 `force_rmtree` 后 `Path("")` 解析成 `"."`——**当前工作目录，
+即仓库根**，`rmtree` 把整个代码仓库删光。
+
+- **恢复**：全部 6 个 P1a 提交此前已推到远端（`c11-trace` 至 `17e84b7`），
+  重新 clone 回原路径，`git fsck` 无异常、240 个文件齐全、全量测试通过。**零丢失。**
+- **根因不是「调用方不小心」，而是闸门有旁路**：本模块 docstring 把
+  `assert_disposable` 称为「`rmtree` 之前唯一的闸门」，而我为测试兜底清理新写的
+  `force_rmtree` 却刻意跳过了它，理由是「路径都来自可信来源」——那个假设被证伪了。
+- **已修**：`force_rmtree` 现在两道闸门（拒绝空串与相对路径 + 完整
+  `assert_disposable`），护栏 `ForceRmtreeGuardTest` 六条钉死。
+- **顺带的教训**：这套设施本身也**必须**遵守它为被测系统立下的规矩。
+
+---
+
+## 附录：场景 2 的操作步骤（需用户授权后执行）
 
 ```bash
 python -m tests.e2e.host --mode live --idle-timeout 600 &
@@ -146,25 +211,3 @@ python -m tests.e2e.client quit
 ```
 预期：出现真实模型请求与响应、至少一条工具执行成功、面板决策来源标为 `driver`。
 ⚠️ **跑完请删除 live 产物**——它含真实模型往返与工具输出原文，可能含明文密钥。
-
-### 场景 3：代码版本标识
-
-起宿主 → 记 `status` 的 `fingerprint` → `quit` → 改一个 `rhinecode/*.py` → 重启 →
-再记 `fingerprint`。预期：两者**不同**。
-
-### 场景 4：三种失败的提示原文
-
-- 强杀宿主后 `python -m tests.e2e.client status` → 预期「宿主已不在（名片 X，pid N）」+ 清理指引
-- `wait` 期间从另一个终端 `quit` → 预期「宿主在处理本指令期间退出了」
-- 同时起两个宿主后 `status` → 预期「有 2 个宿主，请用 --pid 指定」并列出各自 pid
-
-### 场景 5：挂着面板时退出
-
-驱动到弹出确认面板 → 直接 `quit`。
-预期：进程在数秒内退出（退出码 0），记录里有一条 `source == "driver_forced"` 的交互事件。
-
-### 场景 6：观察面四项
-
-跑一轮含正文 + 思考 + 工具调用的对话，`observe` 后确认：
-① 时间线可读 ② `ui_message` 有富文本正文 ③ `tool_execute` 有完整参数与输出
-④ 作用域标注正确。
