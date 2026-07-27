@@ -32,12 +32,12 @@ class DisposableCheckTest(unittest.TestCase):
 
     def test_fresh_workspace_passes(self):
         ws = sandbox.create_workspace()
-        self.addCleanup(shutil.rmtree, ws, True)
+        self.addCleanup(sandbox.force_rmtree, ws)
         sandbox.assert_disposable(ws)  # 不抛即通过
 
     def test_fresh_user_dir_passes(self):
         ud = sandbox.create_user_dir()
-        self.addCleanup(shutil.rmtree, ud, True)
+        self.addCleanup(sandbox.force_rmtree, ud)
         sandbox.assert_disposable(ud)
 
     def test_repo_root_is_rejected(self):
@@ -59,7 +59,7 @@ class DisposableCheckTest(unittest.TestCase):
         「可丢弃」的判据与「目录是否为空」完全无关。
         """
         ws = sandbox.create_workspace()
-        self.addCleanup(shutil.rmtree, ws, True)
+        self.addCleanup(sandbox.force_rmtree, ws)
         seeding.seed_files(ws, {"src/a.py": "print(1)\n", "RHINE.md": "# 项目指令\n"})
         seeding.seed_project_skill(ws, "demo", {"description": "演示"}, "步骤一")
         self.assertTrue(any(ws.iterdir()))
@@ -96,7 +96,7 @@ class CleanupOrderTest(unittest.TestCase):
                 shutil.rmtree(ws)
         finally:
             os.chdir(previous)
-            shutil.rmtree(ws, ignore_errors=True)
+            sandbox.force_rmtree(ws)
 
     def test_cleanup_refuses_non_disposable(self):
         # 清理前永远先校验：传一个不可丢弃的路径必须抛错而不是开删
@@ -109,9 +109,9 @@ class CleanupOrderTest(unittest.TestCase):
 class SeedingTest(unittest.TestCase):
     def setUp(self):
         self.ws = sandbox.create_workspace()
-        self.addCleanup(shutil.rmtree, self.ws, True)
+        self.addCleanup(sandbox.force_rmtree, self.ws)
         self.user = sandbox.create_user_dir()
-        self.addCleanup(shutil.rmtree, self.user, True)
+        self.addCleanup(sandbox.force_rmtree, self.user)
 
     def test_seed_files_creates_parents_and_utf8(self):
         seeding.seed_files(self.ws, {"a/b/c.txt": "中文内容 [dim]标记[/dim]"})

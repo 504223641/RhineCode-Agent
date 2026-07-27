@@ -46,6 +46,11 @@ from typing import Union
 # 标记文件名。改它等于让此前留下的目录全部变成「不可丢弃」，谨慎。
 MARKER = ".rhine-e2e-workspace"
 
+# 清理的重试次数与退避基数（秒）。总耐心 ≈ 0.4+0.8+…+2.8 ≈ 11 秒，
+# 足够覆盖实测到的 Windows 句柄释放延迟；见 `cleanup_workspace` 第③步的注释。
+CLEANUP_ATTEMPTS = 8
+CLEANUP_BACKOFF = 0.4
+
 
 class NotDisposableError(RuntimeError):
     """目标目录不满足「可随时丢弃」的判据。消息里会写明是哪一条不满足。"""
@@ -118,6 +123,48 @@ def assert_disposable(path: Union[str, Path]) -> None:
         )
 
 
+def _clear_readonly(func, path, _exc_info) -> None:
+    """
+    `shutil.rmtree` 的错误处理钩子：把只读位清掉再重试一次。
+
+    **为什么必需**（实测）：git 会把 `.git/objects` 下的对象文件标成**只读**，
+    Windows 上 `rmtree` 撞到只读文件直接抛 `PermissionError`，于是一个预置过
+    git 历史的工作区**永远删不掉**——留下的残骸里只剩半个 `.git`，
+    看起来像「清理成功了但目录还在」。
+
+    只在这里处理只读位这一种情形；别的错误照常抛出（不吞，见 spec N7）。
+    """
+    import stat
+
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def force_rmtree(path: Union[str, Path]) -> None:
+    """
+    尽力删掉一个目录，**供测试的兜底清理使用**（不做可丢弃校验、不切工作目录）。
+
+    ⚠️ **测试里凡是要 `rmtree` 一个沙箱目录，都必须走本函数，不要直接写
+    `shutil.rmtree(path, ignore_errors=True)`。**
+
+    实测教训：`ignore_errors=True` 撞上 git 留下的**只读** `.git/objects` 会
+    「删一半」——目录还在、内容没了，看起来像清理成功了其实没有。
+    这种残骸只在全量测试里出现（单跑那条用例时 git 的句柄早已释放），
+    追起来极费劲：现象是「系统临时目录里莫名多出一个只剩 `.git` 的空壳」，
+    而报错一个都没有。
+    """
+    path = Path(path)
+    for attempt in range(CLEANUP_ATTEMPTS):
+        if not path.exists():
+            return
+        try:
+            shutil.rmtree(str(path), onerror=_clear_readonly)
+            return
+        except OSError:
+            time.sleep(CLEANUP_BACKOFF * (attempt + 1))
+    shutil.rmtree(str(path), ignore_errors=True)
+
+
 def cleanup_workspace(path: Union[str, Path], *, previous_cwd: Union[str, Path]) -> None:
     """
     清理一次性目录——三步中的第②③步。
@@ -138,5 +185,20 @@ def cleanup_workspace(path: Union[str, Path], *, previous_cwd: Union[str, Path])
     assert_disposable(path)
     # 第②步：退出待删目录，否则 Windows 下 rmtree 必抛 WinError 32
     os.chdir(str(previous_cwd))
-    # 第③步：真正删除
-    shutil.rmtree(str(path))
+    # 第③步：真正删除。
+    #
+    # `onerror` 只处理「只读位」这一种情形（见 `_clear_readonly`）。
+    # 外面再套一层**有界重试**：Windows 上刚结束的子进程（尤其是 git）与后台扫描
+    # 会短暂持有文件与目录句柄，第一次 `rmtree` 常常删掉了大部分内容却在
+    # 某个目录上抛 `PermissionError`，留下一个空骨架。实测在全量测试的并发负载下
+    # 才会出现，单独跑必成功——所以判据不是「重写逻辑」而是「等一会儿再试」。
+    #
+    # **最后一次仍然让异常抛出来**：删不掉要暴露，不能吞（spec N7）。
+    for attempt in range(CLEANUP_ATTEMPTS):
+        try:
+            shutil.rmtree(str(path), onerror=_clear_readonly)
+            return
+        except OSError:
+            if attempt == CLEANUP_ATTEMPTS - 1:
+                raise
+            time.sleep(CLEANUP_BACKOFF * (attempt + 1))

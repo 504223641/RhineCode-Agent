@@ -85,7 +85,7 @@ class DriverFixture(unittest.IsolatedAsyncioTestCase):
         os.chdir(self._cwd)
         path_guard.clear_read_roots()
         for path in (self.ws, self.user_dir):
-            shutil.rmtree(path, ignore_errors=True)
+            sandbox.force_rmtree(path)
 
     def assemble(
         self,
