@@ -915,6 +915,58 @@ class EncodingTest(HostFixture):
         self.assertIn("[方括号]", blob)
 
 
+class ConfigPassthroughTest(HostFixture):
+    """
+    `--config` 在 **scripted 模式**下也必须生效。
+
+    ⚠️ **这条护栏是补出来的，起因是一次真实的静默失效**：`make_config` 早先在
+    scripted 分支里完全无视 `--config`，直接返回写死的 `context_window=65536`。
+    用 P1a 验 P0 的「压缩动作可解释」场景时传了 `context_window: 8192`，
+    参数被悄悄丢掉、仍按 64K 判定，于是第二层摘要永远不触发——
+    **现象出在 C8 那边**（看起来像上下文管理坏了），排查绕了一大圈才发现是这里吞了参数。
+
+    **静默丢弃参数是最坏的一类缺陷**：调用方以为生效了，症状却出在别处。
+    """
+
+    def test_scripted_mode_honours_config(self):
+        import tempfile
+
+        import yaml
+
+        cfg = Path(tempfile.gettempdir()) / f"e2e_cfgtest_{os.getpid()}.yaml"
+        cfg.write_text(
+            yaml.safe_dump({
+                "protocol": "deepseek", "model": "deepseek-chat",
+                "base_url": "https://api.deepseek.com", "api_key": "placeholder-should-be-replaced",
+                "debug_log": False, "context_window": 8192,
+            }, allow_unicode=True),
+            encoding="utf-8",
+        )
+        self.addCleanup(cfg.unlink, True)
+
+        self.start_host(
+            "--mode", "scripted", "--script", "tests.e2e.scripts:SAY_HELLO",
+            "--config", str(cfg), "--idle-timeout", "120",
+        )
+        snapshot = self.view().of_type("session_start")[0]
+        self.assertEqual(
+            snapshot["config"]["context_window"], 8192,
+            "scripted 模式必须认 --config 里的 context_window，"
+            "写死 65536 会让任何靠调窗口构造的场景静默失效",
+        )
+        # api_key 被强制换成假值：scripted 下真 key 本就用不上，没必要让它进内存与快照
+        self.assertNotIn("placeholder-should-be-replaced", str(snapshot["config"]))
+
+    def test_scripted_mode_without_config_uses_default(self):
+        """不传 --config 时仍是原来的默认值（缺省行为不变）。"""
+        self.start_host(
+            "--mode", "scripted", "--script", "tests.e2e.scripts:SAY_HELLO",
+            "--idle-timeout", "120",
+        )
+        snapshot = self.view().of_type("session_start")[0]
+        self.assertEqual(snapshot["config"]["context_window"], 65536)
+
+
 class CleanupTest(HostFixture):
     """AC42 / AC26：不留残留、连跑不污染。"""
 

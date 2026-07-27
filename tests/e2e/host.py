@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import importlib
 import os
 import socket
@@ -334,7 +335,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", default=None, help="预置函数，形如 MOD:FUNC，签名 (workspace, user_dir)")
     parser.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
-    parser.add_argument("--config", default=None, help="真实模式用的配置文件路径")
+    parser.add_argument("--config", default=None,
+                        help="配置文件路径。live 模式必须含有效凭据；scripted 模式也认它"
+                             "（用于调 context_window 等构造场景），但 api_key 会被换成假值")
     parser.add_argument(
         "--keep-workspace",
         action="store_true",
@@ -351,10 +354,25 @@ def make_config(args: argparse.Namespace) -> Config:
     """
     造一份配置。
 
-    - scripted：假 key 即可（`create_provider` 只构造客户端对象，不联网），
-      而且真正被调用的是假模型。
+    - scripted：默认用一份写死的假配置（假 key 即可——`create_provider` 只构造客户端
+      对象、不联网，且真正被调用的是假模型）。**给了 `--config` 时以该文件为准**，
+      但 `api_key` 会被强制换成假值。
     - live：读真实配置；**凭据缺失或仍是占位符时明确报错退出，不静默降级**（spec F23）
       ——静默降级会让一次「真实模式」验收其实跑的是假模型，那比失败更糟。
+
+    ## 为什么 scripted 也要认 `--config`（实测补的）
+
+    早先这个函数在 scripted 分支里**完全无视 `--config`**，直接返回写死的
+    `context_window=65536`。后果是任何想调配置来构造场景的驱动都会**静默失效**——
+    用 P1a 验 P0 的「压缩动作可解释」场景时就撞上了：那条场景要求用
+    `context_window: 8192` 的窄窗口**可控地**触发两层压缩（P0 checklist 明确
+    「不要靠聊很久等自动触发」），而传进来的 8192 被丢掉、仍按 64K 判定，
+    于是第二层摘要永远不触发，看起来像是 C8 的 bug，其实是这里吞了参数。
+
+    **静默丢弃参数是最坏的一类缺陷**：调用方以为生效了，现象却出在别处。
+
+    `api_key` 强制换成假值是纵深防御：scripted 模式下 `provider_factory` 恒返回
+    假模型、真 key 本来就用不上，但也没必要让它进到进程内存与 `session_start` 快照里。
     """
     if args.mode == "live":
         path = Path(args.config) if args.config else Path.home() / ".rhinecode" / "config.yaml"
@@ -367,6 +385,13 @@ def make_config(args: argparse.Namespace) -> Config:
                 "（本设施不会静默降级成假模型——那会让一次真实模式验收名不副实。）"
             )
         return cfg
+
+    # scripted：给了 --config 就以它为准（但 api_key 换成假值），否则用写死的默认
+    if args.config:
+        path = Path(args.config)
+        if not path.is_file():
+            raise SystemExit(f"--config 指向的文件不存在：{path}")
+        return dataclasses.replace(load_config(str(path)), api_key="fake-key-for-e2e")
     return Config(
         protocol="deepseek",
         model="deepseek-chat",
