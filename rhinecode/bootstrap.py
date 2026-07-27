@@ -103,6 +103,8 @@ def build_app(
     user_dir: Optional[Path] = None,
     resume_latest: bool = False,
     recorder: Optional[TraceRecorderProtocol] = None,
+    provider_factory: Optional[Callable[[Config], Any]] = None,
+    exclude_tools: frozenset = frozenset(),
 ) -> BuildResult:
     """
     按固定顺序装配一个完整的 RhineCode 应用。
@@ -114,6 +116,16 @@ def build_app(
     :param resume_latest: 对应 `rhine --continue`：启动时恢复最近的未锁定会话。
                           **不可漏传**——漏了 `--continue` 会静默失效
     :param recorder: 行为记录器；缺省 `NullRecorder()`（关闭记录）
+    :param provider_factory: 「怎么造一个模型客户端」的可替换实现，签名
+                     `(Config) -> BaseProvider`；缺省 `create_provider`（等于现状）。
+                     这是**依赖注入**：端到端驱动设施靠它把整条链路换成假模型，
+                     而产品代码里一个 `if 测试模式` 都不必写。
+                     **本参数会一路透传给 `ConversationManager`**——协调层的
+                     `_provider_for`（Skill 指定 `model:` 时的换模型旁路）自己会再造
+                     一次 Provider，不透传的话那条旁路会绕过假模型静默连上真实网络。
+    :param exclude_tools: 装配完成后要从工具注册中心摘掉的工具名集合；
+                     缺省空集（等于现状）。用于把「会突破测试隔离」的工具拿掉，
+                     摘除位置见下方那段窄窗口注释。
     :returns: BuildResult
 
     :raises BootstrapError: 三类致命配置错误（命令注册冲突 / Provider 初始化失败 /
@@ -138,8 +150,12 @@ def build_app(
         raise BootstrapError(f"命令注册冲突：{e}") from e
 
     # ② 模型 Provider。
+    # 工厂可被调用方替换（依赖注入）；不传时逐字等于原来的 `create_provider(cfg)`。
+    # 注意 ValueError 的捕获与 BootstrapError 的文案**一字不改**——那是既有启动测试
+    # 逐字断言的不可变契约（见本文件顶部的三段文案登记）。
+    factory = provider_factory or create_provider
     try:
-        provider = create_provider(cfg)
+        provider = factory(cfg)
     except ValueError as e:
         raise BootstrapError(f"Provider 初始化错误：{e}") from e
 
@@ -200,6 +216,24 @@ def build_app(
     if fatal_tool_names:
         raise BootstrapError(format_fatal_message(fatal_tool_names))
 
+    # ── exclude_tools 的摘除：**位置同样卡在这个窄窗口里，两头都不能挪** ──
+    #
+    # （与上面那段 Skill 校验的窄窗口是同一个窗口、同一类约束。下一个人重排本函数时
+    #  必须把两段一起看，只看到 Skill 那半段会以为这里可以自由移动。）
+    #
+    # 往前挪不行（挪到 known_tools 计算之前）：那会让一个**在真实启动下完全合法**的
+    # 工作区起不来。实测过——白名单里写了 `mcp_add_server` 的 Skill 会因为该名字
+    # 已被摘掉而落进「不认识的工具名」，被第一段严格校验判成笔误并 fail-fast
+    # （实测 `fatals = [('addmcp', 'mcp_add_server')]`）。放在 `startup` **之后**，
+    # 白名单的校验口径就与真实启动逐字一致；被摘掉的名字随后由 Skill 的运行期
+    # 工具交集自然剔除（实测 `tool_policy.allowed = ['read_file']`），模型照样调不到。
+    #
+    # 往后挪不行：必须在 `session_start` 快照之前。快照里的 `tool_names` 是断言
+    # 「工具确实被摘掉了」的依据，摘除若发生在快照之后，快照就会与实际工具集不符——
+    # 观测设施撒谎，且不报错。
+    for name in sorted(exclude_tools):
+        tool_registry.unregister(name)
+
     mcp_manager.connect_all(mcp_configs, tool_registry, extra_errors=mcp_errors)
 
     # ── Skill 系统第二阶段（c11 T58）：MCP 剪枝 + 短命令注册 ──
@@ -225,6 +259,10 @@ def build_app(
         skill_manager=skill_manager,
         user_dir=user_dir,
         recorder=recorder,
+        # **必须透传**：协调层的 `_provider_for` 会在 Skill 声明 `model:` 时自己再造
+        # 一个 Provider。那条旁路在协调层内部，本函数第②步包住的那一层管不到它——
+        # 不透传的话，一个指定了模型的 Skill 会绕过假模型、静默连上真实网络。
+        provider_factory=provider_factory,
     )
 
     # ⑥ 界面层。

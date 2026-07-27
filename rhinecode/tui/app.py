@@ -655,20 +655,45 @@ class RhineApp(App):
         self.query_one(InputBar).disabled = False
         self.query_one(InputBar).focus()
 
-    def on_session_panel_cancelled(self, event: SessionPanel.Cancelled) -> None:
-        """会话选择面板按 Esc 退出：关闭面板，不做任何载入，界面原样保留。"""
-        # 会话选择面板走的不是 _interact 那条路（主线程发起、无 Worker 阻塞等待），
-        # 所以在**两个互斥的结算处**各埋一条：这里是取消，另一处是选中。
-        # ⚠️ 不要在 `_show_session_panel` 也埋——那会让一次会话选择产出两条，
-        # 与「四类面板各产出一条」不符（trace AC16）。
+    def _settle_session(self, session_id: Optional[str], source: str = "human") -> None:
+        """
+        **会话选择面板结算的唯一入口**（选中与取消两条路径都走它）。
+
+        :param session_id: 选中的会话标识；`None` 表示取消（关闭面板不载入）
+        :param source: 结算路径来源，取值集合见 `_resolve_interaction`
+
+        执行步骤：埋一条 INTERACTION 事件 → 关闭面板 → 有 id 则载入该会话。
+
+        ⚠️ **第一行的幂等守卫不可省**：没有面板挂着时静默返回。
+        缺了它，驱动设施退出时的「强制结算」会在没有面板的情况下凭空多埋一条交互
+        事件，破坏 trace「四类面板各产出恰好一条」的口径（trace AC16）。
+
+        ⚠️ 会话选择面板走的不是 `_interact` 那条路（它由主线程发起，没有 Worker 在
+        阻塞等待），所以埋点只能在结算处做，而**两条结算路径必须合并到这里**——
+        分散在两处时，将来任何第三条路径都会漏掉埋点与守卫。
+
+        副作用：产出记录事件、隐藏面板并还焦输入框、可能触发一次会话载入
+        （载入会走后台 Worker，因为它可能触发阻塞的 C8 摘要调用）。
+        """
+        if not self._session_panel_active:
+            return
         self._recorder.emit(
             TraceEventType.INTERACTION,
             kind="session",
-            display="",
-            source="human",
-            result="cancelled",
+            display=str(session_id) if session_id is not None else "",
+            source=source,
+            result="selected" if session_id is not None else "cancelled",
         )
         self._close_session_panel()
+        if session_id is not None:
+            # 直接复用恢复控制器（c10 T48）：与 /resume <id> 命令同一领域入口，
+            # 不再伪造用户没有手输的 "/resume <session_id>" 文本（也不回显它）。
+            # option.id 携带完整 session_id，_resolve_key 按精确 ID 匹配必中。
+            self.resume_session(session_id)
+
+    def on_session_panel_cancelled(self, event: SessionPanel.Cancelled) -> None:
+        """会话选择面板按 Esc 退出：关闭面板，不做任何载入，界面原样保留。"""
+        self._settle_session(None)
 
     # ------------------------------------------------------------------ #
     # Agent 事件流消费
@@ -895,7 +920,9 @@ class RhineApp(App):
                         展示内容全被闭进 `show_fn` 里，本方法拿不到（trace T45）
         :returns: 用户选择的结果
         """
-        box = {"event": threading.Event(), "result": default, "kind": kind}
+        # `source` 记录**这次结算走的是哪条路径**，缺省 human（面板按键路径）。
+        # 结算方（`_resolve_interaction`）可以覆写它，见该方法的说明。
+        box = {"event": threading.Event(), "result": default, "kind": kind, "source": "human"}
         self._pending_interaction = box
         # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
         self._busy_hint_shown = False
@@ -905,12 +932,15 @@ class RhineApp(App):
         # 交互埋点（trace F14）：埋在**阻塞等待返回之后**（即结算时刻），
         # 一次交互恰好一条。埋在弹出时会记不到 result，而「用户选了什么」
         # 正是这条事件的全部价值。
+        # source 从盒子里读而不是写死 "human"：结算可能来自面板按键，也可能来自
+        # 端到端驱动设施的控制通道，二者在记录里必须能分辨。
+        source = box.get("source", "human")
         self._recorder.emit_lazy(
             TraceEventType.INTERACTION,
             lambda: {
                 "kind": kind,
                 "display": clip(display),
-                "source": "human",
+                "source": source,
                 "result": getattr(result, "value", result),
             },
         )
@@ -983,16 +1013,33 @@ class RhineApp(App):
         )
         panel.focus()
 
-    def _resolve_interaction(self, result) -> None:
+    def _resolve_interaction(self, result, source: str = "human") -> None:
         """
         在主线程结算一次交互：隐藏所有交互面板、还焦输入框、唤醒被阻塞的 Worker。
 
         幂等：无待决交互时直接返回，避免重复结算（如选择后又收到取消消息）。
+
+        :param result: 结算值（四态确认枚举 / 布尔 / 澄清摘要文本 / None）
+        :param source: **这次结算走的是哪条路径**，写进待决盒供 `_interact` 埋点时读取。
+            取值集合：
+            - `human`        面板按键路径（真人敲键，也包括测试用 Pilot 模拟的按键）
+            - `driver`       端到端驱动设施经控制通道直接结算
+            - `driver_forced` 驱动设施退出时的强制结算（仍属外部驱动者，单列以便审计）
+            - `policy`       P1b 的固定策略应答者预留
+
+            ⚠️ 它标注的是**结算走的哪条路径**，不是对操作者身份的断言——
+            用 Pilot 模拟按键时走的是面板自身的按键路径，来源就该是 `human`。
+
+            ⚠️ **本方法有四个调用方**，不是一个：`on_option_list_option_selected`
+            的 confirm/approve/clarify 三个分支、`on_confirm_panel_cancelled`、
+            `on_clarify_panel_cancelled`，以及驱动设施。前几个靠默认值 `"human"`
+            兜住——这是对的，但改动本方法的人很容易以为只有一处调用方。
         """
         box = self._pending_interaction
         if box is None:
             return
         self._pending_interaction = None
+        box["source"] = source
         self.query_one(ConfirmPanel).hide()
         self.query_one(ClarifyPanel).hide()
         # 恢复输入框：澄清面板期间被禁用（见 _show_clarify_panel），结算后统一解禁并还焦
@@ -1013,21 +1060,9 @@ class RhineApp(App):
         """
         if isinstance(event.option_list, SessionPanel):
             event.stop()
-            session_id = event.option.id
-            # 选中分支的交互埋点（与上面的 Esc 取消分支互斥，合起来一次交互一条）
-            self._recorder.emit(
-                TraceEventType.INTERACTION,
-                kind="session",
-                display=str(session_id),
-                source="human",
-                result="selected",
-            )
-            self._close_session_panel()
-            # 直接复用恢复控制器（c10 T48）：与 /resume <id> 命令同一领域入口，
-            # 不再伪造用户没有手输的 "/resume <session_id>" 文本（也不回显它）。
-            # option.id 携带完整 session_id，_resolve_key 按精确 ID 匹配必中；
-            # 载入可能触发 C8 压缩（阻塞的摘要 LLM 调用），统一消费路径走后台 Worker。
-            self.resume_session(session_id)
+            # 埋点、关面板、载入三件事全在 `_settle_session` 里（它是会话面板结算的
+            # 唯一入口，与 Esc 取消分支共用同一份实现）。
+            self._settle_session(event.option.id)
             return
 
         box = self._pending_interaction

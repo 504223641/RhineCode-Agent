@@ -168,6 +168,7 @@ class ConversationManager:
         skill_manager: "Optional[SkillManager]" = None,
         user_dir: Optional[Path] = None,
         recorder: "Optional[TraceRecorderProtocol]" = None,
+        provider_factory: Optional[Callable[[Config], BaseProvider]] = None,
     ):
         """
         初始化对话管理器。
@@ -201,8 +202,24 @@ class ConversationManager:
                          真实主目录（trace spec F23）。
         :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`——
                          **不传等于零回归**，全部埋点变成空调用。
+        :param provider_factory: 「怎么造一个模型客户端」的可替换实现，签名
+                         `(Config) -> BaseProvider`；缺省 `create_provider`（逐字等于现状）。
+
+                         **这是「换模型旁路」的注入点**：`_provider_for` 会在 Skill
+                         声明了 `model:` 时自己再造一个 Provider，那条路径完全绕开
+                         构造函数收到的 `provider` 参数。端到端驱动设施若只替换了
+                         `provider` 而没透传本参数，那条旁路会**静默连上真实网络**
+                         ——现象是「测试莫名其妙很慢、偶尔失败」，极难定位。
+                         （与 trace P0 的记录旁路是同一处：那次也是 `_provider_for`
+                         漏包 `TracingProvider` 导致换模型的请求整段不进记录。）
         """
         self._provider = provider
+        # 换模型旁路的工厂。**存 None 而不是在这里就 `or create_provider`**：
+        # 那样会把模块级的 `create_provider` 在**构造时**固化下来，而既有测试
+        # （`test_skill_isolated.py`）是在构造之后猴补 `conversation.create_provider`
+        # 模块属性来验证换模型行为的——固化会让那些猴补静默失效。
+        # 存 None、到 `_provider_for` 里再解析，两种用法就都成立。
+        self._provider_factory: Optional[Callable[[Config], BaseProvider]] = provider_factory
         # 行为记录器：Null Object 兜底，各使用点无需判空（trace spec N1）
         self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         # 用户级目录：**必须在这里解析**，因为下面的 PermissionEngine.load 就要用它。
@@ -729,7 +746,12 @@ class ConversationManager:
         cached = self._provider_cache.get(model)
         if cached is not None:
             return cached
-        provider = create_provider(dataclasses.replace(self._config, model=model))
+        # 走可注入的工厂而不是直接 `create_provider`：这样端到端驱动设施注入假模型时，
+        # 这条换模型旁路也一并被换掉（见构造函数 provider_factory 的说明）。
+        # **每次现取**（而不是构造时固化）：没注入时它就是当下的模块级
+        # `create_provider`，既有测试的猴补照常生效。
+        factory = self._provider_factory or create_provider
+        provider = factory(dataclasses.replace(self._config, model=model))
         # 旁路覆盖（trace spec F18）：这条 Provider 不经装配层，若不在这里包一层，
         # 「Skill 指定了别的模型」的那些请求就完全不会出现在记录里——而那正是
         # 最需要看清楚的场景之一（换了模型之后行为为什么变了）。
