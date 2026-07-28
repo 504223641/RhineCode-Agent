@@ -100,6 +100,16 @@ class GrantTranslationTest(unittest.TestCase):
         rules, _ = grants_for([_spec("Glob", "Grep")])
         self.assertEqual({r.tool for r in rules}, {"Read"})
 
+    def test_duplicate_rules_deduped(self) -> None:
+        """
+        映射到同一条规则的多个声明只产出一条。
+
+        求值上重复无害（命中哪条都一样），但 `/skills prompt` 会把同一行列两遍，
+        用户会以为自己写重了——实测三个内置样板里的 `Read` + `Grep` 就是这样。
+        """
+        rules, _ = grants_for([_spec("Read", "Grep", "Glob")])
+        self.assertEqual(len(rules), 1)
+
     def test_internal_tool_names_also_accepted(self) -> None:
         """
         本系统的内部工具名也收下。

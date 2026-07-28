@@ -93,6 +93,13 @@ def grants_for(specs: Iterable[SkillSpec]) -> tuple[list[Rule], list[str]]:
     """
     rules: list[Rule] = []
     warnings: list[str] = []
+    # 去重：`Rule` 是 frozen 且可哈希，正好当键用。
+    #
+    # 为什么需要：标准把只读检索拆成 `Read` / `Glob` / `Grep` 三个工具名，
+    # 本系统都归在 `Read` 下——一份声明了其中两个的 Skill 会产出两条一模一样的
+    # 规则。求值上无害（命中哪条都一样），但 `/skills prompt` 会把同一行列两遍，
+    # 用户会以为自己写重了。
+    seen: set[Rule] = set()
 
     for spec in specs:
         for item in spec.granted_tools:
@@ -120,7 +127,8 @@ def grants_for(specs: Iterable[SkillSpec]) -> tuple[list[Rule], list[str]]:
                 effect="allow",
                 source=GRANT_SOURCE,
             )
-            if rule is not None:
+            if rule is not None and rule not in seen:
+                seen.add(rule)
                 rules.append(rule)
 
     return rules, warnings
