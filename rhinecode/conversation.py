@@ -587,8 +587,14 @@ class ConversationManager:
     # Skill 领域方法（c11）
     # ------------------------------------------------------------------ #
     def skills_report(self) -> str:
-        """`/skills` 的只读状态报告。"""
-        return self.skill_manager.report()
+        """
+        `/skills` 的只读状态报告。
+
+        传入注册中心当前工具名，供作者期体检判断「白名单是否已等于全集」
+        （口径与 `skills_prompt_report` 一致）。
+        """
+        registered = self._registry.names() if self._registry else frozenset()
+        return self.skill_manager.report(registered)
 
     def skills_prompt_report(self) -> str:
         """`/skills prompt` 的只读注入内容报告。"""
@@ -644,6 +650,11 @@ class ConversationManager:
             lines.append("")
             lines.append("警告：")
             lines.extend(f"- {w}" for w in outcome.warnings)
+        # 作者期体检（1.1）：reload 是作者改文件的**编辑循环**，反馈必须落在这里。
+        if outcome.lint:
+            lines.append("")
+            lines.append("体检建议（不影响运行，但值得改）：")
+            lines.extend(f"- {item}" for item in outcome.lint)
         return "\n".join(lines)
 
     def run_skill(

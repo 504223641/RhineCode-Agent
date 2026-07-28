@@ -18,7 +18,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
-from rhinecode.skills.models import MCP_PREFIX, SkillSpec
+from rhinecode.skills.models import MCP_PREFIX, PLACEHOLDER, SkillSpec
+
+
+# ── 作者期体检（lint）的阈值 ──
+# description 的定位是「一句话说明」：它同时进第一阶段清单（每次请求都发）
+# 与自包含调用文本（每次执行都发）。80 字符是「一行中文能读完」的经验值，
+# 超了不算错、只提醒——所以是警告不是加载失败。
+DESCRIPTION_MAX_CHARS = 80
 
 
 @dataclass(frozen=True)
@@ -190,3 +197,91 @@ def prune_mcp_tool_names(
             out.append(spec)
 
     return out, warnings
+
+
+# ---------------------------------------------------------------------------
+# 作者期体检（lint）
+# ---------------------------------------------------------------------------
+# ## 为什么需要它
+#
+# C11 原本只把 Skill 当成「已经写好的东西」来消费——发现它、加载它、注入它，
+# 却从来没有告诉作者「写得对不对」。而**四类写法问题一个都不会报错**，
+# 全是静默降级：
+#
+# | 写法 | 静默后果 |
+# |---|---|
+# | description 写成一整段 | 列表被撑成多行难以扫读；且它每次执行都被塞进调用文本 |
+# | 正文没有 `$ARGUMENTS` | 参数被追加到正文末尾，作者以为参数没生效 |
+# | 白名单覆盖了全部工具 | 等于没收窄，但读定义的人以为有约束 |
+# | 没写白名单 | 不收窄（可能是有意的，所以只告知不警告） |
+#
+# 这四条都是**实测**出来的：把一份外部 Skill 原样搬进来跑真实模型，四条全中。
+#
+# ## 与「加载失败」的区别
+#
+# 体检产出的是**警告**，不阻断加载——这些写法都能跑，只是跑得不如作者以为的那样。
+# 真正的错误（frontmatter 语法坏、缺必填字段、名字非法）仍走 `catalog.errors`。
+# 两者在 `/skills` 报告里分列两段，别混。
+def lint_skill(spec: SkillSpec, registered: frozenset[str]) -> list[str]:
+    """
+    对单个 Skill 做作者期体检，返回**人话警告**列表（空列表表示没问题）。
+
+    :param spec: 待检查的 Skill 定义
+    :param registered: 注册中心当前的全部工具名，用于判断白名单是否等于全集
+    :returns: 警告文本列表，每条都说明「问题是什么 + 建议怎么改」
+
+    副作用：无（纯函数）。
+
+    ⚠️ 每条警告都必须带**可操作的建议**。只说「description 太长」而不说
+    「它会被塞进每次调用文本、建议压成一句话」，作者不会知道为什么该改，
+    多半就忽略了——那这条检查等于不存在。
+    """
+    out: list[str] = []
+
+    if len(spec.description) > DESCRIPTION_MAX_CHARS:
+        out.append(
+            f"Skill `{spec.name}` 的 description 长 {len(spec.description)} 字符"
+            f"（建议 ≤ {DESCRIPTION_MAX_CHARS}）。它会出现在第一阶段清单里，"
+            f"**也会被原样嵌进每次执行的调用文本**，过长会挤占上下文并让 `/skills` "
+            f"列表难以扫读。建议压成一句话，详细说明放正文。"
+        )
+
+    if PLACEHOLDER not in spec.body:
+        out.append(
+            f"Skill `{spec.name}` 的正文没有 `{PLACEHOLDER}` 占位符。"
+            f"带参数调用时参数会被追加到正文末尾的「用户补充参数」段——"
+            f"能用，但位置由不得你。想让参数落在 SOP 的特定位置，请加上占位符。"
+        )
+
+    if spec.allowed_tools is None:
+        out.append(
+            f"Skill `{spec.name}` 未声明 allowed_tools，不收窄工具集"
+            f"（全部工具对它可见）。若是有意为之可忽略本条。"
+        )
+    elif registered and set(spec.allowed_tools) >= set(registered):
+        # 注意用 `>=` 而不是 `==`：白名单里可能含尚未连接的 mcp__ 项，
+        # 那些项在这一刻不在 registered 里，但它同样覆盖了全部**可用**工具。
+        out.append(
+            f"Skill `{spec.name}` 的 allowed_tools 覆盖了当前全部 "
+            f"{len(registered)} 个已注册工具，**等于没有收窄**。"
+            f"建议按实际需要收窄，或直接删掉这个字段——"
+            f"留着一个覆盖全集的白名单只会让读定义的人误以为有约束。"
+        )
+
+    return out
+
+
+def lint_skills(skills: Iterable[SkillSpec], registered: frozenset[str]) -> list[str]:
+    """
+    对一批 Skill 逐个体检，按 Skill 顺序拼平成一个列表。
+
+    :param skills: 待检查的 Skill 定义序列
+    :param registered: 注册中心当前的全部工具名
+    :returns: 全部警告文本
+
+    副作用：无（纯函数）。
+    """
+    out: list[str] = []
+    for spec in skills:
+        out.extend(lint_skill(spec, registered))
+    return out

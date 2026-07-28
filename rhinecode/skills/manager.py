@@ -66,6 +66,7 @@ from rhinecode.skills.validation import (
     FatalToolName,
     check_builtin_tool_names,
     collect_exempt_notices,
+    lint_skills,
     prune_mcp_tool_names,
 )
 from rhinecode.tools.policy import ToolPolicy
@@ -315,6 +316,10 @@ class SkillManager:
             dropped_fatal=tuple(sorted(fatal_names)),
             warnings=tuple(warnings),
             errors=new_catalog.errors,
+            # 作者期体检（1.1）：reload 是作者的**编辑循环**——改文件、reload、
+            # 看反馈、再改。体检结果必须出现在这里，否则作者要专门去敲 `/skills`
+            # 才看得到，而那时他多半已经以为自己写对了。
+            lint=tuple(lint_skills(new_catalog.skills, registered)),
         )
 
     # ────────────────────── 行为记录埋点（trace）──────────────────────
@@ -681,14 +686,21 @@ class SkillManager:
             f"请确认它们可信。"
         )
 
-    def report(self) -> str:
+    def report(self, registered: frozenset[str] = frozenset()) -> str:
         """
         `/skills` 的完整只读报告。
 
+        :param registered: 注册中心当前工具名，供作者期体检判断「白名单是否等于全集」。
+                           **有缺省值**是为了不打断既有调用点（测试里大量直接调
+                           `report()`）；不传时那一条检查自动跳过，其余三条照常。
         :returns: 多行报告文本
 
         遵守「持锁取快照 → 出锁渲染」：`has_short_command` 是跨层回调，
         必须在锁外调用（加锁约定 ②）。
+
+        体检结果**每次现算**（而不是像 warnings 那样存在 `_runtime_warnings` 里）：
+        它是纯函数、成本极低，而存起来就要考虑何时失效——多一处状态就多一处
+        「reload 之后忘了更新」的机会。
 
         副作用：无（纯只读）。
         """
@@ -730,6 +742,14 @@ class SkillManager:
         if warnings:
             lines.extend(["", "警告："])
             lines.extend(f"- {w}" for w in warnings)
+
+        # 作者期体检（1.1）。**单列一段、排在警告之后**：
+        # 警告说的是「这次运行发生了什么」，体检说的是「你的文件可以写得更好」，
+        # 混排会让两者互相稀释。
+        lint = lint_skills(catalog.skills, registered)
+        if lint:
+            lines.extend(["", "体检建议（不影响运行，但值得改）："])
+            lines.extend(f"- {item}" for item in lint)
 
         # 项目级 Skill 的信任模型告知（spec N8）。**从启动打印挪到了这里**：
         # 启动时 `print()` 发生在 Textual 接管屏幕之前，内容被 alternate screen
