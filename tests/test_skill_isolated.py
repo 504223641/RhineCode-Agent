@@ -107,7 +107,7 @@ class IsolatedTestBase(unittest.TestCase):
         self._home.cleanup()
 
     def _write_skill(self, name: str = "rev", **extra) -> None:
-        lines = [f"name: {name}", "description: 审查改动", "mode: isolated"]
+        lines = [f"name: {name}", "description: 审查改动", "context: fork"]
         lines.extend(f"{k}: {v}" for k, v in extra.items())
         (self.skills_dir / f"{name}.md").write_text(
             "---\n" + "\n".join(lines) + "\n---\n" + self.SKILL_BODY + "\n",
@@ -116,7 +116,7 @@ class IsolatedTestBase(unittest.TestCase):
         # 让已创建的 manager 重新扫盘，这样测试里「先建 manager 再写 Skill 文件」
         # 的自然写法不会踩到一个空 catalog。
         for mgr in self._managers:
-            mgr.skill_manager.startup(_KNOWN_TOOLS)
+            mgr.skill_manager.startup()
 
     def _manager(self, provider=None, registry=None, tools=()) -> ConversationManager:
         provider = provider or ScriptedProvider()
@@ -130,7 +130,7 @@ class IsolatedTestBase(unittest.TestCase):
             builtin_dir=None,
             has_short_command=lambda _n: True,
         )
-        sm.startup(_KNOWN_TOOLS)
+        sm.startup()
         mgr = ConversationManager(provider, _config(), registry, skill_manager=sm)
         mgr.approve_plan_callback = lambda _p: True
         # 默认关掉 c9 的自动笔记钩子：它在自然停止时起一个 daemon 线程，
@@ -266,7 +266,17 @@ class ConclusionFlowTest(IsolatedTestBase):
 class SubHistoryTest(IsolatedTestBase):
     """T49a：子历史构造（AC20/F20）。"""
 
-    def test_zero_history_gives_exactly_one_user_message(self) -> None:
+    def test_sub_history_is_exactly_one_self_contained_message(self) -> None:
+        """
+        子对话固定只带那条自包含调用消息（对齐改造 F9）。
+
+        标准里的 fork 不提供「从主历史带入尾部若干条」，C11 的 `history_messages`
+        随之删除。那条消息是自包含的（含 Skill 名、说明与参数），模型据此就知道
+        要做什么——这也正是「自包含调用文本」当初被设计成这样的原因。
+        """
+        return self._legacy_zero_history_check()
+
+    def _legacy_zero_history_check(self) -> None:
         """
         `history_messages: 0` → 子历史恰为一条 user 消息，内容与主历史那条同源。
 
@@ -289,77 +299,6 @@ class SubHistoryTest(IsolatedTestBase):
         # 与主历史那条同源。
         self.assertEqual(user_msgs[0].content, mgr.history[-2].content)
 
-    def test_history_messages_brings_tail(self) -> None:
-        provider = ScriptedProvider()
-        mgr = self._manager(provider)
-        self._write_skill(history_messages=2)
-        mgr.history.append(Message(role="user", content="早期问题"))
-        mgr.history.append(Message(role="assistant", content="早期回答"))
-        mgr.history.append(Message(role="user", content="最近问题"))
-        mgr.history.append(Message(role="assistant", content="最近回答"))
-
-        list(mgr.run_skill("rev", "", "/rev"))
-
-        sent = " ".join(m.content or "" for m in provider.calls[0]["messages"])
-        self.assertIn("最近问题", sent)
-
-    def test_tool_pair_is_not_split(self) -> None:
-        """
-        尾部是 assistant(tool_calls)+tool 配对时不被拆散（F20）。
-
-        实际带入条数因回退可能多于 n，这是 F20 明确允许的——多带几条完整消息，
-        好过切出一段 API 会拒绝的残缺片段。
-        """
-        provider = ScriptedProvider()
-        mgr = self._manager(provider)
-        self._write_skill(history_messages=2)
-        mgr.history.extend(
-            [
-                Message(role="user", content="边界问题"),
-                Message(
-                    role="assistant",
-                    content="",
-                    tool_calls=[ToolCall(id="t1", name="echo_tool", arguments={})],
-                ),
-                Message(role="tool", tool_call_id="t1", content="结果"),
-            ]
-        )
-        list(mgr.run_skill("rev", "", "/rev"))
-
-        sent = provider.calls[0]["messages"]
-        roles = [m.role for m in sent]
-        # 若被拆散，会出现一条没有前驱 assistant(tool_calls) 的裸 tool。
-        for i, m in enumerate(sent):
-            if m.role == "tool":
-                self.assertTrue(
-                    any(x.role == "assistant" and x.tool_calls for x in sent[:i]),
-                    "出现了孤儿 tool 消息，配对被拆散了",
-                )
-        self.assertEqual(roles[-1], "system")  # 循环拼的 reminder
-
-    def test_take_tail_returns_empty_when_no_user_boundary(self) -> None:
-        """
-        历史里没有任何 user 消息 → 返回空列表，**不是全量**。
-
-        这是与 C8 相反的 None 语义。沿用 C8 的「返回 0」会让
-        `history_messages: 3` 灌进整个主历史。
-        """
-        mgr = self._manager()
-        history = [
-            Message(role="assistant", content="a"),
-            Message(role="assistant", content="b"),
-        ]
-        self.assertEqual(mgr._take_tail(history, 3), [])
-
-    def test_take_tail_zero_and_empty(self) -> None:
-        mgr = self._manager()
-        self.assertEqual(mgr._take_tail([Message(role="user", content="x")], 0), [])
-        self.assertEqual(mgr._take_tail([], 5), [])
-
-
-class SubPromptTest(IsolatedTestBase):
-    """T49a：子系统提示（AC22）。"""
-
     def test_contains_this_skill_body_only(self) -> None:
         """子对话系统提示含本 Skill 正文，**不含**主对话其它已激活 Skill 的正文。"""
         provider = ScriptedProvider()
@@ -369,7 +308,7 @@ class SubPromptTest(IsolatedTestBase):
             "---\nname: other\ndescription: 另一个\n---\n另一个Skill的正文OTHERBODY\n",
             encoding="utf-8",
         )
-        mgr.skill_manager.startup(_KNOWN_TOOLS)
+        mgr.skill_manager.startup()
         mgr.skill_manager.activate("other", "")
 
         list(mgr.run_skill("rev", "", "/rev"))
@@ -387,7 +326,7 @@ class SubPromptTest(IsolatedTestBase):
             "---\nname: other\ndescription: 清单里才有的说明UNIQUEDESC\n---\n正文\n",
             encoding="utf-8",
         )
-        mgr.skill_manager.startup(_KNOWN_TOOLS)
+        mgr.skill_manager.startup()
 
         list(mgr.run_skill("rev", "", "/rev"))
         self.assertNotIn("UNIQUEDESC", provider.calls[0]["system"] or "")

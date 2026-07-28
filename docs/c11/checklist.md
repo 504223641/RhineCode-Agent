@@ -1,5 +1,21 @@
 # C11 Skill 系统 Checklist
 
+> ⚠️ **本清单的一部分已被 `docs/c11/align/` 的对齐改造作废。**
+>
+> 那次改造把 Skill 系统对齐到 Agent Skills 开放标准，三处语义变更让本清单里
+> 相当一部分条目不再成立：
+>
+> | 已作废 | 现状 |
+> | --- | --- |
+> | 第四节整节「工具白名单」 | 收窄能力已移除；`allowed-tools` 改为**预授权**，判据见 `docs/c11/align/checklist.md` 第四节 |
+> | 名字规则与保留词（F4 相关条目） | 命令名来自文件系统路径，字符集与长度不再校验 |
+> | 层内同名去重（F29 相关条目） | 目录下命令名天然唯一，该失败原因已不存在 |
+> | `mode` / `history_messages` 相关条目 | 换成 `context: fork`；带入尾部历史的能力已移除 |
+> | 端到端场景 4（白名单收窄可观测） | 随收窄能力一并作废 |
+>
+> **未被上表覆盖的条目继续有效**，尤其两阶段加载、激活态、独立模式回流、
+> 命令与热更新、安全边界几节。
+
 > 状态：待批准（2026-07-26）
 > 依据：已批准的 `docs/c11/spec.md`（AC1–AC38）、`plan.md`、`task.md`
 >
@@ -150,7 +166,7 @@
 > 以下场景需在 tmux 或真实终端里跑真实对话，逐条记录实际观察结果。
 >
 > **场景 1 / 3 / 4 已用 P1a 驱动设施以真实模型实跑完毕（18/18 判据全通过）**，
-> 结论与证据见 `docs/c11/acceptance-c11-live.md`，预置见 `tests/e2e/c11_scenarios.py`：
+> 结论与证据见 `docs/c11/acceptance/skills-c11-live.md`，预置见 `tests/e2e/c11_scenarios.py`：
 >
 > ```bash
 > python -m tests.e2e.host --mode live --seed tests.e2e.c11_scenarios:seed_commit_repo      # 场景 1、3

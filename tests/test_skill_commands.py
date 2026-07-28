@@ -16,13 +16,13 @@ from rhinecode.commands.models import (
 )
 from rhinecode.commands.registry import CommandRegistrationError, CommandRegistry
 from rhinecode.commands.skill_commands import build_skill_command_specs
-from rhinecode.skills.models import SkillCommandInfo, SkillMode
+from rhinecode.skills.models import SkillCommandInfo
 from tests.test_command_dispatcher import FakeController
 
 
 def _infos(*names) -> list[SkillCommandInfo]:
     return [
-        SkillCommandInfo(name=n, description=f"{n} 的说明", mode=SkillMode.SHARED)
+        SkillCommandInfo(name=n, description=f"{n} 的说明", forked=False)
         for n in names
     ]
 

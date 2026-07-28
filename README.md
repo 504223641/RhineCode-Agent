@@ -2,7 +2,7 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
-当前版本以 DeepSeek Provider 为主实现了 C11 阶段能力：在 C10 斜杠命令系统、C9 记忆系统、C8 上下文管理、C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **Skill 系统**——把反复输入的提示词封装成带 YAML frontmatter 的独立 Markdown 文件，三级存放（项目 > 用户 > 内置）同名覆盖；**两阶段加载**让启动时只注入「名字 + 一句话说明」，模型判断要用时再调 `load_skill` 工具把完整 SOP 拉进上下文；**两种执行模式**——共享模式留在主对话，独立模式开一条子对话跑完只回流结论；`allowed_tools` 白名单收窄可见工具以提升模型选对工具的准确率；每个 Skill 自动注册成斜杠短命令，`/skills reload` 热更新；内置 commit / review / test 三个样板。
+当前版本以 DeepSeek Provider 为主实现了 C11 阶段能力：在 C10 斜杠命令系统、C9 记忆系统、C8 上下文管理、C7 MCP 客户端、C6 五层防御权限系统、C5 结构化系统提示与 C4 Agent Loop 基础上，加入一套 **Skill 系统**——把反复输入的提示词封装成带 YAML frontmatter 的独立 Markdown 文件，三级存放（项目 > 用户 > 内置）同名覆盖；**两阶段加载**让启动时只注入「名字 + 一句话说明」，模型判断要用时再调 `load_skill` 工具把完整 SOP 拉进上下文；**两种执行模式**——共享模式留在主对话，独立模式开一条子对话跑完只回流结论；`allowed-tools` 白名单收窄可见工具以提升模型选对工具的准确率；每个 Skill 自动注册成斜杠短命令，`/skills reload` 热更新；内置 commit / review / test 三个样板。
 
 在此之下，C10 的 **斜杠命令注册与分发系统** 仍在（单一注册中心统一管理执行/帮助/补全/高亮，大小写不敏感、别名、未知命令不进 AI）。C9 的 **记忆系统（项目指令 · 会话存档 · 自动笔记）** 也仍在——三层 RHINE.md 项目指令（用户级 → 项目 `.rhinecode` → 项目根拼接，支持 `@include` 展开）与两级记忆索引在处理首个请求前注入系统提示；每条消息即时以 JSONL 追加写入 `<项目根>/.rhinecode/sessions/`，`/resume` 弹出交互式会话选择面板（上下键选择、回车载入、Esc 退出），载入后聊天区清空并回放该会话的全部历史，相当于完整切换 session，`rhine --continue` 启动时恢复最近会话并同样回放；Agent Loop 自然停止后异步调一次 LLM 把值得记的内容沉淀为四类笔记（用户偏好 / 纠正反馈 / 项目知识 / 参考资料），索引每次注入、正文按需读取；多实例并发由锁文件防护（原子创建、非阻塞退让、过期自愈）。
 
@@ -10,7 +10,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 ## 功能
 
-- **Skill 系统**：把可复用的 AI 操作封装成 Markdown 文件（YAML frontmatter + SOP 正文），三级存放同名覆盖；启动只注入名字与说明、用时由 `load_skill` 按需加载完整指令；共享模式留在主对话、独立模式开子对话只回流结论；`allowed_tools` 收窄可见工具、`$ARGUMENTS` 承接用户参数；自动注册 `/<name>` 短命令并进 Tab 补全，`/skills` 管理、`/skills reload` 热更新（新增的短命令立刻可用）；内置 commit / review / test 三个样板。
+- **Skill 系统**：把可复用的 AI 操作封装成 Markdown 文件（YAML frontmatter + SOP 正文），三级存放同名覆盖；启动只注入名字与说明、用时由 `load_skill` 按需加载完整指令；共享模式留在主对话、独立模式开子对话只回流结论；`allowed-tools` 收窄可见工具、`$ARGUMENTS` 承接用户参数；自动注册 `/<name>` 短命令并进 Tab 补全，`/skills` 管理、`/skills reload` 热更新（新增的短命令立刻可用）；内置 commit / review / test 三个样板。
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
@@ -128,7 +128,7 @@ python -m rhinecode.trace.reader <文件> --seq 42                 # 展开单�
 项目里还附带一套**端到端驱动设施**（同样是测试设施，不是产品功能、不进安装包）：
 起一个常驻宿主进程把 RhineCode 完整跑起来，外部经本机回环通道驱动它完成
 「提交 → 等待 → 读面板 → 应答 → 继续」的交互闭环。用法与设计见
-`docs/c11/trace/p1/`，代码在 `tests/e2e/`。
+`docs/c11/testing/p1-driver/`，代码在 `tests/e2e/`。
 
 ## 斜杠命令
 
@@ -368,7 +368,7 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 - 记忆系统的笔记写盘是内部可信写盘（不经工具权限管线），但写入路径由代码锁死：LLM 只产出 JSON 动作，文件名过白名单校验，物理上出不了两个 memory 目录；笔记与摘要 LLM 请求均强制禁用工具。
 - Skill 正文是「发给模型的文本」，可以指挥模型读写文件、执行命令。**项目级 Skill 随代码仓库分发**，因此每次启动都会提示「发现 N 个项目级 Skill」（刻意不做「只提示一次」的持久化，否则 `git pull` 新增的会被静默吞掉）；评审 `.rhinecode/skills/` 应与评审代码同等对待。
 - Skill **拿不到任何权限豁免**：它指挥的每个工具调用照样过五层管线，正文里写「直接执行 rm -rf /」也只会在黑名单层被拦下。
-- `allowed_tools` **不是安全边界**，而是「提升模型选对工具准确率」的收窄手段——它会因 MCP 未连接而剪枝、因剔空而降级为不收窄、因任一 Skill 未声明而整体塌缩。要限制模型能做什么，请用 `permissions.yaml` 的 deny 规则。
+- `allowed-tools` **不是安全边界**，而是「提升模型选对工具准确率」的收窄手段——它会因 MCP 未连接而剪枝、因剔空而降级为不收窄、因任一 Skill 未声明而整体塌缩。要限制模型能做什么，请用 `permissions.yaml` 的 deny 规则。
 - 用户级与内置 Skill 目录经路径沙箱的**只读白名单**放行（目录型 Skill 的随附资源在工作区外，模型需按清单读取），只对读类判定生效，写入与 glob/grep 搜索面完全不动。
 
 ## 项目结构
@@ -446,8 +446,7 @@ rhinecode/
 │   ├── diff.py          # 结构化 diff 构造
 │   ├── registry.py      # 工具注册中心
 │   ├── mcp_config.py    # mcp_resolve_server / mcp_add_server 内置工具
-│   ├── policy.py        # ToolPolicy：每轮工具集收窄策略（agent 与 skills 的共同下层）
-│   ├── load_skill.py    # load_skill 系统级工具（两阶段加载的第二阶段）
+│   ├── load_skill.py    # load_skill 系统级工具（两阶段加载的第二阶段，system_serial 强制串行）
 │   ├── path_guard.py    # 项目工作目录路径守卫（沙箱层复用）
 │   ├── read_file.py
 │   ├── write_file.py
@@ -481,16 +480,13 @@ Skill 系统部分覆盖解析（六字段与缺省 / 名字规则与保留词 /
 
 ## 当前阶段文档
 
-C11 的规格、实现计划、任务拆解和验收清单位于：
+C11 的全部文档收在 `docs/c11/` 一个目录下，**进门先读 [`docs/c11/README.md`](docs/c11/README.md)**——它是导航，也写明了「同一议题两份文档说法不同时以谁为准」。分三块：
 
-- `docs/c11/spec.md`
-- `docs/c11/plan.md`
-- `docs/c11/task.md`
-- `docs/c11/checklist.md`
+- **产品能力（Skill 系统）**：顶层 `spec.md` / `plan.md` / `task.md` / `checklist.md` 是 C11 原始设计，`docs/c11/align/` 是**对齐 Agent Skills 开放标准的改造**。**冲突以 `align/` 为准**——`allowed-tools` 的语义、命令名来源、执行模式字段等五处在改造中反转了。原始那份刻意保留，用于追溯「当初为什么那样设计」。
+- **跨阶段测试设施**：`docs/c11/testing/`，含 `brief.md`（需求交底）、`p0-trace/`（行为记录器）、`p1-driver/`（端到端驱动设施）。**不占章节号、不属于 Skill 系统**，服务 C2–C11 与未来所有阶段的验收。
+- **验收记录**：`docs/c11/acceptance/` 下四份真实模型实跑报告，每条判据分「机器判到了什么」与「据此做的判断」两栏。
 
-此外，**Trace 记录器**作为**跨阶段的测试设施**（不占章节号、不属于 Skill 系统）另有一套文档：`docs/c11/trace/brief.md`、`spec.md`、`plan.md`、`task.md`、`checklist.md`。
-
-这些文档描述 Skill 系统的需求、架构、任务与验收（frontmatter 定义与三级存放、两阶段加载与提示槽位、共享/独立两种执行模式、工具白名单两段校验与降级、短命令注册与热更新、`/skills` 五形态、激活态清空语义与加锁不变量、安全边界）。C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
+C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 后续补齐项
 

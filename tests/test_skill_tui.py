@@ -11,7 +11,7 @@ import unittest
 
 from rhinecode.commands import build_builtin_registry
 from rhinecode.commands.skill_commands import build_skill_command_specs
-from rhinecode.skills.models import SkillCommandInfo, SkillMode
+from rhinecode.skills.models import SkillCommandInfo
 from rhinecode.tui.app import RhineApp
 from rhinecode.tui.widgets import CommandPanel, InputBar, compose_status_text
 from tests.test_command_tui import _history_text, _make_app
@@ -24,7 +24,7 @@ def _registry_with_skills(*names):
         build_skill_command_specs(
             [
                 SkillCommandInfo(
-                    name=n, description=f"{n} 的说明", mode=SkillMode.SHARED
+                    name=n, description=f"{n} 的说明", forked=False
                 )
                 for n in names
             ]
@@ -247,7 +247,7 @@ class SkillCommandHotReloadTests(unittest.IsolatedAsyncioTestCase):
             builtin_dir=None,
             has_short_command=registry.has_skill_command,
         )
-        sm.startup(frozenset({"load_skill", "ask_user", "present_plan"}))
+        sm.startup()
         return sm
 
     def _app_with_real_skills(self):
@@ -263,7 +263,7 @@ class SkillCommandHotReloadTests(unittest.IsolatedAsyncioTestCase):
         manager.skill_manager = sm
         # 领域方法改为委托真实 SkillManager，与生产实现同口径。
         manager.reload_skills = lambda: (
-            sm.reload(frozenset({"load_skill", "ask_user", "present_plan"}), frozenset()),
+            sm.reload(),
             "Skill 定义已重新加载。",
         )[1]
         manager.skill_status_segment = sm.status_segment

@@ -1,6 +1,6 @@
 # TUI 驱动器 P1a（交互闭环）Plan
 
-> 对应 `docs/c11/trace/p1/spec.md`（已审批）。本文回答「怎么做」。
+> 对应 `docs/c11/testing/p1-driver/spec.md`（已审批）。本文回答「怎么做」。
 > 语言：Python 3.11+，与产品同栈；不引入任何新的第三方依赖
 > （只用标准库 `socket` / `json` / `threading` / `asyncio` / `concurrent.futures` /
 > `tempfile` / `hashlib` / `subprocess`）。

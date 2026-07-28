@@ -1,8 +1,11 @@
 ---
 name: commit
 description: 按项目约定生成提交信息并提交
-mode: shared
-allowed_tools: [run_command, read_file, grep_content]
+when_to_use: 用户说「提交」「commit」「把改动提上去」，或希望按仓库既有风格写提交信息时
+# allowed-tools 是**预授权**（这些操作本次执行内免确认），不是工具限制。
+# 只预授权本 SOP 必然要做的只读调研——`git commit` 本身**刻意不预授权**，
+# 它是真正落盘的那一步，值得让用户看一眼提交信息再点确认。
+allowed-tools: [Bash(git status *), Bash(git diff *), Bash(git log *), Read, Grep]
 ---
 
 按以下步骤完成一次提交。

@@ -1,239 +1,248 @@
 """
-Skill 文本解析单测（c11 T8）。
+Skill 文本解析（对齐 Agent Skills 开放标准后重写）。
 
-覆盖 spec AC1（六个 frontmatter 字段被正确读取、缺省值正确）、
-AC4（名字规则与保留词）、以及 F5 的各类解析失败原因可读。
+C11 的解析规则是自研的：`name` 必填且必须匹配严格字符集、`description` 必填、
+`mode` 只能是 shared/isolated。这些在对齐改造中全部放宽或改写——本文件随之重写，
+不保留任何「已废弃但仍断言」的用例（spec N5）。
 
-全部用字符串字面量驱动，不造临时目录——parse_skill 是纯函数，这正是把
-「读文件」留给 discovery 的收益。
+判据集中在三件事：
+1. **全部字段可选**（标准如此，外部 Skill 才能原样搬进来）；
+2. **两种键名写法等价**，但只有旧的下划线 `allowed_tools` 触发语义变更告知；
+3. **无对应能力的标准字段逐条告知**，而不是静默忽略。
+
+全部用字符串字面量驱动，不造临时目录——`parse_skill` 是纯函数，
+这正是把「读文件」与「推导命令名」都留给 discovery 的收益。
 """
+
+from __future__ import annotations
 
 import unittest
 from pathlib import Path
 
-from rhinecode.skills.models import SkillMode, SkillSource
+from rhinecode.skills.models import UNSUPPORTED_FIELDS, SkillSource
 from rhinecode.skills.parser import parse_skill
 
 
-def _parse(text: str, source: SkillSource = SkillSource.USER):
-    """便捷包装：固定 path 与 source，返回 parse_skill 的三元组。"""
-    return parse_skill(text, Path("/tmp/x.md"), source)
+def P(text: str, command_name: str = "demo"):
+    """解析一份文本；命令名由调用方给（真实链路里它来自发现层的路径推导）。"""
+    return parse_skill(text, Path("/x/demo.md"), SkillSource.PROJECT, command_name)
 
 
-class ParseSuccessTest(unittest.TestCase):
-    """解析成功路径：字段读取与缺省值。"""
+class OptionalFieldsTest(unittest.TestCase):
+    """**全部字段可选**——这是「外部 Skill 原样可用」的地基。"""
 
-    def test_all_six_fields(self) -> None:
-        """六个 frontmatter 字段全部写明时，各字段值与声明一致（AC1）。"""
+    def test_no_frontmatter_at_all(self) -> None:
+        """
+        一份只有正文的 Markdown 就是一个合法 Skill。
+
+        说明从正文第一个非空段落提取，**跳过 Markdown 标题行**——标题通常只是
+        名字的重复，拿它当说明对模型判断「什么时候该用这个 Skill」毫无帮助。
+        """
+        spec, reason, _ = P("# 部署流程\n\n把当前分支部署到预发环境。\n\n步骤一……\n")
+        self.assertIsNone(reason)
+        self.assertEqual(spec.command_name, "demo")
+        self.assertEqual(spec.display_name, "demo")
+        self.assertEqual(spec.description, "把当前分支部署到预发环境。")
+        self.assertEqual(spec.granted_tools, ())
+        self.assertFalse(spec.forked)
+        self.assertTrue(spec.model_invocable)
+        self.assertTrue(spec.user_invocable)
+
+    def test_empty_frontmatter(self) -> None:
+        spec, reason, _ = P("---\n---\n\n正文说明。\n")
+        self.assertIsNone(reason)
+        self.assertEqual(spec.description, "正文说明。")
+
+    def test_name_is_display_only(self) -> None:
+        """
+        `name` 只是显示标签，命令名来自路径。
+
+        含大写、空格、超长——C11 会判它非法，现在一律接受。
+        """
+        spec, reason, _ = P("---\nname: My Very Long Display Name\n---\n正文\n", "frontend-design")
+        self.assertIsNone(reason)
+        self.assertEqual(spec.command_name, "frontend-design")
+        self.assertEqual(spec.display_name, "My Very Long Display Name")
+
+    def test_explicit_description_wins_over_body(self) -> None:
+        spec, _, _ = P("---\ndescription: 明确的说明\n---\n正文第一段\n")
+        self.assertEqual(spec.description, "明确的说明")
+
+
+class KeyNormalisationTest(unittest.TestCase):
+    """标准用连字符，YAML 使用者习惯下划线，两种都要认。"""
+
+    def test_hyphen_and_underscore_equivalent(self) -> None:
+        a, _, _ = P("---\nallowed-tools: Read Grep\nwhen-to-use: 当用户说提交\n"
+                    "disable-model-invocation: true\nuser-invocable: false\n---\n正文\n")
+        b, _, _ = P("---\nallowed_tools: [Read, Grep]\nwhen_to_use: 当用户说提交\n"
+                    "disable_model_invocation: true\nuser_invocable: false\n---\n正文\n")
+        self.assertEqual(a.granted_tools, b.granted_tools)
+        self.assertEqual(a.when_to_use, b.when_to_use)
+        self.assertEqual(a.model_invocable, b.model_invocable)
+        self.assertEqual(a.user_invocable, b.user_invocable)
+
+    def test_both_spellings_present_prefers_standard(self) -> None:
+        """并存且取值不同时以标准写法为准并提示——静默取其一会让用户以为另一个生效了。"""
+        spec, _, _ = P("---\nallowed-tools: Read\nallowed_tools: [Bash]\n---\n正文\n")
+        self.assertEqual(spec.granted_tools, ("Read",))
+        self.assertTrue(any("两种写法" in n for n in spec.notices))
+
+    def test_tool_list_accepts_both_shapes(self) -> None:
+        """标准明确允许 YAML 列表与空格/逗号分隔串两种写法。"""
+        a, _, _ = P("---\nallowed-tools: Read, Bash(git *)\n---\n正文\n")
+        b, _, _ = P("---\nallowed-tools: [Read, Bash(git *)]\n---\n正文\n")
+        self.assertEqual(a.granted_tools, b.granted_tools)
+
+    def test_tool_list_deduped_preserving_order(self) -> None:
+        """去重但保序——保序让 `/skills` 的展示与文件里的顺序一致，排查时不必来回对照。"""
+        spec, _, _ = P("---\nallowed-tools: [Read, Bash, Read]\n---\n正文\n")
+        self.assertEqual(spec.granted_tools, ("Read", "Bash"))
+
+
+class SemanticChangeNoticeTest(unittest.TestCase):
+    """
+    **本次改造唯一「静默会造成实际损害」的迁移点**。
+
+    `allowed_tools` 在旧版本是「收窄可见工具集」，现在是「免确认」，两者相反。
+    同一份文件在新旧版本下行为相反而用户毫不知情，是不可接受的。
+    """
+
+    def test_underscore_spelling_triggers_notice(self) -> None:
+        spec, _, _ = P("---\nallowed_tools: [Bash]\n---\n正文\n")
+        notice = next(n for n in spec.notices if "语义已变更" in n)
+        self.assertIn("免于人工确认", notice)
+        self.assertIn("permissions.yaml", notice, "要指出真正该用的限制手段")
+
+    def test_standard_spelling_does_not_trigger_notice(self) -> None:
+        """
+        连字符是标准写法，作者本来就按预授权语义写的，**不该被打扰**。
+
+        这条与上一条成对：只在写法确实是旧的时才提醒。
+        """
+        spec, _, _ = P("---\nallowed-tools: [Bash]\n---\n正文\n")
+        self.assertFalse(any("语义已变更" in n for n in spec.notices))
+
+    def test_empty_declaration_does_not_trigger_notice(self) -> None:
+        """声明为空时没有行为差异可言，不必提醒。"""
+        spec, _, _ = P("---\nallowed_tools: []\n---\n正文\n")
+        self.assertFalse(any("语义已变更" in n for n in spec.notices))
+
+
+class ContextAndSwitchesTest(unittest.TestCase):
+    def test_context_fork(self) -> None:
+        spec, _, _ = P("---\ncontext: fork\n---\n正文\n")
+        self.assertTrue(spec.forked)
+
+    def test_unknown_context_value_notices_and_stays_in_main(self) -> None:
+        spec, _, _ = P("---\ncontext: background\n---\n正文\n")
+        self.assertFalse(spec.forked)
+        self.assertTrue(any("context" in n for n in spec.notices))
+
+    def test_boolean_literals(self) -> None:
+        """标准允许多种布尔字面量，大小写不敏感。"""
+        for literal in ("true", "yes", "on", "1", "TRUE", "Yes"):
+            with self.subTest(literal=literal):
+                spec, _, _ = P(f'---\ndisable-model-invocation: "{literal}"\n---\n正文\n')
+                self.assertFalse(spec.model_invocable)
+        for literal in ("false", "no", "off", "0"):
+            with self.subTest(literal=literal):
+                spec, _, _ = P(f'---\ndisable-model-invocation: "{literal}"\n---\n正文\n')
+                self.assertTrue(spec.model_invocable)
+
+    def test_unrecognised_boolean_falls_back_to_default(self) -> None:
+        """一个布尔字段写错不该让整个 Skill 用不了。"""
+        spec, reason, _ = P("---\nuser-invocable: maybe\n---\n正文\n")
+        self.assertIsNone(reason)
+        self.assertTrue(spec.user_invocable)
+
+    def test_model_outside_fork_notices(self) -> None:
+        spec, _, _ = P("---\nmodel: gpt-x\n---\n正文\n")
+        self.assertTrue(any("model" in n for n in spec.notices))
+
+    def test_model_inside_fork_is_silent(self) -> None:
+        spec, _, _ = P("---\ncontext: fork\nmodel: gpt-x\n---\n正文\n")
+        self.assertEqual(spec.model, "gpt-x")
+        self.assertFalse(any("model" in n for n in spec.notices))
+
+
+class UnsupportedFieldsTest(unittest.TestCase):
+    """
+    无对应能力的标准字段**必须逐条告知**。
+
+    静默忽略不可接受：作者写 `background: true` 的预期是「后台跑、不阻塞」，
+    实际却同步阻塞跑完，这个差异用户不知道就会误判 Skill 的行为。
+    """
+
+    def test_each_field_produces_one_notice(self) -> None:
         text = (
-            "---\n"
-            "name: deploy-check\n"
-            "description: 部署前的检查清单\n"
-            "allowed_tools: [read_file, run_command]\n"
-            "mode: isolated\n"
-            "history_messages: 5\n"
-            "model: deepseek-reasoner\n"
-            "---\n"
-            "第一步：跑测试。\n"
+            "---\nbackground: true\nagent: explorer\neffort: high\n"
+            "hooks: {}\npaths: src/**\nshell: powershell\n---\n正文\n"
         )
-        spec, reason, warnings = _parse(text)
+        spec, reason, _ = P(text)
+        self.assertIsNone(reason, "有这些字段仍应正常加载")
+        for field in UNSUPPORTED_FIELDS:
+            with self.subTest(field=field):
+                self.assertTrue(
+                    any(n.startswith(f"`{field}`") for n in spec.notices),
+                    f"{field} 应有一条告知",
+                )
+
+    def test_notice_states_actual_behaviour(self) -> None:
+        """只说「不支持」没用，必须说清「本版本实际会怎么做」。"""
+        spec, _, _ = P("---\nbackground: true\n---\n正文\n")
+        notice = next(n for n in spec.notices if n.startswith("`background`"))
+        self.assertIn("同步等待", notice)
+
+    def test_background_false_is_silent(self) -> None:
+        """`background: false` 正是本版本的行为，没有差异可言，不必提醒。"""
+        spec, _, _ = P("---\nbackground: false\n---\n正文\n")
+        self.assertFalse(any(n.startswith("`background`") for n in spec.notices))
+
+    def test_truly_unknown_keys_stay_silent(self) -> None:
+        """
+        未登记的未知键**静默忽略**，这是刻意的向前兼容策略。
+
+        读到更新版本写的 Skill 时应当尽量把它用起来，而不是因为多了个键就整个拒绝。
+        """
+        spec, reason, _ = P("---\nfuture_field: 42\n---\n正文\n")
         self.assertIsNone(reason)
-        self.assertIsNotNone(spec)
-        self.assertEqual(spec.name, "deploy-check")
-        self.assertEqual(spec.description, "部署前的检查清单")
-        self.assertEqual(spec.allowed_tools, ("read_file", "run_command"))
-        self.assertIs(spec.mode, SkillMode.ISOLATED)
-        self.assertEqual(spec.history_messages, 5)
-        self.assertEqual(spec.model, "deepseek-reasoner")
-        self.assertEqual(spec.body.strip(), "第一步：跑测试。")
-        self.assertEqual(warnings, [])
-
-    def test_only_required_fields_take_defaults(self) -> None:
-        """只写两个必填字段时，其余取缺省值（AC1）。"""
-        text = "---\nname: a\ndescription: b\n---\nSOP 正文\n"
-        spec, reason, _ = _parse(text)
-        self.assertIsNone(reason)
-        # allowed_tools 的缺省是 None（未声明 = 不收窄），不是空 tuple。
-        self.assertIsNone(spec.allowed_tools)
-        self.assertIs(spec.mode, SkillMode.SHARED)
-        self.assertEqual(spec.history_messages, 0)
-        self.assertIsNone(spec.model)
-
-    def test_unknown_keys_ignored(self) -> None:
-        """未知键被忽略，既不失败也不警告（向前兼容）。"""
-        text = (
-            "---\n"
-            "name: a\n"
-            "description: b\n"
-            "future_field: 未来版本才有的字段\n"
-            "---\n"
-            "正文\n"
-        )
-        spec, reason, warnings = _parse(text)
-        self.assertIsNone(reason)
-        self.assertIsNotNone(spec)
-        self.assertEqual(warnings, [])
-
-    def test_allowed_tools_deduped_preserving_order(self) -> None:
-        """allowed_tools 含重复项时去重且保序。"""
-        text = (
-            "---\n"
-            "name: a\n"
-            "description: b\n"
-            "allowed_tools: [run_command, read_file, run_command, glob_files]\n"
-            "---\n"
-            "正文\n"
-        )
-        spec, reason, _ = _parse(text)
-        self.assertIsNone(reason)
-        self.assertEqual(spec.allowed_tools, ("run_command", "read_file", "glob_files"))
-
-    def test_leading_blank_lines_before_frontmatter(self) -> None:
-        """frontmatter 之前的空白行被容忍（某些编辑器会留一行）。"""
-        text = "\n\n---\nname: a\ndescription: b\n---\n正文\n"
-        spec, reason, _ = _parse(text)
-        self.assertIsNone(reason)
-        self.assertEqual(spec.name, "a")
-
-    def test_body_preserved_verbatim(self) -> None:
-        """正文原样保留（缩进与空行即语义，它是要发给模型的 SOP）。"""
-        text = "---\nname: a\ndescription: b\n---\n步骤：\n\n  1. 缩进项\n"
-        spec, _, _ = _parse(text)
-        self.assertIn("  1. 缩进项", spec.body)
-        self.assertIn("步骤：\n\n", spec.body)
-
-    def test_shared_mode_with_model_warns_but_loads(self) -> None:
-        """共享模式声明 model → 加载成功但产出警告（F22）。"""
-        text = "---\nname: a\ndescription: b\nmode: shared\nmodel: x-model\n---\n正文\n"
-        spec, reason, warnings = _parse(text)
-        self.assertIsNone(reason)
-        self.assertIsNotNone(spec)
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("共享模式", warnings[0])
-        self.assertIn("x-model", warnings[0])
+        self.assertEqual(spec.notices, ())
 
 
-class ParseFailureTest(unittest.TestCase):
-    """解析失败路径：每种失败都要给出可读原因（F5）。"""
-
-    def test_no_frontmatter(self) -> None:
-        spec, reason, warnings = _parse("直接就是正文，没有 frontmatter\n")
-        self.assertIsNone(spec)
-        self.assertIn("frontmatter", reason)
-        self.assertEqual(warnings, [])
+class FailureTest(unittest.TestCase):
+    """仍然算失败的只剩这几类——它们让 Skill 真的没法用。"""
 
     def test_unclosed_frontmatter(self) -> None:
-        spec, reason, _ = _parse("---\nname: a\ndescription: b\n没有闭合\n")
-        self.assertIsNone(spec)
+        _, reason, _ = P("---\nname: x\n没有第二条分隔线\n")
         self.assertIn("未闭合", reason)
 
     def test_bad_yaml(self) -> None:
-        spec, reason, _ = _parse("---\nname: [未闭合的列表\n---\n正文\n")
-        self.assertIsNone(spec)
+        _, reason, _ = P("---\nname: [unclosed\n---\n正文\n")
         self.assertIn("解析失败", reason)
 
     def test_frontmatter_not_mapping(self) -> None:
-        """frontmatter 是列表而非映射 → 明确报错。"""
-        spec, reason, _ = _parse("---\n- a\n- b\n---\n正文\n")
-        self.assertIsNone(spec)
-        self.assertIn("键值映射", reason)
-
-    def test_empty_frontmatter(self) -> None:
-        """空 frontmatter（safe_load 返回 None）走「顶层必须是映射」分支。"""
-        spec, reason, _ = _parse("---\n---\n正文\n")
-        self.assertIsNone(spec)
+        _, reason, _ = P("---\n- a\n- b\n---\n正文\n")
         self.assertIn("键值映射", reason)
 
     def test_empty_body(self) -> None:
-        spec, reason, _ = _parse("---\nname: a\ndescription: b\n---\n   \n\n")
-        self.assertIsNone(spec)
+        """空正文的 Skill 没有意义——激活了什么都不会发生，只会让用户困惑。"""
+        _, reason, _ = P("---\nname: x\n---\n   \n")
         self.assertIn("正文为空", reason)
 
-    def test_missing_name(self) -> None:
-        spec, reason, _ = _parse("---\ndescription: b\n---\n正文\n")
-        self.assertIsNone(spec)
-        self.assertIn("缺少必填字段 name", reason)
 
-    def test_yaml_boolean_name_gets_quoting_hint(self) -> None:
-        """
-        `name: off` 被 YAML 1.1 解析成布尔 False。
+class BodyPreservationTest(unittest.TestCase):
+    def test_body_preserved_verbatim(self) -> None:
+        """正文是要发给模型的 SOP，**格式即语义**，缩进与空行必须原样保留。"""
+        body = "第一行\n\n    缩进行\n\t制表行\n"
+        spec, _, _ = P(f"---\nname: x\n---\n{body}")
+        self.assertEqual(spec.body, body)
 
-        此时报「缺少 name」是误导（用户明明写了），必须报类型错并提示加引号。
-        同类裸词还有 on/yes/no/true/false。
-        """
-        for raw in ("off", "on", "yes", "no", "true", "false"):
-            with self.subTest(raw=raw):
-                spec, reason, _ = _parse(
-                    f"---\nname: {raw}\ndescription: b\n---\n正文\n"
-                )
-                self.assertIsNone(spec)
-                self.assertIn("加引号", reason)
-                self.assertNotIn("缺少必填字段", reason)
-
-    def test_missing_description(self) -> None:
-        spec, reason, _ = _parse("---\nname: a\n---\n正文\n")
-        self.assertIsNone(spec)
-        self.assertIn("description", reason)
-
-    def test_allowed_tools_as_string(self) -> None:
-        """常见笔误：写成逗号分隔的字符串而非列表（AC1）。"""
-        spec, reason, _ = _parse(
-            "---\nname: a\ndescription: b\nallowed_tools: read_file, run_command\n---\n正文\n"
-        )
-        self.assertIsNone(spec)
-        self.assertIn("字符串列表", reason)
-
-    def test_bad_mode(self) -> None:
-        spec, reason, _ = _parse("---\nname: a\ndescription: b\nmode: parallel\n---\n正文\n")
-        self.assertIsNone(spec)
-        self.assertIn("shared", reason)
-
-    def test_negative_history_messages(self) -> None:
-        spec, reason, _ = _parse(
-            "---\nname: a\ndescription: b\nhistory_messages: -1\n---\n正文\n"
-        )
-        self.assertIsNone(spec)
-        self.assertIn("非负整数", reason)
-
-    def test_boolean_history_messages_rejected(self) -> None:
-        """`history_messages: yes` 被 YAML 解析成 True；不排除 bool 会当成 1 悄悄生效。"""
-        spec, reason, _ = _parse(
-            "---\nname: a\ndescription: b\nhistory_messages: yes\n---\n正文\n"
-        )
-        self.assertIsNone(spec)
-        self.assertIn("非负整数", reason)
-
-
-class NameRuleTest(unittest.TestCase):
-    """名字规则与保留词（AC4）。"""
-
-    def _reason_for_name(self, name: str) -> str:
-        # 名字统一加引号写入 YAML，确保 parser 收到的确实是字符串——
-        # 否则像 off 这类裸词会先被 YAML 变成布尔值，测到的就不是名字规则了
-        # （那条路径由 test_yaml_boolean_name_gets_quoting_hint 单独覆盖）。
-        spec, reason, _ = _parse(f'---\nname: "{name}"\ndescription: b\n---\n正文\n')
-        self.assertIsNone(spec, f"名字 {name!r} 本应被拒绝")
-        return reason
-
-    def test_illegal_names_rejected(self) -> None:
-        """大写 / 空格 / 斜杠 / 下划线开头 / 数字开头 / 超长，各自失败。"""
-        for name in ("Deploy", "my skill", "a/b", "_x", "1x", "a" * 33):
-            with self.subTest(name=name):
-                self.assertIn("不合法", self._reason_for_name(name))
-
-    def test_boundary_length_accepted(self) -> None:
-        """恰好 32 字符合法（边界的另一侧，防止把 <= 写成 <）。"""
-        spec, reason, _ = _parse(
-            f"---\nname: {'a' * 32}\ndescription: b\n---\n正文\n"
-        )
+    def test_leading_blank_lines_before_frontmatter(self) -> None:
+        """有些编辑器会在文件开头留空行。"""
+        spec, reason, _ = P("\n\n---\nname: x\n---\n正文\n")
         self.assertIsNone(reason)
-        self.assertEqual(len(spec.name), 32)
-
-    def test_reserved_subcommands_rejected(self) -> None:
-        """四个 /skills 子命令词不能作为 Skill 名（AC4）。"""
-        for name in ("reload", "off", "prompt", "run"):
-            with self.subTest(name=name):
-                self.assertIn("保留子命令词", self._reason_for_name(name))
+        self.assertEqual(spec.display_name, "x")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,6 @@ from rhinecode.skills.models import (
     ActivationStatus,
     DegradeKind,
     LOAD_SKILL_TOOL,
-    SkillMode,
     SkillSource,
     builtin_skills_dir,
 )
@@ -36,6 +35,12 @@ def _write(path: Path, text: str) -> None:
 
 
 def _skill_text(name: str, description: str = "说明", body: str = None, **extra) -> str:
+    """
+    造一份 Skill 文本。
+
+    ⚠️ 对齐改造后**命令名来自文件路径**，frontmatter 的 `name` 只做显示。
+    各用例一律把文件命名成 `<name>.md`，两者保持一致，断言才好读。
+    """
     lines = [f"name: {name}", f"description: {description}"]
     lines.extend(f"{k}: {v}" for k, v in extra.items())
     return "---\n" + "\n".join(lines) + "\n---\n" + (body or f"{name} 的 SOP\n")
@@ -63,7 +68,7 @@ class ManagerTestBase(unittest.TestCase):
             has_short_command=lambda n: n in self.short_commands,
             **kwargs,
         )
-        m.startup(KNOWN)
+        m.startup()
         return m
 
 
@@ -106,23 +111,23 @@ class ActivateTest(ManagerTestBase):
 
     def test_not_found_returns_available_names(self) -> None:
         """名字不存在 → 附可用名字列表，让模型下一轮能自我纠正而不是反复猜。"""
-        _write(self.user_skills / "a.md", _skill_text("alpha"))
+        _write(self.user_skills / "alpha.md", _skill_text("alpha"))
         m = self._manager()
         result = m.activate("alfa", "")
         self.assertIs(result.status, ActivationStatus.NOT_FOUND)
         self.assertEqual(result.available_names, ("alpha",))
 
     def test_isolated_hint_when_short_command_available(self) -> None:
-        _write(self.user_skills / "r.md", _skill_text("rev", mode="isolated"))
+        _write(self.user_skills / "rev.md", _skill_text("rev", context="fork"))
         self.short_commands.add("rev")
         m = self._manager()
         result = m.activate("rev", "")
-        self.assertIs(result.status, ActivationStatus.ISOLATED)
+        self.assertIs(result.status, ActivationStatus.FORKED)
         self.assertEqual(result.entry_hint, "/rev")
 
     def test_isolated_hint_falls_back_when_no_short_command(self) -> None:
         """短命令因重名未注册时，提示必须指向 /skills run，绝不能指向不存在的命令。"""
-        _write(self.user_skills / "r.md", _skill_text("rev", mode="isolated"))
+        _write(self.user_skills / "rev.md", _skill_text("rev", context="fork"))
         m = self._manager()
         result = m.activate("rev", "")
         self.assertEqual(result.entry_hint, "/skills run rev")
@@ -253,7 +258,7 @@ class LockInvariantTest(ManagerTestBase):
 
         用同样的跨线程探针：回调发生时若锁还被持有，子线程读状态就会超时。
         """
-        _write(self.user_skills / "r.md", _skill_text("rev", mode="isolated"))
+        _write(self.user_skills / "rev.md", _skill_text("rev", context="fork"))
         m_holder: dict = {}
         state, stub_body = self._probe_from_other_thread(
             lambda: m_holder["m"].status_segment()
@@ -269,7 +274,7 @@ class LockInvariantTest(ManagerTestBase):
             builtin_dir=None,
             has_short_command=has_cmd,
         )
-        m.startup(KNOWN)
+        m.startup()
         m_holder["m"] = m
 
         m.activate("rev", "")
@@ -304,73 +309,6 @@ class LockInvariantTest(ManagerTestBase):
         self.assertEqual(m.status_segment(), "Skill:1")
 
 
-class ToolPolicyTest(ManagerTestBase):
-    """工具策略四分支（AC14/AC17）。"""
-
-    def test_no_active_means_no_narrowing(self) -> None:
-        m = self._manager()
-        policy = m.tool_policy(ALL_TOOLS)
-        self.assertIsNone(policy.allowed)
-        self.assertIn(LOAD_SKILL_TOOL, policy.exempt)
-
-    def test_union_of_whitelists(self) -> None:
-        _write(self.user_skills / "a.md",
-               _skill_text("a", allowed_tools="[read_file]"))
-        _write(self.user_skills / "b.md",
-               _skill_text("b", allowed_tools="[run_command]"))
-        m = self._manager()
-        m.activate("a", "")
-        m.activate("b", "")
-        self.assertEqual(m.tool_policy(ALL_TOOLS).allowed,
-                         frozenset({"read_file", "run_command"}))
-
-    def test_one_unrestricted_collapses_the_union(self) -> None:
-        """
-        任一激活 Skill 未声明白名单 → 整体不收窄。
-
-        这不是妥协，是并集语义的必然结果：「不限制」与任何集合取并都是「不限制」。
-        """
-        _write(self.user_skills / "a.md",
-               _skill_text("a", allowed_tools="[read_file]"))
-        _write(self.user_skills / "b.md", _skill_text("b"))
-        m = self._manager()
-        m.activate("a", "")
-        m.activate("b", "")
-        self.assertIsNone(m.tool_policy(ALL_TOOLS).allowed)
-
-    def test_runtime_self_healing_intersects_with_registered(self) -> None:
-        """
-        白名单并集要与注册中心**当前**工具名取交集。
-
-        这就是运行期自愈：MCP 重载让某个远端工具消失后，它自动不再出现在可见集里。
-        """
-        _write(self.user_skills / "a.md",
-               _skill_text("a", allowed_tools="[read_file, run_command]"))
-        m = self._manager()
-        m.activate("a", "")
-        shrunk = frozenset({"read_file", LOAD_SKILL_TOOL})
-        self.assertEqual(m.tool_policy(shrunk).allowed, frozenset({"read_file"}))
-
-    def test_empty_intersection_degrades_to_no_narrowing(self) -> None:
-        """交集为空 → 不收窄（F17）。空白名单会让模型一个工具都看不见。"""
-        _write(self.user_skills / "a.md",
-               _skill_text("a", allowed_tools="[read_file]"))
-        m = self._manager()
-        m.activate("a", "")
-        self.assertIsNone(m.tool_policy(frozenset({"other_tool"})).allowed)
-
-    def test_isolated_policy_excludes_load_skill(self) -> None:
-        """子对话禁止嵌套激活 Skill（F23）：excluded 含 load_skill、exempt 为空。"""
-        _write(self.user_skills / "r.md",
-               _skill_text("rev", mode="isolated", allowed_tools="[read_file]"))
-        m = self._manager()
-        spec = m.get("rev")
-        policy = m.isolated_policy(spec, ALL_TOOLS)
-        self.assertEqual(policy.allowed, frozenset({"read_file"}))
-        self.assertEqual(policy.exempt, frozenset())
-        self.assertIn(LOAD_SKILL_TOOL, policy.excluded)
-
-
 class ReloadTest(ManagerTestBase):
     """热更新（AC27/F26/F27）。"""
 
@@ -380,7 +318,7 @@ class ReloadTest(ManagerTestBase):
         _write(self.user_skills / "b.md", _skill_text("b"))
         (self.user_skills / "a.md").unlink()
 
-        outcome = m.reload(KNOWN, ALL_TOOLS)
+        outcome = m.reload()
         self.assertEqual(outcome.added, ("b",))
         self.assertEqual(outcome.removed, ("a",))
 
@@ -391,7 +329,7 @@ class ReloadTest(ManagerTestBase):
         m.activate("a", "")
         (self.user_skills / "a.md").unlink()
 
-        outcome = m.reload(KNOWN, ALL_TOOLS)
+        outcome = m.reload()
         self.assertEqual(outcome.auto_deactivated, ("a",))
         self.assertIsNone(m.status_segment())
 
@@ -408,43 +346,15 @@ class ReloadTest(ManagerTestBase):
         self.assertIn("旧正文", m.active_text())
 
         _write(self.user_skills / "a.md", _skill_text("a", body="新正文\n"))
-        m.reload(KNOWN, ALL_TOOLS)
+        m.reload()
         text = m.active_text()
         self.assertIn("新正文", text)
         self.assertNotIn("旧正文", text)
 
-    def test_fatal_tool_name_is_dropped_not_fatal_but_warns_about_next_startup(
-        self,
-    ) -> None:
-        """
-        热更新遇到白名单笔误 → 丢弃该 Skill 并警告，**不终止进程**（AC27）。
-
-        依据：F16/N2 的定语锚定「启动」，F31 明确热更新不影响运行中的循环。
-        用户正在进行的会话不该因为顺手改了个文件就被杀掉。
-
-        但警告**必须**写明「下次启动会失败」，否则用户会当成小提示，
-        第二天启动不来还想不起来见过这句话。
-        """
-        _write(self.user_skills / "a.md", _skill_text("a"))
-        m = self._manager()
-        _write(self.user_skills / "bad.md",
-               _skill_text("bad", allowed_tools="[read_fil]"))
-
-        outcome = m.reload(KNOWN, ALL_TOOLS)
-        self.assertEqual(outcome.dropped_fatal, ("bad",))
-        self.assertIsNone(m.get("bad"))
-        joined = " ".join(outcome.warnings)
-        self.assertIn("下次启动", joined)
-        self.assertIn("启动失败", joined)
-
-
-class ReportTest(ManagerTestBase):
-    """/skills 与 /skills prompt 报告（AC11/AC13）。"""
-
     def test_report_lists_source_mode_and_activation(self) -> None:
         _write(self.user_skills / "a.md", _skill_text("a", "甲说明"))
         _write(self.project_root / ".rhinecode" / "skills" / "p.md",
-               _skill_text("p", "乙说明", mode="isolated"))
+               _skill_text("p", "乙说明", context="fork"))
         m = self._manager()
         m.activate("a", "")
 
@@ -454,16 +364,16 @@ class ReportTest(ManagerTestBase):
         self.assertIn("用户级", report)
         self.assertIn("已激活", report)
         self.assertIn("项目级", report)
-        self.assertIn("独立", report)
+        self.assertIn("子对话", report)
 
     def test_report_shows_load_errors_and_warnings(self) -> None:
         _write(self.user_skills / "bad.md", "---\nname: [坏\n---\n正文\n")
         _write(self.user_skills / "w.md",
-               _skill_text("w", mode="shared", model="m"))
+               _skill_text("w", model="m"))
         m = self._manager()
         report = m.report()
         self.assertIn("加载失败", report)
-        self.assertIn("警告", report)
+        self.assertIn("字段提示", report)
 
     def test_prompt_report_has_three_sections(self) -> None:
         _write(self.user_skills / "a.md",
@@ -479,7 +389,7 @@ class ReportTest(ManagerTestBase):
     def test_prompt_report_when_nothing_active(self) -> None:
         m = self._manager()
         report = m.prompt_report(ALL_TOOLS)
-        self.assertIn("未收窄", report)
+        self.assertIn("Skill 不再收窄工具集", report)
 
     def test_prompt_report_lists_only_tools_actually_injected(self) -> None:
         """
@@ -506,7 +416,7 @@ class ReportTest(ManagerTestBase):
         self.assertNotIn("ask_user", listed)
         self.assertNotIn("present_plan", listed)
         # 未声明的普通工具当然也不该出现。
-        self.assertNotIn("write_file", listed)
+        self.assertIn("write_file", listed)  # 不再收窄：全部工具都可见
 
     def test_degrade_shows_in_report_with_distinct_wording(self) -> None:
         """两种降级在报告里措辞不同（AC13）。"""
@@ -569,48 +479,19 @@ class BuiltinSamplesTest(unittest.TestCase):
 
     def test_three_builtin_skills_discovered(self) -> None:
         catalog = discover(None, None, builtin_skills_dir())
-        names = sorted(s.name for s in catalog.skills)
+        names = sorted(s.command_name for s in catalog.skills)
         self.assertEqual(names, ["commit", "review", "test"])
         for spec in catalog.skills:
             self.assertIs(spec.source, SkillSource.BUILTIN)
         self.assertEqual(catalog.errors, ())
 
-    def test_builtin_skills_visible_in_index_and_report(self) -> None:
-        m = SkillManager(
-            project_root=None,
-            user_dir=None,
-            builtin_dir=builtin_skills_dir(),
-            has_short_command=lambda _n: True,
-        )
-        fatals = m.startup(
-            frozenset(
-                {
-                    "read_file",
-                    "write_file",
-                    "edit_file",
-                    "run_command",
-                    "glob_files",
-                    "grep_content",
-                    LOAD_SKILL_TOOL,
-                    "ask_user",
-                    "present_plan",
-                }
-            )
-        )
-        # 样板的白名单必须全部指向真实存在的内置工具，否则启动会 fail-fast。
-        self.assertEqual(fatals, [])
-        index = m.index_text()
-        for name in ("commit", "review", "test"):
-            self.assertIn(name, index)
-            self.assertIn(name, m.report())
-
     def test_builtin_modes_cover_both_paths(self) -> None:
         """样板要同时覆盖共享与独立两条执行路径（F28）。"""
         catalog = discover(None, None, builtin_skills_dir())
-        modes = {s.name: s.mode for s in catalog.skills}
-        self.assertIs(modes["commit"], SkillMode.SHARED)
-        self.assertIs(modes["review"], SkillMode.ISOLATED)
-        self.assertIs(modes["test"], SkillMode.SHARED)
+        modes = {s.command_name: s.forked for s in catalog.skills}
+        self.assertIs(modes["commit"], False)
+        self.assertIs(modes["review"], True)
+        self.assertIs(modes["test"], False)
 
 
 if __name__ == "__main__":
@@ -672,20 +553,20 @@ class LoadSkillToolTest(ManagerTestBase):
         self.assertIn("绝不该出现", m.active_text())
 
     def test_not_found_lists_available_names(self) -> None:
-        _write(self.user_skills / "a.md", _skill_text("alpha"))
+        _write(self.user_skills / "alpha.md", _skill_text("alpha"))
         result = self._tool().execute({"name": "alfa"})
         self.assertFalse(result.ok)
         self.assertIn("alpha", result.output)
 
     def test_isolated_points_at_a_real_command(self) -> None:
         """独立模式失败提示必须指向真实存在的入口，短命令不可用时用 /skills run。"""
-        _write(self.user_skills / "r.md", _skill_text("rev", mode="isolated"))
+        _write(self.user_skills / "rev.md", _skill_text("rev", context="fork"))
         result = self._tool().execute({"name": "rev"})
         self.assertFalse(result.ok)
         self.assertIn("/skills run rev", result.output)
 
     def test_isolated_uses_short_command_when_registered(self) -> None:
-        _write(self.user_skills / "r.md", _skill_text("rev", mode="isolated"))
+        _write(self.user_skills / "rev.md", _skill_text("rev", context="fork"))
         self.short_commands.add("rev")
         result = self._tool().execute({"name": "rev"})
         self.assertIn("/rev", result.output)

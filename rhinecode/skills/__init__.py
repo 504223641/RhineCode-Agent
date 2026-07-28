@@ -16,7 +16,6 @@ models → parser → discovery → render → validation → manager。
 from rhinecode.skills.models import (
     ActivationStatus,
     SkillCommandInfo,
-    SkillMode,
     SkillSource,
     SkillSpec,
     builtin_skills_dir,

@@ -1,8 +1,10 @@
 ---
 name: test
 description: 跑项目测试并解读失败
-mode: shared
-allowed_tools: [run_command, read_file, grep_content, edit_file]
+when_to_use: 用户说「跑测试」「test」「测试挂了看看」，或希望把失败解读成修复方向时
+# 只预授权「跑测试」与只读调研。**改代码刻意不预授权**——
+# 本 SOP 的产出是「解读失败」，动手修是另一件事，该由用户逐次确认。
+allowed-tools: [Bash(python -m unittest *), Bash(python -m pytest *), Bash(npm test *), Read, Grep]
 ---
 
 跑测试，并把失败解读成可执行的修复方向。

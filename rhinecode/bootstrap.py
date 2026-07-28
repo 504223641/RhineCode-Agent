@@ -34,7 +34,6 @@ from rhinecode.mcp.manager import MCPManager
 from rhinecode.provider.factory import create_provider
 from rhinecode.skills.manager import SkillManager
 from rhinecode.skills.models import builtin_skills_dir
-from rhinecode.skills.validation import format_fatal_message
 from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.path_guard import clear_read_roots, workspace_root
@@ -64,7 +63,9 @@ class BootstrapError(Exception):
 # 三段文案登记为**不可变契约**（改动会让既有启动测试变红，且用户看到的提示会变）：
 #   1. f"命令注册冲突：{e}"          —— build_builtin_registry 抛 CommandRegistrationError
 #   2. f"Provider 初始化错误：{e}"   —— create_provider 抛 ValueError
-#   3. format_fatal_message(names)   —— Skill 白名单笔误（该函数返回值本身就是完整文案）
+#
+# （C11 的第三段「Skill 白名单笔误」已随对齐改造删除：`allowed-tools` 现在是
+#  预授权声明，无法识别的项只警告不致命，启动不会再因它失败。）
 
 
 @dataclass(frozen=True)
@@ -204,50 +205,36 @@ def build_app(
     # SkillManager 实例，且 tools/registry.py 若导入 tools/load_skill.py
     # 会把 tools ↔ skills 的包级互依变成真环（见 tools/__init__.py 的说明）。
     #
-    # **必须在算 known_tools 之前注册**：否则白名单里写了 `load_skill` 的
-    # Skill 会被第一段严格校验判成笔误，启动直接挂掉——而那是个完全合法的
-    # 声明（虽然没有效果，只会得到一条「可以删除」的提示）。
-    tool_registry.register(LoadSkillTool(skill_manager))
+    # 注册它的位置不再有额外约束——白名单 fail-fast 已随对齐改造删除
+    # （`allowed-tools` 现在是预授权声明，无法识别的项只警告不致命）。
+    load_skill_tool = LoadSkillTool(skill_manager)
+    tool_registry.register(load_skill_tool)
 
-    # known 的组成：注册中心当前全部工具名 ∪ Plan Mode 的两个特殊工具。
-    # 后两个不在注册中心里但确实可被模型调用，白名单写它们不算笔误。
-    known_tools = tool_registry.names() | {"ask_user", "present_plan"}
-    fatal_tool_names = skill_manager.startup(known_tools)
-    if fatal_tool_names:
-        raise BootstrapError(format_fatal_message(fatal_tool_names))
+    skill_manager.startup()
 
-    # ── exclude_tools 的摘除：**位置同样卡在这个窄窗口里，两头都不能挪** ──
+    # ── exclude_tools 的摘除：**必须在 `session_start` 快照之前** ──
     #
-    # （与上面那段 Skill 校验的窄窗口是同一个窗口、同一类约束。下一个人重排本函数时
-    #  必须把两段一起看，只看到 Skill 那半段会以为这里可以自由移动。）
+    # 快照里的 `tool_names` 是断言「工具确实被摘掉了」的依据，摘除若发生在快照
+    # 之后，快照就会与实际工具集不符——观测设施撒谎，且不报错。
     #
-    # 往前挪不行（挪到 known_tools 计算之前）：那会让一个**在真实启动下完全合法**的
-    # 工作区起不来。实测过——白名单里写了 `mcp_add_server` 的 Skill 会因为该名字
-    # 已被摘掉而落进「不认识的工具名」，被第一段严格校验判成笔误并 fail-fast
-    # （实测 `fatals = [('addmcp', 'mcp_add_server')]`）。放在 `startup` **之后**，
-    # 白名单的校验口径就与真实启动逐字一致；被摘掉的名字随后由 Skill 的运行期
-    # 工具交集自然剔除（实测 `tool_policy.allowed = ['read_file']`），模型照样调不到。
-    #
-    # 往后挪不行：必须在 `session_start` 快照之前。快照里的 `tool_names` 是断言
-    # 「工具确实被摘掉了」的依据，摘除若发生在快照之后，快照就会与实际工具集不符——
-    # 观测设施撒谎，且不报错。
+    # 历史注记：C11 时这里还有另一半约束——「不能挪到 known_tools 计算之前，
+    # 否则白名单里写了 `mcp_add_server` 的 Skill 会被判成笔误并 fail-fast」。
+    # 对齐改造把白名单 fail-fast 整个删除后，那半段不再成立，已一并删去。
     for name in sorted(exclude_tools):
         tool_registry.unregister(name)
 
     mcp_manager.connect_all(mcp_configs, tool_registry, extra_errors=mcp_errors)
 
-    # ── Skill 系统第二阶段（c11 T58）：MCP 剪枝 + 短命令注册 ──
-    # 此刻远端工具已经注册进 tool_registry，可以判断哪些 mcp__ 白名单项有效了。
+    # ── Skill 系统第二阶段：工具集快照 + 短命令注册 ──
+    # 此刻远端工具已经注册进 tool_registry，快照才是完整的。
     skill_manager.bind_tools(registered=tool_registry.names())
     command_registry.replace_skill_commands(
         build_skill_command_specs(skill_manager.command_infos())
     )
-    # 注意：这里**刻意不打印**「短命令冲突 / 白名单警告 / 发现项目级 Skill」这三类
+    # 注意：这里**刻意不打印**「短命令冲突 / 字段提示 / 发现项目级 Skill」这三类
     # 状态信息。启动阶段的 print 发生在 Textual 接管屏幕之前，会被 alternate screen
     # 整个盖住，用户要等到退出程序才在终端里看见——那时早已失去意义。
     # 三类信息全部改由 `/skills` 报告承载（见 SkillManager.report）。
-    # 唯一仍然直接输出的是上面那段白名单笔误 fail-fast：它以异常形式抛给调用方，
-    # 由调用方 print 到 stderr 并以退出码 1 终止进程。
 
     # ⑤ 协调层。resume_latest 透传 --continue：构造时经 MemoryManager 恢复最近会话（c9）。
     manager = ConversationManager(
@@ -264,6 +251,14 @@ def build_app(
         # 不透传的话，一个指定了模型的 Skill 会绕过假模型、静默连上真实网络。
         provider_factory=provider_factory,
     )
+
+    # 把「跑一个 fork Skill」的能力回注给加载工具（对齐改造 F8）。
+    #
+    # **必须在这里、不能提前**：工具要在第 ④ 步之前注册（`bind_tools` 才数得到
+    # 它），而能跑子对话的协调层要到第 ⑤ 步才存在。属性注入让两者的构造顺序解耦，
+    # 与 `memory_manager.notify` / `skill_manager.notify_activation` 是同一形态。
+    load_skill_tool.run_fork = manager.run_forked_for_model
+    load_skill_tool.on_activated = manager.on_skill_activated
 
     # ⑥ 界面层。
     app = RhineApp(manager, cfg, command_registry, recorder=recorder)

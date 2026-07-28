@@ -1,4 +1,4 @@
-# 刻意留空（理由见 docs/c11/trace/p1/plan.md §5）。
+# 刻意留空（理由见 docs/c11/testing/p1-driver/plan.md §5）。
 #
 # 本文件存在的唯一目的：让 tests 成为一个 package，从而 `python -m tests.e2e.host`
 # 与 `python -m tests.e2e.client` 这两个入口可用（宿主与瘦客户端都是以模块方式启动的）。

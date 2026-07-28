@@ -139,55 +139,6 @@ class SkillStartupTest(unittest.TestCase):
 
     # ---- AC16：第一段严格校验 ----
 
-    def test_typo_in_builtin_tool_name_exits_before_mcp_connect(self) -> None:
-        """
-        白名单含不存在的内置工具名 → 退出码 1，且 **connect_all 未被调用**。
-
-        「connect_all 未被调用」是「无子进程残留」的可测形式：stdio 子进程
-        只可能由 connect_all → _connect_one → StdioTransport.start() 创建，
-        比查进程表稳定得多。
-        """
-        self._write_skill("bad", allowed_tools="[read_fil]")
-        code, err = self._run_main()
-
-        self.assertEqual(code, 1)
-        self.assertIn("read_fil", err)
-        self.assertIn("bad.md", err)
-        self.assertIn("版本", err)
-        self.captured["mcp_cls"].return_value.connect_all.assert_not_called()
-        self.app.run.assert_not_called()
-        self.assertNotIn("conversation_kwargs", self.captured)
-
-    def test_exempt_tool_names_start_normally_with_notice(self) -> None:
-        """
-        白名单含 ask_user / load_skill → 正常启动，只给「声明无效果」提示。
-
-        提示走 `/skills` 报告而**不是**启动 stderr：启动阶段的 print 发生在
-        Textual 接管屏幕之前，会被 alternate screen 盖住，用户要等退出程序
-        才看得到。这里一并断言 stderr 为空，锁死这个渠道选择。
-        """
-        self._write_skill("ex", allowed_tools="[ask_user, load_skill, read_file]")
-        code, err = self._run_main()
-
-        self.assertIsNone(code)
-        self.assertEqual(err, "")
-        self.assertIn("没有效果", self._skill_report())
-        self.app.run.assert_called_once()
-
-    def test_whitelisting_load_skill_does_not_kill_startup(self) -> None:
-        """
-        白名单里写 `load_skill` → 正常启动。
-
-        **顺序护栏**：`LoadSkillTool` 必须在算 `known_tools` 之前注册。
-        若在 `startup()` 之后才注册（一个很自然的写法，因为它逻辑上属于
-        「Skill 系统的一部分」），`load_skill` 就不在 known 里，
-        这条完全合法的声明会被判成笔误，启动直接挂掉。
-        """
-        self._write_skill("ls", allowed_tools="[load_skill]")
-        code, err = self._run_main()
-        self.assertIsNone(code, f"不该退出，stderr={err}")
-        self.assertIn("没有效果", self._skill_report())
-
     def test_single_underscore_mcp_builtin_is_not_a_typo(self) -> None:
         """
         白名单含 `mcp_add_server`（**单**下划线内置工具）→ 正常启动。
@@ -202,19 +153,6 @@ class SkillStartupTest(unittest.TestCase):
         self.app.run.assert_called_once()
 
     # ---- AC16/AC17：第二段 MCP 剪枝 ----
-
-    def test_unconnected_mcp_tool_is_pruned_with_warning(self) -> None:
-        """白名单含未连接的 mcp__ 工具 → 正常启动、有警告、该项被剔除。"""
-        self._write_skill("m", allowed_tools="[read_file, mcp__nope__t]")
-        code, err = self._run_main()
-
-        self.assertIsNone(code)
-        self.assertEqual(err, "")
-        self.assertIn("未连接", self._skill_report())
-        sm = self.captured["conversation_kwargs"]["skill_manager"]
-        self.assertEqual(sm.get("m").allowed_tools, ("read_file",))
-
-    # ---- AC25：短命令重名跳过 ----
 
     def test_skill_colliding_with_builtin_command_is_skipped(self) -> None:
         """
@@ -247,6 +185,32 @@ class SkillStartupTest(unittest.TestCase):
         registry = self.captured["command_registry"]
         self.assertTrue(registry.has_skill_command("deploy"))
         self.assertIsNotNone(registry.resolve("/deploy"))
+
+    # ---- 对齐改造：预授权的无法识别项不再致命 ----
+
+    def test_unknown_granted_tool_no_longer_kills_startup(self) -> None:
+        """
+        `allowed-tools` 里写了本系统没有的工具名 → **正常启动**，只给一条警告。
+
+        这与 C11 的取舍**正好相反**（那时是 fail-fast 退出），理由是来源变了：
+        白名单曾是自家格式、写错就是笔误；现在这份声明可能来自 Claude Code 或
+        Codex，里面出现 `Task` / `WebFetch` / `TodoWrite` 是**正常现象**，
+        不该让程序起不来。
+
+        这条是本次改造在启动路径上最重要的行为变化，必须有护栏钉住。
+        """
+        self._write_skill("ext", **{"allowed-tools": "[WebFetch, Bash]"})
+        code, err = self._run_main()
+
+        self.assertIsNone(code, "不该退出")
+        self.assertEqual(err, "")
+        report = self._skill_report()
+        self.assertIn("WebFetch", report)
+        self.assertIn("没有对应的工具类别", report)
+        # 认识的那条仍照常生效
+        sm = self.captured["conversation_kwargs"]["skill_manager"]
+        rules, _ = sm.grants_for_spec(sm.get("ext"))
+        self.assertIn("Bash", [r.tool for r in rules])
 
     # ---- AC38：项目级提示的零状态语义 ----
 

@@ -11,7 +11,6 @@ from pathlib import Path
 from rhinecode.skills.models import (
     BODY_MAX_LINES,
     DegradeKind,
-    SkillMode,
     SkillSource,
     SkillSpec,
     TOTAL_MAX_LINES,
@@ -30,17 +29,22 @@ def _spec(
     name: str = "s",
     description: str = "说明",
     body: str = "SOP 正文",
-    mode: SkillMode = SkillMode.SHARED,
+    forked: bool = False,
+    when_to_use: str = None,
     resource_dir: Path = None,
     resource_files: tuple = (),
+    model_invocable: bool = True,
 ) -> SkillSpec:
     return SkillSpec(
-        name=name,
+        command_name=name,
+        display_name=name,
         description=description,
+        when_to_use=when_to_use,
         body=body,
-        mode=mode,
-        allowed_tools=None,
-        history_messages=0,
+        granted_tools=(),
+        forked=forked,
+        model_invocable=model_invocable,
+        user_invocable=True,
         model=None,
         source=SkillSource.USER,
         entry_path=Path("/tmp") / f"{name}.md",
@@ -53,18 +57,18 @@ class IndexTest(unittest.TestCase):
     """第一阶段清单（AC6）。"""
 
     def test_contains_name_mode_description_but_no_body(self) -> None:
-        """清单含名字/模式/说明，**不含任何 SOP 正文**——这是两阶段加载的定义。"""
+        """清单含命令名/标记/说明，**不含任何 SOP 正文**——这是两阶段加载的定义。"""
         text = render_index(
             [
                 _spec("alpha", "第一个", body="绝密正文AAA"),
-                _spec("beta", "第二个", body="绝密正文BBB", mode=SkillMode.ISOLATED),
+                _spec("beta", "第二个", body="绝密正文BBB", forked=True),
             ]
         )
         self.assertIn("alpha", text)
         self.assertIn("第一个", text)
-        self.assertIn("共享", text)
+        self.assertIn("alpha", text)
         self.assertIn("beta", text)
-        self.assertIn("独立", text)
+        self.assertIn("子对话", text)
         self.assertNotIn("绝密正文", text)
 
     def test_empty_list_returns_empty_string(self) -> None:
@@ -78,6 +82,27 @@ class IndexTest(unittest.TestCase):
         self.assertLessEqual(len(text.splitlines()), 210)
         self.assertIn("另有", text)
         self.assertIn("未列出", text)
+
+    def test_user_only_skill_carries_the_real_entry_command(self) -> None:
+        """
+        `disable-model-invocation` 的 Skill 要在清单里给出**真实入口命令**。
+
+        钉的是一个真实模型端到端场景里抓到的缺陷：清单原本只说「只能建议用户
+        执行对应命令」而从不说明那条命令是什么，模型于是编了一条不存在的
+        `rhine skill deploy` 告诉用户。命令是否注册成短命令要问 `CommandRegistry`
+        （重名会跳过），故由调用方注入。
+        """
+        spec = _spec("deploy", "部署", model_invocable=False)
+        text = render_index([spec], entry_hint=lambda s: f"/{s.command_name}")
+        self.assertIn("/deploy", text)
+        self.assertIn("仅用户可发起", text)
+
+    def test_entry_hint_omitted_falls_back_to_old_wording(self) -> None:
+        """不给 hint 时退回模糊措辞——模糊总比给一条错命令强。"""
+        spec = _spec("deploy", "部署", model_invocable=False)
+        text = render_index([spec])
+        self.assertIn("仅用户可发起", text)
+        self.assertNotIn("/deploy", text)
 
 
 class SubstituteTest(unittest.TestCase):

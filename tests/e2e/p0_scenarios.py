@@ -1,7 +1,7 @@
 """
 用 P1a 驱动设施验收 **P0（Trace 记录器）** 端到端场景的剧本与预置。
 
-对应 `docs/c11/trace/checklist.md` 第九节那 9 条手测场景。它们当初留作手测，
+对应 `docs/c11/testing/p0-trace/checklist.md` 第九节那 9 条手测场景。它们当初留作手测，
 是因为**没有能驱动界面的东西**；P1a 交付后其中大部分已经可以无人驱动。
 
 放在独立模块而不是塞进 `scripts.py`，是因为这些 fixture 的服务对象是**另一份
@@ -44,10 +44,9 @@ def seed_readonly_skill(workspace: Path, user_dir: Path) -> None:
         workspace,
         "readonly",
         {"description": "只读分析，不改任何文件",
-         "mode": "shared",
-         # ⚠️ 只给 read_file 会让模型没法发现目录里有什么（CLAUDE.md 记着的实测教训），
+                  # ⚠️ 只给 read_file 会让模型没法发现目录里有什么（CLAUDE.md 记着的实测教训），
          # 但本场景要的正是「白名单足够窄」，故刻意只留它。
-         "allowed_tools": ["read_file"]},
+         "allowed-tools": ["read_file"]},
         "只读地分析，不要修改任何文件。\n\n$ARGUMENTS",
     )
 
@@ -74,8 +73,8 @@ def seed_isolated_skill(workspace: Path, user_dir: Path) -> None:
     seeding.seed_project_skill(
         workspace,
         "solo",
-        {"description": "独立跑一遍分析", "mode": "isolated",
-         "allowed_tools": ["read_file", "glob_files"]},
+        {"description": "独立跑一遍分析", "context": "fork",
+         "allowed-tools": ["read_file", "glob_files"]},
         "在子对话里完成分析并给出结论。\n\n$ARGUMENTS",
     )
 

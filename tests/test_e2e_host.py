@@ -483,13 +483,27 @@ class FatalAndDiscoveryTest(HostFixture):
         """
         AC5：装配期致命错误必须**经通道回报**而不是超时。
 
-        用一个白名单笔误的 Skill 触发 fail-fast——这正是 socket 必须先于装配的理由：
-        先装配再监听的话，这里只会收到「连接被拒」。
+        用一份**非法 protocol** 的配置触发 `create_provider` 报错——这正是
+        socket 必须先于装配的理由：先装配再监听的话，这里只会收到「连接被拒」。
+
+        ⚠️ C11 时这里用的是「白名单笔误的 Skill」。对齐改造把白名单 fail-fast
+        整个删除后，那个触发源不再致命，只好换一个仍然致命的。
+
+        ⚠️ **必须用 `--mode live`**：scripted 模式下宿主会把 `provider_factory`
+        换成假模型，`create_provider` 压根不会被调用，非法 protocol 也就不会报错
+        （第一次改这条时就撞上了，宿主一切正常地起来了）。
+        本条用的假 key 只是为了过宿主自己那道「凭据不能是占位符」的检查，
+        它永远不会被用来发请求——装配在此之前就失败了。
         """
+        bad_config = self.stderr_path.parent / "bad-protocol.yaml"
+        bad_config.write_text(
+            "protocol: no-such-protocol\nmodel: m\n"
+            "base_url: https://x\napi_key: k\n",
+            encoding="utf-8",
+        )
         self.start_host(
-            "--mode", "scripted",
-            "--script", "tests.e2e.scripts:SAY_HELLO",
-            "--seed", "tests.e2e.scripts:seed_typo_skill",
+            "--mode", "live",
+            "--config", str(bad_config),
             "--idle-timeout", "120",
             wait_ready=False,
         )
@@ -505,8 +519,8 @@ class FatalAndDiscoveryTest(HostFixture):
         self.assertEqual(res["error"]["code"], "fatal")
         # 文案与既有启动测试逐字一致（P0 已把它做成成文的完整 stderr 文案）
         message = res["error"]["message"]
-        self.assertIn("allowed_tools", message)
-        self.assertIn("no_such_tool", message)
+        self.assertIn("Provider 初始化错误", message)
+        self.assertIn("no-such-protocol", message)
 
         self.quit_host(expect_exit=1)
 

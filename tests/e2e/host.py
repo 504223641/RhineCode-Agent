@@ -515,8 +515,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.chdir(workspace)
 
     # 步骤③：预置（在校验之后、装配之前——启动时扫到的内容必须已经落好盘）
+    #
+    # 必须包 try：预置函数是会抛的（`seed_git_repo` 缺 git 时抛、
+    # `seed_foreign_skill` 找不到源文件时抛，两者都是**刻意**明确报错而非静默跳过）。
+    # 不包的话异常直接掀掉进程，第②步刚建的两个临时目录就永远留在系统临时目录里，
+    # 而**这时候还没发布名片**——`client hosts` 看不见它们，排障时只会发现
+    # 「临时目录莫名其妙攒了一堆」。实测就是这么攒出 4 个的。
     if args.seed:
-        load_attr(args.seed)(workspace, user_dir)
+        try:
+            load_attr(args.seed)(workspace, user_dir)
+        except Exception as e:  # noqa: BLE001 —— 预置什么都可能抛，一律清理后退出
+            log(f"致命：预置 {args.seed} 失败：{e}")
+            for path in (workspace, user_dir):
+                try:
+                    sandbox.cleanup_workspace(path, previous_cwd=previous_cwd)
+                except OSError as ce:
+                    log(f"（清理 {path} 失败：{ce}）")
+            return 1
 
     # 步骤④：**socket 先于装配**（见模块 docstring）
     server = ControlServer(host_state)

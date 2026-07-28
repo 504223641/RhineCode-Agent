@@ -1,15 +1,23 @@
 """
-单份 Skill 文本 → SkillSpec 的解析（c11 T6/T7）。
+单份 Skill 文本 → SkillSpec 的解析。
 
-**职责**：把一个 Skill 文件的完整文本（YAML frontmatter + Markdown 正文）
+**职责**：把一个 Skill 文件的完整文本（可选的 YAML frontmatter + Markdown 正文）
 解析成 `SkillSpec`，或给出一条可读的中文失败原因。
 
-**纯函数，不碰文件系统**：读文件、遍历目录、决定去哪里找文件，全部由
-`discovery.py` 负责；本模块只处理「已经拿到的一段文本」。这样解析规则可以
-用字符串字面量直接测试，无需造临时目录。
+**纯函数，不碰文件系统**：读文件、遍历目录、决定去哪里找文件、**推导命令名**，
+全部由 `discovery.py` 负责；本模块只处理「已经拿到的一段文本」。这样解析规则可以
+用字符串字面量直接测试，无需造临时目录。命令名由调用方算好后传进来。
 
-对应 spec 条款：F1（frontmatter 六个字段）、F4（名字规则与保留子命令词）、
-F5（单文件解析失败不阻断整体）、F22（共享模式声明 model 只警告不失败）。
+## 本轮改造要点（对齐 Agent Skills 开放标准）
+
+1. **全部字段可选**——一份没有 frontmatter、只有正文的 Markdown 也是合法 Skill，
+   说明从正文第一个非空段落提取。标准如此，外部 Skill 才能原样搬进来。
+2. **键名连字符与下划线都认**（标准用连字符，YAML 使用者习惯下划线）。
+3. **`allowed_tools`（下划线）触发一条明确的语义变更警告**——它在旧版本里是
+   「收窄可见工具集」，现在是「免确认」，两者**相反**。静默沿用会让同一份文件
+   在新旧版本下行为相反而用户毫不知情，这是本次改造唯一「静默会造成实际损害」
+   的迁移点，故单独处理、措辞不可淡化。
+4. **名字的字符集与长度校验整段删除**——命令名来自文件系统，不来自这里。
 """
 
 from typing import Optional
@@ -17,9 +25,7 @@ from typing import Optional
 import yaml
 
 from rhinecode.skills.models import (
-    NAME_PATTERN,
-    RESERVED_SUBCOMMANDS,
-    SkillMode,
+    UNSUPPORTED_FIELDS,
     SkillSource,
     SkillSpec,
 )
@@ -28,11 +34,162 @@ from rhinecode.skills.models import (
 # 向下找到第二条同样的线为止，中间是 YAML，之后是正文。
 _FENCE = "---"
 
+# YAML 1.1 之外，标准还允许这些布尔字面量（大小写不敏感）。
+# `yaml.safe_load` 已经把 true/false/yes/no/on/off 转成 bool，
+# 这里兜的是被引号包住、或写成 1/0 字符串的情形。
+_TRUE_LITERALS = frozenset({"true", "yes", "on", "1"})
+_FALSE_LITERALS = frozenset({"false", "no", "off", "0"})
+
+
+def _normalize_keys(front: dict) -> tuple[dict, list[str]]:
+    """
+    把 frontmatter 的键名归一到下划线形态。
+
+    :param front: 原始 frontmatter 映射
+    :returns: `(归一后的映射, 提示列表)`
+
+    同一逻辑键的两种写法同时出现时**以连字符版为准**（那是标准写法），
+    并产出一条提示——两种写法并存多半是复制粘贴时的疏漏，
+    静默取其一会让用户以为另一个生效了。
+
+    副作用：无（返回新字典）。
+    """
+    notices: list[str] = []
+    out: dict = {}
+    # 先放下划线版，再让连字符版覆盖它，从而实现「连字符优先」
+    for key, value in front.items():
+        if not isinstance(key, str) or "-" in key:
+            continue
+        out[key] = value
+    for key, value in front.items():
+        if not isinstance(key, str) or "-" not in key:
+            continue
+        normalized = key.replace("-", "_")
+        if normalized in out and out[normalized] != value:
+            notices.append(
+                f"同时出现 `{key}` 与 `{normalized}` 两种写法且取值不同，"
+                f"按标准写法 `{key}` 为准"
+            )
+        out[normalized] = value
+    return out, notices
+
+
+def _as_bool(value, default: bool) -> bool:
+    """
+    宽松地把 frontmatter 取值读成布尔。
+
+    :param value: 原始取值（可能已被 YAML 转成 bool，也可能是字符串）
+    :param default: 取值缺失或无法识别时的缺省
+    :returns: 布尔值
+
+    无法识别时**返回缺省而不是报错**：一个布尔字段写错不该让整个 Skill 用不了。
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if text in _TRUE_LITERALS:
+        return True
+    if text in _FALSE_LITERALS:
+        return False
+    return default
+
+
+def _split_outside_parens(text: str) -> list[str]:
+    """
+    按空白与逗号切分，但**括号内的分隔符不算数**。
+
+    :param text: 形如 `Bash(git add *) Bash(git commit *), Read` 的声明串
+    :returns: 切分后的条目列表
+
+    ⚠️ 不能直接 `text.split()`：标准里最常见的写法恰恰是
+    `allowed-tools: Bash(git add *) Bash(git commit *)`——括号内**必然含空格**，
+    朴素切分会把一条声明劈成 `Bash(git` 与 `add` 与 `*)` 三段，
+    然后三段都因为「不认识的工具类别」被丢掉，而用户只会看到「预授权没生效」。
+
+    副作用：无。
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and (ch.isspace() or ch == ","):
+            if buf:
+                parts.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _as_tool_list(value) -> tuple[str, ...]:
+    """
+    把 `allowed-tools` 的取值读成字符串元组。
+
+    :param value: YAML 列表，或空格/逗号分隔的字符串
+    :returns: 去重且**保序**的元组
+
+    标准明确允许两种写法（列表与分隔串），两种都要认——外部 Skill 里两种都常见。
+    保序是为了让 `/skills` 的展示与用户写在文件里的顺序一致，排查时不必来回对照。
+
+    副作用：无。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw = _split_outside_parens(value)
+    elif isinstance(value, list):
+        raw = [str(item) for item in value]
+    else:
+        return ()
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw:
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return tuple(out)
+
+
+def _first_paragraph(body: str) -> str:
+    """
+    从正文提取第一个非空段落，作为 `description` 的缺省值。
+
+    :param body: SOP 正文
+    :returns: 第一段文本（单行化）；提取不到时返回空串
+
+    跳过 Markdown 标题行（`#` 开头）——标题通常只是 Skill 名字的重复，
+    拿它当说明对模型判断「什么时候该用这个 Skill」毫无帮助。
+
+    副作用：无。
+    """
+    paragraph: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        if stripped.startswith("#"):
+            continue
+        paragraph.append(stripped)
+    return " ".join(paragraph)
+
 
 def parse_skill(
     text: str,
     path,
     source: SkillSource,
+    command_name: str,
     resource_dir=None,
     resource_files: tuple[str, ...] = (),
 ) -> tuple[Optional[SkillSpec], Optional[str], list[str]]:
@@ -40,19 +197,19 @@ def parse_skill(
     解析一份 Skill 文本。
 
     :param text: 文件完整内容（已按 UTF-8 解码）
-    :param path: 该文本的来源路径，只用于填进 SkillSpec.entry_path，本函数不读它
+    :param path: 该文本的来源路径，只用于填进 `entry_path`，本函数不读它
     :param source: 来源层级
+    :param command_name: **由发现层从路径推导好的命令名**，本函数原样填入
     :param resource_dir: 目录型 Skill 的目录；单文件型传 None
     :param resource_files: 目录型的随附文件相对路径清单
     :returns: `(spec, reason, warnings)` 三元组。
-              **`spec` 与 `reason` 恰有一个非 None**——成功时 `reason is None`，
-              失败时 `spec is None` 且 `reason` 是可读中文原因。
-              `warnings` 是非致命提示列表，**成功时也可能非空**（如 F22 的
-              共享模式声明 model），失败时恒为空列表。
+              **`spec` 与 `reason` 恰有一个非 None**。
+              `warnings` **恒为空列表**——本函数的全部告知走 `spec.notices`
+              这一条通路（两边都返回会让报告打印两遍，见函数末尾的注释）。
 
     副作用：无。不读写文件、不改全局状态。
     """
-    warnings: list[str] = []
+    notices: list[str] = []
 
     # ── 第一步：切出 frontmatter 与正文 ──
     #
@@ -61,160 +218,148 @@ def parse_skill(
     # 它是要发给模型的 SOP，格式即语义）。
     lines = text.splitlines(keepends=True)
 
-    # 允许 frontmatter 之前有空白行（有些编辑器会在文件开头留一行）。
     start = 0
     while start < len(lines) and not lines[start].strip():
         start += 1
 
-    if start >= len(lines) or lines[start].strip() != _FENCE:
-        return None, "缺少 YAML frontmatter（文件须以 --- 开头）", []
+    front: dict = {}
+    if start < len(lines) and lines[start].strip() == _FENCE:
+        end = None
+        for i in range(start + 1, len(lines)):
+            if lines[i].strip() == _FENCE:
+                end = i
+                break
+        if end is None:
+            return None, "YAML frontmatter 未闭合（缺少第二条 --- 分隔线）", []
 
-    # 向下找第二条分隔线。
-    end = None
-    for i in range(start + 1, len(lines)):
-        if lines[i].strip() == _FENCE:
-            end = i
-            break
+        try:
+            # safe_load 而非 load：Skill 文件可能来自团队仓库甚至第三方，
+            # 绝不能允许 YAML 里的任意对象构造。
+            parsed = yaml.safe_load("".join(lines[start + 1 : end]))
+        except yaml.YAMLError as exc:
+            first = str(exc).strip().splitlines()[0] if str(exc).strip() else "未知错误"
+            return None, f"frontmatter 解析失败：{first}", []
 
-    if end is None:
-        return None, "YAML frontmatter 未闭合（缺少第二条 --- 分隔线）", []
+        if parsed is None:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            return None, "frontmatter 顶层必须是键值映射", []
+        front = parsed
+        body = "".join(lines[end + 1 :])
+    else:
+        # **没有 frontmatter 也是合法 Skill**（标准如此）：整份文件都是正文。
+        body = "".join(lines[start:])
 
-    front_text = "".join(lines[start + 1 : end])
-    body = "".join(lines[end + 1 :])
-
-    # ── 第二步：解析 YAML ──
-    #
-    # 用 safe_load 而非 load：Skill 文件可能来自团队仓库甚至第三方，
-    # 绝不能允许 YAML 里的任意对象构造（safe_load 只产出基本类型）。
-    try:
-        front = yaml.safe_load(front_text)
-    except yaml.YAMLError as exc:
-        # 异常信息可能很长（含多行上下文），只取首行让报告保持可读。
-        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else "未知错误"
-        return None, f"frontmatter 解析失败：{first_line}", []
-
-    # 空 frontmatter（`---\n---\n`）时 safe_load 返回 None，也归入本分支。
-    if not isinstance(front, dict):
-        return None, "frontmatter 顶层必须是键值映射", []
-
-    # ── 第三步：正文非空 ──
+    # ── 第二步：正文非空 ──
     #
     # 正文是要发给模型的 SOP 指令，空正文的 Skill 没有任何意义，
-    # 加载了反而会占一个名字并让用户困惑「为什么激活了什么都没发生」。
+    # 加载了反而会占一个命令名并让用户困惑「为什么执行了什么都没发生」。
     if not body.strip():
         return None, "SOP 正文为空", []
 
-    # ── 第四步：逐字段校验 ──
-
-    # name：必填，且必须能安全地拼成斜杠短命令。
+    # ── 第三步：键名归一 ──
     #
-    # 「缺失」与「类型不对」要分开报，原因是 YAML 1.1 会把一批裸词解析成布尔值：
-    # `name: off` 得到的是 False 而不是字符串 "off"。若两种情况都报「缺少 name」，
-    # 用户看着自己明明写了 name 却被告知没写，根本无从下手。符合 NAME_PATTERN
-    # 又会被 YAML 吃掉的词有 y / yes / n / no / true / false / on / off，
-    # 这类名字必须加引号，提示里直接把办法说出来。
-    if "name" not in front:
-        return None, "缺少必填字段 name", []
-    name = front.get("name")
-    if not isinstance(name, str) or not name.strip():
-        return None, (
-            "name 必须是非空字符串"
-            "（注意 YAML 会把 on/off/yes/no/true/false 等裸词解析成布尔值，"
-            "这类名字需要加引号写成 name: \"off\"）"
-        ), []
-    name = name.strip()
-    if not NAME_PATTERN.match(name):
-        return None, (
-            f"名字 `{name}` 不合法"
-            "（须小写字母开头、仅含小写字母数字连字符、不超过 32 字符）"
-        ), []
-    if name in RESERVED_SUBCOMMANDS:
-        # 这些词是 `/skills` 的子命令。若允许同名 Skill，`/skills run xxx`
-        # 与「名叫 run 的 Skill」就会产生解析二义。
-        return None, f"名字使用了保留子命令词 `{name}`", []
+    # ⚠️ 归一**之前**先留一份原始键名：归一后连字符形态全部变成下划线，
+    # 就再也分不出「用户写的是标准的 allowed-tools」还是「旧的 allowed_tools」了，
+    # 而下面那条语义变更告知恰恰依赖这个区分。
+    original_keys = {k for k in front if isinstance(k, str)}
+    front, key_notices = _normalize_keys(front)
+    notices.extend(key_notices)
 
-    # description：必填。它是第一阶段清单里模型唯一能看到的信息，
-    # 缺了它这个 Skill 就等于对模型不可见。
-    description = front.get("description")
-    if not isinstance(description, str) or not description.strip():
-        return None, "缺少必填字段 description", []
-    description = description.strip()
+    # ── 第四步：逐字段读取 ──
 
-    # allowed_tools：可选。缺省 None = 不收窄工具集。
-    raw_tools = front.get("allowed_tools")
-    allowed_tools: Optional[tuple[str, ...]]
-    if raw_tools is None:
-        allowed_tools = None
-    elif not isinstance(raw_tools, list) or not all(
-        isinstance(t, str) for t in raw_tools
-    ):
-        # 常见笔误是写成一个逗号分隔的字符串。明确报错好过默默把整串当成一个工具名，
-        # 后者会在启动校验时报出一个匪夷所思的「工具不存在」。
-        return None, "allowed_tools 必须是字符串列表", []
+    # display_name：仅展示标签，缺省回填命令名。
+    raw_name = front.get("name")
+    display_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else command_name
+
+    # description：缺省从正文第一段提取。**不再是必填**。
+    raw_desc = front.get("description")
+    if isinstance(raw_desc, str) and raw_desc.strip():
+        description = raw_desc.strip()
     else:
-        # 去重但**保序**：顺序对语义无影响，但保序能让 `/skills` 的展示与用户
-        # 写在文件里的顺序一致，排查时不必来回对照。
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for tool in raw_tools:
-            tool = tool.strip()
-            if tool and tool not in seen:
-                seen.add(tool)
-                deduped.append(tool)
-        allowed_tools = tuple(deduped)
+        description = _first_paragraph(body) or f"（无说明）{command_name}"
 
-    # mode：可选，缺省共享。
-    raw_mode = front.get("mode", "shared")
-    if raw_mode not in ("shared", "isolated"):
-        return None, f"mode 只能是 shared 或 isolated，实际是 `{raw_mode}`", []
-    mode = SkillMode.SHARED if raw_mode == "shared" else SkillMode.ISOLATED
+    # when_to_use：可选，拼在 description 之后进清单。
+    raw_when = front.get("when_to_use")
+    when_to_use = raw_when.strip() if isinstance(raw_when, str) and raw_when.strip() else None
 
-    # history_messages：可选，缺省 0。
-    #
-    # 必须显式排除 bool：Python 里 `isinstance(True, int)` 为 True，
-    # 写成 `history_messages: yes` 会被 YAML 解析成布尔 True，
-    # 不排除的话它会当成 1 悄悄生效，用户完全看不出哪里错了。
-    raw_history = front.get("history_messages", 0)
-    if isinstance(raw_history, bool) or not isinstance(raw_history, int):
-        return None, "history_messages 必须是非负整数", []
-    if raw_history < 0:
-        return None, "history_messages 必须是非负整数", []
-    history_messages = raw_history
+    # allowed-tools：预授权声明。
+    granted_tools = _as_tool_list(front.get("allowed_tools"))
 
-    # model：可选。
-    raw_model = front.get("model")
-    if raw_model is not None and not isinstance(raw_model, str):
-        return None, "model 必须是字符串", []
-    model = raw_model.strip() if isinstance(raw_model, str) and raw_model.strip() else None
-
-    # F22：共享模式声明 model **不是错误**。共享模式复用主对话的 Provider，
-    # 中途换模型无从谈起，但用户可能只是从别的 Skill 复制了 frontmatter。
-    # 直接失败太苛刻（整个 Skill 都用不了），静默忽略又会让用户以为换成功了，
-    # 所以取中间路线：加载成功 + 一条明确的警告。
-    if mode is SkillMode.SHARED and model is not None:
-        warnings.append(
-            f"Skill `{name}` 是共享模式，声明的 model `{model}` 将被忽略"
-            "（仅独立模式支持指定模型）"
+    # **语义变更的显式告知**：只有用户写的是下划线形态才提示——
+    # 连字符形态是标准写法，作者本来就是按预授权语义写的，无需提醒。
+    if "allowed_tools" in original_keys and "allowed-tools" not in original_keys and granted_tools:
+        notices.append(
+            "检测到 `allowed_tools`（下划线写法）。**该字段的语义已变更**："
+            "旧版本中它表示「收窄模型可见的工具集」，现在表示「列出的操作在本次执行内"
+            "免于人工确认」，两者作用相反。当前按新语义（免确认）处理，"
+            "请确认这符合你的本意；若想限制模型能做什么，请用 permissions.yaml 的 deny 规则。"
         )
 
-    # 未知键一律忽略，不失败也不警告。这是刻意的向前兼容策略，与 c9 笔记的
-    # frontmatter 口径一致：老版本 RhineCode 读到新版本写的 Skill 时，
-    # 应当尽量把它用起来，而不是因为多了个不认识的键就整个拒绝。
+    # context：取值 fork 时开子对话。
+    raw_context = front.get("context")
+    forked = False
+    if raw_context is not None:
+        text_context = str(raw_context).strip().casefold()
+        if text_context == "fork":
+            forked = True
+        else:
+            notices.append(f"`context` 取值 `{raw_context}` 不认识，按留在主对话处理")
+
+    # 两个可调用性开关。
+    model_invocable = not _as_bool(front.get("disable_model_invocation"), False)
+    user_invocable = _as_bool(front.get("user_invocable"), True)
+
+    # model：仅 fork 生效。
+    raw_model = front.get("model")
+    model = raw_model.strip() if isinstance(raw_model, str) and raw_model.strip() else None
+    if model is not None and not forked:
+        notices.append(
+            f"声明的 model `{model}` 将被忽略（只有 `context: fork` 的 Skill 才独立开子对话，"
+            "留在主对话时共用主对话的模型）"
+        )
+
+    # ── 第五步：无对应能力的标准字段，逐条告知 ──
+    #
+    # **不能静默忽略**：作者写 `background: true` 的预期是「后台跑、不阻塞」，
+    # 实际却同步阻塞跑完，这个差异用户不知道就会误判 Skill 的行为。
+    for field, behaviour in UNSUPPORTED_FIELDS.items():
+        if field not in front:
+            continue
+        # background 只有取真值时才与本版本行为不同；取假正是本版本的行为。
+        if field == "background" and not _as_bool(front.get(field), True):
+            continue
+        notices.append(f"`{field}`：{behaviour}")
+
+    # 其余未知键一律忽略，不失败也不提示。这是刻意的向前兼容策略：
+    # 读到更新版本写的 Skill 时应当尽量把它用起来，而不是因为多了个键就整个拒绝。
 
     return (
         SkillSpec(
-            name=name,
+            command_name=command_name,
+            display_name=display_name,
             description=description,
+            when_to_use=when_to_use,
             body=body,
-            mode=mode,
-            allowed_tools=allowed_tools,
-            history_messages=history_messages,
+            granted_tools=granted_tools,
+            forked=forked,
+            model_invocable=model_invocable,
+            user_invocable=user_invocable,
             model=model,
             source=source,
             entry_path=path,
             resource_dir=resource_dir,
             resource_files=resource_files,
+            notices=tuple(notices),
         ),
         None,
-        warnings,
+        # **warnings 恒为空**：本函数的告知全部走 `spec.notices` 这一条通路。
+        #
+        # 曾经两边都返回过，结果是 `/skills` 报告把每条提示**打印两遍**
+        # （一次在「警告」段、一次在「字段提示」段）——实测发现的。
+        #
+        # 而发现层那套「被覆盖那份的警告不发出」的机制在这里是多余的：
+        # 报告只遍历 `catalog.skills`，被覆盖的 spec 压根不在里面，
+        # 它的 notices 自然跟着一起消失。
+        [],
     )

@@ -6,13 +6,13 @@
 > **定位：这是跨阶段的「测试设施」，不是新章节的产品能力。**
 > C2–C11 每章都是给用户的产品能力（工具系统、权限、MCP、上下文、记忆、命令、Skill），
 > 而本模块是给开发者用的——它服务**已完成的 C2–C11 与未来所有阶段**的验收与排查。
-> 因此它**不占新章节号**，作为 C11 的子开发放在 `docs/c11/trace/`，
+> 因此它**不占新章节号**，作为 C11 的子开发放在 `docs/c11/testing/p0-trace/`，
 > 在 `c11-trace` 分支上开发、完成后合回 `c11`。
 > 请不要在 spec 里把它写成「C12」或 Skill 系统的一部分。
 >
 > 前置：请先读 `CLAUDE.md`（尤其「架构」「成对维护点」「安全边界」三节），
 > 再用 `/spec` 技能走 `spec.md → plan.md → task.md → checklist.md`（都放
-> `docs/c11/trace/` 下）。本文只交代**要什么、为什么、地基是什么、坑在哪**，
+> `docs/c11/testing/p0-trace/` 下）。本文只交代**要什么、为什么、地基是什么、坑在哪**，
 > 不代替 spec 的需求澄清。
 >
 > 文中所有对代码现状的断言都在 2026-07-27 的代码库上实测核对过，并标注了
@@ -482,7 +482,7 @@ tools schema 与 system 全文，而不是靠 `/skills prompt` 事后猜）
 
 **两期共同**
 
-9. `docs/c11/trace/` 的 spec / plan / task / checklist
+9. `docs/c11/testing/p0-trace/` 的 spec / plan / task / checklist
 10. `CLAUDE.md` 的架构节与「成对维护点」备忘更新——注意措辞要把它写成
     **跨阶段测试设施**，别挂到 Skill 系统名下
 
@@ -498,13 +498,13 @@ tools schema 与 system 全文，而不是靠 `/skills prompt` 事后猜）
 先确认当前在 c11-trace 分支上（git branch --show-current），不在就先切过去。
 
 然后用 /spec 技能走 spec 驱动开发流程：先跟我澄清需求，再依次产出
-docs/c11/trace/ 下的 spec.md → plan.md → task.md → checklist.md，每份都要我
+docs/c11/testing/p0-trace/ 下的 spec.md → plan.md → task.md → checklist.md，每份都要我
 确认后才进入下一份。不要直接开始写代码。
 
 几个约束先说在前面：
 - 这个模块是**跨阶段的测试设施**，不是新章节、也不属于 Skill 系统。
   它服务 C2–C11 已完成的能力与未来所有阶段的验收，所以不要占新章节号，
-  文档一律放 docs/c11/trace/；
+  文档一律放 docs/c11/testing/p0-trace/；
 - 项目所有回答用中文，代码注释按 CLAUDE.md 的「代码注释规范」写；
 - 我是第一次独立做这类项目，涉及新概念要先解释「是什么、为什么用、解决什么问题」；
 - 改完代码立刻 git commit，一次改动一个 commit，不用问我；

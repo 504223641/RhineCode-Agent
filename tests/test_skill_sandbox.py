@@ -235,7 +235,7 @@ class ResumeClearsActivationTest(unittest.TestCase):
             builtin_dir=None,
             has_short_command=lambda _n: False,
         )
-        sm.startup(frozenset({"load_skill"}))
+        sm.startup()
         config = Config(
             protocol="deepseek", model="m", base_url="http://t",
             api_key="k", debug_log=False,

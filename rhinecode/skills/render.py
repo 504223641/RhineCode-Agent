@@ -14,7 +14,7 @@ Skill 系统的全部文本产出（c11 T12–T15）。
 F12（$ARGUMENTS 替换）、F13（资源清单）、F24（自包含调用文本）。
 """
 
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from rhinecode.skills.models import (
     BODY_MAX_BYTES,
@@ -23,14 +23,12 @@ from rhinecode.skills.models import (
     INDEX_MAX_BYTES,
     INDEX_MAX_LINES,
     PLACEHOLDER,
-    SkillMode,
     SkillSpec,
     TOTAL_MAX_BYTES,
     TOTAL_MAX_LINES,
 )
 
 # 模式的中文标签，清单与报告共用。
-_MODE_LABEL = {SkillMode.SHARED: "共享", SkillMode.ISOLATED: "独立"}
 
 
 def _truncate(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
@@ -66,19 +64,36 @@ def _truncate(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
     return "\n".join(out), truncated
 
 
-def render_index(skills: Iterable[SkillSpec]) -> str:
+def render_index(
+    skills: Iterable[SkillSpec],
+    entry_hint: Optional[Callable[[SkillSpec], str]] = None,
+) -> str:
     """
     渲染第一阶段清单——模型在**启动时**看到的全部 Skill 信息（spec F6）。
 
     :param skills: 已按名字排序的 Skill 列表
+    :param entry_hint: 给出某个 Skill 的**真实用户入口命令**（如 `/deploy` 或
+                       `/skills run deploy`）。只对 `disable-model-invocation`
+                       的 Skill 有用——见下方「为什么需要它」。缺省 None 时
+                       退化为不带命令的旧措辞（纯函数测试与 Null 场景走这条）。
     :returns: 清单文本；**列表为空时返回空串**
 
-    只含名字、模式与一句话说明，**不含任何 SOP 正文**——这正是「两阶段加载」
+    **`entry_hint` 为什么需要**（真实模型端到端场景 5 抓到的）：清单原本只说
+    「你不能自行加载，只能建议用户执行对应命令」，却从不说明那条命令是什么。
+    实测模型于是**编了一条不存在的命令**（`rhine skill deploy`）告诉用户，
+    用户照着敲只会得到「未知命令」。短命令是否注册成功要问 `CommandRegistry`
+    （重名会跳过），渲染层自己算不出来，所以由调用方注入。
+
+    只含命令名与两段说明，**不含任何 SOP 正文**——这正是「两阶段加载」
     第一阶段的定义：让模型知道有什么可用，但不为此付出上下文代价。
     模型想用时再调 `load_skill` 把完整指令拉进来。
 
+    **`description` 与 `when_to_use` 拼接后共享同一字符预算**（对齐改造 F7）。
+    拆成两个字段的意义在于让作者能分别写「这个 Skill 做什么」与「什么时候该用它」，
+    而不是把两件事挤进一个字段——实测中那会让 description 被写成两百多字符。
+
     空列表返回空串是刻意的：`build_default_prompt` 对空内容的槽位会整体跳过，
-    于是没装任何 Skill 的用户，其系统提示与 C10 逐字节相同（spec N3 零回归）。
+    于是没装任何 Skill 的用户，其系统提示与改造前逐字节相同（零回归）。
 
     副作用：无。
     """
@@ -87,14 +102,25 @@ def render_index(skills: Iterable[SkillSpec]) -> str:
         return ""
 
     lines = [
-        "以下 Skill 可用。共享模式的 Skill 可以用 `load_skill` 工具加载其完整指令；",
-        "独立模式的 Skill 需要由用户触发，你只能建议用户执行对应命令，不能自行加载。",
+        "以下 Skill 可用，用 `load_skill` 工具加载其完整指令。",
+        "标注「子对话」的会另开一条对话跑完并只回流结论；"
+        "标注「仅用户可发起」的你不能自行加载，只能建议用户执行对应命令。",
         "",
     ]
     for spec in items:
-        lines.append(
-            f"- {spec.name}（{_MODE_LABEL[spec.mode]}）：{spec.description}"
-        )
+        flags = []
+        if spec.forked:
+            flags.append("子对话")
+        if not spec.model_invocable:
+            # 把真实入口命令直接写进标注。不带 hint 时退回旧措辞——
+            # 模糊总比给一条错命令强。
+            hint = entry_hint(spec) if entry_hint is not None else ""
+            flags.append(f"仅用户可发起，请建议用户执行 {hint}" if hint else "仅用户可发起")
+        suffix = f"（{'、'.join(flags)}）" if flags else ""
+        text = spec.description
+        if spec.when_to_use:
+            text = f"{text} —— {spec.when_to_use}"
+        lines.append(f"- {spec.command_name}{suffix}：{text}")
 
     text = "\n".join(lines)
     truncated, did = _truncate(text, INDEX_MAX_LINES, INDEX_MAX_BYTES)
@@ -190,8 +216,8 @@ def render_active_body(
 
     副作用：无。
     """
-    header = f"===== Skill 指令开始：{spec.name} ====="
-    footer = f"===== Skill 指令结束：{spec.name} ====="
+    header = f"===== Skill 指令开始：{spec.command_name} ====="
+    footer = f"===== Skill 指令结束：{spec.command_name} ====="
     parts = [
         header,
         f"（{spec.description}）",
@@ -249,7 +275,7 @@ def render_active_section(
     for spec, arguments in pairs:
         if overflowed:
             # 前面已经溢出，其后一律丢弃，保持顺序语义。
-            degrades[spec.name] = DegradeKind.DROPPED
+            degrades[spec.command_name] = DegradeKind.DROPPED
             continue
 
         body, degrade = render_active_body(spec, arguments)
@@ -261,14 +287,14 @@ def render_active_section(
             or total_bytes + body_bytes > TOTAL_MAX_BYTES
         ):
             overflowed = True
-            degrades[spec.name] = DegradeKind.DROPPED
+            degrades[spec.command_name] = DegradeKind.DROPPED
             continue
 
         chunks.append(body)
         total_lines += body_lines
         total_bytes += body_bytes
         if degrade is not None:
-            degrades[spec.name] = degrade
+            degrades[spec.command_name] = degrade
 
     return "\n\n".join(chunks), degrades
 
@@ -299,6 +325,6 @@ def render_invocation_text(spec: SkillSpec, arguments: str) -> str:
     """
     shown = arguments.strip() if arguments.strip() else "（无）"
     return (
-        f"执行 Skill /{spec.name}（{spec.description}）\n"
+        f"执行 Skill /{spec.command_name}（{spec.description}）\n"
         f"参数：{shown}"
     )
