@@ -1,6 +1,6 @@
 # 对齐 Agent Skills 开放标准 —— 真实模型端到端验收报告
 
-> 对应 `docs/c11-align/checklist.md` 第九节那 7 条场景。
+> 对应 `docs/c11/align/checklist.md` 第九节那 7 条场景。
 >
 > 驱动方式：`python -m tests.e2e.host --mode live --seed tests.e2e.align_scenarios:<预置>`，
 > 预置见 `tests/e2e/align_scenarios.py`（**只有预置、没有剧本**——判据大半落在

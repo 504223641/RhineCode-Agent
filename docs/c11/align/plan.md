@@ -1,6 +1,6 @@
 # C11 对齐 Agent Skills 开放标准 Plan
 
-> 依据已批准的 `docs/c11-align/spec.md`（F1–F15 / N1–N5 / AC1–AC18）。
+> 依据已批准的 `docs/c11/align/spec.md`（F1–F15 / N1–N5 / AC1–AC18）。
 
 ## 架构概览
 

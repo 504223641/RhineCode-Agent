@@ -1,7 +1,7 @@
 """
 用 P1a 驱动设施验收**对齐 Agent Skills 开放标准**改造的端到端场景预置。
 
-对应 `docs/c11-align/checklist.md` 第九节那 7 条场景。与 `c11_scenarios.py`
+对应 `docs/c11/align/checklist.md` 第九节那 7 条场景。与 `c11_scenarios.py`
 的关系同前：同一套设施、另一份 checklist，放独立模块以免「这个 fixture 是给谁用的」
 说不清。
 

@@ -1,7 +1,7 @@
 # TUI 驱动器 P1a（交互闭环）Tasks
 
-> 对应 `docs/c11/trace/p1/spec.md`（F1–F26 / N1–N9 / AC1–AC43）与
-> `docs/c11/trace/p1/plan.md`（均已审批）。本文回答「按什么顺序做」。
+> 对应 `docs/c11/testing/p1-driver/spec.md`（F1–F26 / N1–N9 / AC1–AC43）与
+> `docs/c11/testing/p1-driver/plan.md`（均已审批）。本文回答「按什么顺序做」。
 >
 > **共 72 个任务，分七段。每段开头写明「本段完成后可验哪些 AC」**——
 > 这是防止验收标准在实现阶段被漏掉的结构性措施（沿用 P0 `task.md` 的做法）。
@@ -57,7 +57,7 @@
 | 修改 | `rhinecode/conversation.py` | 构造函数增 `provider_factory`；`_provider_for` 改用它 |
 | 修改 | `rhinecode/tui/app.py` | 来源字段可传入 + `_settle_session` 收拢两处结算 |
 | 修改 | `CLAUDE.md` / `AGENTS.md` / `README.md` | 架构节 + 成对维护点 + 安全边界 + 常用命令 |
-| 修改 | `docs/c11/trace/p1/spec.md` | 末节补 P1b 可复用接缝与 P1a 的实际偏离 |
+| 修改 | `docs/c11/testing/p1-driver/spec.md` | 末节补 P1b 可复用接缝与 P1a 的实际偏离 |
 
 ---
 
@@ -1096,10 +1096,10 @@ except Exception as e: print('repo rejected:', e)"
 **验证：** 通读一遍；`grep -n "驱动器\|tests/e2e\|_settle_session" CLAUDE.md` 能读到上述各处
 
 ## T71: `AGENTS.md` / `README.md` / spec 交接
-**文件：** `AGENTS.md`、`README.md`、`docs/c11/trace/p1/spec.md`　**依赖：** T70
+**文件：** `AGENTS.md`、`README.md`、`docs/c11/testing/p1-driver/spec.md`　**依赖：** T70
 **步骤：**
 1. `AGENTS.md` 与 `CLAUDE.md` 保持一致口径；`README.md` 只提一句
-   「附带一套端到端驱动设施，见 `docs/c11/trace/p1/`」。**不要写成产品功能**。
+   「附带一套端到端驱动设施，见 `docs/c11/testing/p1-driver/`」。**不要写成产品功能**。
 2. 在 spec 末节「推后到 P1b 的内容」补一小段「P1a 交付后 P1b 可直接复用的接缝」：
    `Responder` 协议（换实现即可）、`--seed` 预置函数组、`TraceView` 与十一项词汇、
    `sandbox` 的三步清理、宿主的 `--mode` 分支、`choice` → 结算值映射表。
@@ -1108,7 +1108,7 @@ except Exception as e: print('repo rejected:', e)"
 **验证：** 通读一遍
 
 ## T72: 按 checklist 验收
-**文件：** `docs/c11/trace/p1/checklist.md`　**依赖：** T71
+**文件：** `docs/c11/testing/p1-driver/checklist.md`　**依赖：** T71
 **步骤：**
 1. **该文件由 `/spec` 流程的第四阶段产出**（在本 task.md 审批之后、开发开始之前），
    本任务只负责**执行**它。它须覆盖 AC1–AC43 与两条环境前置

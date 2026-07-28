@@ -29,7 +29,7 @@ Skill 系统的核心模型：枚举、不可变数据类与模块级常量。
 3. **「在哪执行」与「谁能触发」拆成正交两维**——旧的 `mode: isolated` 同时表达了
    两件事，现在分别是 `forked` 与 `model_invocable`。
 
-对应 spec 条款见 `docs/c11-align/spec.md`。
+对应 spec 条款见 `docs/c11/align/spec.md`。
 """
 
 

@@ -1,4 +1,4 @@
-# 刻意留空（理由见 docs/c11/trace/p1/plan.md §5）。
+# 刻意留空（理由见 docs/c11/testing/p1-driver/plan.md §5）。
 #
 # 有了上一层的 tests/__init__.py 之后，`unittest discover` 会连带导入本包。
 # 本包里的 host.py / control.py 会 import 整个 rhinecode 并起 Textual 应用，

@@ -128,7 +128,7 @@ python -m rhinecode.trace.reader <文件> --seq 42                 # 展开单�
 项目里还附带一套**端到端驱动设施**（同样是测试设施，不是产品功能、不进安装包）：
 起一个常驻宿主进程把 RhineCode 完整跑起来，外部经本机回环通道驱动它完成
 「提交 → 等待 → 读面板 → 应答 → 继续」的交互闭环。用法与设计见
-`docs/c11/trace/p1/`，代码在 `tests/e2e/`。
+`docs/c11/testing/p1-driver/`，代码在 `tests/e2e/`。
 
 ## 斜杠命令
 
@@ -480,16 +480,13 @@ Skill 系统部分覆盖解析（六字段与缺省 / 名字规则与保留词 /
 
 ## 当前阶段文档
 
-C11 的规格、实现计划、任务拆解和验收清单位于：
+C11 的全部文档收在 `docs/c11/` 一个目录下，**进门先读 [`docs/c11/README.md`](docs/c11/README.md)**——它是导航，也写明了「同一议题两份文档说法不同时以谁为准」。分三块：
 
-- `docs/c11/spec.md`
-- `docs/c11/plan.md`
-- `docs/c11/task.md`
-- `docs/c11/checklist.md`
+- **产品能力（Skill 系统）**：顶层 `spec.md` / `plan.md` / `task.md` / `checklist.md` 是 C11 原始设计，`docs/c11/align/` 是**对齐 Agent Skills 开放标准的改造**。**冲突以 `align/` 为准**——`allowed-tools` 的语义、命令名来源、执行模式字段等五处在改造中反转了。原始那份刻意保留，用于追溯「当初为什么那样设计」。
+- **跨阶段测试设施**：`docs/c11/testing/`，含 `brief.md`（需求交底）、`p0-trace/`（行为记录器）、`p1-driver/`（端到端驱动设施）。**不占章节号、不属于 Skill 系统**，服务 C2–C11 与未来所有阶段的验收。
+- **验收记录**：`docs/c11/acceptance/` 下四份真实模型实跑报告，每条判据分「机器判到了什么」与「据此做的判断」两栏。
 
-此外，**Trace 记录器**作为**跨阶段的测试设施**（不占章节号、不属于 Skill 系统）另有一套文档：`docs/c11/trace/brief.md`、`spec.md`、`plan.md`、`task.md`、`checklist.md`。
-
-这些文档描述 Skill 系统的需求、架构、任务与验收（frontmatter 定义与三级存放、两阶段加载与提示槽位、共享/独立两种执行模式、工具白名单两段校验与降级、短命令注册与热更新、`/skills` 五形态、激活态清空语义与加锁不变量、安全边界）。C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
+C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
 ## 后续补齐项
 
