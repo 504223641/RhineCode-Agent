@@ -113,6 +113,22 @@ class FakeMemoryManager:
         pass
 
 
+class FakeSkillManager:
+    """SkillManager 的最小替身：只提供 App 会用到的几个接触点。"""
+
+    def __init__(self) -> None:
+        self.notify_activation = None
+        self.active_count = 0
+        # c11：RhineApp.reload_skills 会拿它去重建 Skill 短命令。
+        self.infos: tuple = ()
+
+    def status_segment(self):
+        return f"Skill:{self.active_count}" if self.active_count else None
+
+    def command_infos(self):
+        return self.infos
+
+
 class FakeManager:
     """ConversationManager 的鸭子替身：记录领域方法调用，不触碰 Provider/网络。"""
 
@@ -128,6 +144,10 @@ class FakeManager:
         self.submitted: list[tuple] = []
         self.resumed: list = []
         self.cleared = 0
+        # c11：App 会在 on_mount 注入激活通知、在刷新状态栏时取 Skill 段。
+        self.skill_manager = FakeSkillManager()
+        self.skills_ran: list[tuple] = []
+        self.deactivated: list = []
 
     @property
     def permission_mode_value(self):
@@ -172,6 +192,34 @@ class FakeManager:
 
     def memory_report(self) -> str:
         return "记忆报告"
+
+    # ---- c11 Skill 相关 ----
+
+    def skill_status_segment(self):
+        return self.skill_manager.status_segment()
+
+    def skills_report(self) -> str:
+        return "Skill 报告"
+
+    def skills_prompt_report(self) -> str:
+        return "Skill 注入报告"
+
+    def reload_skills(self) -> str:
+        return "Skill 已重新加载"
+
+    def deactivate_skill(self, name) -> str:
+        self.deactivated.append(name)
+        return f"已卸载 {name}"
+
+    def run_skill(self, name, arguments, display):
+        self.skills_ran.append((name, arguments, display))
+
+        def gen():
+            yield AgentEvent(
+                type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED
+            )
+
+        return gen()
 
     def manual_compact(self):
         return "无可摘要的早段"

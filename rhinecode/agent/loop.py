@@ -21,7 +21,9 @@ Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_ph
 """
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 if TYPE_CHECKING:
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
 
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.policy import ToolPolicy
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.agent.collector import StreamCollector
 from rhinecode.agent.events import (
@@ -42,6 +45,57 @@ from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
 from rhinecode.permission import Decision, DecisionResult, PermissionEngine, to_request
+from rhinecode.trace import (
+    SCOPE_MAIN,
+    NullRecorder,
+    TraceEventType,
+    TraceRecorderProtocol,
+    clip,
+)
+
+# ── 工具执行的结局取值（trace）──
+# 埋 tool_execute 时用它区分「为什么这次调用是这个结果」。读 trace 时只看 ok=False
+# 分不出「权限拒了」「用户拒了」「工具本身报错」，而这三者的排查方向完全不同。
+OUTCOME_EXECUTED = "executed"                    # 真的跑了（不论 ok 真假）
+OUTCOME_OUT_OF_SCOPE = "out_of_scope"            # 工具存在但本轮没发给模型（Skill 白名单）
+OUTCOME_UNKNOWN_TOOL = "unknown_tool"            # 注册中心里没有这个工具
+OUTCOME_INVALID_ARGUMENTS = "invalid_arguments"  # 模型生成的参数 JSON 非法
+OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
+OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
+
+# ── 用户在人在回路面板里选「拒绝」时回灌给模型的文本 ──
+#
+# ## 为什么这段话要写得这么长
+#
+# 旧文案只有一句「用户拒绝执行该工具。」——它**只说了没执行，没说接下来该干嘛**。
+# 实测后果：模型把它读成「这次尝试失败了」，于是换个路径、换个命令、换个工具
+# 反复重试，把一次明确的「不许」当成了「姿势不对，再试试」。用户被迫连点好几次
+# 拒绝，而每一次拒绝在模型看来都只是又一次技术失败。
+#
+# 关键区分是**「技术失败」与「人的决定」**：前者该调整策略重试，后者该停下来问。
+# 工具结果这个通道天生长得像前者（`ok=False` + 一段错误文本），所以必须由文案
+# 把语义掰回来，明确写出「这不是错误」「不要绕」「去问为什么」。
+#
+# ## 光有文案不够，所以还有硬约束
+#
+# 文案是软约束，模型可以不听。因此 `_RoundContext.user_denied` 置位后，
+# 主循环的**下一轮不发任何工具**（`tools=None`）——模型在物理上只能产出文本，
+# 也就只能向用户说话。两者配合：文案解释「为什么」，机制保证「一定」。
+#
+# ## 为什么不直接终止循环
+#
+# 终止的话模型没有机会解释，用户只会看到工具行变红然后什么都没有——
+# 比反复重试更糟。让它多跑一轮、但手里没有工具，才既停得住又说得出话。
+DENIED_BY_USER_FEEDBACK = (
+    "用户拒绝了这次 {name} 调用。\n"
+    "\n"
+    "**这不是技术故障，是用户的决定。** 不要重试、不要改参数再试一次、"
+    "也不要换用其它工具绕过它——那会把一次明确的拒绝当成「姿势不对」，"
+    "正是用户不希望发生的事。\n"
+    "\n"
+    "请立即停止本次任务的推进，向用户说明你原本打算做什么、为什么需要这一步，"
+    "并询问他拒绝的原因、以及希望你怎么继续。等他答复后再行动。"
+)
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
 MAX_ITERATIONS = 25
@@ -56,6 +110,41 @@ AskFn = Callable[[ToolCall, Tool, DecisionResult], bool]
 ClarifyFn = Callable[[str, list[ClarifyOption]], Optional[str]]
 # approve_plan：弹「是否开始执行」审批，返回是否批准
 ApprovePlanFn = Callable[[str], bool]
+
+
+@dataclass(frozen=True)
+class RunOptions:
+    """
+    `Agent.run` 的可选行为开关（c11 T30）。
+
+    **默认值即 C10 行为——不传这个参数等于零回归**，这是 spec N3 的实现保障：
+    既有的全部调用点都不传，行为一字不变。
+
+    存在的理由：`run()` 已经有 14 个参数，为独立模式子对话再加四个开关会失控。
+    打包成一个 frozen 数据类，新增开关时既有调用点无需改动。
+
+    :param max_iterations: 本次循环的迭代上限。独立模式子对话有**独立且更小**的
+        预算（spec N6）——子任务应当聚焦，不该让一个跑偏的 Skill 把主对话的
+        额度也一并耗光。
+    :param record_usage: 是否用本次 API 返回的 usage 更新 C8 的估算锚点。
+        子对话传 False：它跑的是另一条短历史，用它的 usage 去更新**主历史**的
+        锚点会让主历史的估算彻底失准。
+    :param allow_summary: 是否允许 C8 的第二层（LLM 摘要）。子对话传 False，
+        只跑零成本的第一层存盘（spec F21）。
+    :param tool_policy: 取本轮工具收窄策略的**回调**。
+
+        **必须是 callable 而不是一个值**：模型可能在第 N 轮调 `load_skill`
+        激活一个 Skill，第 N+1 轮的工具集就该按它的白名单收窄。若在 `run()`
+        调用前算一次、整轮不变，F14 的运行期自愈与 AC14 的逐轮断言都会失效——
+        这与下面 `dynamic` 参数改成 callable 是同一个理由。
+
+        为 None 时完全不收窄（C10 行为）。
+    """
+
+    max_iterations: int = MAX_ITERATIONS
+    record_usage: bool = True
+    allow_summary: bool = True
+    tool_policy: Optional[Callable[[], Optional[ToolPolicy]]] = None
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
@@ -75,6 +164,7 @@ class _RoundContext:
     :param cancelled: 本轮交互中用户取消（如澄清面板按 Esc）
     :param approved: 本轮 present_plan 获得用户批准（据此切换到执行阶段）
     :param plan_rejected: 本轮 present_plan 被用户拒绝，主循环应立即停止
+    :param user_denied: 本轮有工具在人在回路面板里被用户拒绝，**下一轮不发工具**
     :param known_count: 本轮命中的已知工具（含特殊工具）数量
     :param unknown_count: 本轮命中的未知工具数量
     """
@@ -83,6 +173,7 @@ class _RoundContext:
         self.cancelled: bool = False
         self.approved: bool = False
         self.plan_rejected: bool = False
+        self.user_denied: bool = False
         self.known_count: int = 0
         self.unknown_count: int = 0
 
@@ -95,34 +186,199 @@ class Agent:
     会话级状态（如「免确认」）由上层封进 confirm 闭包，Plan Mode 开关由上层按消息传入。
     """
 
-    def __init__(self, provider: BaseProvider, registry: Optional[ToolRegistry]):
+    def __init__(
+        self,
+        provider: BaseProvider,
+        registry: Optional[ToolRegistry],
+        recorder: "Optional[TraceRecorderProtocol]" = None,
+    ):
         """
         :param provider: 已实例化的 Provider，负责实际 API 调用
         :param registry: 工具注册中心；为 None 时不向模型暴露任何工具（退化为纯对话循环）
+        :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
+                         **不传等于零回归**——本类的全部埋点都变成空调用
         """
         self._provider = provider
         self._registry = registry
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
+
+    # ------------------------------------------------------------------ #
+    # 行为记录埋点（trace）
+    # ------------------------------------------------------------------ #
+    def _trace_tool(
+        self,
+        tc: ToolCall,
+        res: ToolResult,
+        outcome: str,
+        duration_ms: float = 0,
+        is_concurrent: bool = False,
+    ) -> None:
+        """
+        记一条 `tool_execute` 事件。八处 `results[tc.id]` 写入点共用本方法。
+
+        :param tc: 工具调用
+        :param res: 执行结果（未执行的分支也有结构化结果）
+        :param outcome: 六个 OUTCOME_* 之一，说明「为什么是这个结果」
+        :param duration_ms: 实际执行耗时（毫秒，**保留三位小数**）；
+            `outcome != executed` 时按约定记 0。
+            为什么不取整：读小文件常在 1 毫秒内完成，取整后一律显示 `0ms`，
+            与「计时压根没生效」无法区分（手测场景 1 里五条 read_file 全是 0ms，
+            当时确实要多看一眼才能确认不是 bug）。保留小数则显示 `0.412ms`，
+            一眼就知道是真的快
+        :param is_concurrent: 是否走了只读并发桶
+
+        走 `emit_lazy` 是因为负载里的 `output` 可能很大（一次 `read_file` 就是整份文件），
+        关闭记录时不该白 `clip` 一遍（spec N1）。
+
+        副作用：产出一条 trace 事件；**任何异常都被吞掉**，不影响循环。
+        """
+        self._safe_emit_lazy(
+            TraceEventType.TOOL_EXECUTE,
+            lambda: {
+                "tool": tc.name,
+                "tool_call_id": tc.id,
+                "arguments": clip(tc.arguments) if tc.arguments is not None else None,
+                "ok": res.ok,
+                "summary": res.summary,
+                "output": clip(res.output),
+                "duration_ms": duration_ms if outcome == OUTCOME_EXECUTED else 0,
+                "is_concurrent": is_concurrent,
+                "outcome": outcome,
+            },
+        )
+
+    # 本层的四个「受保护漏斗」。
+    #
+    # 记录器**自己**已经保证 emit 不抛（见 recorder.py 的 try/except），所以这一层
+    # 看起来像是多余的保险。它存在的理由是本层的特殊性：Agent Loop 是**唯一会把
+    # 异常变成「工具结果」回灌给模型**的地方——只读并发桶里的异常会被
+    # `future.result()` 抓住并包成「工具执行异常: …」交给模型。于是「日志写不进去」
+    # 会伪装成「你的工具坏了」，模型开始绕路重试，一个纯观测设施变成了行为污染源
+    # （trace spec AC6 就是为这条风险设的护栏）。
+    #
+    # 把防护收在四个漏斗里（而不是在二十来个埋点处各写一次 try）：本文件的全部
+    # 埋点调用都只经这几个方法，一处加固即全层生效。
+    def _safe_emit(self, type, **payload) -> None:
+        """记一条事件，吞掉任何异常（含记录器实现本身抛错的情形）。"""
+        try:
+            self._recorder.emit(type, **payload)
+        except Exception:
+            pass
+
+    def _safe_emit_lazy(self, type, factory) -> None:
+        """记一条昂贵负载事件，吞掉任何异常。"""
+        try:
+            self._recorder.emit_lazy(type, factory)
+        except Exception:
+            pass
+
+    def _safe_scope(self) -> str:
+        """读当前作用域，失败时退回主作用域（不让观测把主流程带下水）。"""
+        try:
+            return self._recorder.current_scope()
+        except Exception:
+            return SCOPE_MAIN
+
+    def _safe_bind(self, name: str) -> None:
+        """绑定作用域，吞掉任何异常。**池线程入口必须用它。**"""
+        try:
+            self._recorder.bind_scope(name)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 工具集策略
     # ------------------------------------------------------------------ #
-    def _schema_for(self, plan_mode: bool, execution_phase: bool) -> Optional[list[dict]]:
+    @staticmethod
+    def _visible(name: str, policy: Optional[ToolPolicy]) -> bool:
+        """
+        判断某个工具在本轮是否对模型可见（c11 T31）。
+
+        :param name: 工具名
+        :param policy: 本轮策略；None 表示不收窄
+        :returns: 可见为 True
+
+        优先级 `excluded` > `exempt` > `allowed`，三级各有其不可调换的理由：
+        - `excluded` 最高：它是「无论如何都不许出现」（子对话禁用 `load_skill`），
+          若被 `exempt` 翻掉，子对话就能嵌套激活 Skill 了（违反 F23）；
+        - `exempt` 次之：`load_skill` 必须能穿透任何白名单，否则模型激活
+          第一个 Skill 后就再也加载不了第二个；
+        - `allowed` 最后：为 None 时不收窄。
+
+        副作用：无。
+        """
+        if policy is None:
+            return True
+        if name in policy.excluded:
+            return False
+        if name in policy.exempt:
+            return True
+        if policy.allowed is None:
+            return True
+        return name in policy.allowed
+
+    def _visible_names(self, policy: Optional[ToolPolicy]) -> str:
+        """
+        列出本轮实际可见的工具名，用于「工具不可用」的回灌文案。
+
+        :param policy: 本轮收窄策略
+        :returns: 顿号分隔的工具名；无注册中心时给一句兜底说明
+
+        与注册中心取交集而不是直接摊开 `policy.allowed | policy.exempt`：
+        后者含 `ask_user` / `present_plan` 这两个不在注册中心、只在 Plan Mode
+        规划阶段才拼接的特殊工具，列给模型只会误导它去调一个当前不存在的东西。
+
+        副作用：无。
+        """
+        if self._registry is None:
+            return "（当前没有可用工具）"
+        names = set(self._registry.names())
+        if policy is not None and policy.allowed is not None:
+            names &= policy.allowed | policy.exempt
+        if policy is not None:
+            names -= policy.excluded
+        return "、".join(sorted(names)) if names else "（当前没有可用工具）"
+
+    def _schema_for(
+        self,
+        plan_mode: bool,
+        execution_phase: bool,
+        policy: Optional[ToolPolicy] = None,
+    ) -> Optional[list[dict]]:
         """
         计算本轮要发给模型的工具 schema 列表。
 
         - 无注册中心 → None（纯对话，不带工具）
         - Plan Mode 且未获批执行（规划阶段）→ 只读工具 + ask_user/present_plan 特殊工具
         - 其余（普通模式，或 Plan Mode 已获批的执行阶段）→ 全部工具
+        - 无论哪种，都再按 `policy` 过滤一遍（c11 F14）
 
         :param plan_mode: 是否处于 Plan Mode
         :param execution_phase: Plan Mode 下是否已获批进入执行阶段
+        :param policy: 本轮 Skill 工具收窄策略；None 表示不收窄（C10 行为）
         :returns: 工具 schema 列表，或 None
+
+        **`plan_schemas()` 在过滤之后才拼接**，因此 `ask_user` / `present_plan`
+        天然不受白名单影响（spec F15）——它们是流程控制工具，与 Skill 声明的
+        业务能力无关。这样也就不必依赖 `policy.exempt` 里恰好含这两个名字，
+        少一处隐式耦合。
         """
         if self._registry is None:
             return None
-        if plan_mode and not execution_phase:
-            return self._registry.readonly_schemas() + plan_schemas()
-        return self._registry.schemas()
+
+        planning = plan_mode and not execution_phase
+        base = (
+            self._registry.readonly_schemas() if planning else self._registry.schemas()
+        )
+
+        if policy is not None:
+            base = [
+                s for s in base if self._visible(s["function"]["name"], policy)
+            ]
+
+        if planning:
+            base = base + plan_schemas()
+        return base
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -133,7 +389,7 @@ class Agent:
         thinking_effort: str,
         plan_mode: bool,
         stable: str,
-        dynamic: str,
+        dynamic: Callable[[], str],
         model: str,
         debug_log_path: Optional[str],
         engine: PermissionEngine,
@@ -143,6 +399,7 @@ class Agent:
         cancel_event: threading.Event,
         context_manager: "Optional[ContextManager]" = None,
         recorder: Optional[Callable[[Message], None]] = None,
+        options: "RunOptions" = RunOptions(),
     ) -> Iterator[AgentEvent]:
         """
         跑一次完整的 ReAct 循环，逐个产出 AgentEvent。
@@ -151,7 +408,16 @@ class Agent:
         :param thinking_effort: 思考模式强度（透传给 provider）
         :param plan_mode: 是否处于 Plan Mode
         :param stable: 稳定系统提示（可缓存通道）；逐轮以 system 参数传给 provider，内容不变以命中缓存
-        :param dynamic: 动态内容（环境信息等）；每轮与会话级开关提醒合并进 <system-reminder> 注入
+        :param dynamic: 取动态内容（环境信息、已激活 Skill 正文等）的**回调，每轮求值一次**；
+                        结果与会话级开关提醒合并进 <system-reminder> 注入。
+
+                        **为什么是回调而不是字符串**（c11 改造点 1）：
+                        C10 之前这里是个字符串，由协调层在收到用户消息时算一次，
+                        整个循环里 `loop` 只是每轮把同一个不可变字符串重新包一层。
+                        Skill 引入后这不成立了——模型可能在第 N 轮调 `load_skill`
+                        激活一个 Skill，它的 SOP 正文必须从第 N+1 轮起就出现在
+                        提醒里。若还是取值型，模型激活了 Skill 却在本次循环剩余的
+                        全部轮次里完全看不到指令，两阶段加载直接失效。
         :param model: 当前模型名，仅用于缓存调试日志记录
         :param debug_log_path: 缓存调试日志文件路径；为 None 表示关闭日志（c5 F10）
         :param engine: 权限决策引擎（c6）；每个工具执行前调 engine.decide 算放行/拒绝/问
@@ -166,6 +432,7 @@ class Agent:
                          （assistant / tool 结果）就同步调用一次，用于 JSONL 追加写。
                          为 None 时不记录，行为与 c9 之前完全一致。回调内部 fail-safe，
                          这里再包一层 try 保证记录失败绝不影响循环（N2）。
+        :param options: 可选行为开关（c11）。**默认值即 C10 行为，不传等于零回归**。
         :returns: AgentEvent 迭代器；末尾必为一个 FINISHED 事件
 
         副作用：向 history 追加消息；通过 provider 发起多次网络请求；通过回调与用户交互；
@@ -173,6 +440,7 @@ class Agent:
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
+        deny_cooldown = False         # 上一轮有工具被用户拒绝 → 本轮不发工具（见 DENIED_BY_USER_FEEDBACK）
 
         def _record(msg: Message) -> None:
             """把新追加进 history 的消息交给会话存档回调（c9）；失败静默不影响循环。"""
@@ -183,7 +451,7 @@ class Agent:
             except Exception:
                 pass
 
-        for iteration in range(1, MAX_ITERATIONS + 1):
+        for iteration in range(1, options.max_iterations + 1):
             # 安全点 1：进入新一轮前检查取消
             if cancel_event.is_set():
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.USER_CANCELLED)
@@ -196,10 +464,22 @@ class Agent:
             # 每条压缩动作都以 NOTICE 事件反馈给 TUI（F17）。context_manager 为 None 时整段跳过，
             # 保持 c8 之前的行为不变（N1 低侵入）。
             if context_manager is not None:
-                for notice in context_manager.before_request(history):
+                for notice in context_manager.before_request(
+                    history, allow_summary=options.allow_summary
+                ):
                     yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
 
-            tools = self._schema_for(plan_mode, execution_phase)
+            # 工具集收窄策略**每轮现取**（c11 F14）：模型可能上一轮才激活 Skill，
+            # 这一轮的工具集就该随之收窄；注册中心也可能因 MCP 重载增删了工具。
+            policy = options.tool_policy() if options.tool_policy is not None else None
+            tools = self._schema_for(plan_mode, execution_phase, policy)
+
+            # 上一轮有工具被用户拒绝 → **本轮一件工具都不发**（硬约束）。
+            # 理由见 DENIED_BY_USER_FEEDBACK 的注释：回灌文案是软约束、模型可以不听，
+            # 只有真的不给工具，才能保证它停下来跟用户说话而不是换个姿势再试。
+            # 只作用于紧接着的这一轮：用户答复后（新的一次 run）工具自然恢复。
+            if deny_cooldown:
+                tools = None
 
             # 组装请求消息（c5 分通道）：
             # - 稳定系统提示走 stream_chat 的 system 参数（可缓存前缀），不进 messages；
@@ -210,7 +490,9 @@ class Agent:
             toggle = plan_toggle_instruction(
                 iteration, active=plan_mode and not execution_phase
             )
-            reminder = build_system_reminder(dynamic, toggle)
+            # dynamic 每轮求值一次（c11 改造点 1）：模型上一轮激活的 Skill，
+            # 其 SOP 正文要从这一轮起出现在提醒里。
+            reminder = build_system_reminder(dynamic(), toggle)
             # 记录本轮「纯历史消息条数」作为估算锚点长度（c8）：必须在 append reminder 之前、
             # 用 history 的长度而非 req_messages——reminder 是每轮临时拼的尾巴，不属于持久历史，
             # 而估算锚点覆盖的正是 usage 对应的这段纯历史。
@@ -239,7 +521,13 @@ class Agent:
 
             # 更新估算锚点（c8）：本轮 usage.prompt_tokens 是 API 亲口给出的精确输入 token 数，
             # 覆盖 sent_len 条纯历史消息；后续请求只需对锚点之后的新增消息做字符估算。
-            if context_manager is not None and collector.usage is not None:
+            # options.record_usage=False 时跳过（c11）：独立模式子对话跑的是另一条
+            # 短历史，用它的 usage 去更新**主历史**的锚点会让主历史估算彻底失准。
+            if (
+                options.record_usage
+                and context_manager is not None
+                and collector.usage is not None
+            ):
                 context_manager.record_usage(collector.usage, sent_len)
 
             # 停止条件：流出错
@@ -271,7 +559,7 @@ class Agent:
             yield from self._execute(
                 tool_calls, results, ctx,
                 engine, ask, clarify, approve_plan,
-                cancel_event,
+                cancel_event, policy,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -296,6 +584,11 @@ class Agent:
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.USER_CANCELLED)
                 return
 
+            # 用户拒绝冷却：本轮被拒 → 下一轮不发工具；本轮没被拒 → 解除。
+            # 放在这里（而不是消费处）是为了让「置位」与「解除」都只有一处，
+            # 避免出现「拒绝一次之后永远不给工具」这种更糟的形态。
+            deny_cooldown = ctx.user_denied
+
             # 连续未知工具统计：本轮「有未知且无已知」算一次连续，否则清零
             if ctx.unknown_count > 0 and ctx.known_count == 0:
                 consecutive_unknown += 1
@@ -318,7 +611,7 @@ class Agent:
         yield AgentEvent(
             type=AgentEventType.FINISHED,
             stop_reason=StopReason.MAX_ITERATIONS,
-            message=f"已达到迭代上限（{MAX_ITERATIONS} 轮），自动停止。",
+            message=f"已达到迭代上限（{options.max_iterations} 轮），自动停止。",
         )
 
     # ------------------------------------------------------------------ #
@@ -334,6 +627,7 @@ class Agent:
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
+        policy: Optional[ToolPolicy] = None,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -364,6 +658,8 @@ class Agent:
         """
         special: list[ToolCall] = []
         readonly: list[tuple[ToolCall, Tool]] = []
+        # 被本轮工具收窄挡下的调用（工具真实存在，只是没发给模型）。
+        out_of_scope: list[ToolCall] = []
         # 串行桶元素：(调用, 工具或None, 决策或None)。
         # tool=None → 未知工具；decision=None → 参数解析失败（两者都不进引擎）。
         serial: list[tuple[ToolCall, Optional[Tool], Optional[DecisionResult]]] = []
@@ -379,23 +675,83 @@ class Agent:
                 serial.append((tc, None, None))
                 ctx.unknown_count += 1
                 continue
+            # 工具存在，但**本轮没发给模型**（被 Skill 白名单收窄掉了）。
+            # 模型仍可能凭训练先验硬造出这样一次调用——实测 DeepSeek 就在
+            # 只发了 4 个工具的情况下调出了 `edit_file`，参数名还全对，于是
+            # 一个「只读审阅」的窄白名单 Skill 动手改了代码。照常执行等于
+            # 让 allowed_tools「提升选对工具准确率」的作用彻底失效，
+            # 故这里拒绝并回灌结构化原因，让模型改用可见工具（不终止循环）。
+            if not self._visible(tc.name, policy):
+                out_of_scope.append(tc)
+                ctx.unknown_count += 1
+                continue
             ctx.known_count += 1
             if not isinstance(tc.arguments, dict):
                 # 参数解析失败或非对象 JSON：不进引擎，留待串行路径产出结构化错误。
                 serial.append((tc, tool, None))
                 continue
             # 权限决策：规范化 → engine.decide。
-            decision = engine.decide(to_request(tool, tc.arguments, engine.mode))
+            request = to_request(tool, tc.arguments, engine.mode)
+            decision = engine.decide(request)
+            # 权限决策埋点（trace F14）。
+            #
+            # **为什么只埋这一处**：`engine.decide` 在生产代码里还有另一个调用点——
+            # 协调层注入给 `glob_files` / `grep_content` 的逐文件过滤器。一次 grep
+            # 会触发几百次判定，埋进去会把整条时间线淹掉；而且它判的是「这个文件
+            # 要不要出现在结果里」，不是「这次工具调用放不放行」，语义也不同。
+            #
+            # **为什么埋在调用点而不是引擎内部**：保持 `permission/` 包「纯判定、
+            # 无副作用」的既有性质（`decide` 的 docstring 明写「副作用：无」）。
+            # 把埋点塞进引擎会让那句话变成假话，而权限层是安全边界，它的可预测性
+            # 比少写一行埋点重要。
+            self._safe_emit(
+                TraceEventType.PERMISSION_DECISION,
+                tool=tc.name,
+                tool_call_id=tc.id,
+                kind=request.kind,
+                specifier=request.specifier,
+                is_read_only=request.is_read_only,
+                decision=decision.decision.value,
+                layer=decision.layer.value,
+                reason=decision.reason,
+            )
             if decision.decision == Decision.ALLOW and tool.read_only:
                 readonly.append((tc, tool))
             else:
                 serial.append((tc, tool, decision))
+
+        # 被工具收窄挡下的：不执行，回灌结构化原因并告知可用工具
+        for tc in out_of_scope:
+            yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+            res = ToolResult(
+                ok=False,
+                output=(
+                    f"[工具不可用] {tc.name} 不在当前 Skill 声明的工具集内，"
+                    f"本轮未提供给你，因此没有执行。\n"
+                    f"当前可用工具：{self._visible_names(policy)}。\n"
+                    f"请改用其中之一；若确实必须用 {tc.name}，请说明理由让用户决定。"
+                ),
+                summary="不在当前工具集内",
+            )
+            results[tc.id] = res
+            # ⚠️ **这条埋点的分量**：上面那段 `[工具不可用] … 当前可用工具：…` 原文，
+            # 是「模型调用了本轮没发给它的工具」这件事的**唯一物证**——
+            # 它既不在 `permission_decision` 里（压根没进引擎），
+            # 叠加 F17 的字段白名单后也不在 `agent_event` 里（那里只留工具名与 ok）。
+            # 漏埋这一条，本模块就查不出当初立项要查的那个问题。
+            self._trace_tool(tc, res, OUTCOME_OUT_OF_SCOPE)
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 只读且放行：并发
         if readonly:
             yield from self._run_readonly_concurrent(readonly, results)
 
         # 特殊工具：串行（需用户交互）
+        # 裁决（trace T31）：`_run_special`（ask_user / present_plan）内的两处
+        # `results[tc.id]` 写入点**刻意不产 `tool_execute`**。理由有二：
+        # ① 负载完全重叠——它们的输入输出由界面层的 `interaction` 事件承载，
+        #    重复携带违反 F17；② 它们语义上是「与用户交互」而不是「执行工具」，
+        #    混进 tool_execute 会让「工具跑了几次、多慢」这类统计失真。
         for tc in special:
             if cancel_event.is_set():
                 ctx.cancelled = True
@@ -411,7 +767,7 @@ class Agent:
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_one_serial(tc, tool, decision, results, ask)
+            yield from self._run_one_serial(tc, tool, decision, results, ctx, ask)
 
     def _run_special(
         self,
@@ -513,15 +869,42 @@ class Agent:
             if not isinstance(tc.arguments, dict):
                 res = _invalid_args_result(tc)
                 results[tc.id] = res
+                self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS, is_concurrent=True)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         valid = [(tc, tool) for tc, tool in items if isinstance(tc.arguments, dict)]
         if not valid:
             return
 
+        # 提交任务**之前**捕获父作用域（trace T32）。
+        #
+        # 准确的理由（别写成「否则 tool_execute 会被记成 main」——那是错的）：
+        # 下面 `as_completed` 循环里的 `_trace_tool` 跑在**生成器所在的 Worker 线程**上，
+        # 作用域天然正确。真正跑在池线程里的埋点是 **`tool.execute` 内部产生的事件**
+        # ——今天唯一的实例是 `load_skill` → `SkillManager.activate` → `skill_state`。
+        # 本包装是纵深防御：兜住工具内部的埋点，并为将来在工具内部埋点留出正确语义。
+        # `threading.local()` 不跨线程继承，不显式传就没有别的办法。
+        parent_scope = self._safe_scope()
+        # 各调用的实际执行耗时（毫秒），由包装函数在池线程里填、主线程读。
+        # dict 的单键赋值在 CPython 下是原子的，且每个 tc.id 只被一个线程写一次。
+        durations: dict[str, float] = {}
+
+        def _run(tool: Tool, tc: ToolCall):
+            """池线程里的任务入口：绑定父作用域、计时，然后执行工具。"""
+            # 用 _safe_bind 而不是直接 bind_scope：这里是**唯一**「异常会被
+            # future.result() 变成工具结果回灌模型」的位置，必须绝对安全。
+            self._safe_bind(parent_scope)
+            t0 = time.monotonic()
+            try:
+                return tool.execute(tc.arguments)
+            finally:
+                # **不加 try/except 吞异常**：既有的 `future.result()` 兜底逻辑
+                # 不能变。埋点自身的异常由 recorder 内部兜住。
+                durations[tc.id] = round((time.monotonic() - t0) * 1000, 3)
+
         with ThreadPoolExecutor(max_workers=len(valid)) as executor:
             future_to_tc = {
-                executor.submit(tool.execute, tc.arguments): tc
+                executor.submit(_run, tool, tc): tc
                 for tc, tool in valid
             }
             for future in as_completed(future_to_tc):
@@ -531,6 +914,13 @@ class Agent:
                 except Exception as e:
                     res = ToolResult(ok=False, output=f"工具执行异常: {e}")
                 results[tc.id] = res
+                self._trace_tool(
+                    tc,
+                    res,
+                    OUTCOME_EXECUTED,
+                    duration_ms=durations.get(tc.id, 0),
+                    is_concurrent=True,
+                )
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
     def _run_one_serial(
@@ -539,6 +929,7 @@ class Agent:
         tool: Optional[Tool],
         decision: Optional[DecisionResult],
         results: dict[str, ToolResult],
+        ctx: _RoundContext,
         ask: AskFn,
     ) -> Iterator[AgentEvent]:
         """
@@ -559,6 +950,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = ToolResult(ok=False, output=f"未知工具: {tc.name}")
             results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_UNKNOWN_TOOL)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -567,6 +959,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = _invalid_args_result(tc)
             results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -578,6 +971,7 @@ class Agent:
                 summary="权限拒绝",
             )
             results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_DENIED_BY_PERMISSION)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -585,16 +979,24 @@ class Agent:
         if decision.decision == Decision.ASK:
             approved = ask(tc, tool, decision)
             if not approved:
-                res = ToolResult(ok=False, output="用户拒绝执行该工具。")
+                res = ToolResult(ok=False, output=DENIED_BY_USER_FEEDBACK.format(name=tc.name))
                 results[tc.id] = res
+                # 置位后主循环下一轮**不发工具**（硬约束，见 DENIED_BY_USER_FEEDBACK 注释）
+                ctx.user_denied = True
+                self._trace_tool(tc, res, OUTCOME_DENIED_BY_USER)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
                 return
 
         # 放行（ALLOW 或确认通过）：执行工具
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+        t0 = time.monotonic()
         try:
             res = tool.execute(tc.arguments)
         except Exception as e:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res
+        self._trace_tool(
+            tc, res, OUTCOME_EXECUTED,
+            duration_ms=round((time.monotonic() - t0) * 1000, 3),
+        )
         yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)

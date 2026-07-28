@@ -71,13 +71,25 @@ def fixed_modules() -> list[PromptModule]:
 
 def optional_slots() -> list[PromptModule]:
     """
-    返回三个可选模块的「空槽」（动态、不可缓存，c5 内容恒为空）。
+    返回可选模块的「空槽」（c5 预留，内容恒为空）。
 
-    这些槽位只是为将来的能力预留位置与优先级：自定义指令、已激活 Skill、长期记忆。
-    c5 中它们的 content 为空字符串，拼装器会整体跳过、不产生任何文本与多余空行（F3）。
-    将来实现对应能力时，只需在这里（或拼装入口）填入 content 即可，无需改动拼装逻辑（F4）。
+    这些槽位为各项能力预留位置与优先级。content 为空字符串时拼装器会整体跳过、
+    不产生任何文本与多余空行（F3），因此未启用的能力对输出零影响。
+    实现对应能力时只需在拼装入口填入 content，无需改动拼装逻辑（F4）。
 
-    :returns: 3 个 content 为空的 PromptModule，均 cacheable=False
+    当前四个槽位：
+    - 110「自定义指令」（c9 填充：三层 RHINE.md）
+    - 120「已激活 Skill」（c11 填充：已激活 Skill 的完整 SOP 正文）
+    - 130「长期记忆」（c9 填充：两级记忆索引）
+    - 140「可用 Skill 清单」（c11 填充：第一阶段清单）
+
+    **为什么「可用 Skill 清单」是 140 而不是插在 115**（c11 T33）：
+    它进的是**稳定通道**（cacheable=True），而稳定段是前缀缓存的作用对象。
+    前缀缓存的性质是「从第一处变化开始，其后全部失效」。清单会随
+    `/skills reload` 热更新而变；排在最后，一次热更新只失效它自己那一段，
+    不会连带把 130 的记忆索引与 110 的 RHINE.md 的缓存一起打掉。
+
+    :returns: content 为空的 PromptModule 列表，均 cacheable=False
 
     副作用：无。
     """
@@ -85,4 +97,5 @@ def optional_slots() -> list[PromptModule]:
         PromptModule(name="自定义指令", priority=110, cacheable=False, content=""),
         PromptModule(name="已激活 Skill", priority=120, cacheable=False, content=""),
         PromptModule(name="长期记忆", priority=130, cacheable=False, content=""),
+        PromptModule(name="可用 Skill 清单", priority=140, cacheable=True, content=""),
     ]

@@ -26,6 +26,12 @@ TemText.txt
 # c8/c9 运行时数据（不提交）：工具结果存盘、会话存档、自动笔记与锁文件
 # 都可能包含对话原文与被读过的敏感文件片段（含 config 等），必须留在本机。
 # 注：项目级 .rhinecode/RHINE.md、permissions.yaml、mcp.yaml 是「随仓库走、可提交」的，不受影响。
+#     项目级 .rhinecode/skills/ 同样随仓库提交、团队共享（c11）——它们是团队约定的
+#     可复用操作流程。注意其正文可以指挥模型读写文件与执行命令，评审时应与代码同等对待。
 **/.rhinecode/context/
 **/.rhinecode/sessions/
 **/.rhinecode/memory/
+# trace 行为记录（测试设施）：与会话存档同属敏感产物——里面有被读过的**文件内容**
+# 与命令输出，模型读过配置文件时还可能含**明文 API Key**。必须留在本机、勿外传。
+# `**/` 前缀与上面三行同口径，否则嵌套项目路径下失效。
+**/.rhinecode/traces/

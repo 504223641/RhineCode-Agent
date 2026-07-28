@@ -56,8 +56,10 @@ def run_agent(provider, tool, engine, ask):
     registry.register(tool)
     agent = Agent(provider, registry)
     history: list[Message] = [Message(role="user", content="go")]
+    # 第 5 个位置参数是 dynamic：c11 起改成「每轮求值一次」的回调（改造点 1），
+    # 这里传一个恒返回空串的 lambda，语义与改造前的 "" 完全等价。
     return list(agent.run(
-        history, "off", False, "", "", "model", None,
+        history, "off", False, "", lambda: "", "model", None,
         engine, ask, None, None, threading.Event(),
     ))
 

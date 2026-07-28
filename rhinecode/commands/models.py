@@ -64,11 +64,19 @@ class ModeTarget(Enum):
 
 
 class ReportTarget(Enum):
-    """query_report 的目标报告：MCP 连接状态 / 上下文用量 / 记忆系统状态。"""
+    """
+    query_report 的目标报告：MCP 连接状态 / 上下文用量 / 记忆系统状态 /
+    Skill 状态 / Skill 实际注入内容。
+
+    **成对维护点**：新增枚举值须同步三处——本枚举、`tui/app.py` 的
+    `query_report` 分支（未知值明确抛错）、`conversation.py` 的对应领域方法。
+    """
 
     MCP = "mcp"
     CONTEXT = "context"
     MEMORY = "memory"
+    SKILLS = "skills"
+    SKILLS_PROMPT = "skills_prompt"
 
 
 @dataclass(frozen=True)
@@ -229,6 +237,30 @@ class CommandController(Protocol):
 
     def exit_application(self) -> None:
         """退出应用。"""
+        ...
+
+    def run_skill(self, name: str, arguments: str, display: str) -> None:
+        """
+        执行一个 Skill（c11 F24）。
+
+        :param name: Skill 名（不带斜杠）
+        :param arguments: 用户参数，原样保留（不做 shell 分词）
+        :param display: 用户敲的**原始输入**（如 `/commit 修复登录超时`）。
+
+            **这个参数不可省**：spec F24/AC24 要求界面与会话回放显示用户的原始
+            输入，而进入模型历史的是一段自包含文本（含 Skill 名、说明、参数）。
+            两者靠 C10 的双内容模型分流——`Message.content` 给模型、
+            `Message.display_content` 给界面与回放。没有本参数就无从设置后者，
+            `/resume` 回放时用户会看到一段机器生成的文本而不是自己当初敲的命令。
+        """
+        ...
+
+    def reload_skills(self) -> str:
+        """热更新 Skill 定义（c11 F26），返回供界面显示的报告文本。"""
+        ...
+
+    def deactivate_skill(self, name: Optional[str]) -> str:
+        """卸载已激活的 Skill；name 为 None 表示全部卸载。返回结果文本。"""
         ...
 
 

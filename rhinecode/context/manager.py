@@ -29,6 +29,12 @@ from rhinecode.context.summarize import (
     render_transcript,
 )
 from rhinecode.context.models import CompactionNotice, ContextStats
+from rhinecode.trace import (
+    SCOPE_SUMMARY,
+    NullRecorder,
+    TraceEventType,
+    TraceRecorderProtocol,
+)
 
 # 摘要连续失败达到此次数即熔断，避免在失败上死循环（F15）。
 MAX_SUMMARY_FAILURES: int = 3
@@ -65,6 +71,7 @@ class ContextManager:
         window: int,
         store_dir: Path,
         auto_margin: int = 13000,
+        recorder: "Optional[TraceRecorderProtocol]" = None,
     ) -> None:
         """
         :param provider: Provider，用于第二层摘要的 LLM 调用（复用 stream_chat）
@@ -73,7 +80,9 @@ class ContextManager:
         :param store_dir: 第一层存盘目录（<项目根>/.rhinecode/context/）
         :param auto_margin: 自动触发的安全余量（默认 13K，防估算误差）。
                             手动 /compact 不设余量阈值（用户主动触发即尽力压缩），故无对应参数。
+        :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
         """
+        self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         self._provider = provider
         self._model = model
         self.window = window
@@ -96,7 +105,9 @@ class ContextManager:
     # ------------------------------------------------------------------ #
     # 自动路径：每次请求前
     # ------------------------------------------------------------------ #
-    def before_request(self, history: list[Message]) -> list[CompactionNotice]:
+    def before_request(
+        self, history: list[Message], allow_summary: bool = True
+    ) -> list[CompactionNotice]:
         """
         每次 API 请求前执行：先第一层 offload，再按自动余量判断是否第二层摘要（F3）。
 
@@ -104,14 +115,45 @@ class ContextManager:
         从而减轻第二层的触发压力（AC3）。
 
         :param history: 当前对话历史（可能被原地修改：offload 改写内容 / 摘要重构列表）
+        :param allow_summary: 是否允许第二层 LLM 摘要（c11 F21）。
+            Skill 独立模式的子对话传 False——它只跑零成本的第一层。
         :returns: 本次发生的压缩动作通知列表（可能为空）
 
         副作用：可能写盘、原地修改 history、发起摘要 LLM 调用。
         """
         notices = self._offloader.run(history)
-        if not self._circuit_broken and self._estimate(history) > self.window - self.auto_margin:
+        # 第一层存盘埋点（trace F16）：记「哪些工具调用被存了盘、存到哪」。
+        # 明细由 Offloader.last_run_details 提供——tool_call_id 与落盘路径原本都是
+        # 它内部的局部值，本层拿不到（见 offload.py 里那段注释）。
+        details = self._offloader.last_run_details
+        if details:
+            self._recorder.emit(
+                TraceEventType.CONTEXT_COMPACTION,
+                layer="offload",
+                tool_call_ids=[k for k, _ in details],
+                paths=[p for _, p in details],
+                count=len(details),
+            )
+        # allow_summary 必须放在 and 链的**最前面**短路（c11 T34）：
+        # _estimate 依赖的锚点对应的是**主历史**（record_usage 记的是主对话的
+        # prompt_tokens 与主历史条数），而子对话传进来的是另一条短历史；
+        # 拿主历史的锚点去估算它会得到一个毫无意义的值。放在最前面短路，
+        # 可以保证 _estimate 在子对话路径上根本不会被调用。
+        if (
+            allow_summary
+            and not self._circuit_broken
+            and self._estimate(history) > self.window - self.auto_margin
+        ):
             notices.append(self._do_summary(history))
         return notices
+
+    # 关于子对话共享同一个 ContextManager 实例的两项已评估结论（c11）：
+    #
+    # 1. `_offloader` 的幂等集合共享**无害**。它的幂等键是 `tool_call_id`，
+    #    那是 API 生成的全局唯一 id，主对话与子对话的工具调用不会撞键。
+    # 2. `_consecutive_failures` 熔断计数**不会被污染**。子对话恒不摘要
+    #    （allow_summary=False），根本走不到 `_do_summary`，也就不可能给
+    #    主对话的熔断计数加一。
 
     def record_usage(self, usage, sent_len: int) -> None:
         """
@@ -170,8 +212,18 @@ class ContextManager:
                 更新 _anchor_tokens / _summary_failures / _circuit_broken。
         """
         idx = compute_retain_index(history)
+        before_count = len(history)
         if idx <= 0:
             # 没有可摘要的早段（全部落在保留区），不动历史、不计失败。
+            self._recorder.emit(
+                TraceEventType.CONTEXT_COMPACTION,
+                layer="summary",
+                ok=False,
+                retain_index=idx,
+                before_count=before_count,
+                after_count=before_count,
+                skipped="no_early_segment",
+            )
             return CompactionNotice(kind="noop", message="无可摘要的早段，已跳过压缩。")
 
         to_summarize = history[:idx]
@@ -180,10 +232,12 @@ class ContextManager:
         try:
             text = self._call_summary_model(to_summarize)
         except Exception as e:  # noqa: BLE001 —— 任何异常都兜底为失败，绝不外抛（N2）
+            self._trace_summary_failure(idx, before_count, f"摘要请求异常：{e}")
             return self._on_summary_failure(f"摘要请求异常：{e}")
 
         summary = parse_summary(text)
         if summary is None:
+            self._trace_summary_failure(idx, before_count, "摘要模型未返回有效内容。")
             return self._on_summary_failure("摘要模型未返回有效内容。")
 
         # 成功：原地替换历史（用切片赋值保持 ConversationManager 持有的同一列表引用）。
@@ -192,9 +246,40 @@ class ContextManager:
         self._anchor_tokens = None
         self._anchor_len = 0
         self._summary_failures = 0
+        self._recorder.emit(
+            TraceEventType.CONTEXT_COMPACTION,
+            layer="summary",
+            ok=True,
+            retain_index=idx,
+            before_count=before_count,
+            after_count=len(history),
+            summarized_count=len(to_summarize),
+            retained_count=len(retained),
+        )
         return CompactionNotice(
             kind="summary",
             message=f"🗜 已摘要早前 {len(to_summarize)} 条消息，保留近 {len(retained)} 条原文。",
+        )
+
+    def _trace_summary_failure(self, idx: int, before_count: int, reason: str) -> None:
+        """
+        记一条「第二层摘要失败」事件。
+
+        失败计数与熔断标志要在**这里**读（而不是在 `_on_summary_failure` 之后），
+        因为读 trace 时想知道的是「这是第几次连续失败、有没有因此熔断」——
+        故意在 `_on_summary_failure` 之前调用，记的是本次失败**将被计入前**的状态
+        加上「本次失败」这一事实，两者合起来就能推出熔断时机。
+        """
+        self._recorder.emit(
+            TraceEventType.CONTEXT_COMPACTION,
+            layer="summary",
+            ok=False,
+            retain_index=idx,
+            before_count=before_count,
+            after_count=before_count,
+            reason=reason,
+            prior_failures=self._summary_failures,
+            circuit_broken=self._circuit_broken,
         )
 
     def _call_summary_model(self, to_summarize: list[Message]) -> str:
@@ -209,13 +294,22 @@ class ContextManager:
         """
         req = [Message(role="user", content=render_transcript(to_summarize))]
         parts: list[str] = []
-        for chunk in self._provider.stream_chat(
-            req, thinking_effort="off", tools=None, system=SUMMARY_SYSTEM_PROMPT
-        ):
-            if chunk.type == "error":
-                raise RuntimeError(chunk.content or "摘要流出错")
-            if chunk.type == "text":
-                parts.append(chunk.content)
+        # 摘要调用包进 summary 作用域（trace F2）：它与主对话**共用同一个 Provider
+        # 实例**，不区分的话摘要请求会被算进主对话的轮次计数，读 trace 时会看到
+        # 「用户只说了一句话却发了两轮请求」这种假象。
+        #
+        # ⚠️ `with` 必须包住**整个 for 循环**而不只是 `stream_chat(...)` 那一行：
+        # `stream_chat` 是生成器函数，调用它只是造出生成器对象、函数体一行都没跑；
+        # 真正产出 `api_request` 事件是在**首次迭代**时。只包调用的话，作用域在
+        # 迭代开始前就已退出，那条请求会被记成主作用域。
+        with self._recorder.scope(SCOPE_SUMMARY):
+            for chunk in self._provider.stream_chat(
+                req, thinking_effort="off", tools=None, system=SUMMARY_SYSTEM_PROMPT
+            ):
+                if chunk.type == "error":
+                    raise RuntimeError(chunk.content or "摘要流出错")
+                if chunk.type == "text":
+                    parts.append(chunk.content)
         return "".join(parts)
 
     def _on_summary_failure(self, reason: str) -> CompactionNotice:

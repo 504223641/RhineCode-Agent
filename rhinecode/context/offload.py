@@ -18,6 +18,7 @@
 """
 
 from pathlib import Path
+from typing import Optional
 
 from rhinecode.provider.base import Message
 from rhinecode.tools.base import human_size
@@ -39,6 +40,7 @@ class Offloader:
     :ivar _store_dir: 存盘目录（<项目根>/.rhinecode/context/），惰性创建
     :ivar _offloaded: 已存盘的消息键集合（tool_call_id 或回退序号），用于幂等
     :ivar _seq: 无 tool_call_id 时的回退递增序号，保证文件名唯一
+    :ivar last_run_details: 上一次 run() 里成功存盘的「(调用标识, 落盘路径)」列表
     """
 
     def __init__(self, store_dir: Path) -> None:
@@ -48,6 +50,13 @@ class Offloader:
         self._store_dir = store_dir
         self._offloaded: set[str] = set()
         self._seq: int = 0
+        # 上一次 run() 的存盘明细，供 trace 的 context_compaction 事件读取。
+        #
+        # 为什么需要这个属性：trace spec F16 要求记「第一层存盘的调用标识列表与
+        # 落盘路径」，而现状下 `tool_call_id` 是 `_key()` 的局部返回值、落盘路径是
+        # `_offload_one()` 的局部变量，`ContextManager` 那一层完全拿不到。
+        # 让 run() 改返回值会牵连 C8 既有的 notices 契约，所以改成额外暴露一个属性。
+        self.last_run_details: list[tuple[str, str]] = []
 
     @property
     def count(self) -> int:
@@ -85,14 +94,18 @@ class Offloader:
             f"（需要完整内容时，请用 read_file 读取该文件路径）"
         )
 
-    def _offload_one(self, msg: Message) -> bool:
+    def _offload_one(self, msg: Message) -> Optional[Path]:
         """
         把单条工具结果存盘并原地替换为占位。
 
         :param msg: 待存盘的 role="tool" 消息（原地修改其 content）
-        :returns: 存盘成功 True；写盘失败 False（此时保留原文，不改 content）
+        :returns: 存盘成功返回落盘路径；写盘失败返回 None（此时保留原文，不改 content）
 
-        副作用：可能创建目录、写文件；成功时修改 msg.content 并登记幂等键。
+        副作用：可能创建目录、写文件；成功时修改 msg.content、登记幂等键、
+        并往 `last_run_details` 追加一条明细。
+
+        返回类型从 bool 改成 Optional[Path] 是为了把落盘路径交回调用方
+        （trace 需要它），判真假的调用方改判 `is not None` 即可。
         """
         key = self._key(msg)
         try:
@@ -101,10 +114,11 @@ class Offloader:
             file_path.write_text(msg.content, encoding="utf-8")
         except OSError:
             # 写盘失败：保留原文、不登记幂等键，本次不压缩这条（fail-safe，N2）。
-            return False
+            return None
         msg.content = self._placeholder(msg.content, file_path)
         self._offloaded.add(key)
-        return True
+        self.last_run_details.append((key, str(file_path)))
+        return file_path
 
     def run(self, history: list[Message]) -> list[CompactionNotice]:
         """
@@ -123,13 +137,15 @@ class Offloader:
             return not (m.tool_call_id and m.tool_call_id in self._offloaded)
 
         offloaded_count = 0
+        # 每次 run 开头清空明细：它描述的是「本次」存盘了什么，不是累计
+        self.last_run_details = []
 
         # 第一趟：单结果超阈值直接存盘。
         for m in history:
             if not is_candidate(m):
                 continue
             if estimate_message_tokens(m) > SINGLE_RESULT_TOKENS:
-                if self._offload_one(m):
+                if self._offload_one(m) is not None:
                     offloaded_count += 1
 
         # 第二趟：聚合。对仍未存盘的工具结果算合计，若超阈值则按体积降序依次存盘。
@@ -142,7 +158,7 @@ class Offloader:
                 if total <= COMBINED_RESULT_TOKENS:
                     break
                 tokens = estimate_message_tokens(m)
-                if self._offload_one(m):
+                if self._offload_one(m) is not None:
                     offloaded_count += 1
                     total -= tokens
 

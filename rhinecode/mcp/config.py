@@ -82,8 +82,23 @@ class MCPServerConfig:
     headers: dict[str, str] = field(default_factory=dict)
 
 
-def user_config_path() -> Path:
-    """用户级配置路径：~/.rhinecode/mcp.yaml（跨项目全局默认）。"""
+def user_config_path(user_dir: Optional[Path] = None) -> Path:
+    """
+    用户级配置路径：~/.rhinecode/mcp.yaml（跨项目全局默认）。
+
+    :param user_dir: 用户级目录。**必须可选**——缺省时保持原有的
+                     `Path.home() / ".rhinecode"` 取值，行为与参数化之前完全一致。
+                     给定时改用该目录，使装配层能把用户级 MCP 声明重定向到临时目录，
+                     测试装配时不会去连真实主目录里配置的外部 Server（trace spec F23）。
+    :returns: MCP 配置文件的绝对路径
+
+    副作用：无（纯路径计算）。
+
+    注意本参数只覆盖**读取侧**。`auto_config` 的写入侧（`mcp_add_server` 落盘）
+    保持不动——那已在 trace spec 的「不做的事」里登记。
+    """
+    if user_dir is not None:
+        return user_dir / _CONFIG_FILE
     return Path.home() / _CONFIG_DIR_NAME / _CONFIG_FILE
 
 
@@ -210,7 +225,7 @@ def _load_layer(path: Path) -> tuple[dict, Optional[str]]:
     return servers, None
 
 
-def load_all() -> tuple[list[MCPServerConfig], list[str]]:
+def load_all(user_dir: Optional[Path] = None) -> tuple[list[MCPServerConfig], list[str]]:
     """
     加载两层 mcp.yaml 并合并，产出规范化的 Server 配置列表与错误列表。
 
@@ -218,13 +233,15 @@ def load_all() -> tuple[list[MCPServerConfig], list[str]]:
     （后者盖前者）。合并后逐条 _parse_server；解析错误与两层加载错误一并收集返回，
     由上层（MCPManager/启动流程）展示但不阻断启动（fail-safe）。
 
+    :param user_dir: 用户级目录，透传给 `user_config_path()`。**必须可选**——
+                     缺省等于现状（读真实主目录）。
     :returns: (MCPServerConfig 列表, 可读错误列表)；无错误时列表为空
 
     副作用：读取两层配置文件（若存在）、读取环境变量。
     """
     errors: list[str] = []
 
-    user_map, user_err = _load_layer(user_config_path())
+    user_map, user_err = _load_layer(user_config_path(user_dir))
     if user_err:
         errors.append(user_err)
     project_map, project_err = _load_layer(project_config_path())

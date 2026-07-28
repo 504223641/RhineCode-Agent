@@ -8,6 +8,7 @@
 协调层的用户确认弹窗兜底（spec N6）。命令带超时上限，避免无限期挂起（N1）。
 """
 
+import locale
 import subprocess
 
 from rhinecode.tools.base import Tool, ToolResult
@@ -21,6 +22,34 @@ DEFAULT_TIMEOUT = 30
 # 只保留前 RUN_HEAD 行与后 RUN_TAIL 行，中间以省略提示替代，避免长输出爆 token。
 RUN_HEAD = 30
 RUN_TAIL = 10
+
+
+def _decode(raw: bytes) -> str:
+    """
+    把子进程的原始字节输出解码成文本。
+
+    :param raw: 子进程某一路输出的原始字节（可能为空）
+    :returns: 解码后的文本；解不出来时用替换字符兜底，**绝不抛异常**
+
+    为什么必须自己解码，而不是让 subprocess 用 `text=True` 代劳：
+    `text=True` 会按 `locale.getpreferredencoding()` 解码，在中文 Windows 上
+    是 cp936(GBK)。而 git / python / node 这些现代工具链一律输出 UTF-8。
+    两者一撞，subprocess 的**读取线程**里抛出 UnicodeDecodeError——那个异常
+    死在后台线程里被吞掉，`proc.stdout` 最终是空字符串，**退出码仍是 0**。
+    表现就是「命令明明成功了，输出却凭空消失」：`git log` / `git diff` 只要
+    提交信息或代码注释里有中文就整段变空，模型据此得出「这仓库没有提交历史」
+    之类的错误结论，且没有任何报错可循。
+
+    因此这里固定按 UTF-8 优先解码，失败再退回本地编码（照顾 `dir`、`chcp`
+    这类仍按 ANSI 输出的旧 Windows 命令），最后一道 errors="replace" 保证
+    任何字节序列都能出结果——乱码远好过静默丢失。
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(locale.getpreferredencoding(False), errors="replace")
 
 
 def _clip(text: str) -> str:
@@ -90,17 +119,18 @@ class RunCommandTool(Tool):
             timeout = args.get("timeout") or DEFAULT_TIMEOUT
 
             # 显式固定 cwd，避免调用方未来改变进程目录后命令跑到工作区外。
+            # 刻意不传 text=True：由 _decode 自己按 UTF-8 优先解码，
+            # 否则中文输出会在 subprocess 的读取线程里解码失败并被静默吞成空串。
             proc = subprocess.run(
                 command,
                 shell=True,
                 cwd=workspace_root(),
                 capture_output=True,
-                text=True,
                 timeout=timeout,
             )
 
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
+            stdout = _decode(proc.stdout)
+            stderr = _decode(proc.stderr)
             out_lines = len(stdout.splitlines())
             err_lines = len(stderr.splitlines())
 

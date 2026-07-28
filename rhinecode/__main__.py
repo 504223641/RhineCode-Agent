@@ -1,16 +1,22 @@
 """
 RhineCode 命令行入口模块。
 
+本模块只负责「命令行的事」：解析参数、首次运行的模板生成、加载配置、
+构造行为记录器，然后把真正的装配工作交给 `rhinecode.bootstrap.build_app`。
+
 执行流程：
-1. 解析 --config 参数，获取配置文件路径
-2. 加载并校验 YAML 配置文件
-3. 根据配置创建对应的 Provider 实例
-4. 创建 ConversationManager，绑定 Provider
-5. 创建并启动 Textual TUI 应用
+1. 解析 --config / --continue / --trace 参数
+2. 首次运行时生成三类用户级配置模板
+3. 加载并校验 YAML 配置文件（含占位符 api_key 拦截）
+4. 按 --trace 的三态语义构造行为记录器
+5. 调 build_app 完成装配，启动 Textual 事件循环，退出时统一清理
 
 用法：
     rhine                          # 安装后直接运行，读 ~/.rhinecode/config.yaml
     rhine --config config.yaml     # 显式指定配置文件覆盖全局配置
+    rhine --continue               # 启动时恢复最近一次会话
+    rhine --trace                  # 开启行为记录，写 <项目根>/.rhinecode/traces/
+    rhine --trace /tmp/x.jsonl     # 开启行为记录并指定文件
     python -m rhinecode            # 未安装或开发调试时的等价入口
 """
 
@@ -18,32 +24,31 @@ import argparse
 import sys
 from pathlib import Path
 
+from rhinecode.bootstrap import BootstrapError, build_app
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
-from rhinecode.commands import CommandRegistrationError, build_builtin_registry
-from rhinecode.provider.factory import create_provider
-from rhinecode.conversation import ConversationManager
-from rhinecode.tools.registry import ToolRegistry
-from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.permission import config as perm_config
 from rhinecode.mcp import config as mcp_config
-from rhinecode.mcp.manager import MCPManager
-from rhinecode.tui.app import RhineApp
+from rhinecode.tools.path_guard import workspace_root
+from rhinecode.trace import NullRecorder, default_trace_path
+from rhinecode.trace.recorder import create_recorder
+
+# `--trace` 不带值时 argparse 填进 args.trace 的哨兵字符串。
+# 取一个不可能是真实路径的值，与「用户显式给了路径」区分开。
+_TRACE_DEFAULT = "<default>"
 
 
 def main() -> None:
     """
-    程序主入口，负责初始化所有组件并启动 TUI。
-
-    执行步骤：
-    1. 解析命令行参数（--config）
-    2. 加载配置文件，失败时打印错误并以非零状态码退出
-    3. 按配置创建 Provider → ConversationManager → RhineApp
-    4. 启动 Textual 事件循环（阻塞直到用户退出）
+    程序主入口：解析命令行、加载配置、装配并启动 TUI。
 
     异常处理：
-    - FileNotFoundError：配置文件路径不存在
-    - ValueError：配置文件缺少必填字段，或 Provider 配置无效
-    两种情况均打印可读错误信息后 sys.exit(1)，不向用户暴露堆栈。
+    - FileNotFoundError / ValueError（配置文件缺失或字段缺失）
+    - BootstrapError（装配阶段三类致命错误：命令注册冲突 / Provider 初始化失败 /
+      Skill 白名单笔误）
+    三类情况均打印可读错误信息后 sys.exit(1)，不向用户暴露堆栈。
+
+    副作用：可能生成配置模板、连接外部 MCP Server、创建会话存档与锁、
+    创建行为记录文件。
     """
     parser = argparse.ArgumentParser(description="RhineCode - 终端 AI 编程助手")
     # --config 缺省为 None，表示「用用户级全局配置 ~/.rhinecode/config.yaml」；
@@ -60,6 +65,23 @@ def main() -> None:
         dest="continue_session",
         action="store_true",
         help="启动时恢复最近一次会话，接着上次继续",
+    )
+    # --trace（trace spec F8/F25）：**三态**语义，靠 nargs="?" + const 实现——
+    #   ① 完全没写 --trace       → args.trace 为 None（default）       → 关闭
+    #   ② 写了 --trace 但没给值  → args.trace 为 _TRACE_DEFAULT（const）→ 缺省路径
+    #   ③ 写了 --trace <路径>    → args.trace 为该路径                  → 指定路径
+    #
+    # 为什么必须有 const：不给的话「给了但无值」也会拿到 None，与「未给」无法区分，
+    # 于是 `rhine --trace` 会静默地什么都不记。
+    # 为什么必须 nargs="?"：写成普通带值选项（nargs 默认）时 `--trace` 后面若紧跟
+    # 其它参数（`rhine --trace --continue`），会把 `--continue` 当成路径吞掉。
+    parser.add_argument(
+        "--trace",
+        nargs="?",
+        const=_TRACE_DEFAULT,
+        default=None,
+        metavar="PATH",
+        help="开启行为记录（测试设施）；不给值时写 <项目根>/.rhinecode/traces/<时间戳>.jsonl",
     )
     args = parser.parse_args()
 
@@ -106,55 +128,35 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # 构建命令注册表（c10 T53）：必须在 Provider / 工具注册中心 / MCP 连接等昂贵资源
-    # 之前完成——命令名/别名冲突属于代码级配置错误，fail-fast 在此拦下（退出码 1），
-    # 此时尚未创建网络连接、MCP 子进程或会话锁，启动失败干净利落（spec F2/N4）。
+    # 按三态构造记录器。后两态**一律经 create_recorder 工厂**，不得直接
+    # TraceRecorder(...)：目标路径不可写时构造必然抛异常，直接构造会让进程
+    # 带着 traceback 崩在装配之前——用户只是想开个日志，结果程序起不来
+    # （trace spec AC22 明确要求这种情形不阻断）。
+    if args.trace is None:
+        recorder = NullRecorder()
+    elif args.trace == _TRACE_DEFAULT:
+        recorder = create_recorder(default_trace_path(workspace_root()))
+    else:
+        recorder = create_recorder(Path(args.trace))
+
+    # 装配：顺序与理由全部收在 bootstrap.build_app 里。
+    # BootstrapError 的 args[0] 已是成文的完整文案，这里原样打印、不再拼前缀。
     try:
-        command_registry = build_builtin_registry()
-    except CommandRegistrationError as e:
-        print(f"命令注册冲突：{e}", file=sys.stderr)
+        result = build_app(
+            cfg,
+            resume_latest=args.continue_session,
+            recorder=recorder,
+        )
+    except BootstrapError as e:
+        print(e, file=sys.stderr)
         sys.exit(1)
 
-    # 根据配置创建模型 Provider。
+    # try/finally 保证无论正常退出还是异常，都统一回收资源（清理动作幂等，
+    # 五步顺序与理由见 bootstrap.build_app 里的 cleanup）。
     try:
-        provider = create_provider(cfg)
-    except ValueError as e:
-        print(f"Provider 初始化错误：{e}", file=sys.stderr)
-        sys.exit(1)
-
-    # 构建工具注册中心（含 6 个核心工具），注入协调层以启用工具能力。
-    # 工具仅在 DeepSeek 协议下实际生效，其余协议下协调层会自动忽略（见 ConversationManager）。
-    # 命名为 tool_registry 与上面的 command_registry 明确区分（两者互不相干）。
-    tool_registry = ToolRegistry.default()
-
-    # 加载 MCP 配置并连接外部 Server，把发现到的远端工具注册进同一个 tool_registry（c7）。
-    # connect_all 逐 Server 隔离：单个失败只跳过、不影响内置工具与启动（spec F13）；
-    # 无 mcp.yaml 时 configs 为空、无任何 MCP 工具，行为与 c6 完全一致。
-    mcp_configs, mcp_errors = mcp_config.load_all()
-    mcp_manager = MCPManager()
-    # mcp_add_server 需要同时写配置、重载目标 server、更新 registry，因此必须在 MCPManager
-    # 创建后注入运行时依赖；只读的 mcp_resolve_server 已在 ToolRegistry.default() 中注册。
-    tool_registry.register(MCPAddServerTool(mcp_manager, tool_registry))
-    mcp_manager.connect_all(mcp_configs, tool_registry, extra_errors=mcp_errors)
-
-    # 依次构建各层组件，层间通过依赖注入解耦。
-    # resume_latest 透传 --continue：协调层构造时经 MemoryManager 恢复最近会话（c9）。
-    manager = ConversationManager(
-        provider, cfg, tool_registry, mcp_manager=mcp_manager,
-        resume_latest=args.continue_session,
-    )
-    app = RhineApp(manager, cfg, command_registry)
-    # try/finally 保证无论正常退出还是异常，都统一回收资源：
-    # MCP 连接与 stdio 子进程（c7）、会话锁（c9，不释放会短暂挡住其它实例接管，
-    # 直到锁过期自愈）。两者各自 try 住，互不影响。
-    try:
-        app.run()
+        result.app.run()
     finally:
-        try:
-            manager.memory_manager.close()
-        except Exception:
-            pass
-        mcp_manager.close_all()
+        result.cleanup()
 
 
 if __name__ == "__main__":

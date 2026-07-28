@@ -14,7 +14,24 @@ from contextlib import redirect_stderr
 from unittest.mock import MagicMock, patch
 
 import rhinecode.__main__ as entry
+import rhinecode.bootstrap as bootstrap
 from rhinecode.commands import CommandRegistrationError, CommandRegistry
+
+
+def _fake_skill_manager() -> MagicMock:
+    """
+    SkillManager 的假替身（c11）。
+
+    必须显式给出返回值：`startup()` 默认返回一个**真值** MagicMock，
+    而 `__main__` 把非空返回视为「白名单里有不存在的工具名」并 exit(1)——
+    不设的话本文件所有用例都会以退出码 1 结束，且报错完全指不到真正的原因。
+    """
+    sm = MagicMock()
+    sm.startup.return_value = []
+    sm.runtime_warnings.return_value = ()
+    sm.project_skill_notice.return_value = None
+    sm.command_infos.return_value = ()
+    return sm
 
 
 def _fake_config() -> MagicMock:
@@ -33,14 +50,17 @@ class StartupWiringTests(unittest.TestCase):
         fake_app = MagicMock()
         with (
             patch.object(entry, "load", return_value=_fake_config()),
-            patch.object(entry, "build_builtin_registry", return_value=registry) as build,
-            patch.object(entry, "create_provider", return_value=MagicMock()),
-            patch.object(entry.ToolRegistry, "default", return_value=MagicMock()),
-            patch.object(entry.mcp_config, "load_all", return_value=({}, [])),
-            patch.object(entry, "MCPManager") as mcp_cls,
-            patch.object(entry, "MCPAddServerTool", return_value=MagicMock()),
-            patch.object(entry, "ConversationManager", return_value=MagicMock()),
-            patch.object(entry, "RhineApp", return_value=fake_app) as app_cls,
+            patch.object(bootstrap, "build_builtin_registry", return_value=registry) as build,
+            patch.object(bootstrap, "create_provider", return_value=MagicMock()),
+            patch.object(bootstrap.ToolRegistry, "default", return_value=MagicMock()),
+            patch.object(bootstrap.mcp_config, "load_all", return_value=({}, [])),
+            patch.object(bootstrap, "MCPManager") as mcp_cls,
+            patch.object(bootstrap, "MCPAddServerTool", return_value=MagicMock()),
+            patch.object(bootstrap, "SkillManager", return_value=_fake_skill_manager()),
+            patch.object(bootstrap, "LoadSkillTool", return_value=MagicMock()),
+            patch.object(bootstrap, "build_skill_command_specs", return_value=[]),
+            patch.object(bootstrap, "ConversationManager", return_value=MagicMock()),
+            patch.object(bootstrap, "RhineApp", return_value=fake_app) as app_cls,
             patch("sys.argv", ["rhine", "--config", "fake.yaml"]),
         ):
             entry.main()
@@ -58,12 +78,12 @@ class StartupWiringTests(unittest.TestCase):
         stderr = io.StringIO()
         with (
             patch.object(entry, "load", return_value=_fake_config()),
-            patch.object(entry, "build_builtin_registry", side_effect=conflict),
-            patch.object(entry, "create_provider") as create_provider,
-            patch.object(entry.ToolRegistry, "default") as tool_default,
-            patch.object(entry, "MCPManager") as mcp_cls,
-            patch.object(entry, "ConversationManager") as manager_cls,
-            patch.object(entry, "RhineApp") as app_cls,
+            patch.object(bootstrap, "build_builtin_registry", side_effect=conflict),
+            patch.object(bootstrap, "create_provider") as create_provider,
+            patch.object(bootstrap.ToolRegistry, "default") as tool_default,
+            patch.object(bootstrap, "MCPManager") as mcp_cls,
+            patch.object(bootstrap, "ConversationManager") as manager_cls,
+            patch.object(bootstrap, "RhineApp") as app_cls,
             patch("sys.argv", ["rhine", "--config", "fake.yaml"]),
             redirect_stderr(stderr),
         ):

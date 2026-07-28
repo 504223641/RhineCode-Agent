@@ -91,11 +91,43 @@ def compute_retain_index(history: list[Message]) -> int:
     idx = min(idx_tok, idx_cnt)
 
     # —— 步骤 2：回退到最近的 user 边界 ——
+    # 找不到边界时本函数返回 0 = 「全部保留、无可摘要段」，语义与抽出该辅助函数前一致。
+    boundary = snap_back_to_user(history, idx)
+    return 0 if boundary is None else boundary
+
+
+def snap_back_to_user(history: list[Message], idx: int) -> Optional[int]:
+    """
+    从 idx 向前回退到最近一个 `role == "user"` 的下标（c11 T35）。
+
+    :param history: 消息列表
+    :param idx: 起始下标
+    :returns: 找到的 user 下标；**找不到、空序列、idx 越界一律返回 None**
+
+    用途：任何「从某处切一刀」的场景都必须切在 user 边界上，否则会拆散
+    `assistant(tool_calls)` 与其配对的 `tool` 消息，切出来的片段发给 API 会被拒。
+
+    **为什么返回 `Optional[int]` 而不是用 0 当哨兵**——这是本函数存在的全部理由：
+    两个调用方对「找不到边界」的正确反应**恰好相反**。
+
+    - `compute_retain_index`（C8 摘要）：找不到边界 → 返回 0 = **全部保留**，
+      这是安全的（什么都不摘要）。
+    - `_take_tail`（C11 独立模式取尾部历史）：找不到边界 → 应当**不带入任何历史**，
+      返回空列表。若沿用「返回 0」，下标 0 意味着 `history[0:]` = **整个主历史**——
+      用户写 `history_messages: 3`，实际却把几百条消息全灌进子对话，
+      既违背独立模式的目的，又因子对话关闭了第二层摘要而当场撑爆窗口。
+
+    返回 None 强制每个调用方自己声明「找不到时该怎么办」，把这个反向 bug
+    变成一个必须显式处理的分支。
+
+    副作用：无。
+    """
+    if not history or idx < 0 or idx >= len(history):
+        return None
     while idx > 0 and history[idx].role != "user":
         idx -= 1
-    # idx 停在某个 user 上；若一路退到 0 且 history[0] 也非 user，则无可用 user 边界。
-    if idx == 0 and history[0].role != "user":
-        return 0
+    if history[idx].role != "user":
+        return None
     return idx
 
 

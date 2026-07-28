@@ -63,6 +63,27 @@ class ToolRegistry:
         """
         return self._tools.pop(name, None) is not None
 
+    def names(self) -> frozenset[str]:
+        """
+        返回当前已注册的全部工具名。
+
+        用途（c11 T3）：
+        1. **启动校验**——Skill 的 `allowed_tools` 白名单里若出现不存在的内置工具名
+           （通常是笔误），启动时立刻 fail-fast（spec F16）；
+        2. **每轮运行期自愈**——已激活 Skill 的白名单并集要与「注册中心当前工具名」
+           取交集，这样 MCP 运行时重载导致某个远端工具消失后，它自动不再出现在
+           可见工具集里，无需任何额外同步（spec F14）。
+
+        返回 frozenset 而非 list/set：调用方只做成员判断与集合运算，
+        不可变的返回值能防止调用方误改注册中心内部状态。
+
+        注意：`ToolRegistry` 没有实现 `__iter__`，调用方不得写 `for t in registry`，
+        取名字请用本方法、取工具对象请用 `get(name)`。
+
+        副作用：无（只读快照，此后注册/注销不影响已返回的集合）。
+        """
+        return frozenset(self._tools)
+
     def schemas(self) -> list[dict]:
         """
         导出所有已注册工具的 API 描述列表。
