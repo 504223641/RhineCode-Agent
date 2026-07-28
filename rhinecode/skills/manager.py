@@ -269,7 +269,6 @@ class SkillManager:
             added=tuple(sorted(new_names - old_names)),
             removed=tuple(sorted(old_names - new_names)),
             auto_deactivated=tuple(sorted(auto_deactivated)),
-            dropped_fatal=(),
             warnings=tuple(warnings),
             errors=new_catalog.errors,
         )

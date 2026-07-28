@@ -25,7 +25,7 @@ class RetainIndexTest(unittest.TestCase):
         for _ in range(10):
             msgs.append(self._big("user"))
             msgs.append(self._big("assistant"))
-        idx = compute_retain_index(msgs)
+        idx = compute_retain_index(msgs, 65536)
         self.assertGreater(idx, 0)
         self.assertEqual(msgs[idx].role, "user")
 
@@ -39,13 +39,13 @@ class RetainIndexTest(unittest.TestCase):
             )
             msgs.append(Message(role="tool", content="R" * 2000, tool_call_id=f"t{i}"))
             msgs.append(Message(role="user", content="U" * 2000))
-        idx = compute_retain_index(msgs)
+        idx = compute_retain_index(msgs, 65536)
         self.assertEqual(msgs[idx].role, "user")
 
     def test_small_history_retains_all(self) -> None:
         # 全部很小（< RETAIN_TOKENS）→ 保留全部，无早段可摘要（idx==0）
         msgs = [Message(role="user", content="hi"), Message(role="assistant", content="yo")]
-        self.assertEqual(compute_retain_index(msgs), 0)
+        self.assertEqual(compute_retain_index(msgs, 65536), 0)
 
     def test_min_retain_messages(self) -> None:
         # 即便按 token 想少留，也至少保留 MIN_RETAIN_MESSAGES 条 → idx <= n - 5
@@ -53,7 +53,7 @@ class RetainIndexTest(unittest.TestCase):
         for _ in range(10):
             msgs.append(self._big("user"))
             msgs.append(self._big("assistant"))
-        idx = compute_retain_index(msgs)
+        idx = compute_retain_index(msgs, 65536)
         self.assertLessEqual(idx, len(msgs) - MIN_RETAIN_MESSAGES)
 
 
@@ -103,3 +103,81 @@ class RenderTranscriptTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetainScalesWithWindowTest(unittest.TestCase):
+    """
+    **保留区与触发余量随窗口缩放**（已知项 #8，本轮修复）。
+
+    ## 这组护栏钉的是一个实测缺陷
+
+    `RETAIN_TOKENS` 与 `auto_margin` 原本是固定常量（10000 / 13000），不随
+    `config.context_window` 变。后果在小窗口模型上是**第二层摘要完全失效**：
+
+    - 保留区目标 10000 token **比整个 8192 窗口还大** → 早段恒为空 → 无可摘要；
+    - 触发线 `window - auto_margin` = 8192 − 13000 = **负数** → 判据恒真
+      → 每一次请求都尝试压缩、每一次都白跑。
+
+    两件事叠加的结果是「看起来一直在压缩，实际一次都没压过」，历史一路涨到溢出。
+    这在界面上完全看不出来——用户只看到上下文百分比一直涨。
+    """
+
+    def test_default_window_behaviour_is_unchanged(self) -> None:
+        """
+        默认窗口 65536 及以上必须**逐字维持改造前的取值**。
+
+        这是零回归的形式化表达：比例乘出来超过上限，被夹回原来的固定值。
+        """
+        from rhinecode.context.summarize import retain_budget, RETAIN_TOKENS_CAP
+        from rhinecode.context.manager import _derive_margin, MARGIN_CAP
+
+        for window in (65536, 131072, 1000000):
+            with self.subTest(window=window):
+                self.assertEqual(retain_budget(window), RETAIN_TOKENS_CAP)
+                self.assertEqual(_derive_margin(window), MARGIN_CAP)
+
+    def test_small_window_scales_down(self) -> None:
+        """小窗口下预算必须真的变小，否则早段永远为空。"""
+        from rhinecode.context.summarize import retain_budget
+
+        self.assertLess(retain_budget(8192), 8192, "保留预算不得大于整个窗口")
+        self.assertLess(retain_budget(8192), retain_budget(65536))
+
+    def test_trigger_line_is_always_positive(self) -> None:
+        """
+        `window - auto_margin` 必须恒为正。
+
+        它一旦为负，触发判据就恒真——压缩在每一次请求上空转，
+        而这**不产生任何错误**，只是悄悄浪费一轮判断。
+        """
+        from rhinecode.context.manager import _derive_margin
+
+        for window in (1000000, 65536, 8192, 4096, 1024, 100, 2):
+            with self.subTest(window=window):
+                self.assertGreater(window - _derive_margin(window), 0)
+
+    def test_small_window_actually_yields_an_early_segment(self) -> None:
+        """
+        **端到端判据**：同一段历史，大窗口下无早段可摘要，小窗口下必须有。
+
+        只断言常量变小是不够的——真正要证明的是「第二层终于能压缩了」。
+        """
+        msgs = []
+        for _ in range(40):
+            msgs.append(Message(role="user", content="用户请求" * 60))
+            msgs.append(Message(role="assistant", content="回答内容" * 60))
+
+        self.assertEqual(
+            compute_retain_index(msgs, 65536), 0,
+            "这段历史在 64K 窗口下本就全部落在保留区，无早段——对照组",
+        )
+        self.assertGreater(
+            compute_retain_index(msgs, 8192), 0,
+            "同一段历史在 8K 窗口下必须切得出早段，否则修复没生效",
+        )
+
+    def test_min_messages_still_floors_it(self) -> None:
+        """窗口小到离谱时，`MIN_RETAIN_MESSAGES` 仍保证近期上下文不被压没。"""
+        msgs = [Message(role="user", content="x" * 500) for _ in range(20)]
+        idx = compute_retain_index(msgs, 100)
+        self.assertLessEqual(idx, len(msgs) - MIN_RETAIN_MESSAGES)

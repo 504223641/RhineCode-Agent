@@ -16,6 +16,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | [`internals/testing.md`](docs/internals/testing.md) | 要加/改测试，或想知道某个行为**有没有护栏钉着** |
 | [`internals/config.md`](docs/internals/config.md) | 要动配置加载、新增配置项或模板生成 |
 | [`docs/c11/README.md`](docs/c11/README.md) | 当前章节的 spec/plan/task/checklist 与验收记录导航 |
+| [`docs/todo/README.md`](docs/todo/README.md) | **下一步做什么** —— 待选方向，按优先级编号，每份自带可一键复制的开工 Prompt |
 
 留在主文件里的都是**不请自来才有用**的东西：成对维护点、安全边界、代码注释规范、
 学习与解释要求、已知后续工程项。索引解决「我要查点东西」，解决不了
@@ -220,14 +221,14 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 869 项，skipped 4
+python -m unittest discover -s tests      # 882 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
 慢速专项（需 `RHINE_E2E_SLOW=1`）。**本机需装 git**——有预置依赖真实提交历史，
 缺 git 时明确报错而非静默跳过（静默跳过会让那些场景假绿）。
 
-逐层的覆盖清单见 **[`docs/internals/testing.md`](docs/internals/testing.md)**。
+逐层的覆盖清单见 **[`docs/internals/testing.md`](docs/internals/testing.md)**（前半是按层的概览表，后半三节是 Skill / Trace / 驱动设施的逐条留存）。
 **动某条测试之前先去那里搜一下它**——里面夹着若干「这条护栏为什么不能简化」的说明，
 很多看起来啰嗦的写法是踩过坑之后刻意保留的（例如死锁护栏必须用完成计数而不是
 布尔标志，同线程版本在 `RLock` 下会静默通过）。
@@ -261,14 +262,13 @@ python -m unittest discover -s tests      # 869 项，skipped 4
 以下问题已完成工程审查确认，但不属于当前阶段开发范围。后续章节会集中补齐；在当前阶段不要把它们视为阻塞项，除非用户明确要求处理：
 
 1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
-2. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。**已有真实观测样本**（C11 场景 10 验收时撞到，见 `docs/c11/acceptance/skills-c11-live.md`）：规划阶段那一轮的 `tool_names` 里没有 `run_command`（`_schema_for` 用 `readonly_schemas()` 滤掉了它），模型仍凭先验调了出来，而 `_execute` 的 `out_of_scope` 判据只查 **Skill 白名单**（`_visible(name, policy)`）、不查规划阶段的只读过滤，于是 `outcome=executed`。**这不是 C11 `out_of_scope` 守卫漏了**——两处过滤职责不同。缓解是五层管线一层没少（照样弹确认面板）；这次夹带的恰好是 `git diff`，但同一路径上完全可能是写命令。
-
+2. ~~Plan Mode 规划阶段的工具阶段强校验~~ **已于 2026-07-29 修复**：规划阶段（`plan_mode and not execution_phase`）夹带的非只读工具现在在 `_execute` 的预扫里被独立通道 `plan_blocked` 挡下并回灌「先用 present_plan 提交计划」，trace outcome 为 `plan_blocked`（与 `out_of_scope` **刻意分开**——两处过滤职责不同，回灌指引也不同）。原缺陷有真实观测样本：规划阶段那轮 `tool_names` 里没有 `run_command`，模型仍凭先验调了出来，而当时唯一的守卫只查 Skill 白名单，于是 `outcome=executed`。护栏见 `tests/test_plan_stage_guard.py`（含「放行权限模式下也挡得住」与「获批后放行」两条反证）。
 3. `write_file` / `edit_file` 的文件系统级原子写入。
 4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问——C6 的应用层黑名单+路径沙箱已覆盖命令与文件工具的常见高危场景，但管不住子进程内部的间接访问。
 5. 权限系统后续项：网络请求限制、资源配额、审计日志（C6 spec 明确不做，留待后续章节）。
 6. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
 7. MCP 后续项（C7 spec 明确不做）：Server 健康检查与自动重连、资源/提示词/采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化、stdio 之外的旧版 HTTP+SSE 传输、MCP 工具结果里图片/二进制内容的实际渲染。
-8. 上下文管理后续项（C8 spec 明确不做）：精确 tokenizer（当前仅「锚点+增量」近似估算）、摘要策略的机器学习/质量优化、存盘文件的清理与生命周期管理（`/clear` 只复位幂等状态、不删磁盘文件）、除窗口大小外其它阈值（存盘/保留/余量等）的可配置化、摘要内容的分段/多轮压缩与跨会话持久化。**其中「保留区阈值」有一处已实测确认的局限**（P1a 验 P0 场景 7 时发现）：`summarize.RETAIN_TOKENS = 10000` 与 `auto_margin = 13000` 都是**固定常量、不随 `context_window` 缩放**，因此配置了小窗口（如 8192）的模型上，保留区比整个窗口还大、早段恒为空，**第二层摘要永远不会真正压缩**（实测连续三次 `no_early_segment`），历史只会一路涨到溢出。大窗口（64K 及以上）不受影响。修法需重新设计「保留多少」的语义（按窗口比例？按绝对条数？），不宜顺手改，故登记在此。
+8. 上下文管理后续项（C8 spec 明确不做）：精确 tokenizer（当前仅「锚点+增量」近似估算）、摘要策略的机器学习/质量优化、存盘文件的清理与生命周期管理（`/clear` 只复位幂等状态、不删磁盘文件）、除窗口大小外其它阈值（存盘/保留/余量等）的可配置化、摘要内容的分段/多轮压缩与跨会话持久化。~~其中「保留区阈值」曾有一处实测局限~~ **已于 2026-07-29 修复**：`RETAIN_TOKENS` 与 `auto_margin` 原是固定常量、不随 `context_window` 缩放，导致小窗口（如 8192）上保留区比整个窗口还大、触发线为负——第二层摘要**永不真正压缩**且每轮空转。现改为「按窗口比例算再夹上限」（`summarize.retain_budget` / `manager._derive_margin`），**64K 及以上逐字维持原值**。护栏见 `tests/test_context_summarize.py::RetainScalesWithWindowTest`。
 9. Skill 系统后续项（C11 spec 明确不做）：Skill 的市场分发与版本管理、嵌套激活（Skill 里再激活 Skill）、参数 schema 与校验、模板引擎（`$ARGUMENTS` 只做字面替换）、多个 Skill 并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、阈值（字段截断 4000 字符 / 消息条数 400）可配置化、采样与按类型开关（当前只有「全开」与「全关」两态）。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。

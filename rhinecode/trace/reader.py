@@ -169,7 +169,7 @@ def _s_skill_state(r: dict) -> str:
     if action == "reload":
         return (
             f"热更新 · 新增 {r.get('added')} · 移除 {r.get('removed')} · "
-            f"自动卸载 {r.get('auto_deactivated')} · 丢弃 {r.get('dropped_fatal')}"
+            f"自动卸载 {r.get('auto_deactivated')}"
         )
     if action == "bind_tools":
         return f"白名单绑定 · Skill {len(r.get('skills') or [])} 个"

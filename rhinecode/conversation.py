@@ -643,8 +643,6 @@ class ConversationManager:
             lines.append(
                 f"已自动卸载（定义已消失）：{'、'.join(outcome.auto_deactivated)}"
             )
-        if outcome.dropped_fatal:
-            lines.append(f"因白名单错误被丢弃：{'、'.join(outcome.dropped_fatal)}")
         if not (outcome.added or outcome.removed or outcome.auto_deactivated):
             lines.append("（Skill 列表无变化；已激活 Skill 的正文按最新定义生效）")
         if outcome.errors:
