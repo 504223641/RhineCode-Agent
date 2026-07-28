@@ -9,8 +9,8 @@ Skill 的三层目录扫描（c11 T9/T10）。
 目录不存在直接当空层，不算错误。理由很直接——Skill 是可选增强，
 不该因为某人往目录里丢了个记事本文件就让整个 RhineCode 起不来。
 
-对应 spec 条款：F2（目录型入口 SKILL.md）、F3（三层优先级覆盖）、
-F5（单文件失败不阻断）、F13（资源清单）、F29（层内同名去重）。
+对应 spec 条款见 `docs/c11-align/spec.md`：F2（命令名来自路径）、
+F3（三层优先级覆盖）、F4（命令名最低限度校验）、F5（单文件失败不阻断）。
 """
 
 from pathlib import Path
@@ -18,6 +18,7 @@ from typing import Optional
 
 from rhinecode.skills.models import (
     ENTRY_FILENAME,
+    RESERVED_SUBCOMMANDS,
     RESOURCE_LIST_MAX,
     SkillCatalog,
     SkillLoadError,
@@ -79,10 +80,10 @@ def _scan_layer(
       理由：用户可能在 skills 目录里放 README、草稿或编辑器临时文件，
       为这些东西刷一堆错误只会让 `/skills` 报告变成噪音。
 
-    **层内同名去重（F29）**：`sorted(iterdir())` 保证字典序遍历，
-    先到者生效、后到者记一条错误并丢弃。用字典序而不是文件系统返回顺序，
-    是为了让「谁生效」这件事在任何机器上都确定，否则同一个仓库在不同人机器上
-    行为可能不同，这种问题极难排查。
+    **命令名来自路径**（对齐改造 F2）：目录型取目录名、单文件型取去扩展名的文件名。
+    因此同一层内不可能出现重名，C11 的「层内同名去重」整段删除。
+    仍用 `sorted(iterdir())` 遍历，是为了让扫描顺序（进而是错误与警告的顺序）
+    在任何机器上都确定。
 
     副作用：读目录与读文件。不写任何东西。
     """
@@ -104,18 +105,20 @@ def _scan_layer(
         )
         return specs, errors, warnings
 
-    # name → 已生效的那个文件路径，用于层内同名冲突的错误提示。
-    seen: dict[str, Path] = {}
-
     for entry in entries:
         entry_path: Path
         resource_dir: Optional[Path]
         resource_files: tuple[str, ...]
+        # **命令名来自文件系统路径**（对齐改造 F2）：目录型取目录名，
+        # 单文件型取去扩展名的文件名。这是「外部 Skill 原样可用」的基础——
+        # 从任何来源拉一个目录丢进去，命令名就是目录名，不必检查 frontmatter。
+        command_name: str
 
         if entry.is_file() and entry.suffix == ".md":
             entry_path = entry
             resource_dir = None
             resource_files = ()
+            command_name = entry.stem
         elif entry.is_dir():
             candidate = entry / ENTRY_FILENAME
             if not candidate.is_file():
@@ -128,7 +131,22 @@ def _scan_layer(
             entry_path = candidate
             resource_dir = entry
             resource_files = _collect_resource_files(entry)
+            command_name = entry.name
         else:
+            continue
+
+        # 命令名的最低限度校验（对齐改造 F4）。字符集与长度**不再校验**——
+        # 文件系统已经保证名字合法，再叠一层自定义规则只会让本可直接使用的
+        # 外部 Skill 目录（含大写、下划线、超长名）被无理由拒绝。
+        if command_name in RESERVED_SUBCOMMANDS:
+            errors.append(
+                SkillLoadError(
+                    entry_path,
+                    source,
+                    f"命令名 `{command_name}` 是 /skills 的保留子命令词，"
+                    f"请改名（否则 `/skills {command_name}` 会产生解析二义）",
+                )
+            )
             continue
 
         try:
@@ -140,26 +158,17 @@ def _scan_layer(
             continue
 
         spec, reason, spec_warnings = parse_skill(
-            text, entry_path, source, resource_dir, resource_files
+            text, entry_path, source, command_name, resource_dir, resource_files
         )
         if spec is None:
             errors.append(SkillLoadError(entry_path, source, reason or "未知解析错误"))
             continue
 
-        if spec.name in seen:
-            errors.append(
-                SkillLoadError(
-                    entry_path,
-                    source,
-                    f"名字 `{spec.name}` 与同层 {seen[spec.name].name} 重复，本文件被忽略",
-                )
-            )
-            continue
-
-        seen[spec.name] = entry_path
+        # **层内重名的检测已整段删除**（对齐改造 F8）：命令名现在来自文件系统，
+        # 同一目录下不可能有两个同名条目，这个失败原因不再可能发生。
         specs.append(spec)
         if spec_warnings:
-            warnings[spec.name] = spec_warnings
+            warnings[spec.command_name] = spec_warnings
 
     return specs, errors, warnings
 
@@ -210,16 +219,16 @@ def discover(
         all_errors.extend(errors)
         for spec in specs:
             # setdefault：高优先层已占用的名字，低优先层直接落空，静默丢弃。
-            chosen.setdefault(spec.name, spec)
+            chosen.setdefault(spec.command_name, spec)
         for name, items in warnings_by_name.items():
             warning_index[(source, name)] = items
 
-    ordered = sorted(chosen.values(), key=lambda s: s.name)
+    ordered = sorted(chosen.values(), key=lambda s: s.command_name)
 
     # 只发出生效那份的警告，按 Skill 名排序（与 skills 列表同序，便于对照）。
     all_warnings: list[str] = []
     for spec in ordered:
-        all_warnings.extend(warning_index.get((spec.source, spec.name), []))
+        all_warnings.extend(warning_index.get((spec.source, spec.command_name), []))
 
     return SkillCatalog(
         skills=tuple(ordered),

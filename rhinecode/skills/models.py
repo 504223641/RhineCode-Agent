@@ -1,28 +1,38 @@
 """
-Skill 系统的核心模型（c11 T4/T5）：枚举、不可变数据类与模块级常量。
+Skill 系统的核心模型：枚举、不可变数据类与模块级常量。
 
-本模块处于 skills 包依赖链的**最底层**，只依赖标准库与 `tools/policy.py`：
+本模块处于 skills 包依赖链的**最底层**，只依赖标准库：
 
     models.py      ← 本模块（数据结构与常量）
        ↑
     parser.py      单份 Skill 文本 → SkillSpec / 失败原因（纯函数）
        ↑
-    discovery.py   三层目录扫描、层内去重、跨层覆盖
+    discovery.py   三层目录扫描、命令名推导、跨层覆盖
        ↑
     render.py      清单 / 激活正文 / 参数替换 / 自包含文本（纯函数）
        ↑
-    validation.py  白名单两段校验与空集降级（纯函数）
+    validation.py  预授权声明 → 权限规则（纯函数）
        ↑
     manager.py     SkillManager：唯一持有可变状态与副作用编排
 
 严格单向，下层不感知上层。本模块不导入 Textual、Provider SDK、commands 包，
-可在无终端无网络的测试进程中独立使用（spec N1）。
+可在无终端无网络的测试进程中独立使用。
 
-对应 spec 条款：F1（frontmatter 字段）、F2（目录型入口名）、F3（三级存放）、
-F4（名字规则与保留词）、F6/F9（注入上限）、F13（资源清单上限）。
+## 本轮改造（对齐 Agent Skills 开放标准）
+
+字段表按标准重定义，三处**语义变更**需要格外留意：
+
+1. **`allowed-tools` 从「收窄可见工具集」改为「本次执行内免确认」**——语义相反。
+   这是本次立项的直接动因：一份外部 Skill 写 `allowed-tools: Read Grep`，
+   作者本意是「这两个别烦我确认」，旧实现却当成「只有这两个能用」。
+2. **命令名来自文件系统路径，不再来自 `name` 字段**（见 `SkillSpec.command_name`）。
+3. **「在哪执行」与「谁能触发」拆成正交两维**——旧的 `mode: isolated` 同时表达了
+   两件事，现在分别是 `forked` 与 `model_invocable`。
+
+对应 spec 条款见 `docs/c11-align/spec.md`。
 """
 
-import re
+
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -30,20 +40,6 @@ from typing import Optional
 
 
 # ────────────────────────────── 枚举 ──────────────────────────────
-
-
-class SkillMode(Enum):
-    """
-    执行模式（spec F18/F19）。
-
-    - SHARED：共享当前对话。SOP 正文注入主对话上下文，模型在主历史里直接执行，
-      过程中的工具调用与结果全部留在主历史。
-    - ISOLATED：开一条独立子对话跑完，只把最终结论作为一条 assistant 消息回流主历史，
-      子对话的中间过程不污染主历史。
-    """
-
-    SHARED = "shared"
-    ISOLATED = "isolated"
 
 
 class SkillSource(Enum):
@@ -84,29 +80,47 @@ class ActivationStatus(Enum):
     """
     一次激活尝试的结果状态（spec F7）。
 
-    - ACTIVATED：共享模式激活成功（含幂等的重复激活）。
+    - ACTIVATED：正文已注入动态槽位（含幂等的重复激活）。
     - NOT_FOUND：名字不存在，需把可用名字列表回灌给模型。
-    - ISOLATED：目标是独立模式 Skill。模型**不能**自行发起独立模式
-      （它会开一条新的子对话，必须由用户显式触发），因此这里视为一种失败，
-      并给出用户实际可执行的入口提示。
+    - FORKED：目标声明了 `context: fork`，**不能**用注入正文的方式处理——
+      它要开一条子对话完整跑完。调用方据此改走子对话路径。
+      注意这**不是失败**（对齐改造 F8：模型可以自行发起 fork Skill）。
+    - NOT_MODEL_INVOCABLE：目标声明了 `disable-model-invocation`，
+      模型不得自行发起。这才是失败，需给出用户实际可执行的入口提示。
     """
 
     ACTIVATED = "activated"
     NOT_FOUND = "not_found"
-    ISOLATED = "isolated"
+    FORKED = "forked"
+    NOT_MODEL_INVOCABLE = "not_model_invocable"
 
 
 # ────────────────────────────── 常量 ──────────────────────────────
 
-# Skill 名字规则（spec F4）：小写字母开头，其后可跟小写字母/数字/连字符，总长 1–32。
-# 之所以卡这么死：名字要直接拼成斜杠短命令 `/<name>`，必须与 C10 的命令字段口径兼容
-# （不含空白、大小写不敏感解析下无歧义）。
-NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
-
-# `/skills` 的子命令词（spec F4）。Skill 不得叫这些名字，否则 `/skills run` 之类的
-# 子命令解析会与「名叫 run 的 Skill」产生二义。注意这与「短命令 `/run` 是否冲突」无关，
-# 冲突检查是另一条路径（F25），这里挡的是 `/skills <子命令>` 的解析歧义。
+# `/skills` 的子命令词。命令名不得取这些值，否则 `/skills run` 之类的子命令解析
+# 会与「命令名叫 run 的 Skill」产生二义。注意这与「短命令 `/run` 是否与内置命令冲突」
+# 无关，那是另一条路径，这里挡的是 `/skills <子命令>` 的解析歧义。
+#
+# ⚠️ 名字的**字符集与长度校验已整段删除**（对齐改造 F4）：命令名现在来自文件系统，
+# 文件系统已经保证它是合法文件名；再叠一层自定义规则，只会让本可直接使用的外部
+# Skill 目录（含大写、下划线、超长名）被无理由拒绝，而那正是本次改造要消灭的摩擦。
 RESERVED_SUBCOMMANDS = frozenset({"reload", "off", "prompt", "run"})
+
+# 键名归一（对齐改造 F1）：标准用连字符，而 YAML 使用者习惯下划线，两种都要认。
+# 归一方向是「连字符 → 下划线」，因为下划线形态才能做 Python 标识符与字段名。
+HYPHEN_KEYS = ("allowed-tools", "when-to-use", "disable-model-invocation", "user-invocable")
+
+# 无对应能力的标准字段（对齐改造 F10）：名字 → 本版本的实际行为。
+# **必须逐条告知而不是静默忽略**——作者写 `background: true` 的预期是「后台跑、
+# 不阻塞」，实际却同步阻塞跑完；这个差异用户不知道就会误判 Skill 的行为。
+UNSUPPORTED_FIELDS: dict[str, str] = {
+    "background": "本版本不支持后台执行，将同步等待子对话跑完",
+    "agent": "本版本没有子代理类型的概念，该声明被忽略",
+    "effort": "本版本的思考强度由 /think 全局控制，该声明被忽略",
+    "hooks": "本版本不支持 Skill 级钩子，该声明被忽略",
+    "paths": "本版本不支持按路径自动激活，该声明被忽略",
+    "shell": "本版本的命令执行走系统默认 shell，该声明被忽略",
+}
 
 # 目录型 Skill 的入口文件名（spec F2）。一个目录含此文件即视为目录型 Skill，
 # 目录内其余文件是随附资源（模板/示例/脚本/参考文档）。
@@ -177,37 +191,57 @@ class SkillSpec:
 
     由 `parser.parse_skill` 产出，此后在整个系统里只读传递。
 
-    :param name: frontmatter 的 `name`，已通过 F4 的格式与保留词校验
-    :param description: 一句话说明。它是第一阶段清单里模型唯一能看到的信息，
-                        决定模型会不会想到去加载这个 Skill
+    :param command_name: **由发现层从文件系统路径推导**（目录型取目录名，单文件型取
+                         去扩展名的文件名），不来自 frontmatter。它是斜杠命令名、
+                         跨层覆盖的判定键、以及模型加载时使用的标识。
+
+                         这条是「外部 Skill 原样可用」的基础：从任何来源拉一个目录
+                         丢进去，命令名就是目录名，不必检查也不必修改 frontmatter。
+    :param display_name: frontmatter 的 `name`，**仅作展示标签**；缺省回填为 `command_name`
+    :param description: 一句话说明。它与 `when_to_use` 一起构成第一阶段清单里模型
+                        唯一能看到的信息，决定模型会不会想到去加载这个 Skill。
+                        frontmatter 未声明时由解析层从正文第一个非空段落提取
+    :param when_to_use: 触发说明，拼接在 `description` 之后进清单。把「这个 Skill 做什么」
+                        与「什么时候该用它」拆开写，避免 description 一个字段扛两个职责
+                        （实测中它会因此被写成两百多字符）
     :param body: SOP 正文原文（**未做参数替换**，替换发生在渲染时）
-    :param mode: 共享 / 独立
-    :param allowed_tools: 可见工具白名单。
-                          **None = 未声明白名单（不收窄工具集）**；
-                          **空 tuple = 声明了但被剔空**（F17 降级的输入）。
-                          两者语义完全不同，**不可合并**——前者是用户没打算限制，
-                          后者是用户想限制但白名单项全部失效，需要产出警告并降级。
-    :param history_messages: 独立模式带入子对话的主历史条数，>= 0；共享模式下无意义
-    :param model: 指定模型，**仅独立模式生效**（共享模式共用主对话的 Provider，
-                  换模型无从谈起）。共享模式声明它不算错误，只产出一条警告（F22）
+    :param granted_tools: `allowed-tools` 的原始声明串，**预授权语义**——
+                          列出的操作在本次执行内免于人工确认，**不限制**模型能调用什么。
+
+                          ⚠️ 与 C11 的 `allowed_tools`（收窄可见工具集）**语义相反**。
+                          用空元组而非 None 表示「未声明」：预授权没有「未声明 = 不收窄」
+                          那种三态，空就是不授权，一种含义一个取值。
+    :param forked: `context: fork` —— 开子对话执行、只回流结论。
+                   **它不再隐含「只能由用户触发」**，那由 `model_invocable` 单独表达
+    :param model_invocable: 模型是否可自行发起（`disable-model-invocation` 的反面），缺省真
+    :param user_invocable: 是否注册斜杠短命令、进补全菜单，缺省真
+    :param model: 指定模型，**仅 `forked` 时生效**（留在主对话时共用主对话的 Provider，
+                  换模型无从谈起）。非 fork 声明它不算错误，只产出一条 notice
     :param source: 来源层级，决定同名覆盖的胜负，并在 `/skills` 中展示
     :param entry_path: 单文件型 = 该 `.md` 文件；目录型 = 其中的 `SKILL.md`。
                        用于错误提示定位与 `/skills` 展示
-    :param resource_dir: **仅目录型非空**，指向 Skill 目录本身（F13）
+    :param resource_dir: **仅目录型非空**，指向 Skill 目录本身
     :param resource_files: 目录型的随附文件相对路径，按字典序、上限 RESOURCE_LIST_MAX
+    :param notices: 解析期产出的告知性提示（旧字段语义变更、无对应能力的标准字段）。
+                    **不是加载失败**——这些 Skill 照常可用，只是有些声明的效果与作者
+                    预期不同，必须让用户看见。随 spec 一路带到状态报告
     """
 
-    name: str
+    command_name: str
+    display_name: str
     description: str
+    when_to_use: Optional[str]
     body: str
-    mode: SkillMode
-    allowed_tools: Optional[tuple[str, ...]]
-    history_messages: int
+    granted_tools: tuple[str, ...]
+    forked: bool
+    model_invocable: bool
+    user_invocable: bool
     model: Optional[str]
     source: SkillSource
     entry_path: Path
     resource_dir: Optional[Path]
     resource_files: tuple[str, ...]
+    notices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -281,14 +315,17 @@ class SkillCommandInfo:
     由 `commands/skill_commands.py` 单向地转成真正的 `CommandSpec`。
     这样 skills 仍然是一个不被任何层反向依赖的叶子包。
 
-    :param name: 不带斜杠的 Skill 名
+    :param name: 不带斜杠的命令名（即 `SkillSpec.command_name`）
     :param description: 一句话说明（进 `/help` 与补全菜单）
-    :param mode: 供命令层在需要时区分两种执行路径
+    :param forked: 供命令层在需要时区分两种执行路径
+
+    注意本结构**只承载 `user_invocable` 为真的 Skill**——为假的那些根本不该走到
+    命令层（对齐改造 F8），过滤发生在管理器产出这批描述时，而不是命令层再判一次。
     """
 
     name: str
     description: str
-    mode: SkillMode
+    forked: bool
 
 
 @dataclass(frozen=True)

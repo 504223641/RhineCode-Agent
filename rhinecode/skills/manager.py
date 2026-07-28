@@ -57,7 +57,6 @@ from rhinecode.skills.models import (
     ReloadOutcome,
     SkillCatalog,
     SkillCommandInfo,
-    SkillMode,
     SkillSource,
     SkillSpec,
 )
@@ -381,11 +380,11 @@ class SkillManager:
         # ── ② 独立模式早返回（锁外）──
         # 本分支根本不动可变状态，本就不需要锁；且它含 has_short_command 这个
         # 跨层回调，按加锁约定 ② 必须在锁外。
-        if spec.mode is SkillMode.ISOLATED:
+        if spec.forked:
             hint = (
-                f"/{spec.name}"
-                if self._has_short_command(spec.name)
-                else f"/skills run {spec.name}"
+                f"/{spec.command_name}"
+                if self._has_short_command(spec.command_name)
+                else f"/skills run {spec.command_name}"
             )
             return ActivationResult(
                 status=ActivationStatus.ISOLATED, name=name, entry_hint=hint
@@ -620,7 +619,7 @@ class SkillManager:
         副作用：无（读不可变快照，无需持锁）。
         """
         for spec in self._catalog.skills:
-            if spec.name == name:
+            if spec.command_name == name:
                 return spec
         return None
 
@@ -716,20 +715,20 @@ class SkillManager:
             lines.append("（未发现任何 Skill）")
         else:
             for spec in catalog.skills:
-                mode = "共享" if spec.mode is SkillMode.SHARED else "独立"
+                mode = "子对话" if spec.forked else "主对话"
                 flags: list[str] = []
-                if spec.name in active_map:
+                if spec.command_name in active_map:
                     flags.append("已激活")
                 # 锁外调用跨层回调。
-                if self._has_short_command(spec.name):
-                    flags.append(f"短命令 /{spec.name}")
+                if self._has_short_command(spec.command_name):
+                    flags.append(f"短命令 /{spec.command_name}")
                 else:
-                    flags.append(f"需用 /skills run {spec.name}")
-                degrade = degrades.get(spec.name)
+                    flags.append(f"需用 /skills run {spec.command_name}")
+                degrade = degrades.get(spec.command_name)
                 if degrade is not None:
                     flags.append(_DEGRADE_LABEL[degrade])
                 lines.append(
-                    f"- {spec.name}（{_SOURCE_LABEL[spec.source]} · {mode}）"
+                    f"- {spec.command_name}（{_SOURCE_LABEL[spec.source]} · {mode}）"
                     f"：{spec.description}"
                 )
                 lines.append(f"    {' · '.join(flags)}")
