@@ -82,7 +82,7 @@ P0 解决「看清实际发生了什么」，P1a 解决「让 Claude 自己把�
 | 你想知道 | 读这份 |
 | --- | --- |
 | Skill 系统现在是什么行为 | `align/spec.md` |
-| 怎么写一个 Skill / 怎么从 CC 搬一个过来 | 仓库根 `CLAUDE.md` 的「新增 Skill」一节 |
+| 怎么写一个 Skill / 怎么从 CC 搬一个过来 | 仓库根 [`README.md` 的「Skill 系统」一节](../../README.md#skill-系统) |
 | 某条设计当初为什么那么定 | `spec.md`（原始）→ `align/spec.md`（改造理由） |
 | 实跑时到底发现了什么问题 | `acceptance/` 下四份，每条判据都分「机器判到了什么」与「据此做的判断」 |
 | 怎么用 `--trace` 排查行为问题 | `testing/p0-trace/spec.md` + 根 `CLAUDE.md` 的「常用命令」 |
