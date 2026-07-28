@@ -154,5 +154,76 @@ class ForkNestingGuardTest(_Base):
         self.assertIn("load_skill", m.fork_excluded_tools())
 
 
+class UserTriggerBypassesModelGateTest(_Base):
+    """
+    **`disable-model-invocation` 只挡模型，挡不到用户**。
+
+    ## 这组护栏钉的是一个真实缺陷（真实模型端到端场景 5 抓到）
+
+    早期版本的 `activate()` 把 `disable-model-invocation` 当成 Skill 的
+    **无条件属性**，于是用户敲 `/deploy` 也走进 NOT_MODEL_INVOCABLE 分支：
+    Skill 从未被真正激活（SOP 正文进不了动态槽位），模型只收到一句自包含
+    调用文本，又在清单上看到「仅用户可发起」，就回过头**让用户去执行
+    `/deploy`**——而那正是用户刚刚做过的事。
+
+    从用户视角是死循环，且**界面上看不出任何异常**：模型答得有理有据，
+    你只会以为自己命令敲错了。根子在于把两个正交维度混成了一个——
+    `disable-model-invocation` 判「**谁**在调用」，`context: fork` 判「**在哪**执行」。
+    """
+
+    def _deploy(self) -> SkillManager:
+        _write(
+            self.root,
+            "deploy",
+            "description: 部署\ndisable-model-invocation: true",
+            body="独一无二的正文标记。",
+        )
+        return self._manager()
+
+    def test_model_path_is_still_blocked(self) -> None:
+        """模型自行发起（缺省 by_model=True）仍被挡下，且不留激活态。"""
+        m = self._deploy()
+        result = m.activate("deploy", "")
+        self.assertIs(result.status, ActivationStatus.NOT_MODEL_INVOCABLE)
+        self.assertEqual(m.active_text(), "", "被挡下时不得留下激活态")
+
+    def test_user_path_actually_activates(self) -> None:
+        """
+        用户显式触发时**真的激活**——SOP 正文必须进得了动态槽位。
+
+        断言正文而不只是断言状态码：缺陷的实际危害正是「正文没进去」，
+        只看状态码的话，一个「返回 ACTIVATED 但没写激活列表」的实现也能通过。
+        """
+        m = self._deploy()
+        result = m.activate("deploy", "", by_model=False)
+        self.assertIs(result.status, ActivationStatus.ACTIVATED)
+        self.assertIn("独一无二的正文标记", m.active_text())
+
+    def test_default_is_fail_safe(self) -> None:
+        """
+        缺省值是 True（当作模型发起）。
+
+        新调用方忘了传参时，最坏结果是「模型被多挡一次」，
+        而不是「本该只许用户发起的 Skill 被模型悄悄跑了」。
+        """
+        import inspect
+
+        sig = inspect.signature(SkillManager.activate)
+        self.assertIs(sig.parameters["by_model"].default, True)
+
+    def test_conversation_layer_passes_by_model_false(self) -> None:
+        """
+        协调层的用户入口必须传 `by_model=False`。
+
+        这是端到端那半边——manager 支持了但调用方没传，缺陷照样存在。
+        """
+        import inspect
+
+        from rhinecode.conversation import ConversationManager
+
+        src = inspect.getsource(ConversationManager.run_skill)
+        self.assertIn("by_model=False", src)
+
+
 if __name__ == "__main__":
     unittest.main()

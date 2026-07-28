@@ -14,7 +14,7 @@ Skill 系统的全部文本产出（c11 T12–T15）。
 F12（$ARGUMENTS 替换）、F13（资源清单）、F24（自包含调用文本）。
 """
 
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from rhinecode.skills.models import (
     BODY_MAX_BYTES,
@@ -64,12 +64,25 @@ def _truncate(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
     return "\n".join(out), truncated
 
 
-def render_index(skills: Iterable[SkillSpec]) -> str:
+def render_index(
+    skills: Iterable[SkillSpec],
+    entry_hint: Optional[Callable[[SkillSpec], str]] = None,
+) -> str:
     """
     渲染第一阶段清单——模型在**启动时**看到的全部 Skill 信息（spec F6）。
 
     :param skills: 已按名字排序的 Skill 列表
+    :param entry_hint: 给出某个 Skill 的**真实用户入口命令**（如 `/deploy` 或
+                       `/skills run deploy`）。只对 `disable-model-invocation`
+                       的 Skill 有用——见下方「为什么需要它」。缺省 None 时
+                       退化为不带命令的旧措辞（纯函数测试与 Null 场景走这条）。
     :returns: 清单文本；**列表为空时返回空串**
+
+    **`entry_hint` 为什么需要**（真实模型端到端场景 5 抓到的）：清单原本只说
+    「你不能自行加载，只能建议用户执行对应命令」，却从不说明那条命令是什么。
+    实测模型于是**编了一条不存在的命令**（`rhine skill deploy`）告诉用户，
+    用户照着敲只会得到「未知命令」。短命令是否注册成功要问 `CommandRegistry`
+    （重名会跳过），渲染层自己算不出来，所以由调用方注入。
 
     只含命令名与两段说明，**不含任何 SOP 正文**——这正是「两阶段加载」
     第一阶段的定义：让模型知道有什么可用，但不为此付出上下文代价。
@@ -99,7 +112,10 @@ def render_index(skills: Iterable[SkillSpec]) -> str:
         if spec.forked:
             flags.append("子对话")
         if not spec.model_invocable:
-            flags.append("仅用户可发起")
+            # 把真实入口命令直接写进标注。不带 hint 时退回旧措辞——
+            # 模糊总比给一条错命令强。
+            hint = entry_hint(spec) if entry_hint is not None else ""
+            flags.append(f"仅用户可发起，请建议用户执行 {hint}" if hint else "仅用户可发起")
         suffix = f"（{'、'.join(flags)}）" if flags else ""
         text = spec.description
         if spec.when_to_use:

@@ -258,6 +258,7 @@ def build_app(
     # 它），而能跑子对话的协调层要到第 ⑤ 步才存在。属性注入让两者的构造顺序解耦，
     # 与 `memory_manager.notify` / `skill_manager.notify_activation` 是同一形态。
     load_skill_tool.run_fork = manager.run_forked_for_model
+    load_skill_tool.on_activated = manager.on_skill_activated
 
     # ⑥ 界面层。
     app = RhineApp(manager, cfg, command_registry, recorder=recorder)

@@ -833,13 +833,13 @@ class SkillStateHookTest(TraceHookBase):
             ["bind_tools", "activate", "deactivate", "activate", "clear_active", "reload"],
         )
 
-    def test_turn_grants_does_not_record(self) -> None:
-        """明确排除：turn_grants 每次执行前都被调用，埋进去会淹掉时间线。"""
+    def test_grants_for_spec_does_not_record(self) -> None:
+        """明确排除：grants_for_spec 每次触发都被调用，埋进去会淹掉时间线。"""
         sm = self._manager()
         sm.bind_tools(registered=frozenset({"read_file"}))
         before = len(self.records(T.SKILL_STATE))
         for _ in range(5):
-            sm.turn_grants()
+            sm.grants_for_spec(sm.get("demo"))
         self.assertEqual(len(self.records(T.SKILL_STATE)), before)
 
 

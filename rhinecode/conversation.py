@@ -378,7 +378,10 @@ class ConversationManager:
     # 领域方法（c10：命令解析已迁出到 commands 层，这里只做领域能力）
     # ------------------------------------------------------------------ #
     def submit_user_message(
-        self, content: str, display_content: Optional[str] = None
+        self,
+        content: str,
+        display_content: Optional[str] = None,
+        grant_skill: "Optional[SkillSpec]" = None,
     ) -> Iterator[AgentEvent]:
         """
         提交一条用户消息并启动 Agent 循环（普通对话与提示词命令共用的唯一入口）。
@@ -386,6 +389,11 @@ class ConversationManager:
         :param content: 模型实际接收的完整内容（语义历史）
         :param display_content: 界面/回放优先显示的原始输入（c10 双内容，
                                 仅提示词命令如 /init 需要设置；普通消息为 None）
+        :param grant_skill: 本次由哪个 Skill 触发（短命令路径传入）。它的
+                            `allowed-tools` 会在**本次执行内**生效，结束即撤销。
+                            **必须由 `_wrap_events` 在取过令牌之后授予**——
+                            在这之前授予的话，令牌把它一起圈了进去，撤销时保留下来，
+                            于是授权跟着常驻态一直活下去（实测踩过）。
         :returns: Agent 事件流（由 TUI Worker 消费）
 
         副作用：向 self.history 追加用户消息并写入会话存档（c9 F6）；
@@ -394,7 +402,7 @@ class ConversationManager:
         user_msg = Message(role="user", content=content, display_content=display_content)
         self.history.append(user_msg)
         self.memory_manager.record_message(user_msg)
-        return self._run()
+        return self._run(grant_skill=grant_skill)
 
     def cycle_thinking(self) -> str:
         """
@@ -666,7 +674,10 @@ class ConversationManager:
 
         副作用：修改激活列表；向主历史追加消息；发起 API 请求。
         """
-        result = self.skill_manager.activate(name, arguments)
+        # `by_model=False`：用户敲斜杠命令是显式动作，`disable-model-invocation`
+        # 那道闸门只挡模型（对齐改造 F8，两个维度正交）。不传的话
+        # `/deploy` 会被自己的闸门挡下，模型转头让用户去敲 `/deploy`——死循环。
+        result = self.skill_manager.activate(name, arguments, by_model=False)
 
         if result.status is ActivationStatus.NOT_FOUND:
             available = (
@@ -685,9 +696,13 @@ class ConversationManager:
                 self._run_forked_skill(spec, arguments, display), extra_skill=spec
             )
 
-        # 共享模式：激活成功，把自包含文本作为一条普通用户消息提交。
+        # 留在主对话：激活成功，把自包含文本作为一条普通用户消息提交，
+        # 并把「本次由谁触发」透传下去——授予与撤销都由 `_wrap_events` 负责，
+        # 顺序才对得上（先取令牌、再授予、finally 回滚到令牌）。
         events = self.submit_user_message(
-            render_invocation_text(spec, arguments), display_content=display
+            render_invocation_text(spec, arguments),
+            display_content=display,
+            grant_skill=spec,
         )
         if result.degrade is not None:
             # 降级必须让用户看见（F9）。在事件流最前面插一条 NOTICE——
@@ -1005,7 +1020,7 @@ class ConversationManager:
 
         return ask
 
-    def _run(self) -> Iterator[AgentEvent]:
+    def _run(self, grant_skill: "Optional[SkillSpec]" = None) -> Iterator[AgentEvent]:
         """
         构造一次 Agent 运行并返回其事件流。
 
@@ -1094,7 +1109,35 @@ class ConversationManager:
             self.memory_manager.record_message,
             options=RunOptions(),   # 主对话不排除任何工具
         )
-        return self._wrap_events(events)
+        return self._wrap_events(events, extra_skill=grant_skill)
+
+    def _grant_for_skill(self, spec: "SkillSpec") -> None:
+        """
+        为一个**刚被触发**的 Skill 授予预授权（F11/F12）。
+
+        :param spec: 被触发的 Skill
+
+        由三条触发路径共用：用户敲短命令（`run_skill`）、模型调加载工具
+        （经 `on_skill_activated` 回调）、以及 fork 子对话（`_wrap_events`）。
+        撤销统一由 `_wrap_events` 的 `finally` 负责。
+
+        副作用：向权限引擎追加本次执行级规则。
+        """
+        rules, _ = self.skill_manager.grants_for_spec(spec)
+        self._engine.grant_turn_rules(rules)
+
+    def on_skill_activated(self, name: str) -> None:
+        """
+        模型经加载工具激活一个共享模式 Skill 后的回调（由 `LoadSkillTool` 注入调用）。
+
+        必须在这里授权而不是在 `_wrap_events` 起点：模型可能在第 N 轮才激活，
+        那时外层的 `try` 早已进入，起点授权错过了它。
+
+        副作用：同 `_grant_for_skill`。
+        """
+        spec = self.skill_manager.get(name)
+        if spec is not None:
+            self._grant_for_skill(spec)
 
     def _wrap_events(
         self, events: Iterator[AgentEvent], extra_skill: "Optional[SkillSpec]" = None
@@ -1126,8 +1169,16 @@ class ConversationManager:
         其它停止原因（取消/出错/迭代上限）不触发笔记：非自然结束的对话大概率
         不完整，不值得沉淀。
         """
-        rules, _ = self.skill_manager.turn_grants(extra_skill)
-        token = self._engine.grant_turn_rules(rules)
+        # **只记录起点、不在这里授予**（F12）。授予发生在 Skill 被**触发**的那一刻
+        # （`run_skill` 或模型调 `load_skill`），因为共享模式 Skill 是常驻的——
+        # 若在这里按激活列表授予，用户跑过一次带写权限的 Skill 之后，
+        # 此后每一轮都会重新拿到授权，写操作从此静默免确认而用户毫不知情。
+        # **顺序不可调**：先取令牌，再授予。反过来的话令牌把本次授予也圈了进去，
+        # `finally` 的回滚就留着它不动——授权于是跟着 Skill 的常驻态一直活下去，
+        # 用户跑过一次带写权限的 Skill 之后每一轮都免确认而毫不知情（实测踩过）。
+        token = len(self._engine.turn_rules)
+        if extra_skill is not None:
+            self._grant_for_skill(extra_skill)
         try:
             for event in events:
                 if (

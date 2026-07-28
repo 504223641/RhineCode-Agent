@@ -236,7 +236,8 @@ class LayerPriorityTest(DiscoveryTestBase):
             "---\nname: s\ndescription: 内置\nmode: shared\nmodel: m\n---\n正文\n",
         )
         catalog = self._discover()
-        self.assertEqual(catalog.warnings, ())
+        notices = [n for spec in catalog.skills for n in spec.notices]
+        self.assertEqual(notices, [], "被覆盖那份的提示不该出现")
 
     def test_effective_skill_warning_is_kept(self) -> None:
         """反过来，生效那份的警告必须保留（不能一刀切全丢）。"""
@@ -245,8 +246,12 @@ class LayerPriorityTest(DiscoveryTestBase):
             "---\nname: s\ndescription: 项目级\nmode: shared\nmodel: m\n---\n正文\n",
         )
         catalog = self._discover()
-        self.assertEqual(len(catalog.warnings), 1)
-        self.assertIn("model", catalog.warnings[0])
+        # 提示挂在 spec 上（`catalog.warnings` 现在只承载运行期警告）。
+        # 「被覆盖那份的提示不发出」是**自动成立**的：报告只遍历 catalog.skills，
+        # 被覆盖的 spec 压根不在里面。
+        notices = [n for spec in catalog.skills for n in spec.notices]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("model", notices[0])
 
     def test_skills_sorted_by_name(self) -> None:
         """产出的 skills 按**命令名**排序（清单展示顺序稳定）。"""

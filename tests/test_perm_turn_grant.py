@@ -204,6 +204,46 @@ class GrantLifecycleTest(unittest.TestCase):
         self.assertIs(engine.decide(_bash("npm test")).decision, Decision.ALLOW)
 
 
+class GrantIsPerTriggerNotPerActivationTest(unittest.TestCase):
+    """
+    **授权跟「触发」走，不跟「激活态」走**（F12）。
+
+    ## 这条护栏钉的是一个真实缺陷
+
+    初版的 `turn_grants()` 从**激活列表**取规则。共享模式 Skill 是常驻的，
+    于是实测发现：用户跑一次 `/notetaker`（声明了 Write 授权）之后，
+    **此后整个会话的每一轮都会重新拿到那份授权**——写操作从此静默免确认，
+    而用户完全不知情。那正是 spec N3 要防的「在不知情的情况下失去确认机会」。
+
+    改成「谁触发就为谁授权」之后，授权的生命周期由调用方的 `try/finally` 界定，
+    与「Skill 正文是否常驻」彻底解耦。
+    """
+
+    def test_grants_come_from_the_triggered_spec_only(self) -> None:
+        """接口层面：取规则要传入具体的 spec，不再有「读激活列表」那条路。"""
+        from rhinecode.skills.manager import SkillManager
+
+        self.assertFalse(
+            hasattr(SkillManager, "turn_grants"),
+            "按激活列表取授权的旧入口必须已移除——它会让授权跟着常驻态一起长命",
+        )
+        self.assertTrue(callable(SkillManager.grants_for_spec))
+
+    def test_grants_for_spec_ignores_activation_state(self) -> None:
+        """
+        同一个 spec 无论激活与否，产出的规则都一样——它是**静态**函数。
+
+        这正是「授权与常驻态解耦」的形式化表达。
+        """
+        from rhinecode.skills.manager import SkillManager
+
+        spec = _spec("Write")
+        a, _ = SkillManager.grants_for_spec(spec)
+        b, _ = SkillManager.grants_for_spec(spec)
+        self.assertEqual(a, b)
+        self.assertEqual([r.tool for r in a], ["Write"])
+
+
 class GrantCannotBypassEarlierLayersTest(unittest.TestCase):
     """
     **本模块最重要的两条**：预授权翻不过前三层。

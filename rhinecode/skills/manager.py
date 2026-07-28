@@ -91,7 +91,7 @@ class SkillManager:
 
     生命周期：`__main__` 在启动早期构造它 → `startup()` 扫盘并做第一段白名单校验
     → MCP 连接完成后 `bind_tools()` 做第二段剪枝 → 交给 `ConversationManager` 持有，
-    此后每轮请求调 `index_text()` / `active_text()`，执行前调 `turn_grants()`。
+    此后每轮请求调 `index_text()` / `active_text()`；Skill 被触发时调 `grants_for_spec()`。
     """
 
     def __init__(
@@ -283,7 +283,7 @@ class SkillManager:
     # 就等于给「临界区内只做纯内存读写」这条不变量开了一个口子，下一个人照抄时
     # 很容易把回调也塞进去。宁可结构上不给这个机会。
     #
-    # **明确排除 `turn_grants()`**：它每次执行前都被调用，埋进去会把时间线淹掉。
+    # **明确排除 `grants_for_spec()`**：它每次触发都被调用，埋进去会把时间线淹掉。
     # 工具集快照只在 `bind_tools`（启动一次）记一次。
 
     def _trace_state(self, action: str, **extra) -> None:
@@ -307,13 +307,29 @@ class SkillManager:
 
     # ────────────────────────── 激活 ──────────────────────────
 
-    def activate(self, name: str, arguments: str) -> ActivationResult:
+    def activate(
+        self, name: str, arguments: str, by_model: bool = True
+    ) -> ActivationResult:
         """
         激活一个共享模式 Skill（spec F7/F30）。
 
         :param name: Skill 名（不带斜杠）
         :param arguments: 用户参数，原样保留
+        :param by_model: 本次是**模型自行发起**（True，加载工具那条路）还是
+                         **用户显式触发**（False，斜杠命令那条路）。
+                         只影响 `disable-model-invocation` 那一道判定。
         :returns: 三态 `ActivationResult`
+
+        **`by_model` 为什么必须存在**（真实模型端到端场景 5 抓到的缺陷）：
+        `disable-model-invocation` 判的是「**谁**在调用」，不是 Skill 的无条件属性。
+        它与「在哪执行」（`context: fork`）是正交的两个维度（对齐改造 F8）。
+        缺省值给 True 是 fail-safe：新调用方忘了传，最坏结果是「模型被多挡一次」，
+        而不是「本该只许用户发起的 Skill 被模型跑了」。
+
+        早期版本没有这个参数，于是用户敲 `/deploy` 也走进 NOT_MODEL_INVOCABLE 分支：
+        Skill 没被真正激活（SOP 正文进不了动态槽位），模型只收到一句自包含调用文本，
+        再看清单上写着「仅用户可发起」，就回过头**让用户去执行 `/deploy`**——
+        而那正是用户刚刚做过的事。从用户视角是一个死循环。
 
         **严格四段式，只有第 ③ 段持锁**（见模块 docstring 的加锁不变量）：
 
@@ -337,13 +353,10 @@ class SkillManager:
         # 一个既 `context: fork` 又 `disable-model-invocation` 的 Skill，
         # 该给出的是「你不能自行发起」而不是「去开子对话」——前者才是模型
         # 需要知道的下一步。
-        hint = (
-            f"/{spec.command_name}"
-            if self._has_short_command(spec.command_name)
-            else f"/skills run {spec.command_name}"
-        )
+        hint = self._entry_hint(spec)
 
-        if not spec.model_invocable:
+        # 只在**模型自行发起**时挡。用户敲斜杠命令是显式动作，这道闸门与他无关。
+        if by_model and not spec.model_invocable:
             return ActivationResult(
                 status=ActivationStatus.NOT_MODEL_INVOCABLE, name=name, entry_hint=hint
             )
@@ -449,6 +462,22 @@ class SkillManager:
 
     # ────────────────────── 注入（每轮调用）──────────────────────
 
+    def _entry_hint(self, spec: SkillSpec) -> str:
+        """
+        给出某个 Skill 的**真实用户入口命令**。
+
+        :param spec: 目标 Skill
+        :returns: `/名字`（短命令注册成功时）或 `/skills run 名字`（重名被跳过时）
+
+        副作用：无，但内部调 `_has_short_command` 这个**跨层回调**
+        （它会调进 `CommandRegistry`）。按加锁约定 ②，调用本方法时**不得持锁**。
+        """
+        return (
+            f"/{spec.command_name}"
+            if self._has_short_command(spec.command_name)
+            else f"/skills run {spec.command_name}"
+        )
+
     def index_text(self) -> str:
         """
         第一阶段清单文本，进系统提示的**稳定通道**（spec F6）。
@@ -457,7 +486,11 @@ class SkillManager:
 
         副作用：无。
         """
-        return render_index(self._catalog.skills)
+        # 传入 entry_hint：`disable-model-invocation` 的 Skill 要在清单里
+        # 直接给出真实入口命令，否则模型会自己编一条（实测编出了
+        # `rhine skill deploy`）。`_entry_hint` 里的 `_has_short_command`
+        # 是跨层回调——本方法不持锁，符合加锁约定 ②。
+        return render_index(self._catalog.skills, entry_hint=self._entry_hint)
 
     def active_text(self) -> str:
         """
@@ -496,31 +529,30 @@ class SkillManager:
 
         return text
 
-    def turn_grants(self, extra: "Optional[SkillSpec]" = None) -> tuple[list, list[str]]:
+    @staticmethod
+    def grants_for_spec(spec: "SkillSpec") -> tuple[list, list[str]]:
         """
-        取本次执行应当授予的预授权规则（对齐改造 F11/F12）。
+        取**单个** Skill 的预授权规则。
 
-        :param extra: 本次额外触发的 Skill（`context: fork` 走子对话时它不进激活列表，
-                      但它的 `allowed-tools` 同样该生效）
+        :param spec: 刚被触发的那个 Skill
         :returns: `(规则列表, 警告列表)`
 
-        取的是**当前全部激活 Skill** 的声明并集，加上 `extra`。
-        一次执行中可能有多个 Skill 先后触发，各自的授权叠加。
+        ## ⚠️ 为什么是「单个」而不是「全部激活项」
 
-        遵守加锁不变量：**持锁只取名字快照，翻译在锁外做**——`grants_for` 要解析
-        字符串、构造规则对象，那是纯计算但没有理由占着锁；更重要的是，
-        把任何「不只是内存读写」的东西放进临界区，都是在给后来者开一个口子。
+        初版取的是激活列表的并集，实测发现那**违反 F12**：共享模式 Skill 是常驻的，
+        于是用户跑一次 `/notetaker` 之后，此后整个会话的每一轮都会重新拿到它的
+        授权——写操作从此静默免确认，而用户完全不知情。那正是 N3 要防的
+        「在不知情的情况下失去一次确认机会」。
+
+        改成「谁触发就为谁授权」之后，授权的生命周期由调用方的 `try/finally`
+        界定，与「Skill 正文是否常驻」彻底解耦——这也正是 F12 那句
+        「Skill 正文的常驻与否不影响授权有效期」的实现。
+
+        本方法是**静态的**：它不读任何可变状态，因此也不需要锁。
 
         副作用：无。
         """
-        with self._lock:
-            names = [a.name for a in self._active]
-
-        by_name = {s.command_name: s for s in self._catalog.skills}
-        specs = [by_name[n] for n in names if n in by_name]
-        if extra is not None:
-            specs.append(extra)
-        return grants_for(specs)
+        return grants_for([spec])
 
     def fork_excluded_tools(self) -> frozenset[str]:
         """
@@ -714,7 +746,11 @@ class SkillManager:
         """
         index = self.index_text()
         active = self.active_text()
-        rules, grant_warnings = self.turn_grants()
+        # 报告里展示「当前激活项**若被触发**会授予什么」——它是给用户看的预览，
+        # 与运行期实际授权（谁触发就为谁授权）口径不同，故单独算。
+        by_name = {sp.command_name: sp for sp in self._catalog.skills}
+        active_specs = [by_name[a.name] for a in self._active if a.name in by_name]
+        rules, grant_warnings = grants_for(active_specs)
 
         lines = ["Skill 注入内容", "", "【第一阶段清单（稳定通道）】", ""]
         lines.append(index if index else "（空——未发现任何 Skill）")

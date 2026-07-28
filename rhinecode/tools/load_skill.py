@@ -101,6 +101,10 @@ class LoadSkillTool(Tool):
         # （它得先进注册中心，`bind_tools` 才数得到它），而能跑子对话的协调层
         # 要到第 ⑤ 步才存在。属性注入让两者的构造顺序解耦。
         self.run_fork = None
+        # 同为协调层注入：模型激活一个共享模式 Skill 后为它授予预授权。
+        # **必须在激活那一刻授予**——模型可能在第 N 轮才调本工具，那时外层
+        # `_wrap_events` 的 try 早已进入，起点授权错过了它。
+        self.on_activated = None
 
     def execute(self, args: dict) -> ToolResult:
         """
@@ -140,6 +144,8 @@ class LoadSkillTool(Tool):
             result = self._manager.activate(name, arguments)
 
             if result.status is ActivationStatus.ACTIVATED:
+                if self.on_activated is not None:
+                    self.on_activated(name)
                 output = f"已激活 Skill `{name}`，其完整指令已注入你的上下文，请按其步骤执行。"
                 if result.degrade is not None:
                     output += "\n" + _DEGRADE_NOTE[result.degrade]

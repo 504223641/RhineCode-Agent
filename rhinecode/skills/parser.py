@@ -204,8 +204,8 @@ def parse_skill(
     :param resource_files: 目录型的随附文件相对路径清单
     :returns: `(spec, reason, warnings)` 三元组。
               **`spec` 与 `reason` 恰有一个非 None**。
-              `warnings` 与 `spec.notices` 内容相同——前者供发现层做「被覆盖
-              就不发出」的过滤，后者随 spec 一路带到状态报告。
+              `warnings` **恒为空列表**——本函数的全部告知走 `spec.notices`
+              这一条通路（两边都返回会让报告打印两遍，见函数末尾的注释）。
 
     副作用：无。不读写文件、不改全局状态。
     """
@@ -353,8 +353,13 @@ def parse_skill(
             notices=tuple(notices),
         ),
         None,
-        # **同一批 notices 也作为 warnings 返回**：发现层已经有一套「只发出生效
-        # 那份的警告」的机制（低优先层被覆盖时它的警告不该发出去，否则用户会被
-        # 指去改一个根本没生效的文件）。复用它，而不是另建一条 notices 通路。
-        list(notices),
+        # **warnings 恒为空**：本函数的告知全部走 `spec.notices` 这一条通路。
+        #
+        # 曾经两边都返回过，结果是 `/skills` 报告把每条提示**打印两遍**
+        # （一次在「警告」段、一次在「字段提示」段）——实测发现的。
+        #
+        # 而发现层那套「被覆盖那份的警告不发出」的机制在这里是多余的：
+        # 报告只遍历 `catalog.skills`，被覆盖的 spec 压根不在里面，
+        # 它的 notices 自然跟着一起消失。
+        [],
     )

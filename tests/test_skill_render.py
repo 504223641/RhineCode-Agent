@@ -33,6 +33,7 @@ def _spec(
     when_to_use: str = None,
     resource_dir: Path = None,
     resource_files: tuple = (),
+    model_invocable: bool = True,
 ) -> SkillSpec:
     return SkillSpec(
         command_name=name,
@@ -42,7 +43,7 @@ def _spec(
         body=body,
         granted_tools=(),
         forked=forked,
-        model_invocable=True,
+        model_invocable=model_invocable,
         user_invocable=True,
         model=None,
         source=SkillSource.USER,
@@ -81,6 +82,27 @@ class IndexTest(unittest.TestCase):
         self.assertLessEqual(len(text.splitlines()), 210)
         self.assertIn("另有", text)
         self.assertIn("未列出", text)
+
+    def test_user_only_skill_carries_the_real_entry_command(self) -> None:
+        """
+        `disable-model-invocation` 的 Skill 要在清单里给出**真实入口命令**。
+
+        钉的是一个真实模型端到端场景里抓到的缺陷：清单原本只说「只能建议用户
+        执行对应命令」而从不说明那条命令是什么，模型于是编了一条不存在的
+        `rhine skill deploy` 告诉用户。命令是否注册成短命令要问 `CommandRegistry`
+        （重名会跳过），故由调用方注入。
+        """
+        spec = _spec("deploy", "部署", model_invocable=False)
+        text = render_index([spec], entry_hint=lambda s: f"/{s.command_name}")
+        self.assertIn("/deploy", text)
+        self.assertIn("仅用户可发起", text)
+
+    def test_entry_hint_omitted_falls_back_to_old_wording(self) -> None:
+        """不给 hint 时退回模糊措辞——模糊总比给一条错命令强。"""
+        spec = _spec("deploy", "部署", model_invocable=False)
+        text = render_index([spec])
+        self.assertIn("仅用户可发起", text)
+        self.assertNotIn("/deploy", text)
 
 
 class SubstituteTest(unittest.TestCase):

@@ -209,7 +209,7 @@ class SkillStartupTest(unittest.TestCase):
         self.assertIn("没有对应的工具类别", report)
         # 认识的那条仍照常生效
         sm = self.captured["conversation_kwargs"]["skill_manager"]
-        rules, _ = sm.turn_grants(sm.get("ext"))
+        rules, _ = sm.grants_for_spec(sm.get("ext"))
         self.assertIn("Bash", [r.tool for r in rules])
 
     # ---- AC38：项目级提示的零状态语义 ----

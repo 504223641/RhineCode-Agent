@@ -373,7 +373,7 @@ class ReloadTest(ManagerTestBase):
         m = self._manager()
         report = m.report()
         self.assertIn("加载失败", report)
-        self.assertIn("警告", report)
+        self.assertIn("字段提示", report)
 
     def test_prompt_report_has_three_sections(self) -> None:
         _write(self.user_skills / "a.md",
