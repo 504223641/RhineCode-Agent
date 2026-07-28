@@ -18,8 +18,37 @@ from typing import Optional
 from rhinecode.provider.base import Message
 from rhinecode.context.estimate import estimate_message_tokens
 
-# 从尾部保留原文的目标 token 量。
-RETAIN_TOKENS: int = 10000
+# 从尾部保留原文的目标 token 量的**上限**。
+#
+# 它曾经是个固定常量，直接当目标值用——那是一个已实测确认的缺陷（已知项 #8）：
+# 配了小窗口（如 8192）的模型上，保留区目标比整个窗口还大，早段恒为空，
+# **第二层摘要永远不会真正压缩**，而触发判据 `window - auto_margin` 已经是负数，
+# 于是每一次请求都尝试压缩、每一次都以「无可摘要的早段」告终，历史一路涨到溢出。
+#
+# 现在改成「按窗口比例算，再夹在上限内」，见 `retain_budget`。
+RETAIN_TOKENS_CAP: int = 10000
+
+# 保留区占窗口的比例。取 0.16 使**默认窗口 65536 及以上逐字维持原行为**：
+# 65536 × 0.16 = 10485 > 10000，被上限夹回 10000，与改造前完全一致。
+# 小窗口才会真正生效：8192 × 0.16 ≈ 1310。
+RETAIN_RATIO: float = 0.16
+
+
+def retain_budget(window: int) -> int:
+    """
+    按窗口算出「尾部保留原文」的 token 预算。
+
+    :param window: 上下文窗口上限（token），来自 `config.context_window`
+    :returns: 保留区目标 token 量，恒 >= 1（避免非正窗口把预算算成 0）
+
+    副作用：无（纯函数）。
+
+    **为什么是比例而不是绝对值**：保留多少「近期原文」本质上是个相对量——
+    在 64K 窗口里留 10K 原文是合理的（15%），在 8K 窗口里留 10K 就是荒谬的
+    （比窗口还大）。绝对下限由 `MIN_RETAIN_MESSAGES` 兜底：无论 token 预算多小，
+    至少留 5 条，近期上下文不会被压没。
+    """
+    return max(1, min(int(window * RETAIN_RATIO), RETAIN_TOKENS_CAP))
 # 无论 token 多少，至少保留的尾部消息条数（保证近期上下文不被压没）。
 MIN_RETAIN_MESSAGES: int = 5
 # 草稿与正式摘要的分隔标记：模型先自由写分析草稿，再在此标记后写正式摘要。
@@ -52,12 +81,12 @@ BOUNDARY_MESSAGE: str = (
 )
 
 
-def compute_retain_index(history: list[Message]) -> int:
+def compute_retain_index(history: list[Message], window: int) -> int:
     """
     计算「保留区」的起始下标：history[idx:] 保留原文，history[:idx] 交给摘要。
 
     步骤：
-    1. 从尾部往前累加 estimate_message_tokens，直到累计 >= RETAIN_TOKENS
+    1. 从尾部往前累加 estimate_message_tokens，直到累计 >= retain_budget(window)
        或已数满 MIN_RETAIN_MESSAGES 条——两条件谁先「让保留区更靠前（保留更多）」就用谁，
        即取更小的 idx。
     2. 把该 idx 回退到「<= idx 的最近一个 role='user' 消息下标」，保证保留区以 user 开头，
@@ -65,6 +94,9 @@ def compute_retain_index(history: list[Message]) -> int:
     3. 找不到任何 user（极端情况）→ 返回 0（即全部保留、无可摘要段，由上层按 noop 处理）。
 
     :param history: 当前对话历史
+    :param window: 上下文窗口上限（token）。保留区预算由它按比例算出——
+                   **不可省**：固定预算在小窗口下会让早段恒为空、第二层永不压缩
+                   （已知项 #8 的实测缺陷）。
     :returns: 保留区起始下标 idx（0 表示没有可摘要的早段）
 
     副作用：无。
@@ -73,12 +105,14 @@ def compute_retain_index(history: list[Message]) -> int:
     if n == 0:
         return 0
 
+    budget = retain_budget(window)
+
     # —— 步骤 1：先按 token 从尾部回数，得到「按 token」的边界 idx_tok ——
     acc = 0
-    idx_tok = n  # 若循环没提前 break，说明全部累加仍不足 RETAIN_TOKENS，边界落在 0
+    idx_tok = n  # 若循环没提前 break，说明全部累加仍不足 budget，边界落在 0
     for i in range(n - 1, -1, -1):
         acc += estimate_message_tokens(history[i])
-        if acc >= RETAIN_TOKENS:
+        if acc >= budget:
             idx_tok = i
             break
     else:

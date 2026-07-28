@@ -58,6 +58,34 @@ def _abbrev(n: int) -> str:
     return f"{n / 1024:.1f}K".replace(".0K", "K")
 
 
+# 自动触发余量占窗口的比例与上限。
+#
+# 与 `summarize.RETAIN_RATIO` 同因同源（已知项 #8）：余量原本是固定 13000，
+# 在 8192 窗口下 `window - auto_margin` 直接变成**负数**，触发判据恒真——
+# 每一次请求都尝试压缩，而保留区预算又比窗口还大导致每次都「无可摘要的早段」，
+# 于是白跑一整轮判断、历史照样涨到溢出。
+#
+# 0.21 这个比例使**默认窗口 65536 及以上逐字维持原行为**：
+# 65536 × 0.21 = 13762 > 13000，被上限夹回 13000。
+MARGIN_RATIO: float = 0.21
+MARGIN_CAP: int = 13000
+
+
+def _derive_margin(window: int) -> int:
+    """
+    按窗口算出自动触发的安全余量。
+
+    :param window: 上下文窗口上限（token）
+    :returns: 余量 token 数；恒 < window，保证 `window - margin` 为正
+              （否则触发判据恒真，压缩会在每一次请求上空转）
+
+    副作用：无（纯函数）。
+    """
+    margin = min(int(window * MARGIN_RATIO), MARGIN_CAP)
+    # 兜底：窗口小到离谱时也必须留出正的触发线。
+    return max(1, min(margin, max(1, window - 1)))
+
+
 class ContextManager:
     """
     编排两层压缩并维护会话级状态。构造于 ConversationManager（仅 DeepSeek 工具模式），
@@ -70,7 +98,7 @@ class ContextManager:
         model: str,
         window: int,
         store_dir: Path,
-        auto_margin: int = 13000,
+        auto_margin: Optional[int] = None,
         recorder: "Optional[TraceRecorderProtocol]" = None,
     ) -> None:
         """
@@ -78,7 +106,8 @@ class ContextManager:
         :param model: 模型名（当前仅备用/日志语义，摘要请求直接走 provider 默认模型）
         :param window: 上下文窗口上限（token），来自 config.context_window
         :param store_dir: 第一层存盘目录（<项目根>/.rhinecode/context/）
-        :param auto_margin: 自动触发的安全余量（默认 13K，防估算误差）。
+        :param auto_margin: 自动触发的安全余量（防估算误差）。**缺省 None = 按窗口比例推导**，
+                            见 `_derive_margin`；显式传值则原样采用（测试用）。
                             手动 /compact 不设余量阈值（用户主动触发即尽力压缩），故无对应参数。
         :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
         """
@@ -86,7 +115,9 @@ class ContextManager:
         self._provider = provider
         self._model = model
         self.window = window
-        self.auto_margin = auto_margin
+        self.auto_margin = (
+            auto_margin if auto_margin is not None else _derive_margin(window)
+        )
         self._offloader = Offloader(store_dir)
         # 估算锚点：上次 API 的精确 prompt_tokens 及其覆盖的历史条数；None 表示暂无锚点。
         self._anchor_tokens: Optional[int] = None
@@ -211,7 +242,7 @@ class ContextManager:
         副作用：发起一次 provider.stream_chat（不带工具）；成功时原地修改 history 列表内容；
                 更新 _anchor_tokens / _summary_failures / _circuit_broken。
         """
-        idx = compute_retain_index(history)
+        idx = compute_retain_index(history, self.window)
         before_count = len(history)
         if idx <= 0:
             # 没有可摘要的早段（全部落在保留区），不动历史、不计失败。
