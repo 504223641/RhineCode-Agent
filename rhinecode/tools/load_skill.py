@@ -10,9 +10,8 @@
 - **第二阶段**（按需，本工具）：模型判断该用某个 Skill 时调本工具，
   完整 SOP 才被拉进上下文。
 
-**本工具是系统级的**（spec F8）：它不受任何 Skill 的 `allowed_tools` 白名单约束
-（在 `ToolPolicy.exempt` 里恒常存在）。否则模型激活第一个 Skill 之后，
-若那个 Skill 的白名单没写 `load_skill`，它就再也加载不了第二个 Skill 了。
+**本工具是系统级的**：`system_serial = True` 使它直接放行并强制串行执行，
+既不进权限管线也不进只读并发桶。理由见下方类文档。
 
 依赖方向：`tools/load_skill.py → skills/manager.py`。本模块**不由
 `tools/registry.py` 导入**（`ToolRegistry.default()` 里没有它），而是由
@@ -61,6 +60,7 @@ class LoadSkillTool(Tool):
     """
 
     name = "load_skill"
+    system_serial = True
     read_only = True
     description = (
         "加载一个 Skill 的完整操作指令。当用户的请求与某个已列出的 Skill 匹配时调用它，"
@@ -94,24 +94,35 @@ class LoadSkillTool(Tool):
                         全部委托给它——激活列表的唯一真相在 manager 里。
         """
         self._manager = manager
+        # 由协调层在构造后注入（与 `memory_manager.notify` 同形态）。
+        # 签名：`(skill 名, 参数) -> 结论文本`。
+        #
+        # 为什么用属性注入而不是构造参数：本工具在装配的**第 ④ 步之前**就要注册
+        # （它得先进注册中心，`bind_tools` 才数得到它），而能跑子对话的协调层
+        # 要到第 ⑤ 步才存在。属性注入让两者的构造顺序解耦。
+        self.run_fork = None
 
     def execute(self, args: dict) -> ToolResult:
         """
-        激活指定的 Skill。
+        按名发起一个 Skill。
 
         :param args: 含 `name`（必填）与 `arguments`（可选）
-        :returns: 三态结果——
-                  ACTIVATED → ok=True，**只回一句简短确认**；
+        :returns: 四态结果——
+                  ACTIVATED → ok=True，**只回一句简短确认**（正文走系统提示槽位）；
+                  FORKED → ok=True，回子对话跑完的**结论正文**；
                   NOT_FOUND → ok=False，附可用名字列表；
-                  ISOLATED → ok=False，附用户实际可执行的入口
+                  NOT_MODEL_INVOCABLE → ok=False，附用户实际可执行的入口
 
-        **成功时为什么不把正文回灌给模型**：正文已经通过系统提示的
+        **ACTIVATED 时为什么不把正文回灌给模型**：正文已经通过系统提示的
         「已激活 Skill」槽位注入了，且**每轮都在**。在工具结果里再回一份，
         等于同一段文本在上下文里存两份，纯浪费——而且工具结果是一次性的，
         随着对话变长会被上下文压缩挪走，系统提示槽位才是持久的那份。
 
-        副作用：修改 `SkillManager` 的激活列表；可能触发状态栏刷新回调。
-        本方法自行兜底全部异常（Tool 契约要求绝不向上抛）。
+        **FORKED 时反过来必须回灌正文**：子对话的过程完全不进主历史，
+        它跑出来的结论就是模型这次动作的唯一产出，不回灌等于白跑。
+
+        副作用：修改 `SkillManager` 的激活列表；FORKED 分支会**跑一整条子对话**
+        （可能读写文件、执行命令、弹确认面板）。本方法自行兜底全部异常。
         """
         try:
             name = args.get("name")
@@ -148,16 +159,36 @@ class LoadSkillTool(Tool):
                     summary=f"未找到 {name}",
                 )
 
-            # ISOLATED：模型不能自行发起独立模式（它会开一条新的子对话，
-            # 必须由用户显式触发）。给出用户实际可执行的入口——
-            # entry_hint 由 manager 保证指向真实存在的命令。
+            if result.status is ActivationStatus.NOT_MODEL_INVOCABLE:
+                # 作者显式声明了 `disable-model-invocation`，模型不得自行发起。
+                # 给出用户实际可执行的入口——entry_hint 由 manager 保证指向
+                # **真实存在**的命令（重名时它会指向 /skills run 而不是短命令）。
+                return ToolResult(
+                    ok=False,
+                    output=(
+                        f"Skill `{name}` 声明了只能由用户主动触发，你无法自行加载它。\n"
+                        f"请建议用户执行：{result.entry_hint}"
+                    ),
+                    summary=f"{name} 需用户触发",
+                )
+
+            # FORKED：开一条子对话完整跑完，把结论作为本次调用的结果回灌。
+            if self.run_fork is None:
+                # 协调层没注入回调（例如某些只构造工具不构造会话的测试路径）。
+                # 明确说明而不是假装成功——静默降级会让模型以为 Skill 跑过了。
+                return ToolResult(
+                    ok=False,
+                    output=(
+                        f"Skill `{name}` 需要在子对话中执行，但当前运行环境不支持。\n"
+                        f"请建议用户执行：{result.entry_hint}"
+                    ),
+                    summary=f"{name} 无法在此发起",
+                )
+            conclusion = self.run_fork(name, arguments)
             return ToolResult(
-                ok=False,
-                output=(
-                    f"Skill `{name}` 是独立模式，需要由用户主动触发，你无法加载它。\n"
-                    f"请建议用户执行：{result.entry_hint}"
-                ),
-                summary=f"{name} 需用户触发",
+                ok=True,
+                output=conclusion,
+                summary=f"子对话执行 {name}",
             )
         except Exception as exc:  # noqa: BLE001 —— Tool 契约：绝不向上抛
             return ToolResult(

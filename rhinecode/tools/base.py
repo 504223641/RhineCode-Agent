@@ -68,12 +68,22 @@ class Tool(ABC):
     - parameters：参数的 JSON Schema（顶层 type 固定为 "object"），随工具描述发给模型
     - read_only：是否只读。True 表示无副作用（如读文件、搜索），执行前不需确认且可并发；
                  False 表示有副作用（如写文件、执行命令），执行前需用户确认且须串行执行
+    - system_serial：**系统级串行工具**。为 True 时循环直接放行并强制串行执行，
+                 既不进权限管线也不进只读并发桶。
+
+                 目前唯一的使用者是加载 Skill 的工具：它可能开一整条子对话
+                 （`context: fork` 的 Skill 由模型自行发起时），而在只读并发桶里
+                 跑子对话意味着子对话自己的确认面板会从线程池的工作线程里弹出来。
+
+                 之所以做成工具自己声明的标志、而不是在循环里按名字判断：
+                 循环不该认识任何具体工具的名字，那会让 agent 层反向依赖 skills 层。
     """
 
     name: str = ""
     description: str = ""
     parameters: dict = {}
     read_only: bool = True
+    system_serial: bool = False
 
     @abstractmethod
     def execute(self, args: dict) -> ToolResult:

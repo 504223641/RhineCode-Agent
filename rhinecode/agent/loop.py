@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
-from rhinecode.tools.policy import ToolPolicy
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.agent.collector import StreamCollector
 from rhinecode.agent.events import (
@@ -44,7 +43,7 @@ from rhinecode.agent.events import (
 from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
-from rhinecode.permission import Decision, DecisionResult, PermissionEngine, to_request
+from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
 from rhinecode.trace import (
     SCOPE_MAIN,
     NullRecorder,
@@ -131,20 +130,22 @@ class RunOptions:
         锚点会让主历史的估算彻底失准。
     :param allow_summary: 是否允许 C8 的第二层（LLM 摘要）。子对话传 False，
         只跑零成本的第一层存盘（spec F21）。
-    :param tool_policy: 取本轮工具收窄策略的**回调**。
+    :param excluded_tools: 本轮**不提供给模型、且调用了也要拒绝**的工具名。
 
-        **必须是 callable 而不是一个值**：模型可能在第 N 轮调 `load_skill`
-        激活一个 Skill，第 N+1 轮的工具集就该按它的白名单收窄。若在 `run()`
-        调用前算一次、整轮不变，F14 的运行期自愈与 AC14 的逐轮断言都会失效——
-        这与下面 `dynamic` 参数改成 callable 是同一个理由。
+        C11 曾用一个三元组（allowed / exempt / excluded）表达 Skill 的工具收窄，
+        随白名单语义改为预授权而整体移除；**只有排除项还有用户**——
+        子对话靠它禁用加载工具来防止「Skill 里再激活 Skill」的无限嵌套。
 
-        为 None 时完全不收窄（C10 行为）。
+        既然只剩一种用途，就塌缩成一个集合：静态值即可，不需要像 C11 那样
+        每轮回调求值（子对话的排除集在整条子对话里恒定不变）。
+
+        缺省空集 = 不排除任何工具。
     """
 
     max_iterations: int = MAX_ITERATIONS
     record_usage: bool = True
     allow_summary: bool = True
-    tool_policy: Optional[Callable[[], Optional[ToolPolicy]]] = None
+    excluded_tools: frozenset = frozenset()
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
@@ -290,60 +291,45 @@ class Agent:
     # 工具集策略
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _visible(name: str, policy: Optional[ToolPolicy]) -> bool:
+    def _visible(name: str, excluded: frozenset) -> bool:
         """
-        判断某个工具在本轮是否对模型可见（c11 T31）。
+        判断某个工具在本轮是否对模型可见。
 
         :param name: 工具名
-        :param policy: 本轮策略；None 表示不收窄
+        :param excluded: 本轮被排除的工具名集合
         :returns: 可见为 True
 
-        优先级 `excluded` > `exempt` > `allowed`，三级各有其不可调换的理由：
-        - `excluded` 最高：它是「无论如何都不许出现」（子对话禁用 `load_skill`），
-          若被 `exempt` 翻掉，子对话就能嵌套激活 Skill 了（违反 F23）；
-        - `exempt` 次之：`load_skill` 必须能穿透任何白名单，否则模型激活
-          第一个 Skill 后就再也加载不了第二个；
-        - `allowed` 最后：为 None 时不收窄。
+        **排除既作用于「发不发 schema」也作用于「调了认不认」**，两处缺一不可：
+        只做前者的话，模型仍可能凭训练先验硬造出一次调用，而那次调用会照常执行——
+        子对话的防嵌套防线就此失效。
 
         副作用：无。
         """
-        if policy is None:
-            return True
-        if name in policy.excluded:
-            return False
-        if name in policy.exempt:
-            return True
-        if policy.allowed is None:
-            return True
-        return name in policy.allowed
+        return name not in excluded
 
-    def _visible_names(self, policy: Optional[ToolPolicy]) -> str:
+    def _visible_names(self, excluded: frozenset) -> str:
         """
         列出本轮实际可见的工具名，用于「工具不可用」的回灌文案。
 
-        :param policy: 本轮收窄策略
+        :param excluded: 本轮被排除的工具名集合
         :returns: 顿号分隔的工具名；无注册中心时给一句兜底说明
 
-        与注册中心取交集而不是直接摊开 `policy.allowed | policy.exempt`：
-        后者含 `ask_user` / `present_plan` 这两个不在注册中心、只在 Plan Mode
-        规划阶段才拼接的特殊工具，列给模型只会误导它去调一个当前不存在的东西。
+        只摊开注册中心里的名字，不含 `ask_user` / `present_plan`——那两个不在
+        注册中心、只在 Plan Mode 规划阶段才拼接，列给模型只会误导它去调一个
+        当前不存在的东西。
 
         副作用：无。
         """
         if self._registry is None:
             return "（当前没有可用工具）"
-        names = set(self._registry.names())
-        if policy is not None and policy.allowed is not None:
-            names &= policy.allowed | policy.exempt
-        if policy is not None:
-            names -= policy.excluded
+        names = set(self._registry.names()) - set(excluded)
         return "、".join(sorted(names)) if names else "（当前没有可用工具）"
 
     def _schema_for(
         self,
         plan_mode: bool,
         execution_phase: bool,
-        policy: Optional[ToolPolicy] = None,
+        excluded: frozenset = frozenset(),
     ) -> Optional[list[dict]]:
         """
         计算本轮要发给模型的工具 schema 列表。
@@ -351,17 +337,16 @@ class Agent:
         - 无注册中心 → None（纯对话，不带工具）
         - Plan Mode 且未获批执行（规划阶段）→ 只读工具 + ask_user/present_plan 特殊工具
         - 其余（普通模式，或 Plan Mode 已获批的执行阶段）→ 全部工具
-        - 无论哪种，都再按 `policy` 过滤一遍（c11 F14）
+        - 无论哪种，都再排除 `excluded` 里的工具（防子对话嵌套）
 
         :param plan_mode: 是否处于 Plan Mode
         :param execution_phase: Plan Mode 下是否已获批进入执行阶段
-        :param policy: 本轮 Skill 工具收窄策略；None 表示不收窄（C10 行为）
+        :param excluded: 本轮要排除的工具名集合；空集表示不排除
         :returns: 工具 schema 列表，或 None
 
         **`plan_schemas()` 在过滤之后才拼接**，因此 `ask_user` / `present_plan`
         天然不受白名单影响（spec F15）——它们是流程控制工具，与 Skill 声明的
-        业务能力无关。这样也就不必依赖 `policy.exempt` 里恰好含这两个名字，
-        少一处隐式耦合。
+        业务能力无关。
         """
         if self._registry is None:
             return None
@@ -371,9 +356,9 @@ class Agent:
             self._registry.readonly_schemas() if planning else self._registry.schemas()
         )
 
-        if policy is not None:
+        if excluded:
             base = [
-                s for s in base if self._visible(s["function"]["name"], policy)
+                s for s in base if self._visible(s["function"]["name"], excluded)
             ]
 
         if planning:
@@ -471,8 +456,8 @@ class Agent:
 
             # 工具集收窄策略**每轮现取**（c11 F14）：模型可能上一轮才激活 Skill，
             # 这一轮的工具集就该随之收窄；注册中心也可能因 MCP 重载增删了工具。
-            policy = options.tool_policy() if options.tool_policy is not None else None
-            tools = self._schema_for(plan_mode, execution_phase, policy)
+            excluded = options.excluded_tools
+            tools = self._schema_for(plan_mode, execution_phase, excluded)
 
             # 上一轮有工具被用户拒绝 → **本轮一件工具都不发**（硬约束）。
             # 理由见 DENIED_BY_USER_FEEDBACK 的注释：回灌文案是软约束、模型可以不听，
@@ -559,7 +544,7 @@ class Agent:
             yield from self._execute(
                 tool_calls, results, ctx,
                 engine, ask, clarify, approve_plan,
-                cancel_event, policy,
+                cancel_event, excluded,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -627,7 +612,7 @@ class Agent:
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
-        policy: Optional[ToolPolicy] = None,
+        excluded: frozenset = frozenset(),
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -675,13 +660,30 @@ class Agent:
                 serial.append((tc, None, None))
                 ctx.unknown_count += 1
                 continue
+            # 系统级串行工具**强制走串行、不进只读并发桶**（对齐改造 F8）。
+            #
+            # 理由是它现在可能开一整条子对话（`context: fork` 的 Skill 由模型自行
+            # 发起时）。在只读并发桶里跑子对话意味着：子对话自己的确认面板会从
+            # 线程池的工作线程里弹出来，而那正是 C11 加锁不变量那一课的同型场景，
+            # 只是后果更重——那次是状态栏刷新，这次是整条交互链。
+            #
+            # 给一个 ALLOW 决策直接放行：它与改造前的实际效果相同（`read_only=True`
+            # 会在权限引擎的只读简化分支被直接放行），只是不再经过引擎。
+            if tool.system_serial and self._visible(tc.name, excluded):
+                ctx.known_count += 1
+                serial.append((
+                    tc,
+                    tool,
+                    DecisionResult(Decision.ALLOW, Layer.RULE, "系统级工具，免确认"),
+                ))
+                continue
             # 工具存在，但**本轮没发给模型**（被 Skill 白名单收窄掉了）。
             # 模型仍可能凭训练先验硬造出这样一次调用——实测 DeepSeek 就在
             # 只发了 4 个工具的情况下调出了 `edit_file`，参数名还全对，于是
             # 一个「只读审阅」的窄白名单 Skill 动手改了代码。照常执行等于
             # 让 allowed_tools「提升选对工具准确率」的作用彻底失效，
             # 故这里拒绝并回灌结构化原因，让模型改用可见工具（不终止循环）。
-            if not self._visible(tc.name, policy):
+            if not self._visible(tc.name, excluded):
                 out_of_scope.append(tc)
                 ctx.unknown_count += 1
                 continue
@@ -720,15 +722,19 @@ class Agent:
             else:
                 serial.append((tc, tool, decision))
 
-        # 被工具收窄挡下的：不执行，回灌结构化原因并告知可用工具
+        # 被排除挡下的：不执行，回灌结构化原因并告知可用工具。
+        #
+        # **这条分支在本轮改造后只剩一个用户：子对话的防嵌套。** Skill 的工具收窄
+        # 已随白名单语义变更而移除，普通对话里 `excluded` 恒为空、这里恒不触发。
+        # 但它不能删——排除只是不发 schema，模型仍可能凭训练先验硬造出调用，
+        # 没有这道判定的话那次调用会照常执行，嵌套防线就此失效。
         for tc in out_of_scope:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = ToolResult(
                 ok=False,
                 output=(
-                    f"[工具不可用] {tc.name} 不在当前 Skill 声明的工具集内，"
-                    f"本轮未提供给你，因此没有执行。\n"
-                    f"当前可用工具：{self._visible_names(policy)}。\n"
+                    f"[工具不可用] {tc.name} 本轮未提供给你，因此没有执行。\n"
+                    f"当前可用工具：{self._visible_names(excluded)}。\n"
                     f"请改用其中之一；若确实必须用 {tc.name}，请说明理由让用户决定。"
                 ),
                 summary="不在当前工具集内",
