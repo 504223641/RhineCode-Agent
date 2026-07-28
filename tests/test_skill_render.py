@@ -11,7 +11,6 @@ from pathlib import Path
 from rhinecode.skills.models import (
     BODY_MAX_LINES,
     DegradeKind,
-    SkillMode,
     SkillSource,
     SkillSpec,
     TOTAL_MAX_LINES,
@@ -30,17 +29,21 @@ def _spec(
     name: str = "s",
     description: str = "说明",
     body: str = "SOP 正文",
-    mode: SkillMode = SkillMode.SHARED,
+    forked: bool = False,
+    when_to_use: str = None,
     resource_dir: Path = None,
     resource_files: tuple = (),
 ) -> SkillSpec:
     return SkillSpec(
-        name=name,
+        command_name=name,
+        display_name=name,
         description=description,
+        when_to_use=when_to_use,
         body=body,
-        mode=mode,
-        allowed_tools=None,
-        history_messages=0,
+        granted_tools=(),
+        forked=forked,
+        model_invocable=True,
+        user_invocable=True,
         model=None,
         source=SkillSource.USER,
         entry_path=Path("/tmp") / f"{name}.md",
@@ -53,18 +56,18 @@ class IndexTest(unittest.TestCase):
     """第一阶段清单（AC6）。"""
 
     def test_contains_name_mode_description_but_no_body(self) -> None:
-        """清单含名字/模式/说明，**不含任何 SOP 正文**——这是两阶段加载的定义。"""
+        """清单含命令名/标记/说明，**不含任何 SOP 正文**——这是两阶段加载的定义。"""
         text = render_index(
             [
                 _spec("alpha", "第一个", body="绝密正文AAA"),
-                _spec("beta", "第二个", body="绝密正文BBB", mode=SkillMode.ISOLATED),
+                _spec("beta", "第二个", body="绝密正文BBB", forked=True),
             ]
         )
         self.assertIn("alpha", text)
         self.assertIn("第一个", text)
-        self.assertIn("共享", text)
+        self.assertIn("alpha", text)
         self.assertIn("beta", text)
-        self.assertIn("独立", text)
+        self.assertIn("子对话", text)
         self.assertNotIn("绝密正文", text)
 
     def test_empty_list_returns_empty_string(self) -> None:

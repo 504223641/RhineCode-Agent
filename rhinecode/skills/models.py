@@ -365,12 +365,6 @@ class ReloadOutcome:
                           热更新时只丢弃并警告（详见 manager.reload 的注释）
     :param warnings: 全部警告，含「下次启动会失败」这条关键提示
     :param errors: 本次扫描的加载失败记录
-    :param lint: 作者期体检建议（写法可改进但不影响运行，见 validation.lint_skill）。
-                 **与 warnings 分开**：warnings 说的是「这次运行发生了什么」
-                 （MCP 没连上、Skill 被丢弃），lint 说的是「你的文件可以写得更好」。
-                 混在一起的话，一条长 description 的提醒会和真实的运行期故障
-                 并列出现，久而久之两者都会被无视。
-                 缺省空 tuple，既有构造点无需改动。
     """
 
     added: tuple[str, ...]
@@ -379,4 +373,3 @@ class ReloadOutcome:
     dropped_fatal: tuple[str, ...]
     warnings: tuple[str, ...]
     errors: tuple[SkillLoadError, ...]
-    lint: tuple[str, ...] = ()

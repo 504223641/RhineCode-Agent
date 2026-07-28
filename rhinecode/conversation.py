@@ -647,11 +647,6 @@ class ConversationManager:
             lines.append("")
             lines.append("警告：")
             lines.extend(f"- {w}" for w in outcome.warnings)
-        # 作者期体检（1.1）：reload 是作者改文件的**编辑循环**，反馈必须落在这里。
-        if outcome.lint:
-            lines.append("")
-            lines.append("体检建议（不影响运行，但值得改）：")
-            lines.extend(f"- {item}" for item in outcome.lint)
         return "\n".join(lines)
 
     def run_skill(
@@ -836,7 +831,7 @@ class ConversationManager:
         #    `__exit__` 可能压根不跑（比如 TUI 退出竞态里 `call_from_thread` 抛
         #    RuntimeError），而 Textual 复用池化线程，泄漏出去的 `isolated:<name>`
         #    会污染后续复用该线程的主对话运行。见 `tui/app.py` 的 `_do_stream`。
-        with self._recorder.scope(isolated_scope(spec.name)):
+        with self._recorder.scope(isolated_scope(spec.command_name)):
             sub_provider = (
                 self._provider_for(spec.model) if spec.model else self._provider
             )

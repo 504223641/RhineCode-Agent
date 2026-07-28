@@ -272,10 +272,6 @@ class SkillManager:
             dropped_fatal=(),
             warnings=tuple(warnings),
             errors=new_catalog.errors,
-            # 作者期体检（1.1）：reload 是作者的**编辑循环**——改文件、reload、
-            # 看反馈、再改。体检结果必须出现在这里，否则作者要专门去敲 `/skills`
-            # 才看得到，而那时他多半已经以为自己写对了。
-            lint=tuple(lint_skills(new_catalog.skills, registered)),
         )
 
     # ────────────────────── 行为记录埋点（trace）──────────────────────
@@ -482,7 +478,7 @@ class SkillManager:
             snapshot = list(self._active)
         catalog = self._catalog  # 不可变，锁外取引用安全
 
-        by_name = {s.name: s for s in catalog.skills}
+        by_name = {s.command_name: s for s in catalog.skills}
         items: list[tuple[SkillSpec, str]] = []
         for item in snapshot:
             spec = by_name.get(item.name)
@@ -615,7 +611,7 @@ class SkillManager:
         project = [s for s in self._catalog.skills if s.source is SkillSource.PROJECT]
         if not project:
             return None
-        names = "、".join(s.name for s in project)
+        names = "、".join(s.command_name for s in project)
         location = (
             str(self._project_root / ".rhinecode" / "skills")
             if self._project_root
@@ -684,13 +680,13 @@ class SkillManager:
             lines.extend(["", "警告："])
             lines.extend(f"- {w}" for w in warnings)
 
-        # 作者期体检（1.1）。**单列一段、排在警告之后**：
-        # 警告说的是「这次运行发生了什么」，体检说的是「你的文件可以写得更好」，
-        # 混排会让两者互相稀释。
-        lint = lint_skills(catalog.skills, registered)
-        if lint:
-            lines.extend(["", "体检建议（不影响运行，但值得改）："])
-            lines.extend(f"- {item}" for item in lint)
+        # 解析期产出的告知（旧字段语义变更、无对应能力的标准字段）。
+        # **单列一段、排在警告之后**：警告说的是「这次运行发生了什么」，
+        # 这里说的是「你的声明与实际行为有出入」，混排会让两者互相稀释。
+        notices = [n for spec in catalog.skills for n in spec.notices]
+        if notices:
+            lines.extend(["", "字段提示（不影响运行，但与你的声明有出入）："])
+            lines.extend(f"- {item}" for item in notices)
 
         # 项目级 Skill 的信任模型告知（spec N8）。**从启动打印挪到了这里**：
         # 启动时 `print()` 发生在 Textual 接管屏幕之前，内容被 alternate screen

@@ -96,6 +96,39 @@ def _as_bool(value, default: bool) -> bool:
     return default
 
 
+def _split_outside_parens(text: str) -> list[str]:
+    """
+    按空白与逗号切分，但**括号内的分隔符不算数**。
+
+    :param text: 形如 `Bash(git add *) Bash(git commit *), Read` 的声明串
+    :returns: 切分后的条目列表
+
+    ⚠️ 不能直接 `text.split()`：标准里最常见的写法恰恰是
+    `allowed-tools: Bash(git add *) Bash(git commit *)`——括号内**必然含空格**，
+    朴素切分会把一条声明劈成 `Bash(git` 与 `add` 与 `*)` 三段，
+    然后三段都因为「不认识的工具类别」被丢掉，而用户只会看到「预授权没生效」。
+
+    副作用：无。
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and (ch.isspace() or ch == ","):
+            if buf:
+                parts.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
 def _as_tool_list(value) -> tuple[str, ...]:
     """
     把 `allowed-tools` 的取值读成字符串元组。
@@ -111,7 +144,7 @@ def _as_tool_list(value) -> tuple[str, ...]:
     if value is None:
         return ()
     if isinstance(value, str):
-        raw = [part for chunk in value.split(",") for part in chunk.split()]
+        raw = _split_outside_parens(value)
     elif isinstance(value, list):
         raw = [str(item) for item in value]
     else:
@@ -171,7 +204,8 @@ def parse_skill(
     :param resource_files: 目录型的随附文件相对路径清单
     :returns: `(spec, reason, warnings)` 三元组。
               **`spec` 与 `reason` 恰有一个非 None**。
-              `warnings` 是非致命提示，**成功时也可能非空**，失败时恒为空列表。
+              `warnings` 与 `spec.notices` 内容相同——前者供发现层做「被覆盖
+              就不发出」的过滤，后者随 spec 一路带到状态报告。
 
     副作用：无。不读写文件、不改全局状态。
     """
@@ -319,5 +353,8 @@ def parse_skill(
             notices=tuple(notices),
         ),
         None,
-        [],
+        # **同一批 notices 也作为 warnings 返回**：发现层已经有一套「只发出生效
+        # 那份的警告」的机制（低优先层被覆盖时它的警告不该发出去，否则用户会被
+        # 指去改一个根本没生效的文件）。复用它，而不是另建一条 notices 通路。
+        list(notices),
     )

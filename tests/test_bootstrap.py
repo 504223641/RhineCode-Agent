@@ -175,30 +175,25 @@ class FatalErrorTest(BootstrapFixture):
                 build_app(_cfg(), user_dir=self.user_dir)
         self.assertEqual(str(ctx.exception), "Provider 初始化错误：坏协议")
 
-    def test_skill_typo_raises_before_mcp_connect(self) -> None:
-        """AC29：白名单笔误时抛异常，且 connect_all 一次都没被调用。"""
-        skills = self.user_dir / "skills"
+    def test_unknown_granted_tool_no_longer_fatal(self) -> None:
+        """
+        `allowed-tools` 里的无法识别项**不再让装配失败**（对齐改造 F13）。
+
+        C11 时它是三类致命错误之一（白名单笔误 fail-fast）；对齐之后
+        `allowed-tools` 是预授权声明，来源可能是外部工具，出现本系统没有的
+        工具名是正常现象，只警告不致命。
+
+        连带：`connect_all` 现在**会**被调用（C11 时它被 fail-fast 挡在前面）。
+        """
+        skills = self.work / ".rhinecode" / "skills"
         skills.mkdir(parents=True, exist_ok=True)
-        (skills / "bad.md").write_text(
-            textwrap.dedent(
-                """\
-                ---
-                name: bad
-                description: 白名单里有个不存在的工具名
-                allowed_tools: [read_fil]
-                ---
-                正文
-                """
-            ),
+        (skills / "ext.md").write_text(
+            "---\nname: ext\ndescription: d\nallowed-tools: [WebFetch]\n---\n正文\n",
             encoding="utf-8",
         )
-        with patch.object(bootstrap.MCPManager, "connect_all") as connect:
-            with self.assertRaises(BootstrapError) as ctx:
-                build_app(_cfg(), user_dir=self.user_dir)
-        connect.assert_not_called()
-        message = str(ctx.exception)
-        self.assertIn("read_fil", message)
-        self.assertIn("bad.md", message)
+        result = build_app(_cfg(), user_dir=self.user_dir)
+        self.addCleanup(lambda: result.cleanup("test"))
+        self.assertIsNotNone(result.app)
 
     def test_no_sys_exit_inside_factory(self) -> None:
         """
@@ -398,19 +393,35 @@ class SubprocessTest(unittest.TestCase):
         # 不开记录时不产生任何 traces 目录（AC4 的子进程侧）
         self.assertFalse((self.tmp / ".rhinecode" / "traces").exists())
 
-    def test_bootstrap_error_reaches_stderr_without_prefix_duplication(self) -> None:
-        """装配错误经 BootstrapError 抛出后，入口原样打印、不再拼前缀（AC32）。"""
-        work = self.tmp / "typo-work"
+    def test_unknown_granted_tool_starts_normally_in_subprocess(self) -> None:
+        """
+        真起一个子进程验：`allowed-tools` 写了本系统没有的工具名 → **正常启动**。
+
+        C11 时同一份样本会以退出码 1 终止（白名单笔误 fail-fast）。
+        对齐之后它只是一条警告——本条用例就是那次行为反转的子进程级护栏。
+        """
+        work = self.tmp / "ext-work"
         (work / ".rhinecode" / "skills").mkdir(parents=True, exist_ok=True)
-        (work / ".rhinecode" / "skills" / "typo.md").write_text(
-            "---\nname: typo\ndescription: 笔误\nallowed_tools: [read_fil]\n---\n正文\n",
+        (work / ".rhinecode" / "skills" / "ext.md").write_text(
+            "---\nname: ext\ndescription: 外部来的\nallowed-tools: [WebFetch]\n---\n正文\n",
             encoding="utf-8",
         )
-        proc = self._run("--config", str(self._good_config()), cwd=work)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("read_fil", proc.stderr)
-        self.assertIn("typo.md", proc.stderr)
-        self.assertNotIn("Traceback", proc.stderr)
+        # 用 `_launch_until_trace`：启动成功意味着进程会一直跑着 TUI，
+        # 不能用 `_run`（它会等到超时）。产出记录即证明它跨过了装配。
+        traces_dir = work / ".rhinecode" / "traces"
+
+        def probe():
+            files = sorted(traces_dir.glob("*.jsonl")) if traces_dir.exists() else []
+            return files[0] if files and files[0].stat().st_size > 0 else None
+
+        path = self._launch_until_trace(
+            "--config", str(self._good_config()), "--trace", cwd=work, probe=probe
+        )
+        records = _read(path)
+        self.assertTrue(
+            any(r["type"] == "session_start" for r in records),
+            "装配跨过去了才会有 session_start",
+        )
 
     def test_trace_flag_creates_default_file(self) -> None:
         """AC23 形态一：`--trace` 不带值 → 缺省路径下产出可解析的记录。"""

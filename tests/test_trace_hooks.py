@@ -26,7 +26,6 @@ from rhinecode.permission.models import PermissionMode
 from rhinecode.permission.rules import RuleSet, Rule
 from rhinecode.provider.base import Message, StreamChunk, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
-from rhinecode.tools.policy import ToolPolicy
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.trace.models import SCOPE_MAIN, SCOPE_NOTES, SCOPE_SUMMARY, TraceEventType
 from rhinecode.trace.recorder import TraceRecorder, bind_scope
@@ -340,13 +339,8 @@ class ToolOutcomeTest(TraceHookBase):
         provider = ScriptedProvider(
             [_tool_round("edit_file", args={"path": "a"}), _text_round()]
         )
-        options = RunOptions(
-            tool_policy=lambda: ToolPolicy(
-                allowed=frozenset({"read_file"}),
-                exempt=frozenset(),
-                excluded=frozenset(),
-            )
-        )
+        # 排除 edit_file → 模型调它会落进 out_of_scope 分支。
+        options = RunOptions(excluded_tools=frozenset({"edit_file"}))
 
         self.run_loop(provider, registry, options=options)
 
@@ -821,7 +815,7 @@ class SkillStateHookTest(TraceHookBase):
             has_short_command=lambda _n: True,
             recorder=self.rec,
         )
-        sm.startup(frozenset({"read_file"}))
+        sm.startup()
         return sm
 
     def test_activate_deactivate_clear_reload_each_record_once(self) -> None:
@@ -831,7 +825,7 @@ class SkillStateHookTest(TraceHookBase):
         sm.deactivate("demo")
         sm.activate("demo", "")
         sm.clear_active()
-        sm.reload(frozenset({"read_file"}), frozenset({"read_file"}))
+        sm.reload()
 
         actions = [r["action"] for r in self.records(T.SKILL_STATE)]
         self.assertEqual(
@@ -839,13 +833,13 @@ class SkillStateHookTest(TraceHookBase):
             ["bind_tools", "activate", "deactivate", "activate", "clear_active", "reload"],
         )
 
-    def test_tool_policy_does_not_record(self) -> None:
-        """明确排除：tool_policy 每轮被调用，埋进去会淹掉时间线。"""
+    def test_turn_grants_does_not_record(self) -> None:
+        """明确排除：turn_grants 每次执行前都被调用，埋进去会淹掉时间线。"""
         sm = self._manager()
         sm.bind_tools(registered=frozenset({"read_file"}))
         before = len(self.records(T.SKILL_STATE))
         for _ in range(5):
-            sm.tool_policy(frozenset({"read_file"}))
+            sm.turn_grants()
         self.assertEqual(len(self.records(T.SKILL_STATE)), before)
 
 

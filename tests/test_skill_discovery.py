@@ -1,8 +1,10 @@
 """
 Skill 三层目录扫描单测（c11 T11）。
 
-覆盖 spec AC2（单文件型与目录型都被发现）、AC3（三层同名按优先级覆盖、整份替换）、
-AC5（坏文件不阻断其余）、AC31（层内同名去重确定性）。
+覆盖：单文件型与目录型都被发现、**命令名来自文件系统路径**（对齐改造 F2）、
+三层同名按优先级覆盖且整份替换、坏文件不阻断其余。
+
+C11 的「层内同名去重」用例整段删除——命令名现在来自路径，同一目录下不可能重名。
 
 用真实临时目录而非 mock 文件系统：本模块的职责就是「和文件系统打交道」，
 mock 掉它等于什么也没测。
@@ -13,7 +15,7 @@ import unittest
 from pathlib import Path
 
 from rhinecode.skills.discovery import discover
-from rhinecode.skills.models import RESOURCE_LIST_MAX, SkillMode, SkillSource
+from rhinecode.skills.models import RESOURCE_LIST_MAX, SkillSource
 
 
 def _write(path: Path, text: str) -> None:
@@ -59,7 +61,7 @@ class ScanTest(DiscoveryTestBase):
         _write(self.user_skills / "beta" / "template.txt", "模板内容")
 
         catalog = self._discover()
-        names = [s.name for s in catalog.skills]
+        names = [s.command_name for s in catalog.skills]
         self.assertEqual(names, ["alpha", "beta"])
 
         alpha = catalog.skills[0]
@@ -71,11 +73,22 @@ class ScanTest(DiscoveryTestBase):
         self.assertEqual(beta.resource_dir, self.user_skills / "beta")
         self.assertEqual(beta.resource_files, ("template.txt",))
 
-    def test_name_wins_over_filename(self) -> None:
-        """name 与文件名不一致时以 frontmatter 的 name 为准。"""
+    def test_path_wins_over_frontmatter_name(self) -> None:
+        """
+        **命令名来自路径，frontmatter 的 name 只做显示**（对齐改造 F2）。
+
+        这与 C11 恰好相反，是「外部 Skill 原样可用」的地基：从任何来源拉一个
+        目录丢进去，命令名就是目录名，不必检查也不必修改 frontmatter。
+        """
         _write(self.user_skills / "whatever.md", _skill_text("real-name"))
         catalog = self._discover()
-        self.assertEqual([s.name for s in catalog.skills], ["real-name"])
+        self.assertEqual([s.command_name for s in catalog.skills], ["whatever"])
+        self.assertEqual(catalog.skills[0].display_name, "real-name")
+
+    def test_directory_name_is_the_command_name(self) -> None:
+        _write(self.user_skills / "my-pack" / "SKILL.md", _skill_text("别的名字"))
+        catalog = self._discover()
+        self.assertEqual([s.command_name for s in catalog.skills], ["my-pack"])
 
     def test_resource_files_sorted_excluding_entry_and_truncated(self) -> None:
         """资源清单：不含 SKILL.md、按字典序、超上限被截断（F13）。"""
@@ -110,37 +123,53 @@ class ScanTest(DiscoveryTestBase):
         _write(self.user_skills / "notes.txt", "随手记")
         _write(self.user_skills / "ok.md", _skill_text("ok"))
         catalog = self._discover()
-        self.assertEqual([s.name for s in catalog.skills], ["ok"])
+        self.assertEqual([s.command_name for s in catalog.skills], ["ok"])
         self.assertEqual(catalog.errors, ())
 
-    def test_four_bad_samples_do_not_block_the_rest(self) -> None:
-        """四种坏样本同时存在 → 好的照常可用，errors 含四条各自原因（AC5）。"""
+    def test_bad_samples_do_not_block_the_rest(self) -> None:
+        """
+        坏样本不阻断其余。
+
+        ⚠️ 与 C11 相比**失败面小了很多**：缺 description（改从正文提取）、
+        名字含大写（不再校验）都不再是失败。真正还会失败的只剩「YAML 坏了」
+        「正文为空」「目录型缺入口」——它们让 Skill 真的没法用。
+        """
         _write(self.user_skills / "good.md", _skill_text("good"))
         _write(self.user_skills / "bad-yaml.md", "---\nname: [坏\n---\n正文\n")
-        _write(self.user_skills / "no-desc.md", "---\nname: x\n---\n正文\n")
-        _write(self.user_skills / "bad-name.md", "---\nname: BAD\ndescription: d\n---\n正文\n")
+        _write(self.user_skills / "empty-body.md", "---\nname: x\n---\n   \n")
+        _write(self.user_skills / "no-desc.md", "---\nname: x\n---\n这段会成为说明\n")
+        _write(self.user_skills / "UpperName.md", "---\ndescription: d\n---\n正文\n")
         _write(self.user_skills / "dir-no-entry" / "readme.md", "不是入口")
 
         catalog = self._discover()
-        self.assertEqual([s.name for s in catalog.skills], ["good"])
-        self.assertEqual(len(catalog.errors), 4)
+        self.assertEqual(
+            sorted(s.command_name for s in catalog.skills),
+            ["UpperName", "good", "no-desc"],
+        )
+        self.assertEqual(len(catalog.errors), 3)
         reasons = " | ".join(e.reason for e in catalog.errors)
         self.assertIn("解析失败", reasons)
-        self.assertIn("description", reasons)
-        self.assertIn("不合法", reasons)
+        self.assertIn("正文为空", reasons)
         self.assertIn("SKILL.md", reasons)
 
-    def test_intra_layer_duplicate_resolved_by_sort_order(self) -> None:
-        """层内同名：字典序在前的生效，另一条进 errors（AC31/F29）。"""
-        _write(self.user_skills / "aaa.md", _skill_text("dup", "先到的"))
-        _write(self.user_skills / "zzz.md", _skill_text("dup", "后到的"))
+    def test_reserved_subcommand_name_rejected(self) -> None:
+        """
+        命令名取了 `/skills` 的保留子命令词 → 加载失败。
 
+        这是命令名**仅剩的**校验（对齐改造 F4）：字符集与长度不再校验，
+        文件系统已保证名字合法，再叠一层自定义规则只会让本可直接使用的外部
+        Skill 目录（含大写、下划线、超长名）被无理由拒绝。
+        """
+        _write(self.user_skills / "run.md", _skill_text("x"))
+        catalog = self._discover()
+        self.assertEqual(catalog.skills, ())
+        self.assertIn("保留子命令词", catalog.errors[0].reason)
+
+    def test_uppercase_and_long_names_now_accepted(self) -> None:
+        """C11 会判这两个名字非法；现在一律接受。"""
+        _write(self.user_skills / "MyLongSkillNameThatExceedsThirtyTwoChars.md", _skill_text("x"))
         catalog = self._discover()
         self.assertEqual(len(catalog.skills), 1)
-        self.assertEqual(catalog.skills[0].description, "先到的")
-        self.assertEqual(len(catalog.errors), 1)
-        self.assertIn("与同层", catalog.errors[0].reason)
-        self.assertEqual(catalog.errors[0].path.name, "zzz.md")
 
 
 class LayerPriorityTest(DiscoveryTestBase):
@@ -167,9 +196,9 @@ class LayerPriorityTest(DiscoveryTestBase):
         """
         覆盖是整份替换，不做字段合并（AC3）。
 
-        造两层字段互补的样本反证：项目级只写必填字段，用户级额外声明了
-        allowed_tools 与 isolated 模式。若实现做了字段合并，项目级那份就会
-        「继承」到用户级的白名单与模式——这里断言它没有。
+        造两层字段互补的样本反证：项目级只写基本字段，用户级额外声明了
+        预授权与 fork。若实现做了字段合并，项目级那份就会「继承」到用户级的
+        声明——这里断言它没有。
         """
         _write(self.project_skills / "s.md", _skill_text("s", "项目级"))
         _write(
@@ -182,9 +211,8 @@ class LayerPriorityTest(DiscoveryTestBase):
         catalog = self._discover()
         won = catalog.skills[0]
         self.assertIs(won.source, SkillSource.PROJECT)
-        self.assertIsNone(won.allowed_tools)
-        self.assertIs(won.mode, SkillMode.SHARED)
-        self.assertEqual(won.history_messages, 0)
+        self.assertEqual(won.granted_tools, ())
+        self.assertFalse(won.forked)
         self.assertIn("项目级", won.description)
         self.assertNotIn("用户级正文", won.body)
 
@@ -199,7 +227,7 @@ class LayerPriorityTest(DiscoveryTestBase):
         """
         被覆盖那份的警告不该发出去。
 
-        内置层的 s 是共享模式却声明了 model（会产出 F22 警告），
+        内置层的 s 不是 fork 却声明了 model（会产出一条提示），
         但它被项目级覆盖了——若仍发出该警告，用户会被指去改一个根本没生效的文件。
         """
         _write(self.project_skills / "s.md", _skill_text("s", "项目级"))
@@ -218,15 +246,15 @@ class LayerPriorityTest(DiscoveryTestBase):
         )
         catalog = self._discover()
         self.assertEqual(len(catalog.warnings), 1)
-        self.assertIn("共享模式", catalog.warnings[0])
+        self.assertIn("model", catalog.warnings[0])
 
     def test_skills_sorted_by_name(self) -> None:
-        """产出的 skills 按名字排序（清单展示顺序稳定）。"""
-        _write(self.user_skills / "z.md", _skill_text("zeta"))
-        _write(self.builtin_dir / "a.md", _skill_text("alpha"))
-        _write(self.project_skills / "m.md", _skill_text("mid"))
+        """产出的 skills 按**命令名**排序（清单展示顺序稳定）。"""
+        _write(self.user_skills / "zeta.md", _skill_text("z"))
+        _write(self.builtin_dir / "alpha.md", _skill_text("a"))
+        _write(self.project_skills / "mid.md", _skill_text("m"))
         catalog = self._discover()
-        self.assertEqual([s.name for s in catalog.skills], ["alpha", "mid", "zeta"])
+        self.assertEqual([s.command_name for s in catalog.skills], ["alpha", "mid", "zeta"])
 
 
 if __name__ == "__main__":
