@@ -35,8 +35,21 @@ class PermissionEngine:
 
     :ivar file_ruleset: 启动时从三层 YAML 加载的规则集（本会话内不变）
     :ivar session_rules: 会话级临时规则（「本会话放行」登记于此，关程序即失效）
+    :ivar turn_rules: **本次执行**级临时规则（Skill 的 `allowed-tools` 预授权登记于此）。
+        与 `session_rules` 同型、同求值逻辑，只是命更短——用户发出下一条消息即清空。
     :ivar mode: 当前权限模式（默认 DEFAULT，可经 /perm 运行时切换）
     :ivar load_errors: 配置加载阶段收集的可读错误（供上层提示，不阻断启动）
+
+    ## 三级规则的优先级
+
+        turn_rules（本次执行）→ session_rules（本会话）→ file_ruleset（三层配置）
+
+    三者合并后仍由 `RuleSet.evaluate` 统一求值，**deny 依旧优先**。
+
+    预授权之所以做成「第③层的又一级规则」而不是新造一层，是因为它在语义上
+    **恰好等价于**用户在确认面板上选「本会话放行」，只是有效期更短。复用同一套
+    求值逻辑之后，「预授权不得绕过黑名单与路径沙箱」这条自动成立——
+    那两层排在第③层**之前**，压根轮不到规则说话。
     """
 
     def __init__(
@@ -52,6 +65,7 @@ class PermissionEngine:
         """
         self.file_ruleset = file_ruleset
         self.session_rules: list[Rule] = []
+        self.turn_rules: list[Rule] = []
         self.mode = mode
         self.load_errors: list[str] = load_errors or []
 
@@ -107,8 +121,14 @@ class PermissionEngine:
                     Decision.DENY, Layer.SANDBOX, f"路径越界，超出项目工作目录：{request.specifier}"
                 )
 
-        # ③ 规则：会话级规则在前、文件级在后合并；deny 优先求值。
-        merged = RuleSet(self.session_rules + self.file_ruleset.rules)
+        # ③ 规则：本次执行级 → 会话级 → 文件级，依次合并；deny 优先求值。
+        #
+        # ⚠️ 本层位于①黑名单与②沙箱**之后**，这个顺序是预授权安全性的全部依据：
+        # 一个声明「放行全部命令」的 Skill 也翻不过前两层。改动合并点位置之前，
+        # 先看 `tests/test_perm_turn_grant.py` 里那两条护栏。
+        merged = RuleSet(
+            self.turn_rules + self.session_rules + self.file_ruleset.rules
+        )
         hit = merged.evaluate(request)
         if hit is not None:
             return hit
@@ -134,6 +154,33 @@ class PermissionEngine:
     def add_session_rule(self, rule: Rule) -> None:
         """登记一条会话级规则（「本会话放行」调用）；仅存内存，关程序即失效。"""
         self.session_rules.append(rule)
+
+    def grant_turn_rules(self, rules: "list[Rule]") -> None:
+        """
+        授予一批**本次执行内有效**的规则（Skill 的 `allowed-tools` 预授权）。
+
+        :param rules: 待追加的规则，通常 `effect="allow"`、`source="skill"`
+
+        追加而非替换：一次执行中可能有多个 Skill 先后被触发（用户敲了短命令，
+        模型又自行加载了另一个），各自的授权应当叠加。
+
+        副作用：修改 `turn_rules`。**调用方必须保证与 `revoke_turn_rules` 成对**，
+        且撤销要放在 `finally` 里——否则一次异常终止就会让授权泄漏到下一次执行。
+        """
+        self.turn_rules.extend(rules)
+
+    def revoke_turn_rules(self) -> None:
+        """
+        撤销全部本次执行级规则。
+
+        **整体清空而非按条移除，且幂等**：按条移除需要调用方记住自己授予了哪些，
+        任何一条记漏就会永久泄漏；而异常路径上「记住了但没走到移除」正是最容易
+        发生的情形。整体清空让「撤销」成为一个无需任何前置状态的操作，
+        重复调用也安全。
+
+        副作用：清空 `turn_rules`。
+        """
+        self.turn_rules.clear()
 
     def persist_local_rule(self, rule_string: str) -> bool:
         """

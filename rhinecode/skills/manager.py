@@ -61,14 +61,7 @@ from rhinecode.skills.models import (
     SkillSpec,
 )
 from rhinecode.skills.render import render_active_section, render_index
-from rhinecode.skills.validation import (
-    FatalToolName,
-    check_builtin_tool_names,
-    collect_exempt_notices,
-    lint_skills,
-    prune_mcp_tool_names,
-)
-from rhinecode.tools.policy import ToolPolicy
+from rhinecode.skills.validation import grants_for
 # trace 是只依赖标准库的叶子包，从 skills 依赖它不会形成环
 from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol
 
@@ -98,7 +91,7 @@ class SkillManager:
 
     生命周期：`__main__` 在启动早期构造它 → `startup()` 扫盘并做第一段白名单校验
     → MCP 连接完成后 `bind_tools()` 做第二段剪枝 → 交给 `ConversationManager` 持有，
-    此后每轮请求调 `index_text()` / `active_text()` / `tool_policy()`。
+    此后每轮请求调 `index_text()` / `active_text()`，执行前调 `turn_grants()`。
     """
 
     def __init__(
@@ -179,107 +172,72 @@ class SkillManager:
 
     # ──────────────────────── 生命周期 ────────────────────────
 
-    def startup(self, known: frozenset[str]) -> list[FatalToolName]:
+    def startup(self) -> None:
         """
-        启动时扫盘并做第一段白名单校验（spec F16 第一段）。
+        启动时扫盘。
 
-        :param known: 已知工具名全集
-                      （注册中心当前全部名字 ∪ `{ask_user, present_plan}`）
-        :returns: 致命项列表。**本方法不自行退出进程**——是否 fail-fast 由
-                  `__main__` 决定，因为只有它知道此刻该做哪些清理
+        **不再有「白名单校验」这一步**（对齐改造 F13）：白名单收窄能力已移除，
+        `allowed-tools` 现在是预授权声明，其无法识别项只警告不致命，
+        因此启动不会再因为一个 Skill 的工具名写错而退出。
 
-        副作用：读三层目录（扫盘在锁外）、替换 `_catalog`、追加 `_runtime_warnings`。
+        副作用：读三层目录（扫盘在锁外）、替换 `_catalog`、重置 `_runtime_warnings`。
         """
         # 扫盘在锁外：它要读几十个文件，不该占着锁。
         catalog = discover(self._project_root, self._user_dir, self._builtin_dir)
-
-        fatals = check_builtin_tool_names(catalog.skills, known)
-        notices = collect_exempt_notices(catalog.skills, _EXEMPT_TOOLS)
+        # 预授权声明里无法识别的项，在这里一次性收集成警告。
+        _, grant_warnings = grants_for(catalog.skills)
 
         with self._lock:
             self._catalog = catalog
-            self._runtime_warnings = list(catalog.warnings) + notices
-
-        return fatals
+            self._runtime_warnings = list(catalog.warnings) + grant_warnings
 
     def bind_tools(self, registered: frozenset[str]) -> None:
         """
-        MCP 连接完成后做第二段白名单剪枝（spec F16 第二段 / F17）。
+        MCP 连接完成后记一次工具集快照。
 
         :param registered: 连接完成后注册中心的全部工具名
 
-        副作用：替换 `_catalog`（其中部分 spec 的 `allowed_tools` 被改写）、
-        追加 `_runtime_warnings`。
+        **不再做白名单剪枝**（对齐改造 F13）：收窄能力已移除，
+        `allowed-tools` 是预授权声明，它指向哪个工具、那个工具连没连上，
+        都不影响其它 Skill 能不能用——未命中的规则只是永远不生效而已。
+
+        保留本方法是为了那条 trace 快照：读记录时需要知道「装配完成那一刻
+        注册中心里有哪些工具」，这是排查「模型为什么没看到某个工具」的起点。
+
+        副作用：产出一条 skill_state 事件。不改任何状态。
         """
         catalog = self._catalog  # 不可变快照，取引用即可
-        pruned, warnings = prune_mcp_tool_names(catalog.skills, registered)
-
-        with self._lock:
-            self._catalog = SkillCatalog(
-                skills=tuple(pruned),
-                errors=catalog.errors,
-                warnings=catalog.warnings,
-            )
-            self._runtime_warnings.extend(warnings)
-
-        # 白名单的最终计算结果只在这里记一次（启动一次），不在每轮的 tool_policy 里记。
         self._trace_state(
             "bind_tools",
-            skills=[s.name for s in pruned],
-            allowed_tools={s.name: list(s.allowed_tools) for s in pruned if s.allowed_tools},
-            prune_warnings=list(warnings),
+            skills=[s.command_name for s in catalog.skills],
+            granted_tools={
+                s.command_name: list(s.granted_tools)
+                for s in catalog.skills
+                if s.granted_tools
+            },
+            registered=sorted(registered),
         )
 
-    def reload(
-        self, known: frozenset[str], registered: frozenset[str]
-    ) -> ReloadOutcome:
+    def reload(self) -> ReloadOutcome:
         """
-        热更新：重新扫盘、重跑两段校验、同步激活列表（spec F26/F27）。
+        热更新：重新扫盘、同步激活列表。
 
-        :param known: 同 `startup`
-        :param registered: 同 `bind_tools`
         :returns: `ReloadOutcome`，由上层渲染成可读报告
 
-        **与 `startup` 只差一处，但这一处很关键**：第一段校验的致命项在这里
-        **不终止进程**，而是把对应 Skill 从新 catalog 中丢弃并记一条警告。
-
-        依据：F16 与 N2 的定语都锚定「**启动**时 fail-fast」；F26 只要求热更新时
-        「重跑白名单校验」；F31 明确热更新不影响运行中的循环。用户正在进行的会话，
-        不该因为顺手改了个 Skill 文件、打错一个工具名就被杀掉。
-
-        **连带告知义务**：警告文案必须写明「下次启动时此错误会导致启动失败」。
-        否则用户会把它当成一条无关紧要的提示，第二天启动不来还完全想不起来
-        昨天见过这句话。
+        **不再有白名单校验这一步**（对齐改造 F13）：收窄能力已移除，
+        `allowed-tools` 的无法识别项只警告不致命，因此热更新也不会再丢弃 Skill。
+        C11 时那条「下次启动时此错误会导致启动失败」的连带告知随之作废——
+        现在启动本来就不会因为它失败。
 
         副作用：读三层目录、替换 `_catalog`、重置 `_runtime_warnings`、
         可能移除 `_active` 中的条目。
         """
-        catalog = discover(self._project_root, self._user_dir, self._builtin_dir)
+        new_catalog = discover(self._project_root, self._user_dir, self._builtin_dir)
+        _, warnings = grants_for(new_catalog.skills)
+        warnings = list(new_catalog.warnings) + warnings
 
-        # 第一段校验：致命项对应的 Skill 被丢弃，而不是退出进程。
-        fatals = check_builtin_tool_names(catalog.skills, known)
-        fatal_names = {f.skill_name for f in fatals}
-        warnings: list[str] = list(catalog.warnings)
-        for f in fatals:
-            warnings.append(
-                f"Skill `{f.skill_name}`（{f.path}）的白名单含不存在的工具名 "
-                f"`{f.tool_name}`，该 Skill 已被本次热更新丢弃；"
-                f"**下次启动时此错误会导致启动失败**，请尽快修正"
-            )
-        surviving = [s for s in catalog.skills if s.name not in fatal_names]
-
-        warnings.extend(collect_exempt_notices(surviving, _EXEMPT_TOOLS))
-
-        # 第二段：MCP 剪枝。
-        pruned, prune_warnings = prune_mcp_tool_names(surviving, registered)
-        warnings.extend(prune_warnings)
-
-        new_catalog = SkillCatalog(
-            skills=tuple(pruned), errors=catalog.errors, warnings=catalog.warnings
-        )
-
-        old_names = {s.name for s in self._catalog.skills}
-        new_names = {s.name for s in new_catalog.skills}
+        old_names = {s.command_name for s in self._catalog.skills}
+        new_names = {s.command_name for s in new_catalog.skills}
 
         with self._lock:
             self._catalog = new_catalog
@@ -303,7 +261,6 @@ class SkillManager:
             added=sorted(new_names - old_names),
             removed=sorted(old_names - new_names),
             auto_deactivated=sorted(auto_deactivated),
-            dropped_fatal=sorted(fatal_names),
             warning_count=len(warnings),
             active=self._active_snapshot(),
         )
@@ -312,7 +269,7 @@ class SkillManager:
             added=tuple(sorted(new_names - old_names)),
             removed=tuple(sorted(old_names - new_names)),
             auto_deactivated=tuple(sorted(auto_deactivated)),
-            dropped_fatal=tuple(sorted(fatal_names)),
+            dropped_fatal=(),
             warnings=tuple(warnings),
             errors=new_catalog.errors,
             # 作者期体检（1.1）：reload 是作者的**编辑循环**——改文件、reload、
@@ -330,9 +287,8 @@ class SkillManager:
     # 就等于给「临界区内只做纯内存读写」这条不变量开了一个口子，下一个人照抄时
     # 很容易把回调也塞进去。宁可结构上不给这个机会。
     #
-    # **明确排除 `tool_policy()`**：它被 `RunOptions.tool_policy` 回调**每轮**调用，
-    # 埋进去会每轮刷一条 skill_state、把整条时间线淹掉。白名单的计算结果只在
-    # `bind_tools`（启动一次）记一次。
+    # **明确排除 `turn_grants()`**：它每次执行前都被调用，埋进去会把时间线淹掉。
+    # 工具集快照只在 `bind_tools`（启动一次）记一次。
 
     def _trace_state(self, action: str, **extra) -> None:
         """
@@ -533,79 +489,46 @@ class SkillManager:
 
         return text
 
-    def tool_policy(self, registered: frozenset[str]) -> ToolPolicy:
+    def turn_grants(self, extra: "Optional[SkillSpec]" = None) -> tuple[list, list[str]]:
         """
-        主对话的工具收窄策略（spec F14/F15/F17）。
+        取本次执行应当授予的预授权规则（对齐改造 F11/F12）。
 
-        :param registered: 注册中心**当前**的全部工具名
-        :returns: 本轮生效的 `ToolPolicy`
+        :param extra: 本次额外触发的 Skill（`context: fork` 走子对话时它不进激活列表，
+                      但它的 `allowed-tools` 同样该生效）
+        :returns: `(规则列表, 警告列表)`
 
-        四个分支，其中三个都是「不收窄」：
+        取的是**当前全部激活 Skill** 的声明并集，加上 `extra`。
+        一次执行中可能有多个 Skill 先后触发，各自的授权叠加。
 
-        1. 没有激活任何 Skill → 不收窄（等价于 C10 行为，N3 零回归）；
-        2. 任一激活 Skill 未声明白名单 → **整体塌缩为不收窄**。
-           理由：白名单取并集，一个「不限制」与任何集合取并都是「不限制」。
-           这不是妥协，是并集语义的必然结果（N10 已说明白名单不是安全边界，
-           塌缩不带来安全问题）；
-        3. 否则取各白名单并集，**再与 `registered` 取交集**——这就是「运行期自愈」：
-           MCP 运行时重载让某个远端工具消失后，它自动不再出现在可见集里，
-           不需要任何额外的同步机制；
-        4. 交集为空 → 不收窄（F17，理由同 `prune_mcp_tool_names` 的降级）。
-
-        `exempt` 恒含 `load_skill`：否则模型激活第一个 Skill 之后就再也
-        加载不了第二个了。
+        遵守加锁不变量：**持锁只取名字快照，翻译在锁外做**——`grants_for` 要解析
+        字符串、构造规则对象，那是纯计算但没有理由占着锁；更重要的是，
+        把任何「不只是内存读写」的东西放进临界区，都是在给后来者开一个口子。
 
         副作用：无。
         """
         with self._lock:
             names = [a.name for a in self._active]
 
-        if not names:
-            return ToolPolicy(None, _EXEMPT_TOOLS, frozenset())
+        by_name = {s.command_name: s for s in self._catalog.skills}
+        specs = [by_name[n] for n in names if n in by_name]
+        if extra is not None:
+            specs.append(extra)
+        return grants_for(specs)
 
-        by_name = {s.name: s for s in self._catalog.skills}
-        union: set[str] = set()
-        for name in names:
-            spec = by_name.get(name)
-            if spec is None:
-                continue
-            if spec.allowed_tools is None:
-                # 塌缩：并集里出现「不限制」，整体就是不限制。
-                return ToolPolicy(None, _EXEMPT_TOOLS, frozenset())
-            union.update(spec.allowed_tools)
-
-        allowed = union & set(registered)
-        if not allowed:
-            return ToolPolicy(None, _EXEMPT_TOOLS, frozenset())
-        return ToolPolicy(frozenset(allowed), _EXEMPT_TOOLS, frozenset())
-
-    def isolated_policy(
-        self, spec: SkillSpec, registered: frozenset[str]
-    ) -> ToolPolicy:
+    def fork_excluded_tools(self) -> frozenset[str]:
         """
-        独立模式子对话的工具收窄策略（spec F21/F23）。
+        子对话中要排除的工具名（防止 Skill 里再激活 Skill）。
 
-        :param spec: 本次执行的 Skill
-        :param registered: 注册中心当前的全部工具名
-        :returns: 子对话专用的 `ToolPolicy`
+        :returns: 恒为 `{load_skill}`
 
-        与 `tool_policy` 的两处不同：
-
-        1. **只看这一个 spec**——子对话是为这个 Skill 开的，主对话里激活的
-           其它 Skill 与它无关；
-        2. **`excluded` 含 `load_skill`、`exempt` 为空**——禁止子对话再嵌套激活
-           Skill（F23）。嵌套激活会让「独立」这个语义失去意义，也让上下文预算
-           完全不可控。
+        **这是 C11 的 `ToolPolicy` 三元组塌缩后唯一留下的用途。**
+        排除只是不把 schema 发给模型；模型仍可能凭训练先验硬造出一次调用，
+        因此循环层还有一道「调用了本轮未提供的工具就拒绝」的兜底判定——
+        两者缺一，嵌套防线就不成立。
 
         副作用：无。
         """
-        excluded = frozenset({LOAD_SKILL_TOOL})
-        if spec.allowed_tools is None:
-            return ToolPolicy(None, frozenset(), excluded)
-        allowed = set(spec.allowed_tools) & set(registered)
-        if not allowed:
-            return ToolPolicy(None, frozenset(), excluded)
-        return ToolPolicy(frozenset(allowed), frozenset(), excluded)
+        return frozenset({LOAD_SKILL_TOOL})
 
     # ────────────────────────── 查询 ──────────────────────────
 
@@ -776,7 +699,7 @@ class SkillManager:
         """
         index = self.index_text()
         active = self.active_text()
-        policy = self.tool_policy(registered)
+        rules, grant_warnings = self.turn_grants()
 
         lines = ["Skill 注入内容", "", "【第一阶段清单（稳定通道）】", ""]
         lines.append(index if index else "（空——未发现任何 Skill）")
@@ -784,22 +707,30 @@ class SkillManager:
         lines.extend(["", "【已激活 Skill 正文（动态通道）】", ""])
         lines.append(active if active else "（空——当前没有已激活的 Skill）")
 
+        # **可见工具集不再随 Skill 变化**（对齐改造 F13）：收窄能力已移除，
+        # 模型任何时候都能看到注册中心的全部工具。这一段保留，是因为它仍然回答
+        # 「模型这一刻究竟能看到什么」——那是本报告的唯一职责。
         lines.extend(["", "【当前可见工具集】", ""])
-        if policy.allowed is None:
-            lines.append("未收窄（全部已注册工具对模型可见）")
-        else:
-            # **必须与注册中心取交集**：`policy.exempt` 里除了 `load_skill`，
-            # 还有 `ask_user` / `present_plan` 两个 Plan Mode 专用工具，而它们
-            # 根本不在注册中心里——`_schema_for` 是在过滤之后才由 `plan_schemas()`
-            # 单独拼上去的，且**只在规划阶段拼**。不取交集的话，普通模式下这份
-            # 报告会多报两个模型其实看不到的工具，违背本报告「所见即实际注入」
-            # 的唯一职责（AC26），排查问题时反而误导。
-            visible = sorted((policy.allowed | policy.exempt) & set(registered))
-            lines.append("、".join(visible))
-            lines.append(
-                "（Plan Mode 的规划阶段还会另外附加 ask_user / present_plan，"
-                "它们不受白名单约束）"
+        lines.append("、".join(sorted(registered)) if registered else "（无）")
+        lines.append(
+            "（Skill 不再收窄工具集；Plan Mode 的规划阶段会另外只保留只读工具"
+            "并附加 ask_user / present_plan）"
+        )
+
+        # 预授权是现在真正影响行为的那样东西，必须在同一份报告里看得到——
+        # 否则用户排查「为什么这个操作没弹确认面板」时无从下手。
+        lines.extend(["", "【已激活 Skill 授予的免确认操作】", ""])
+        if rules:
+            lines.extend(
+                f"- {r.tool}({r.pattern})" if r.pattern else f"- {r.tool}"
+                for r in rules
             )
+            lines.append("（这些操作在本次执行内免于人工确认，用户下一条消息后失效）")
+        else:
+            lines.append("（无——所有有副作用的操作都会照常弹确认面板）")
+        if grant_warnings:
+            lines.append("")
+            lines.extend(f"⚠ {w}" for w in grant_warnings)
 
         return "\n".join(lines)
 
