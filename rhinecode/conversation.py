@@ -55,7 +55,6 @@ from rhinecode.skills.models import (
     builtin_skills_dir,
 )
 from rhinecode.skills.render import render_active_body, render_invocation_text
-from rhinecode.context.summarize import snap_back_to_user
 from rhinecode.agent.loop import Agent, RunOptions
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import (
@@ -625,9 +624,7 @@ class ConversationManager:
         短命令的重新注册由控制器方法 `RhineApp.reload_skills()` 在调完本方法后
         接上，它本来就同时持有注册表与 SkillManager。
         """
-        registered = self._registry.names() if self._registry else frozenset()
-        known = registered | {"ask_user", "present_plan"}
-        outcome = self.skill_manager.reload(known, registered)
+        outcome = self.skill_manager.reload()
 
         lines = ["Skill 定义已重新加载。"]
         if outcome.added:
@@ -668,9 +665,9 @@ class ConversationManager:
         :param display: 用户敲的原始输入，作为 `Message.display_content`
         :returns: 事件流（成功执行）或提示文本（找不到）
 
-        - **共享模式**：激活它，然后把一段自包含调用文本作为普通用户消息提交，
-          走完全正常的 Agent 路径。SOP 正文由系统提示的动态槽位注入。
-        - **独立模式**：开一条子对话跑完，只回流结论（见 `_run_isolated_skill`）。
+        - **留在主对话**（不写 `context`）：激活它，然后把一段自包含调用文本作为
+          普通用户消息提交，走完全正常的 Agent 路径。SOP 正文由动态槽位注入。
+        - **`context: fork`**：开一条子对话跑完，只回流结论（见 `_run_forked_skill`）。
 
         副作用：修改激活列表；向主历史追加消息；发起 API 请求。
         """
@@ -686,10 +683,11 @@ class ConversationManager:
 
         spec = self.skill_manager.get(name)
 
-        if result.status is ActivationStatus.ISOLATED:
-            # 用户主动触发独立模式是合法的（只有**模型**不能自行发起）。
+        if result.status is ActivationStatus.FORKED:
+            # 用户经斜杠命令触发是显式动作，`disable-model-invocation` 只挡模型，
+            # 挡不到这里（对齐改造 F8：两个维度正交）。
             return self._wrap_events(
-                self._run_isolated_skill(spec, arguments, display)
+                self._run_forked_skill(spec, arguments, display), extra_skill=spec
             )
 
         # 共享模式：激活成功，把自包含文本作为一条普通用户消息提交。
@@ -709,32 +707,6 @@ class ConversationManager:
         """在一个事件流最前面插一条 NOTICE，其余原样透传。"""
         yield AgentEvent(type=AgentEventType.NOTICE, message=message)
         yield from events
-
-    def _take_tail(self, history: list[Message], n: int) -> list[Message]:
-        """
-        取主历史尾部 n 条，并回退到最近的 user 边界（c11 F20）。
-
-        :param history: 主对话历史
-        :param n: 期望带入的条数
-        :returns: 尾部消息列表；不带入任何历史时为空列表
-
-        **实际带入条数可能多于 n**：为了不拆散 `assistant(tool_calls)` 与其配对的
-        `tool` 消息，边界会向前回退到最近的 user。F20 明确允许这一点——
-        多带几条完整消息，好过切出一段 API 会拒绝的残缺片段。
-
-        **找不到 user 边界时返回空列表，这与 C8 的语义相反**：
-        `snap_back_to_user` 返回 None 时，C8 的 `compute_retain_index` 取 0
-        表示「全部保留」（安全）；这里若也取 0，`history[0:]` 就是**整个主历史**——
-        用户写 `history_messages: 3`，实际却灌进几百条消息，既违背独立模式的目的，
-        又因子对话关闭了第二层摘要而当场撑爆窗口。所以这里必须取空列表。
-        """
-        if n <= 0 or not history:
-            return []
-        idx = max(0, len(history) - n)
-        boundary = snap_back_to_user(history, idx)
-        if boundary is None:
-            return []
-        return history[boundary:]
 
     def _provider_for(self, model: str) -> BaseProvider:
         """
@@ -773,8 +745,8 @@ class ConversationManager:
         self._provider_cache[model] = provider
         return provider
 
-    def _run_isolated_skill(
-        self, spec: SkillSpec, arguments: str, display: str
+    def _run_forked_skill(
+        self, spec: SkillSpec, arguments: str, display: str, record: bool = True
     ) -> Iterator[AgentEvent]:
         """
         独立模式：开一条子对话跑完，只把结论回流主历史（c11 F19/F20/F21/F23）。
@@ -782,7 +754,11 @@ class ConversationManager:
         :param spec: 要执行的 Skill
         :param arguments: 用户参数
         :param display: 用户敲的原始输入
-        :returns: 事件流；主历史最终**恰好**新增两条配对消息（user + assistant）
+        :param record: 是否把那两条配对消息写进主历史与会话存档。
+            用户经斜杠命令触发时为真；**模型自行发起时为假**——模型这次动作
+            已经在主历史里留下 `assistant(tool_calls)` 与 `tool` 结果一对，
+            再追加一对 user/assistant 会凭空多出一轮不存在的对话。
+        :returns: 事件流；`record` 为真时主历史**恰好**新增两条配对消息
 
         为什么值得开一条子对话：一次代码审查可能读二十个文件、跑几条命令，
         这些中间过程对主对话毫无价值，却会占掉大量上下文。子对话跑完只回流
@@ -808,17 +784,15 @@ class ConversationManager:
         user_msg = Message(
             role="user", content=invocation, display_content=display
         )
-        self.history.append(user_msg)
-        self.memory_manager.record_message(user_msg)
+        if record:
+            self.history.append(user_msg)
+            self.memory_manager.record_message(user_msg)
 
-        # ── 3. 子历史 = 尾部主历史 + 那条 user 消息 ──
-        # `self.history[:-1]` 排除刚追加的这条，避免它被算进「尾部 n 条」里重复。
-        # 末尾追加不可省：`history_messages: 0` 时子对话会完全没有用户轮，
-        # 模型收到一个只有系统提示、没有任务陈述的请求，根本不知道要做什么。
-        sub_history: list[Message] = self._take_tail(
-            self.history[:-1], spec.history_messages
-        )
-        sub_history.append(Message(role="user", content=invocation))
+        # ── 3. 子历史 = 只有那条自包含消息 ──
+        # 标准里的 fork 不提供「从主历史带入尾部若干条」，C11 的 `history_messages`
+        # 随之删除。子对话拿到的就是这一条——它是自包含的（含 Skill 名、说明与参数），
+        # 模型据此就能知道要做什么。
+        sub_history: list[Message] = [Message(role="user", content=invocation)]
 
         # ── 4. 子系统提示：stable 复用主对话，dynamic 只带这一个 Skill 的正文 ──
         project_root = str(workspace_root())
@@ -893,13 +867,8 @@ class ConversationManager:
                     max_iterations=SKILL_MAX_ITERATIONS,
                     record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
                     allow_summary=False,  # 只跑 C8 第一层（F21）
-                    tool_policy=(
-                        (lambda: self.skill_manager.isolated_policy(
-                            spec, registry.names()
-                        ))
-                        if registry is not None
-                        else None
-                    ),
+                    # 防嵌套：子对话里看不到加载工具，也调不动它。
+                    excluded_tools=self.skill_manager.fork_excluded_tools(),
                 ),
             )
 
@@ -931,8 +900,11 @@ class ConversationManager:
 
         # ── 8. 结论回流主历史。至此主历史新增恰好两条配对消息 ──
         assistant_msg = Message(role="assistant", content=conclusion)
-        self.history.append(assistant_msg)
-        self.memory_manager.record_message(assistant_msg)
+        if record:
+            self.history.append(assistant_msg)
+            self.memory_manager.record_message(assistant_msg)
+        # 模型路径靠它把结论交回给 `run_forked_for_model`（生成器没有返回值可用）。
+        self._last_fork_conclusion = conclusion
 
         # ── 9. 「未产出」时必须补一条 NOTICE ──
         # 第 6 步拦下了全部 FINISHED，而 TUI 对 COMPLETED 的收尾行**不渲染任何东西**。
@@ -944,6 +916,46 @@ class ConversationManager:
         yield AgentEvent(
             type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED
         )
+
+    def run_forked_for_model(self, name: str, arguments: str) -> str:
+        """
+        **模型自行发起**一个 `context: fork` 的 Skill（对齐改造 F8）。
+
+        :param name: Skill 命令名
+        :param arguments: 模型传入的参数
+        :returns: 子对话跑出的结论文本，由加载工具作为工具结果回灌给模型
+
+        由 `LoadSkillTool.run_fork` 回调进来，运行在 Agent 循环的**串行段**
+        （`system_serial` 保证它不在只读并发桶里，见 `tools/base.py` 的说明）。
+
+        ## 与用户触发那条路径的三处差别
+
+        1. **不向主历史追加那两条配对消息**——模型这次动作本身已经在主历史里
+           留下了 `assistant(tool_calls)` 与 `tool` 结果一对；再追加一对
+           user/assistant 会凭空多出一轮不存在的对话；
+        2. 因此也不写会话存档（那两条不存在）；
+        3. 结论以**返回值**交回，而不是以事件流回流。
+
+        共用的是：同一份 `_run_forked_skill` 的子对话实现、同一套权限管线、
+        同一个 `ask` 确认闭包。
+
+        副作用：跑一整条子对话（可能读写文件、执行命令、弹确认面板）。
+        """
+        spec = self.skill_manager.get(name)
+        if spec is None:
+            return f"没有名为 `{name}` 的 Skill。"
+
+        # 复用子对话实现（`record=False`：不碰主历史、不写存档），
+        # 就地耗尽它产出的事件流——模型路径不需要事件，只需要最后那段结论。
+        self._last_fork_conclusion = ""
+        for _ in self._wrap_events(
+            self._run_forked_skill(
+                spec, arguments, f"/{name} {arguments}".strip(), record=False
+            ),
+            extra_skill=spec,
+        ):
+            pass
+        return self._last_fork_conclusion or "本次 Skill 未产出结果。"
 
     def _build_ask(self) -> "AskFn":
         """
@@ -1085,41 +1097,51 @@ class ConversationManager:
             self._cancel_event,
             self._context_manager,
             self.memory_manager.record_message,
-            options=RunOptions(tool_policy=self._main_tool_policy()),
+            options=RunOptions(),   # 主对话不排除任何工具
         )
         return self._wrap_events(events)
 
-    def _main_tool_policy(self) -> "Optional[Callable[[], ToolPolicy]]":
+    def _wrap_events(
+        self, events: Iterator[AgentEvent], extra_skill: "Optional[SkillSpec]" = None
+    ) -> Iterator[AgentEvent]:
         """
-        构造主对话的工具收窄策略回调（c11 F14）。
-
-        :returns: 每轮被循环调用一次的回调；无工具模式返回 None（不收窄）
-
-        **注册中心的工具名在 lambda 体内现取，不在外面捕获快照**：
-        MCP 支持运行时 `reload_server`，会在会话中途增删工具。若在这里
-        `names = self._registry.names()` 捕获一次，之后 MCP 重载新增的工具
-        就永远进不了白名单交集——用户明明连上了新 Server，Skill 却看不见它的工具。
-        """
-        if self._registry is None:
-            return None
-        return lambda: self.skill_manager.tool_policy(self._registry.names())
-
-    def _wrap_events(self, events: Iterator[AgentEvent]) -> Iterator[AgentEvent]:
-        """
-        Agent 事件流的包装生成器（c9 自然停止钩子，单点接入）。
-
-        逐个透传事件；看到 FINISHED 且停止原因为 COMPLETED（自然完成）时，先触发
-        MemoryManager 的异步笔记更新再透传——钩子只是「起一个 daemon 线程」，
-        本身不阻塞事件流。其它停止原因（取消/出错/迭代上限）不触发笔记：
-        非自然结束的对话大概率不完整，不值得沉淀。
+        Agent 事件流的包装生成器：**预授权的成对授予/撤销** + 自然停止钩子。
 
         :param events: Agent 产出的原始事件流
-        :returns: 语义完全相同的事件流（仅多了钩子副作用）
+        :param extra_skill: 本次额外触发的 Skill（`context: fork` 走子对话时它不进
+                            激活列表，但它的 `allowed-tools` 同样该生效）
+        :returns: 语义完全相同的事件流（仅多了两处副作用）
+
+        ## 为什么授予与撤销放在这里
+
+        本方法是**每一次 Agent 执行的唯一包装点**——主对话、用户触发的子对话、
+        模型自行发起的子对话，三条路径都经过它。把 `try/finally` 放在这里，
+        spec N3 要求的「取消/出错/迭代上限三种终止都要撤销」就由生成器的
+        `finally` 语义自动保证，不需要在每条停止路径上各写一次。
+
+        ⚠️ **生成器的 `finally` 只在生成器被耗尽或关闭时执行。** 消费方提前
+        `break` 时靠的是垃圾回收触发 `close()`——这在 CPython 上即时发生，
+        但不是语言保证。所有实际消费方（TUI 的 Worker）都会跑到 FINISHED 事件，
+        故这里可接受；若将来出现「消费一半就丢弃」的调用方，需要显式 `closing()`。
+
+        ## 自然停止钩子（c9）
+
+        看到 FINISHED 且停止原因为 COMPLETED（自然完成）时，先触发 MemoryManager
+        的异步笔记更新再透传——钩子只是「起一个 daemon 线程」，本身不阻塞事件流。
+        其它停止原因（取消/出错/迭代上限）不触发笔记：非自然结束的对话大概率
+        不完整，不值得沉淀。
         """
-        for event in events:
-            if (
-                event.type == AgentEventType.FINISHED
-                and event.stop_reason == StopReason.COMPLETED
-            ):
-                self.memory_manager.on_natural_stop(self.history)
-            yield event
+        rules, _ = self.skill_manager.turn_grants(extra_skill)
+        token = self._engine.grant_turn_rules(rules)
+        try:
+            for event in events:
+                if (
+                    event.type == AgentEventType.FINISHED
+                    and event.stop_reason == StopReason.COMPLETED
+                ):
+                    self.memory_manager.on_natural_stop(self.history)
+                yield event
+        finally:
+            # 回滚而非清空：模型在主对话里自行发起子对话时，这里是内层，
+            # 清空会连外层那次执行的授权一并抹掉（见 grant_turn_rules 的说明）。
+            self._engine.restore_turn_rules(token)

@@ -155,28 +155,51 @@ class PermissionEngine:
         """登记一条会话级规则（「本会话放行」调用）；仅存内存，关程序即失效。"""
         self.session_rules.append(rule)
 
-    def grant_turn_rules(self, rules: "list[Rule]") -> None:
+    def grant_turn_rules(self, rules: "list[Rule]") -> int:
         """
         授予一批**本次执行内有效**的规则（Skill 的 `allowed-tools` 预授权）。
 
         :param rules: 待追加的规则，通常 `effect="allow"`、`source="skill"`
+        :returns: 一个**令牌**，交给 `restore_turn_rules` 回滚到本次授予之前的状态
 
         追加而非替换：一次执行中可能有多个 Skill 先后被触发（用户敲了短命令，
         模型又自行加载了另一个），各自的授权应当叠加。
 
-        副作用：修改 `turn_rules`。**调用方必须保证与 `revoke_turn_rules` 成对**，
-        且撤销要放在 `finally` 里——否则一次异常终止就会让授权泄漏到下一次执行。
+        ## 为什么返回令牌而不是配一个「整体清空」
+
+        **授权会嵌套**：模型在主对话里自行发起一个 `context: fork` 的 Skill 时，
+        外层那次执行已经授过权，子对话又要为自己授一次。若撤销是「整体清空」，
+        子对话结束时会顺手把**外层的授权也清掉**——外层剩下的轮次突然开始弹
+        它本不该弹的确认面板，而这种偏差在界面上看不出任何异常。
+
+        令牌即「授予前的长度」，回滚只截掉自己那一段，天然可嵌套。
+
+        副作用：修改 `turn_rules`。**调用方必须把 `restore_turn_rules` 放进
+        `finally`**——否则一次异常终止就会让授权泄漏到下一次执行。
         """
+        token = len(self.turn_rules)
         self.turn_rules.extend(rules)
+        return token
+
+    def restore_turn_rules(self, token: int) -> None:
+        """
+        回滚到 `token` 对应的状态，即撤销该次 `grant_turn_rules` 之后追加的全部规则。
+
+        :param token: `grant_turn_rules` 返回的令牌
+
+        **幂等**：重复调用只会反复截到同一长度。这一点很重要——异常路径上
+        「已经回滚过但又走了一次 finally」是完全可能的，那时不该再出事。
+
+        副作用：截短 `turn_rules`。
+        """
+        del self.turn_rules[token:]
 
     def revoke_turn_rules(self) -> None:
         """
-        撤销全部本次执行级规则。
+        清空全部本次执行级规则。
 
-        **整体清空而非按条移除，且幂等**：按条移除需要调用方记住自己授予了哪些，
-        任何一条记漏就会永久泄漏；而异常路径上「记住了但没走到移除」正是最容易
-        发生的情形。整体清空让「撤销」成为一个无需任何前置状态的操作，
-        重复调用也安全。
+        这是**最外层的兜底**，等价于 `restore_turn_rules(0)`。会话被清空
+        （`/clear`）或恢复（`/resume`）时用它，确保不把上一段对话的授权带过去。
 
         副作用：清空 `turn_rules`。
         """

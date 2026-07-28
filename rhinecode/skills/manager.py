@@ -550,16 +550,24 @@ class SkillManager:
         """
         产出供命令层构造斜杠短命令的中立描述（spec F25）。
 
-        :returns: 每个 Skill 一条，按名字排序（catalog 已排好）
+        :returns: 每个**可被用户触发**的 Skill 一条，按命令名排序（catalog 已排好）
 
         返回的是中立结构而不是 `CommandSpec`——这样 skills 包不必认识 commands 包，
         依赖方向保持单向。
 
+        **`user-invocable: false` 的 Skill 在这里就被滤掉**（对齐改造 F8），
+        而不是让命令层再判一次：命令层只该关心「怎么把一条描述变成命令」，
+        不该关心「这条描述该不该存在」。滤在源头，下游少一个分支。
+        注意它们仍然出现在 `/skills` 列表与第一阶段清单里——不进菜单不等于不存在。
+
         副作用：无。
         """
         return tuple(
-            SkillCommandInfo(name=s.name, description=s.description, mode=s.mode)
+            SkillCommandInfo(
+                name=s.command_name, description=s.description, forked=s.forked
+            )
             for s in self._catalog.skills
+            if s.user_invocable
         )
 
     def runtime_warnings(self) -> tuple[str, ...]:
