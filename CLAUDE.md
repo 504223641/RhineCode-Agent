@@ -2,6 +2,9 @@
 
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
+> **改代码前先看两处**：[架构](#架构)开头的分层速查表（定位到层）与
+> [成对维护点](#成对维护点)（改一处必须同步另一处，漏改一律不报错）。
+
 当前主线到 **C11**，以 DeepSeek Provider 为主。能力自下而上分层，每一层都仍在生效：
 
 | 章节 | 能力 | 一句话 |
@@ -13,15 +16,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | C8 | 上下文管理（两层压缩） | 每次请求前「锚点 + 增量」估算用量；第一层把过大工具结果存盘留占位，第二层调 LLM 把早段压成结构化摘要。幂等、fail-safe、连续失败 3 次熔断，用户原始消息永不改写 |
 | C9 | 记忆系统 | 三层 RHINE.md 项目指令（含 `@include` 展开）+ 每条消息即时 JSONL 存档与容错恢复 + Agent 自然停止后异步沉淀四类笔记；多实例由锁文件防护 |
 | C10 | 斜杠命令系统 | 单一 `CommandSpec` 注册表同时驱动执行 / `/help` / 补全 / 高亮；本地与界面命令绕过 Agent，未知命令不进 AI |
-| C11 | **Skill 系统** | 见下 |
-
-**C11 Skill 系统**（已对齐 Agent Skills 开放标准）——把重复输入的提示词封装成独立 Markdown 文件：
-
-- **三级存放**（项目 > 用户 > 内置）同名整份覆盖，单文件解析失败不阻断其余；**命令名来自文件系统路径**，frontmatter 全部可选
-- **两阶段加载**：启动时只把「名字 + 一句话说明」注入稳定通道，模型判断要用时再调系统级 `load_skill` 把完整 SOP 拉进动态槽位（每轮重建、多个可同时激活）
-- **「在哪执行」与「谁能触发」正交**：`context: fork` 开子对话跑完只回流结论（主历史**恰好新增两条配对消息**）；`disable-model-invocation` / `user-invocable` 各管一维
-- **`allowed-tools` 是预授权不是收窄**：列出的操作在本次执行内免于人工确认，**不限制**模型能调用什么
-- 每个 Skill 自动注册斜杠短命令（与内置重名则跳过并提示 `/skills run`），`/skills reload` 热更新，`/clear` 与 `/resume` 一并清空激活态；内置 commit / review / test 三个样板
+| C11 | **Skill 系统** | 把重复输入的提示词封装成独立 Markdown 文件（三级存放、两阶段加载、`context: fork` 子对话、`allowed-tools` 预授权、自动注册短命令）。**已对齐 Agent Skills 开放标准**，外部 Skill 目录复制进来即可用。字段与行为细节见下一节 |
 
 另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成十五类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
 
@@ -69,6 +64,29 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 ## 架构
 
+先按下表定位到层，再读那一层的详细说明（每层的说明里都夹着「违反会出事」的不变量，改动前务必读完对应那段）：
+
+| 层 | 路径 | 职责一句话 |
+| --- | --- | --- |
+| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现命令层的 `CommandController` 协议 |
+| Commands | `commands/` | 斜杠命令注册与分发（纯逻辑，不依赖 Textual） |
+| 协调层 | `conversation.py` | TUI 与 Agent/Provider 之间的中转；持有历史、构建权限引擎、封装四类回调、接线上下文/记忆/Skill |
+| Agent | `agent/` | ReAct 循环、事件类型、流式收集、结构化系统提示 |
+| Permission | `permission/` | 五层防御的纯逻辑引擎（与 TUI/Provider 解耦） |
+| MCP | `mcp/` | MCP 客户端：配置、JSON-RPC、两种传输、工具适配、多 Server 编排 |
+| Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 |
+| Skills | `skills/` | Skill 定义的解析/发现/渲染/预授权翻译/激活编排（叶子包） |
+| Context | `context/` | 两层压缩：估算、工具结果存盘、LLM 摘要 |
+| Trace | `trace/` | 行为记录器（**跨阶段测试设施**，不占章节号，叶子包只依赖标准库） |
+| 驱动设施 | `tests/e2e/` | 端到端驱动（**跨阶段测试设施**，不进产品包，产品代码绝不反向依赖） |
+| 装配层 | `bootstrap.py` | `build_app` 按固定顺序组装应用，致命错误抛 `BootstrapError` |
+| Provider | `provider/` | `BaseProvider` 抽象与三个实现，`create_provider` 按 `protocol` 分发 |
+| Tools | `tools/` | `Tool` 抽象、注册中心、路径边界与各内置工具 |
+
+依赖方向总原则：上层可依赖下层，反之不可。`skills` / `trace` 是叶子包；
+`commands` 不被 conversation/memory/context/provider 反向依赖；
+`tools/__init__.py` **必须保持为空**（否则 `tools ↔ skills`、`tools ↔ mcp` 的包级互依会成环）。
+
 当前核心分层如下，上层尽量不感知下层具体实现，通过抽象接口和事件流解耦：
 
 - **TUI 层**（`rhinecode/tui/`）— `app.py` 是 Textual App 主类，用 Worker 消费 AgentEvent 并逐块渲染；c10 起实现命令层的 `CommandController` 协议（`tools_enabled` / `show_user_input` / `show_message` / `send_user_message` / `switch_mode` / `query_report` / `refresh_status` / `clear_conversation` / `compact_context` / `resume_session` / `exit_application`，c11 增 `run_skill` / `reload_skills` / `deactivate_skill`），输入提交唯一入口是 `dispatcher.dispatch(text, self)`；c11 起提交守卫从静默 return 改为三分支（确认面板期间与流式运行中各给一条可见提示、同一次忙碌期只提示一次，会话面板分支保留裸 return 且不可达），并把 `_notify_skill_activation` 注入 `SkillManager`（工作线程回调，必须 `call_from_thread` 且包 try/except——它跑在只读并发桶里，抛异常会被 `future.result()` 外层当成「工具执行异常」回灌模型），Manager 三类返回值（str / SessionListRequest / 事件迭代器）经 `_consume_manager_result` 统一消费（迭代器走后台 Worker）；SessionPanel 选中后直调 `resume_session(session_id)`，不再拼接 `/resume <id>` 文本。`widgets.py` 提供 HistoryView / InputBar（接收注册表、装 `CommandHighlighter` 高亮完整命中的命令字段、命令字段内 Tab post `CommandCompletionRequested`）/ StatusBar（`compose_status_text` 纯函数组装，`[DEFAULT]`/`[PLAN]` 模式标记，c11 增 `Skill:N` 段、None 即隐藏且刻意不含方括号）/ CommandPanel（构造时注入注册表、`show_for` 用 `registry.complete` 动态取候选）/ 工具行 / diff / 确认、澄清和会话选择面板（`SessionPanel`），以及历史回放（`build_replay_items` 纯函数——user 消息优先展示非空 `display_content`——+ `HistoryView.render_history` 清屏批量重画，回放工具行用简化静态行、不复用带计时器的 `ToolCallWidget`）。
@@ -115,38 +133,45 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 > 于是开始盲猜文件名（`main.c`、`app.cpp`、`index.html`、`forms.py`、`views.py`、
 > `urls.py`……12 次猜、11 次失败），白烧了 8 轮 API 调用。
 > **收窄过度比不收窄更糟**：它不会报错，只会让模型退化成穷举，而这在界面上完全看不出来
-> （用户只看到「读了几个文件然后给了个回答」）。新增**内置样板**才需要动代码：在 `rhinecode/skills/builtin/` 加 `.md`，`pyproject.toml` 的 package-data 已覆盖 `builtin/*.md` 无需再改，但要确认白名单里的工具名全部真实存在（否则启动 fail-fast）。
+> （用户只看到「读了几个文件然后给了个回答」）。
 
-> 「成对维护点」备忘（改一处常需同步另一处，避免遗漏）：
-> - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）+ 若要在 `allowed-tools` 里可写，还要在 `skills/validation.py` 的 `_TOOL_ALIASES` 加一行
-> - 新增 MCP 传输方式 → `mcp/transport.py`（`Transport` 子类）+ `mcp/manager.py` `_build_transport`（按 `kind` 分支）
-> - 新增斜杠命令 → 只需 `commands/builtins.py` 登记一条 `CommandSpec` + 处理函数 + 测试（c10 单一注册来源；补全/帮助/高亮自动生效）
-> - 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
-> - 新增状态栏展示字段 → `tui/widgets.py` `compose_status_text`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
-> - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
-> - 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
-> - 新增 Skill 内置样板 → `rhinecode/skills/builtin/*.md` + 确认 `pyproject.toml` 的 `[tool.setuptools.package-data]` 仍覆盖它（否则 `pip install -e .` 正常但真安装后样板凭空消失且不报错）
-> - **预授权的授予与撤销必须成对**，且撤销放在 `finally`：`_wrap_events` 是每一次 Agent 执行的唯一包装点，三条路径（主对话 / 用户触发的子对话 / 模型自行发起的子对话）都经过它。**撤销用 `restore_turn_rules(token)` 回滚而不是 `revoke_turn_rules()` 清空**——授权会嵌套（模型在主对话里发起 fork 时内层若清空，会把外层那次执行的授权也抹掉，外层剩下的轮次突然开始弹本不该弹的确认面板，界面上看不出任何异常）
-> - **新增 Skill frontmatter 字段** → `skills/models.py`（`SkillSpec` 字段 + 若无对应能力则登记进 `UNSUPPORTED_FIELDS`）+ `skills/parser.py`（读取与归一）+ `skills/render.py`（若要进清单）；连字符写法要能被 `_normalize_keys` 认出
-> - **命令名的来源是文件系统路径，不是 frontmatter** → 改动 `discovery.py` 的推导逻辑时，`跨层覆盖键`、`短命令注册`、`/skills 报告` 三处的「同一个 Skill」判定都跟着它走
-> - `rhinecode/tools/__init__.py` **不得 re-export 任何子模块**：`tools ↔ skills` 与 `tools ↔ mcp` 都是包级互相依赖，不成环唯一依靠这个文件是空的
-> - `SkillManager` 持锁期间**禁止任何回调与跨线程调度**：违反会与 Textual 阻塞式 `call_from_thread` 组成确定性死锁，整个 TUI 冻结
-> - Skill 短命令的两处注册必须同口径：`__main__` 启动时一次、`RhineApp.reload_skills()` 热更新时一次（都走 `build_skill_command_specs` + `replace_skill_commands`，且都要把 skipped 的冲突项提示成 `/skills run`）
-> - 启动接线中 `LoadSkillTool` 必须在算 `known_tools` **之前**注册，且整段 Skill 校验必须夹在 `MCPAddServerTool` 注册之后、`connect_all` 之前（两头都不能挪，理由见 `__main__.py` 注释）
-> - 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
-> - **任何往 markup 串里嵌纯文本的地方，一律用 `tui/widgets.py` 的 `escape`，绝不要 `from rich.markup import escape`**：rich 那版只转义「看起来像完整标签」的 `[...]`（正则要求闭合的 `]`），因此**被截断的括号会被它整个放过**；而 Textual 的 Content markup 比 Rich 严格，会把落单的 `[` 当标签开头并抛 `MarkupError`——抛出点在 `OptionList.get_content_height` 这类**布局阶段的主线程**调用里，不在业务调用栈上，没有任何 try/except 兜得住，**Textual 直接拆掉整个 app、程序退出**。真实现场：`summarize_args` 先截断后转义，把 `allowed_tools: [read_file, glob_files, …]` 切成 `allowed_tools: [read_file, glo…`，`edit_file` 的 `old_string`+`new_string` 天然成对凑够两个未闭合括号（一个不够，实测 Textual 容忍），确认面板一弹就崩。护栏见 `tests/test_tui_markup_escape.py`（含现场重演与「旧口径确实会崩」的反证）
-> - 新增 trace 事件类型 → `trace/models.py`（`TraceEventType` 枚举）+ `trace/reader.py` 的 `SUMMARIZERS`「type → 摘要函数」表（**漏了不报错**，只会让新事件在阅读器里显示成「（未登记类型）」——那句话就是为暴露这个遗漏而刻意保留的）
-> - `bootstrap.build_app` 的装配顺序 → 那段「位置为什么卡在这个窄窗口里 / 两头都不能挪」的理由注释**必须随代码走**；迁代码留注释等于把知识丢了。**该窗口里现在卡着两件事**：C11 的 Skill 白名单校验，与 P1a 的 `exclude_tools` 摘除——两者理由同型（往前挪会让合法工作区被判笔误而 fail-fast，往后挪会让 `session_start` 快照与实际工具集不符）。重排 bootstrap 时**必须两段一起看**，只看到 Skill 那半段就会以为另一半可以自由移动
-> - 新增控制通道指令 → `tests/e2e/protocol.py`（取值/错误码）+ `control.py`（`DriverCore` 方法）+ `host.py` 的 `dispatch` 分支 + `client.py`（子命令）+ `test_e2e_control.py`（**五处齐改，漏一处是静默失效**：客户端能发但宿主不认、或宿主认了但没人调得到）
-> - 产品侧交互结算点新增来源取值 → `tui/app.py` 三处（`_interact` 的待决盒 / `_resolve_interaction` / `_settle_session`）+ `tests/e2e/protocol.py` 的取值集合 + 断言词汇
-> - `build_app` 新增参数 → `rhinecode/bootstrap.py` + `tests/e2e/host.py` 的装配调用（**宿主是它的第二个真实调用方**，漏改会让驱动设施与真实启动行为分叉，而分叉处恰恰是「验收依据」）
-> - **`_settle_session` 是会话面板结算的唯一入口** → 将来任何第三条会话结算路径都必须走它，否则丢埋点、丢幂等守卫（`test_tui_keybindings.py` 有结构护栏钉着）
-> - `tests/e2e/assertions.py` 的十一项断言词汇 ↔ spec F25 清单 → 增删要同步 spec / `assertions.py` / `test_e2e_assertions.py` 三处
-> - 测试里删沙箱目录 → 一律走 `tests/e2e/sandbox.py` 的 `force_rmtree`，**不要直接写 `shutil.rmtree(path, ignore_errors=True)`**：撞上 git 留下的只读 `.git/objects` 会「删一半」，留下一个只剩空 `.git` 的残骸且**一个错都不报**（实测只在全量测试的并发负载下出现，单跑那条用例必成功，追起来极费劲）
-> - 新增状态栏字段 → 除原有两处（`compose_status_text` 渲染 + `_refresh_status` 取值）外，`_refresh_status` 现在把**同一份**参数组同时喂给 `compose_status_text` 做 trace 快照。**保持单一参数组、不要抄第二份清单**——抄了会让维护点从两处涨到三处，而漏改的后果是记录里的状态栏文本与用户实际看到的不一致（观测设施撒谎但不报错）
-> - trace 埋点一律走**受保护漏斗**：`agent/loop.py` 的 `_safe_emit` / `_safe_emit_lazy` / `_safe_scope` / `_safe_bind`。Agent Loop 是唯一会把异常变成「工具结果」回灌模型的地方，埋点异常会伪装成「你的工具坏了」
-> - `ui_message` 的 AI 正文由 `tui/app.py` `_do_stream` 里的 `reset_text_widgets()` 收尾产出，调用点共**四处**：循环内三处（PROGRESS / TOOL_START / HISTORY）+ **`finally` 里一处**。第四处不可省——前三处都是「靠下一个动作给上一段收尾」，所以一轮运行里的**最后**一段正文没有它就一条事件都不产（P1a 实测发现的 P0 缺口，**界面上完全看不出来**：界面显示得好好的，只是没被记下来）。它在 `finally` 里的位置也定死：`bind_scope(SCOPE_MAIN)` **之后**（该段呈现在主界面上、该记 `main`）、两个 `call_from_thread` **之前**（后者在退出竞态下会抛，放后面等于「出错时不记录」）。护栏见 `tests/test_e2e_control.py::FinalTextRecordedTest`
-> - `SkillManager` 的 trace 埋点必须在锁**外**（`deactivate` 为此改成「锁内算结果 → 出锁 → 埋点 → 返回」）；明确**不埋** `tool_policy()`——它每轮被调用，埋进去会淹掉时间线
+新增**内置样板**才需要动代码：在 `rhinecode/skills/builtin/` 加 `.md`，`pyproject.toml` 的 package-data 已覆盖 `builtin/*.md` 无需再改。（`allowed-tools` 里写了认不出的名字**不会**让启动失败——只会跳过并警告。）
+
+## 成对维护点
+
+**改一处就必须同步另一处的地方。** 这一节是全文对防 bug 最有用的部分——下面每一条
+都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
+只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
+
+- 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）+ 若要在 `allowed-tools` 里可写，还要在 `skills/validation.py` 的 `_TOOL_ALIASES` 加一行
+- 新增 MCP 传输方式 → `mcp/transport.py`（`Transport` 子类）+ `mcp/manager.py` `_build_transport`（按 `kind` 分支）
+- 新增斜杠命令 → 只需 `commands/builtins.py` 登记一条 `CommandSpec` + 处理函数 + 测试（c10 单一注册来源；补全/帮助/高亮自动生效）
+- 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
+- 新增状态栏展示字段 → `tui/widgets.py` `compose_status_text`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
+- 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+- 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
+- 新增 Skill 内置样板 → `rhinecode/skills/builtin/*.md` + 确认 `pyproject.toml` 的 `[tool.setuptools.package-data]` 仍覆盖它（否则 `pip install -e .` 正常但真安装后样板凭空消失且不报错）
+- **预授权的授予与撤销必须成对**，且撤销放在 `finally`：`_wrap_events` 是每一次 Agent 执行的唯一包装点，三条路径（主对话 / 用户触发的子对话 / 模型自行发起的子对话）都经过它。**撤销用 `restore_turn_rules(token)` 回滚而不是 `revoke_turn_rules()` 清空**——授权会嵌套（模型在主对话里发起 fork 时内层若清空，会把外层那次执行的授权也抹掉，外层剩下的轮次突然开始弹本不该弹的确认面板，界面上看不出任何异常）
+- **新增 Skill frontmatter 字段** → `skills/models.py`（`SkillSpec` 字段 + 若无对应能力则登记进 `UNSUPPORTED_FIELDS`）+ `skills/parser.py`（读取与归一）+ `skills/render.py`（若要进清单）；连字符写法要能被 `_normalize_keys` 认出
+- **命令名的来源是文件系统路径，不是 frontmatter** → 改动 `discovery.py` 的推导逻辑时，`跨层覆盖键`、`短命令注册`、`/skills 报告` 三处的「同一个 Skill」判定都跟着它走
+- `rhinecode/tools/__init__.py` **不得 re-export 任何子模块**：`tools ↔ skills` 与 `tools ↔ mcp` 都是包级互相依赖，不成环唯一依靠这个文件是空的
+- `SkillManager` 持锁期间**禁止任何回调与跨线程调度**：违反会与 Textual 阻塞式 `call_from_thread` 组成确定性死锁，整个 TUI 冻结
+- Skill 短命令的两处注册必须同口径：`__main__` 启动时一次、`RhineApp.reload_skills()` 热更新时一次（都走 `build_skill_command_specs` + `replace_skill_commands`，且都要把 skipped 的冲突项提示成 `/skills run`）
+- 启动接线中 `LoadSkillTool` 必须在算 `known_tools` **之前**注册，且整段 Skill 校验必须夹在 `MCPAddServerTool` 注册之后、`connect_all` 之前（两头都不能挪，理由见 `__main__.py` 注释）
+- 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
+- **任何往 markup 串里嵌纯文本的地方，一律用 `tui/widgets.py` 的 `escape`，绝不要 `from rich.markup import escape`**：rich 那版只转义「看起来像完整标签」的 `[...]`（正则要求闭合的 `]`），因此**被截断的括号会被它整个放过**；而 Textual 的 Content markup 比 Rich 严格，会把落单的 `[` 当标签开头并抛 `MarkupError`——抛出点在 `OptionList.get_content_height` 这类**布局阶段的主线程**调用里，不在业务调用栈上，没有任何 try/except 兜得住，**Textual 直接拆掉整个 app、程序退出**。真实现场：`summarize_args` 先截断后转义，把 `allowed_tools: [read_file, glob_files, …]` 切成 `allowed_tools: [read_file, glo…`，`edit_file` 的 `old_string`+`new_string` 天然成对凑够两个未闭合括号（一个不够，实测 Textual 容忍），确认面板一弹就崩。护栏见 `tests/test_tui_markup_escape.py`（含现场重演与「旧口径确实会崩」的反证）
+- 新增 trace 事件类型 → `trace/models.py`（`TraceEventType` 枚举）+ `trace/reader.py` 的 `SUMMARIZERS`「type → 摘要函数」表（**漏了不报错**，只会让新事件在阅读器里显示成「（未登记类型）」——那句话就是为暴露这个遗漏而刻意保留的）
+- `bootstrap.build_app` 的装配顺序 → 那段「位置为什么卡在这个窄窗口里 / 两头都不能挪」的理由注释**必须随代码走**；迁代码留注释等于把知识丢了。**窗口里现在只剩一件事**：P1a 的 `exclude_tools` 摘除，理由是「往后挪会让 `session_start` 快照与实际工具集不符」。另半件（C11 的 Skill 白名单 fail-fast）已随对齐改造删除——`allowed-tools` 现在认不出的项只警告不终止，`bootstrap.py` 里留着那段删除说明，别再照着它推理
+- 新增控制通道指令 → `tests/e2e/protocol.py`（取值/错误码）+ `control.py`（`DriverCore` 方法）+ `host.py` 的 `dispatch` 分支 + `client.py`（子命令）+ `test_e2e_control.py`（**五处齐改，漏一处是静默失效**：客户端能发但宿主不认、或宿主认了但没人调得到）
+- 产品侧交互结算点新增来源取值 → `tui/app.py` 三处（`_interact` 的待决盒 / `_resolve_interaction` / `_settle_session`）+ `tests/e2e/protocol.py` 的取值集合 + 断言词汇
+- `build_app` 新增参数 → `rhinecode/bootstrap.py` + `tests/e2e/host.py` 的装配调用（**宿主是它的第二个真实调用方**，漏改会让驱动设施与真实启动行为分叉，而分叉处恰恰是「验收依据」）
+- **`_settle_session` 是会话面板结算的唯一入口** → 将来任何第三条会话结算路径都必须走它，否则丢埋点、丢幂等守卫（`test_tui_keybindings.py` 有结构护栏钉着）
+- `tests/e2e/assertions.py` 的十一项断言词汇 ↔ spec F25 清单 → 增删要同步 spec / `assertions.py` / `test_e2e_assertions.py` 三处
+- 测试里删沙箱目录 → 一律走 `tests/e2e/sandbox.py` 的 `force_rmtree`，**不要直接写 `shutil.rmtree(path, ignore_errors=True)`**：撞上 git 留下的只读 `.git/objects` 会「删一半」，留下一个只剩空 `.git` 的残骸且**一个错都不报**（实测只在全量测试的并发负载下出现，单跑那条用例必成功，追起来极费劲）
+- 新增状态栏字段 → 除原有两处（`compose_status_text` 渲染 + `_refresh_status` 取值）外，`_refresh_status` 现在把**同一份**参数组同时喂给 `compose_status_text` 做 trace 快照。**保持单一参数组、不要抄第二份清单**——抄了会让维护点从两处涨到三处，而漏改的后果是记录里的状态栏文本与用户实际看到的不一致（观测设施撒谎但不报错）
+- trace 埋点一律走**受保护漏斗**：`agent/loop.py` 的 `_safe_emit` / `_safe_emit_lazy` / `_safe_scope` / `_safe_bind`。Agent Loop 是唯一会把异常变成「工具结果」回灌模型的地方，埋点异常会伪装成「你的工具坏了」
+- `ui_message` 的 AI 正文由 `tui/app.py` `_do_stream` 里的 `reset_text_widgets()` 收尾产出，调用点共**四处**：循环内三处（PROGRESS / TOOL_START / HISTORY）+ **`finally` 里一处**。第四处不可省——前三处都是「靠下一个动作给上一段收尾」，所以一轮运行里的**最后**一段正文没有它就一条事件都不产（P1a 实测发现的 P0 缺口，**界面上完全看不出来**：界面显示得好好的，只是没被记下来）。它在 `finally` 里的位置也定死：`bind_scope(SCOPE_MAIN)` **之后**（该段呈现在主界面上、该记 `main`）、两个 `call_from_thread` **之前**（后者在退出竞态下会抛，放后面等于「出错时不记录」）。护栏见 `tests/test_e2e_control.py::FinalTextRecordedTest`
+- `SkillManager` 的 trace 埋点必须在锁**外**（`deactivate` 为此改成「锁内算结果 → 出锁 → 埋点 → 返回」）；明确**不埋** `tool_policy()`——它每轮被调用，埋进去会淹掉时间线
 
 ## 常用命令
 
@@ -321,6 +346,8 @@ Trace 记录器测试（`tests/test_trace_*.py` + `tests/test_bootstrap.py`，�
 9. Skill 系统后续项（C11 spec 明确不做）：Skill 的市场分发与版本管理、嵌套激活（Skill 里再激活 Skill）、参数 schema 与校验、模板引擎（`$ARGUMENTS` 只做字面替换）、多个 Skill 并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、阈值（字段截断 4000 字符 / 消息条数 400）可配置化、采样与按类型开关（当前只有「全开」与「全关」两态）。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
+
+12. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
 
 ## 代码注释规范
 
