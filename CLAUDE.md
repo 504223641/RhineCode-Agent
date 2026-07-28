@@ -220,14 +220,14 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 869 项，skipped 4
+python -m unittest discover -s tests      # 882 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
 慢速专项（需 `RHINE_E2E_SLOW=1`）。**本机需装 git**——有预置依赖真实提交历史，
 缺 git 时明确报错而非静默跳过（静默跳过会让那些场景假绿）。
 
-逐层的覆盖清单见 **[`docs/internals/testing.md`](docs/internals/testing.md)**。
+逐层的覆盖清单见 **[`docs/internals/testing.md`](docs/internals/testing.md)**（前半是按层的概览表，后半三节是 Skill / Trace / 驱动设施的逐条留存）。
 **动某条测试之前先去那里搜一下它**——里面夹着若干「这条护栏为什么不能简化」的说明，
 很多看起来啰嗦的写法是踩过坑之后刻意保留的（例如死锁护栏必须用完成计数而不是
 布尔标志，同线程版本在 `RLock` 下会静默通过）。
