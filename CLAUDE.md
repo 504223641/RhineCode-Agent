@@ -16,6 +16,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | [`internals/testing.md`](docs/internals/testing.md) | 要加/改测试，或想知道某个行为**有没有护栏钉着** |
 | [`internals/config.md`](docs/internals/config.md) | 要动配置加载、新增配置项或模板生成 |
 | [`docs/c11/README.md`](docs/c11/README.md) | 当前章节的 spec/plan/task/checklist 与验收记录导航 |
+| [`docs/todo/README.md`](docs/todo/README.md) | **下一步做什么** —— 待选方向，按优先级编号，每份自带可一键复制的开工 Prompt |
 
 留在主文件里的都是**不请自来才有用**的东西：成对维护点、安全边界、代码注释规范、
 学习与解释要求、已知后续工程项。索引解决「我要查点东西」，解决不了
