@@ -1,9 +1,11 @@
 ---
 name: review
 description: 审查当前改动并只回流结论
-mode: isolated
-history_messages: 0
-allowed_tools: [read_file, grep_content, glob_files, run_command]
+when_to_use: 用户说「审查」「review」「看看这些改动有没有问题」时
+context: fork
+# 审查是纯只读的调研，全部预授权；它一次可能读二十个文件、跑几条 git 命令，
+# 逐个确认会让人失去耐心，而这些操作没有任何副作用。
+allowed-tools: [Read, Grep, Glob, Bash(git status *), Bash(git diff *), Bash(git log *)]
 ---
 
 审查当前工作区的改动，找出真正的问题。

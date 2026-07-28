@@ -6,8 +6,8 @@
 放在这里而不是散在各测试文件里，是为了让**手工驱动**也能直接用——
 手测时不该为了起一个宿主先去写一个 Python 模块。
 
-⚠️ 预置 Skill 的 `allowed_tools` 不得写 `mcp_add_server` / `mcp_resolve_server`
-（宿主会摘掉它们，见 `host.EXCLUDED_TOOLS`）。
+⚠️ `allowed-tools` 现在是**预授权**（本次执行内免确认），不是工具收窄。
+写 `mcp_add_server` / `mcp_resolve_server` 没有意义——宿主会摘掉这两个工具。
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def seed_typo_skill(workspace: Path, user_dir: Path) -> None:
     seeding.seed_project_skill(
         workspace,
         "broken",
-        {"description": "白名单写错了", "allowed_tools": ["read_file", "no_such_tool"]},
+        {"description": "白名单写错了", "allowed-tools": ["read_file", "no_such_tool"]},
         "这个 Skill 起不来。",
     )
 
@@ -129,9 +129,9 @@ def seed_isolated_skill(workspace: Path, user_dir: Path) -> None:
         "solo",
         {
             "description": "独立模式跑一遍",
-            "mode": "isolated",
+            "context": "fork",
             "model": "deepseek-reasoner",
-            "allowed_tools": ["read_file", "glob_files"],
+            "allowed-tools": ["read_file", "glob_files"],
         },
         "在子对话里完成分析并给出结论。\n\n$ARGUMENTS",
     )
@@ -171,7 +171,7 @@ def seed_basic(workspace: Path, user_dir: Path) -> None:
             "description": "审阅改动并给出结论",
             # 只读白名单里 read_file 必须配上 glob_files，否则模型没法发现目录里有什么
             # （CLAUDE.md 里记着的实测教训）
-            "allowed_tools": ["read_file", "glob_files"],
+            "allowed-tools": ["read_file", "glob_files"],
         },
         "第一步：列出改动。第二步：逐个读。第三步：给结论。\n\n$ARGUMENTS",
     )

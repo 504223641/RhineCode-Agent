@@ -17,8 +17,9 @@ C11 这三条场景的判据是「**真实模型是否按 SOP 行事**」。脚�
 
 ## 预置 Skill 的硬约束
 
-`allowed_tools` 不得写 `mcp_add_server` / `mcp_resolve_server`——宿主会摘掉它们
-（`host.EXCLUDED_TOOLS`），写了会在运行期交集时被剔空、静默降级为「不收窄」。
+`allowed-tools` 现在是**预授权**（本次执行内免确认），不是工具收窄。
+写 `mcp_add_server` / `mcp_resolve_server` 没有意义——宿主会摘掉这两个工具
+（`host.EXCLUDED_TOOLS`），针对它们的预授权规则永远命不中。
 """
 
 from __future__ import annotations
@@ -178,79 +179,6 @@ def seed_commit_repo(workspace: Path, user_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 场景 4：白名单收窄可观测
-# ---------------------------------------------------------------------------
-# 需要两个 Skill 形成对照：
-#
-#   - `audit`：声明窄白名单（只读两件），用来验「收窄真的发生了」；
-#   - `freeform`：**不声明** `allowed_tools`，用来验「任一 Skill 未声明则整体
-#     塌缩为不收窄」——这是 C11 的既定语义，也是这条场景后半段的判据。
-#
-# ⚠️ `audit` 的白名单里 `glob_files` 是**必须**的，不是顺手加的：
-# CLAUDE.md 记着的实测教训——只给 `read_file` 的话模型没有任何办法发现目录里
-# 有哪些文件，会退化成盲猜文件名，白烧好几轮。那样这条场景验到的就不是
-# 「收窄可观测」而是「收窄过度有多糟」了。
-
-
-def seed_whitelist_pair(workspace: Path, user_dir: Path) -> None:
-    """
-    预置场景 4 的一对 Skill 与一个可供审阅的小项目。
-
-    `audit` 放**项目级**、`freeform` 放**用户级**，顺带覆盖两个存放层级。
-    副作用：写 `.rhinecode/skills/audit.md`、`<user_dir>/skills/freeform.md`
-    与几个源文件。
-    """
-    seeding.seed_files(
-        workspace,
-        {
-            "app/__init__.py": "",
-            "app/config.py": (
-                '"""服务配置。"""\n\n'
-                "LOGIN_TIMEOUT = 30\n"
-                "DB_POOL_SIZE = 5\n"
-                "DEBUG = True\n"
-            ),
-            "app/auth.py": (
-                '"""登录相关逻辑。"""\n\n'
-                "from app.config import LOGIN_TIMEOUT\n\n\n"
-                "def login(username, password):\n"
-                "    # 注意：这里没有做任何密码强度校验\n"
-                "    return bool(username) and bool(password)\n\n\n"
-                "def session_ttl():\n"
-                "    return LOGIN_TIMEOUT\n"
-            ),
-            "notes.md": "# 待办\n\n- 补充登录失败次数限制\n",
-        },
-    )
-
-    # ① 窄白名单：只读两件
-    seeding.seed_project_skill(
-        workspace,
-        "audit",
-        {
-            "description": "只读审阅代码，产出审阅意见但不改任何文件",
-            "mode": "shared",
-            "allowed_tools": ["read_file", "glob_files"],
-        },
-        "以只读方式审阅代码，把发现写成一段意见。\n\n"
-        "**本流程不修改任何文件**：即使发现问题，也只在回复里说明，"
-        "不要动手改，也不要把意见写进文件。\n\n"
-        "$ARGUMENTS",
-    )
-
-    # ② 不声明白名单：用来验「整体塌缩为不收窄」
-    seeding.seed_user_skill(
-        user_dir,
-        "freeform",
-        {
-            "description": "不限定工具的自由协助",
-            "mode": "shared",
-        },
-        "按用户要求自由地完成任务，可以使用任何可用工具。\n\n$ARGUMENTS",
-    )
-
-
-# ---------------------------------------------------------------------------
 # 场景 6：启动 fail-fast（白名单里的内置工具名拼错）
 # ---------------------------------------------------------------------------
 # 这条场景**一次模型调用都不会发生**：装配在 Provider 之前就终止了。
@@ -296,8 +224,7 @@ def seed_typo_whitelist(workspace: Path, user_dir: Path) -> None:
         "broken",
         {
             "description": "白名单里有个拼错的工具名",
-            "mode": "shared",
-            "allowed_tools": [TYPO_TOOL_NAME, "glob_files"],
+                        "allowed-tools": [TYPO_TOOL_NAME, "glob_files"],
         },
         "随便做点什么。\n\n$ARGUMENTS",
     )
@@ -318,8 +245,7 @@ def seed_fixed_whitelist(workspace: Path, user_dir: Path) -> None:
         "broken",
         {
             "description": "白名单里有个拼错的工具名",
-            "mode": "shared",
-            "allowed_tools": ["read_file", "glob_files"],
+                        "allowed-tools": ["read_file", "glob_files"],
         },
         "随便做点什么。\n\n$ARGUMENTS",
     )
@@ -357,13 +283,13 @@ def seed_thirdparty_repo(workspace: Path, user_dir: Path) -> None:
     seeding.seed_project_skill(
         workspace,
         "context",
-        {"description": "名字故意与内置命令重名", "mode": "shared"},
+        {"description": "名字故意与内置命令重名", },
         "请只回复一行：`重名 Skill 已执行`。不要调用任何工具。\n\n$ARGUMENTS",
     )
     seeding.seed_project_skill(
         workspace,
         "houserules",
-        {"description": "本仓库的编码约定", "mode": "shared"},
+        {"description": "本仓库的编码约定", },
         "按本仓库约定作答。\n\n$ARGUMENTS",
     )
 
@@ -442,8 +368,8 @@ def seed_plan_skill(workspace: Path, user_dir: Path) -> None:
         "fixit",
         {
             "description": "按要求改代码（独立模式）",
-            "mode": "isolated",
-            "allowed_tools": ["read_file", "glob_files", "grep_content", "edit_file", "write_file"],
+            "context": "fork",
+            "allowed-tools": ["read_file", "glob_files", "grep_content", "edit_file", "write_file"],
         },
         "你要按用户的要求**修改代码**。\n\n"
         "先读懂相关文件，然后**给出完整的改动计划并等待批准**，"
@@ -536,7 +462,7 @@ def seed_capability_pack(workspace: Path, user_dir: Path) -> None:
         "name: naming\n"
         "description: 按本组内部命名约定给出标识符名字\n"
         "mode: shared\n"
-        "allowed_tools: [read_file, glob_files]\n"
+        "allowed-tools: [read_file, glob_files]\n"
         "---\n\n"
         "本组的命名约定写在随附的 `reference.md` 里，**你必须先把它读完**再作答。\n"
         "约定的细节不在本文件中，凭印象作答一定是错的。\n\n"

@@ -330,20 +330,31 @@ class SkillManager:
             return ActivationResult(
                 status=ActivationStatus.NOT_FOUND,
                 name=name,
-                available_names=tuple(s.name for s in self._catalog.skills),
+                available_names=tuple(s.command_name for s in self._catalog.skills),
             )
 
-        # ── ② 独立模式早返回（锁外）──
-        # 本分支根本不动可变状态，本就不需要锁；且它含 has_short_command 这个
+        # ── ② 两个早返回分支（锁外）──
+        # 它们都不动可变状态，本就不需要锁；且都含 has_short_command 这个
         # 跨层回调，按加锁约定 ② 必须在锁外。
-        if spec.forked:
-            hint = (
-                f"/{spec.command_name}"
-                if self._has_short_command(spec.command_name)
-                else f"/skills run {spec.command_name}"
-            )
+        #
+        # **顺序有讲究**：先判「谁能触发」，再判「在哪执行」。
+        # 一个既 `context: fork` 又 `disable-model-invocation` 的 Skill，
+        # 该给出的是「你不能自行发起」而不是「去开子对话」——前者才是模型
+        # 需要知道的下一步。
+        hint = (
+            f"/{spec.command_name}"
+            if self._has_short_command(spec.command_name)
+            else f"/skills run {spec.command_name}"
+        )
+
+        if not spec.model_invocable:
             return ActivationResult(
-                status=ActivationStatus.ISOLATED, name=name, entry_hint=hint
+                status=ActivationStatus.NOT_MODEL_INVOCABLE, name=name, entry_hint=hint
+            )
+
+        if spec.forked:
+            return ActivationResult(
+                status=ActivationStatus.FORKED, name=name, entry_hint=hint
             )
 
         # ── ③ 状态变更（锁内，且只有这一段）──
