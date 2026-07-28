@@ -360,10 +360,14 @@ class ReloadOutcome:
     :param added: 新出现的 Skill 名
     :param removed: 消失的 Skill 名
     :param auto_deactivated: 原本已激活、但在新 catalog 中消失，因而被自动卸载的（F27）
-    :param dropped_fatal: 白名单含不存在的内置工具名、被本次热更新丢弃的。
-                          注意与启动时不同：启动时这是**致命错误直接退出**，
-                          热更新时只丢弃并警告（详见 manager.reload 的注释）
-    :param warnings: 全部警告，含「下次启动会失败」这条关键提示
+    :param dropped_fatal: **已废弃，恒为空元组**。C11 时它表示「白名单含不存在的
+                          内置工具名、被本次热更新丢弃的项」，而那时启动路径上同样的
+                          错误是致命的（直接退出）。对齐改造把 `allowed-tools` 从
+                          「收窄」改成「预授权」后，认不出的项一律只警告不丢弃，
+                          启动也不再 fail-fast——这个字段随之没有了产生者
+                          （`manager.reload` 里硬编码传 `()`）。字段暂留是为了不动
+                          `trace/reader.py` 的事件摘要契约。
+    :param warnings: 全部警告
     :param errors: 本次扫描的加载失败记录
     """
 

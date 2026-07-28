@@ -401,7 +401,7 @@ class RhineApp(App):
         热更新 Skill 定义**并重新注册斜杠短命令**（c11 F26），返回报告文本。
 
         分两步，顺序不能反：
-        1. 领域侧 `manager.reload_skills()` 重新扫盘、重跑白名单两段校验、
+        1. 领域侧 `manager.reload_skills()` 重新扫盘、重新解析 `allowed-tools` 声明、
            同步激活列表，产出可读报告；
         2. 界面侧用**新的** `command_infos()` 整体替换注册表里的 Skill 短命令。
 
