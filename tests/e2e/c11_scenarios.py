@@ -390,7 +390,18 @@ def seed_plan_skill(workspace: Path, user_dir: Path) -> None:
 # 它的形态与我们的样板完全不同（指导型、英文长 description、无 $ARGUMENTS），
 # 正是真实用户会遇到的那种。
 FOREIGN_SKILL_ENV = "RHINE_E2E_FOREIGN_SKILL"
-_DEFAULT_FOREIGN_SKILL = Path(r"G:\Rhine-test\c11-p1a\.rhinecode\skills\frontend-design\SKILL.md")
+# 缺省指向本机那份**真实的 Claude Code Skill**。
+#
+# 为什么用它而不是自己写一份：本预置的全部意义就是「用一份不是我们写的 Skill」——
+# 我知道契约，我写的样本必然照着契约写，验不出「外部作者会怎么写」。
+# 这份是 Claude Code 自己装的、英文、目录型、frontmatter 只有 name + description，
+# 恰好是标准里最常见的形态。
+#
+# 早先指向的 `G:\Rhine-test\c11-p1a\...\frontend-design` 是一次手测留下的目录，
+# 已随那次临时工作区一并删除。要换成别的，用 RHINE_E2E_FOREIGN_SKILL 指路径。
+_DEFAULT_FOREIGN_SKILL = Path(
+    r"C:\Users\Administrator\.claude\skills\context7-mcp\SKILL.md"
+)
 
 
 def seed_foreign_skill(workspace: Path, user_dir: Path) -> None:

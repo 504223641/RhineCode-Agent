@@ -14,13 +14,169 @@
 
 | 场景 | 判据 | 结果 |
 | --- | --- | --- |
-| 1 外部 Skill 原样可用 | 待跑 | |
-| 2 预授权的边界 | 待跑 | |
+| 1 外部 Skill 原样可用 | 5/5 | ✅ |
+| 2 预授权的边界 | 4/4 | ✅（修掉 1 个缺陷） |
 | 3 预授权翻不过前三层 | 3/3 | ✅ |
 | 4 模型自行发起 fork | 5/5 | ✅ |
 | 5 两个可调用性开关 | 5/5 | ✅（修掉 2 个缺陷） |
 | 6 旧格式迁移提示 | 4/4 | ✅ |
 | 7 无能力字段告知 | 3/3 | ✅ |
+| **合计** | **29/29** | **全通过，修掉 4 个缺陷** |
+
+## 本轮验收修掉的 4 个缺陷
+
+全部是**小修**（几行、判据明确），均已当场改完并补上护栏：
+
+| # | 缺陷 | 危害 | 场景 |
+| --- | --- | --- | --- |
+| 1 | 预授权跟着「激活态」走，共享模式 Skill 常驻导致此后每轮都免确认 | 用户在不知情的情况下永久失去确认机会 | 2 |
+| 2 | 授权在取令牌之前授予，`finally` 回滚不掉 | 同上（第一次修完仍然红） | 2 |
+| 3 | 清单不说入口命令，模型编出不存在的 `rhine skill deploy` | 用户照着敲得到「未知命令」 | 5 |
+| 4 | 用户敲 `/deploy` 也被 `disable-model-invocation` 挡下 | **死循环**，且界面上看不出异常 | 5 |
+
+另修一处测试设施缺陷：预置函数抛错时宿主不清理临时目录（实测攒出 4 个）。
+
+**4 个缺陷全部逃过了 869 条单测**，共同点是都落在**接缝处**——
+第 1/2 条在「授权」与「常驻态」的交界，第 3/4 条在「模型路径」与「用户路径」
+的交界。单测各自验一侧，交界处没人验。这正是端到端跑真实模型的价值。
+
+---
+
+## 场景 1：外部 Skill 原样可用
+
+**这是本次改造的立身之本**：如果一份 Claude Code 的 Skill 搬进来还要改，
+那「对齐标准」就没有兑现。
+
+用的是本机上那份**真实的 Claude Code Skill**——`~/.claude/skills/context7-mcp/`，
+Claude Code 自己装的、英文、目录型、frontmatter 只有 `name` + `description`。
+预置**原样复制、一个字节不改**。
+
+> 用它而不是自己写一份，是因为「我知道契约」这件事本身就是污染源——
+> 我写的样本必然照着契约写，验不出外部作者会怎么写。
+> （原先指向的 `frontend-design` 是一次手测留下的目录，已随那次临时工作区删除，
+> 故改指这份。要换别的用 `RHINE_E2E_FOREIGN_SKILL` 指路径。）
+
+### ① 零改动加载，零警告
+
+**机器判到了什么**（`/skills`）：
+
+```
+- context7-mcp（项目级 · 主对话）：This skill should be used when the user asks
+  about libraries, frameworks, API references, or needs code examples. ...
+    短命令 /context7-mcp
+```
+
+报告里**没有「警告」段，也没有「字段提示」段**。
+
+**判断**：一个字节没改就被完整识别。没有任何字段被判为不认识——
+这份 frontmatter 只用了 `name` + `description` 两个标准字段，
+本版本原生支持。通过。
+
+### ② 命令名取自目录名
+
+**机器判到了什么**：短命令是 `/context7-mcp`，与目录名 `context7-mcp` 一致
+（frontmatter 里的 `name` 恰好也是它，但取值来源是路径——见 `discovery.py`）。
+
+**判断**：与 CC 一致。通过。
+
+### ③ 未声明 allowed-tools 就没有任何预授权
+
+**机器判到了什么**：该 Skill 触发后模型调 `run_command`，判定为
+
+```
+run_command → ask（④模式）· 默认模式：无规则命中，交由用户确认
+interaction  confirm → allow · run_command {'command': 'npx -y context7 resolve-l…
+```
+
+**判断**：不写 `allowed-tools` 就一条预授权都没有，照常弹面板。
+这是正确的缺省——预授权必须是作者显式声明的，不能靠推断。通过。
+
+### ④ 模型凭 description 自行发起
+
+**机器判到了什么**：发一句英文 `How do I configure Next.js middleware?`
+（没提任何 Skill 名），模型第 2 轮 `load_skill` → `SKILL activate active=context7-mcp`。
+
+**判断**：`description` 里写的「Activates for setup questions ... mentions of
+specific frameworks like React, Vue, Next.js」被命中了。
+**这份 description 是外部作者按 CC 的习惯写的**——它把 when-to-use 的内容
+直接塞进了 description（本版本另有 `when_to_use` 字段，但不强制）。
+两种写法都工作。通过。
+
+### ⑤ SOP 被实际遵循
+
+**机器判到了什么**：激活后模型第 3 轮按该 Skill 的 Step 1
+（"Resolve the Library ID"）去调 context7，命令是
+`npx -y context7 resolve-library-id ...`。
+
+**判断**：不只是「加载了」，而是**照着它的步骤做了**。
+调用最终失败（沙箱里没连 MCP，context7 返回 404），模型随后自行回退到
+用自身知识作答——这是环境限制，不是缺陷。判据是「SOP 是否被遵循」，
+而记录证明它被遵循到了第一步的具体命令层面。通过。
+
+---
+
+## 场景 2：预授权的边界
+
+预置 `seed_grant_pair` 里的 `notetaker`——`allowed-tools: [Write, Edit, Read]`，
+**刻意不声明 Bash**。这条对照是判据的全部依据：声明了的免确认、没声明的照常问。
+
+### ① 声明了的操作免确认
+
+**机器判到了什么**（第一次触发 `/notetaker`）：
+
+```
+glob_files  → allow（rule）命中 allow 规则 Read（来源：skill）
+read_file   → allow（rule）命中 allow 规则 Read（来源：skill）
+edit_file   → allow（rule）命中 allow 规则 Edit（来源：skill）
+```
+
+**判断**：三条都走第③层规则命中，`来源：skill` 标明是预授权给的，
+而不是用户自己配的规则。通过。
+
+### ② 没声明的操作照常弹面板
+
+**机器判到了什么**：同一次执行内
+
+```
+run_command → ask（mode）默认模式：无规则命中，交由用户确认
+```
+
+**判断**：这是本场景最关键的一条——**同一次执行、同一个 Skill**，
+声明了的放行、没声明的仍然问。预授权确实是「按声明逐项放行」，
+而不是「触发了 Skill 就整体降级」。通过。
+
+### ③ 授权只在触发那一次有效（**发现并修掉的缺陷**）
+
+**机器判到了什么**（第二次发一条**普通消息**，不带任何 Skill 命令）：
+
+```
+read_file   → allow（rule）只读工具默认放行     ← reason 变了，skill 规则没了
+edit_file   → ask（mode）默认模式：无规则命中，交由用户确认
+run_command → ask（mode）默认模式：无规则命中，交由用户确认
+```
+
+**判断**：与第一次逐条对照，`edit_file` 从 `allow（来源：skill）`变回了 `ask`，
+`read_file` 的放行理由也从「skill 规则」变成了「只读工具默认放行」。
+授权确实随那次执行结束而消失。通过。
+
+**这条一开始是红的，且连修两次才好**：
+
+- **第一次**：初版的 `turn_grants()` 从**激活列表**取规则。共享模式 Skill 是
+  常驻的，于是用户跑一次 `/notetaker` 之后，**此后整个会话每一轮都重新拿到
+  那份授权**——写操作从此静默免确认而用户毫不知情。改成「谁触发就为谁授权」。
+- **第二次仍然红**：`run_skill` 在 `_wrap_events` 取令牌**之前**就调了
+  `_grant_for_skill`，于是 `finally` 里的 `restore(token)` 把这次授予也算进了
+  「令牌之前的存量」，回滚时留着不动。改成把 `grant_skill` 一路透传到
+  `_wrap_events`，**先取令牌、再授予**。
+
+护栏见 `tests/test_perm_turn_grant.py::GrantIsPerTriggerNotPerActivationTest`。
+
+### ④ 撤销不影响会话级规则
+
+**机器判到了什么**：第二次执行里用户在面板上选过「本会话放行」的项仍然免确认。
+
+**判断**：`restore_turn_rules` 只回滚本次执行级那一段，
+`session_rules` 与文件级规则完全不动。通过。
 
 ---
 
