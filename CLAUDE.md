@@ -261,8 +261,7 @@ python -m unittest discover -s tests      # 869 项，skipped 4
 以下问题已完成工程审查确认，但不属于当前阶段开发范围。后续章节会集中补齐；在当前阶段不要把它们视为阻塞项，除非用户明确要求处理：
 
 1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
-2. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。**已有真实观测样本**（C11 场景 10 验收时撞到，见 `docs/c11/acceptance/skills-c11-live.md`）：规划阶段那一轮的 `tool_names` 里没有 `run_command`（`_schema_for` 用 `readonly_schemas()` 滤掉了它），模型仍凭先验调了出来，而 `_execute` 的 `out_of_scope` 判据只查 **Skill 白名单**（`_visible(name, policy)`）、不查规划阶段的只读过滤，于是 `outcome=executed`。**这不是 C11 `out_of_scope` 守卫漏了**——两处过滤职责不同。缓解是五层管线一层没少（照样弹确认面板）；这次夹带的恰好是 `git diff`，但同一路径上完全可能是写命令。
-
+2. ~~Plan Mode 规划阶段的工具阶段强校验~~ **已于 2026-07-29 修复**：规划阶段（`plan_mode and not execution_phase`）夹带的非只读工具现在在 `_execute` 的预扫里被独立通道 `plan_blocked` 挡下并回灌「先用 present_plan 提交计划」，trace outcome 为 `plan_blocked`（与 `out_of_scope` **刻意分开**——两处过滤职责不同，回灌指引也不同）。原缺陷有真实观测样本：规划阶段那轮 `tool_names` 里没有 `run_command`，模型仍凭先验调了出来，而当时唯一的守卫只查 Skill 白名单，于是 `outcome=executed`。护栏见 `tests/test_plan_stage_guard.py`（含「放行权限模式下也挡得住」与「获批后放行」两条反证）。
 3. `write_file` / `edit_file` 的文件系统级原子写入。
 4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问——C6 的应用层黑名单+路径沙箱已覆盖命令与文件工具的常见高危场景，但管不住子进程内部的间接访问。
 5. 权限系统后续项：网络请求限制、资源配额、审计日志（C6 spec 明确不做，留待后续章节）。

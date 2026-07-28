@@ -61,6 +61,7 @@ OUTCOME_UNKNOWN_TOOL = "unknown_tool"            # 注册中心里没有这个�
 OUTCOME_INVALID_ARGUMENTS = "invalid_arguments"  # 模型生成的参数 JSON 非法
 OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
 OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
+OUTCOME_PLAN_BLOCKED = "plan_blocked"            # Plan Mode 规划阶段夹带的副作用工具
 
 # ── 用户在人在回路面板里选「拒绝」时回灌给模型的文本 ──
 #
@@ -545,6 +546,9 @@ class Agent:
                 tool_calls, results, ctx,
                 engine, ask, clarify, approve_plan,
                 cancel_event, excluded,
+                # 与 `_schema_for` 的 `planning` **同口径**：两者必须一致，
+                # 否则会出现「发了工具却拒绝执行」或「没发工具也照常执行」。
+                planning=plan_mode and not execution_phase,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -613,6 +617,7 @@ class Agent:
         approve_plan: Optional[ApprovePlanFn],
         cancel_event: threading.Event,
         excluded: frozenset = frozenset(),
+        planning: bool = False,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -645,6 +650,10 @@ class Agent:
         readonly: list[tuple[ToolCall, Tool]] = []
         # 被本轮工具收窄挡下的调用（工具真实存在，只是没发给模型）。
         out_of_scope: list[ToolCall] = []
+        # Plan Mode 规划阶段夹带的副作用工具（已知项 #2）。
+        # **与 out_of_scope 分开是刻意的**：两处过滤职责不同，回灌给模型的
+        # 下一步指引也完全不同——那边是「换个工具」，这边是「先提交计划」。
+        plan_blocked: list[ToolCall] = []
         # 串行桶元素：(调用, 工具或None, 决策或None)。
         # tool=None → 未知工具；decision=None → 参数解析失败（两者都不进引擎）。
         serial: list[tuple[ToolCall, Optional[Tool], Optional[DecisionResult]]] = []
@@ -685,6 +694,22 @@ class Agent:
             # 故这里拒绝并回灌结构化原因，让模型改用可见工具（不终止循环）。
             if not self._visible(tc.name, excluded):
                 out_of_scope.append(tc)
+                ctx.unknown_count += 1
+                continue
+            # Plan Mode 规划阶段：只允许只读调研（已知项 #2）。
+            #
+            # `_schema_for` 在规划阶段用 `readonly_schemas()` 已经不发副作用工具，
+            # 但**模型仍会凭训练先验硬造出调用**——C11 场景 10 验收时实测撞到：
+            # 那一轮 `tool_names` 里没有 `run_command`，模型照样调了出来，
+            # 而当时唯一的守卫 `_visible` 只查 Skill 白名单、不查规划阶段的只读过滤，
+            # 于是 `outcome=executed`：**规划阶段真的执行了副作用命令**。
+            # 那次夹带的恰好是 `git diff`，但同一路径上完全可能是写命令。
+            #
+            # 五层权限管线仍会照常拦截（会弹确认面板），但那是「最后一道」而非
+            # 「本该有的一道」——Plan Mode 的承诺是「批准前不动手」，
+            # 不该退化成「批准前每次都问你要不要动手」。
+            if planning and not tool.read_only:
+                plan_blocked.append(tc)
                 ctx.unknown_count += 1
                 continue
             ctx.known_count += 1
@@ -746,6 +771,26 @@ class Agent:
             # 叠加 F17 的字段白名单后也不在 `agent_event` 里（那里只留工具名与 ok）。
             # 漏埋这一条，本模块就查不出当初立项要查的那个问题。
             self._trace_tool(tc, res, OUTCOME_OUT_OF_SCOPE)
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
+
+        # Plan Mode 规划阶段夹带的副作用工具：拒绝并指回「先提交计划」。
+        #
+        # 文案要点：说清**现在是什么阶段**、**为什么被拒**、**下一步该做什么**。
+        # 只说「不允许」会让模型换个工具名再试一次（同 out_of_scope 的教训）。
+        for tc in plan_blocked:
+            yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+            res = ToolResult(
+                ok=False,
+                output=(
+                    f"[计划模式] 现在处于**规划阶段**，{tc.name} 会产生副作用，因此没有执行。\n"
+                    f"规划阶段只允许只读调研（读文件、搜索、查看结构）与向用户提问。\n"
+                    f"若这一步是方案的一部分，请把它写进计划、用 present_plan 提交给用户审批；"
+                    f"获批后你才可以执行它。不要改用别的工具绕过这一限制。"
+                ),
+                summary="规划阶段不执行副作用工具",
+            )
+            results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_PLAN_BLOCKED)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 只读且放行：并发
