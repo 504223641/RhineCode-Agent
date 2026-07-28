@@ -63,6 +63,40 @@ OUTCOME_INVALID_ARGUMENTS = "invalid_arguments"  # 模型生成的参数 JSON �
 OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
 OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
 
+# ── 用户在人在回路面板里选「拒绝」时回灌给模型的文本 ──
+#
+# ## 为什么这段话要写得这么长
+#
+# 旧文案只有一句「用户拒绝执行该工具。」——它**只说了没执行，没说接下来该干嘛**。
+# 实测后果：模型把它读成「这次尝试失败了」，于是换个路径、换个命令、换个工具
+# 反复重试，把一次明确的「不许」当成了「姿势不对，再试试」。用户被迫连点好几次
+# 拒绝，而每一次拒绝在模型看来都只是又一次技术失败。
+#
+# 关键区分是**「技术失败」与「人的决定」**：前者该调整策略重试，后者该停下来问。
+# 工具结果这个通道天生长得像前者（`ok=False` + 一段错误文本），所以必须由文案
+# 把语义掰回来，明确写出「这不是错误」「不要绕」「去问为什么」。
+#
+# ## 光有文案不够，所以还有硬约束
+#
+# 文案是软约束，模型可以不听。因此 `_RoundContext.user_denied` 置位后，
+# 主循环的**下一轮不发任何工具**（`tools=None`）——模型在物理上只能产出文本，
+# 也就只能向用户说话。两者配合：文案解释「为什么」，机制保证「一定」。
+#
+# ## 为什么不直接终止循环
+#
+# 终止的话模型没有机会解释，用户只会看到工具行变红然后什么都没有——
+# 比反复重试更糟。让它多跑一轮、但手里没有工具，才既停得住又说得出话。
+DENIED_BY_USER_FEEDBACK = (
+    "用户拒绝了这次 {name} 调用。\n"
+    "\n"
+    "**这不是技术故障，是用户的决定。** 不要重试、不要改参数再试一次、"
+    "也不要换用其它工具绕过它——那会把一次明确的拒绝当成「姿势不对」，"
+    "正是用户不希望发生的事。\n"
+    "\n"
+    "请立即停止本次任务的推进，向用户说明你原本打算做什么、为什么需要这一步，"
+    "并询问他拒绝的原因、以及希望你怎么继续。等他答复后再行动。"
+)
+
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
 MAX_ITERATIONS = 25
 # 连续「整轮都是未知工具」达到该次数即停止，避免模型在不存在的工具上空转（spec F2）。
@@ -130,6 +164,7 @@ class _RoundContext:
     :param cancelled: 本轮交互中用户取消（如澄清面板按 Esc）
     :param approved: 本轮 present_plan 获得用户批准（据此切换到执行阶段）
     :param plan_rejected: 本轮 present_plan 被用户拒绝，主循环应立即停止
+    :param user_denied: 本轮有工具在人在回路面板里被用户拒绝，**下一轮不发工具**
     :param known_count: 本轮命中的已知工具（含特殊工具）数量
     :param unknown_count: 本轮命中的未知工具数量
     """
@@ -138,6 +173,7 @@ class _RoundContext:
         self.cancelled: bool = False
         self.approved: bool = False
         self.plan_rejected: bool = False
+        self.user_denied: bool = False
         self.known_count: int = 0
         self.unknown_count: int = 0
 
@@ -404,6 +440,7 @@ class Agent:
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
+        deny_cooldown = False         # 上一轮有工具被用户拒绝 → 本轮不发工具（见 DENIED_BY_USER_FEEDBACK）
 
         def _record(msg: Message) -> None:
             """把新追加进 history 的消息交给会话存档回调（c9）；失败静默不影响循环。"""
@@ -436,6 +473,13 @@ class Agent:
             # 这一轮的工具集就该随之收窄；注册中心也可能因 MCP 重载增删了工具。
             policy = options.tool_policy() if options.tool_policy is not None else None
             tools = self._schema_for(plan_mode, execution_phase, policy)
+
+            # 上一轮有工具被用户拒绝 → **本轮一件工具都不发**（硬约束）。
+            # 理由见 DENIED_BY_USER_FEEDBACK 的注释：回灌文案是软约束、模型可以不听，
+            # 只有真的不给工具，才能保证它停下来跟用户说话而不是换个姿势再试。
+            # 只作用于紧接着的这一轮：用户答复后（新的一次 run）工具自然恢复。
+            if deny_cooldown:
+                tools = None
 
             # 组装请求消息（c5 分通道）：
             # - 稳定系统提示走 stream_chat 的 system 参数（可缓存前缀），不进 messages；
@@ -539,6 +583,11 @@ class Agent:
             if ctx.cancelled:
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.USER_CANCELLED)
                 return
+
+            # 用户拒绝冷却：本轮被拒 → 下一轮不发工具；本轮没被拒 → 解除。
+            # 放在这里（而不是消费处）是为了让「置位」与「解除」都只有一处，
+            # 避免出现「拒绝一次之后永远不给工具」这种更糟的形态。
+            deny_cooldown = ctx.user_denied
 
             # 连续未知工具统计：本轮「有未知且无已知」算一次连续，否则清零
             if ctx.unknown_count > 0 and ctx.known_count == 0:
@@ -718,7 +767,7 @@ class Agent:
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_one_serial(tc, tool, decision, results, ask)
+            yield from self._run_one_serial(tc, tool, decision, results, ctx, ask)
 
     def _run_special(
         self,
@@ -880,6 +929,7 @@ class Agent:
         tool: Optional[Tool],
         decision: Optional[DecisionResult],
         results: dict[str, ToolResult],
+        ctx: _RoundContext,
         ask: AskFn,
     ) -> Iterator[AgentEvent]:
         """
@@ -929,8 +979,10 @@ class Agent:
         if decision.decision == Decision.ASK:
             approved = ask(tc, tool, decision)
             if not approved:
-                res = ToolResult(ok=False, output="用户拒绝执行该工具。")
+                res = ToolResult(ok=False, output=DENIED_BY_USER_FEEDBACK.format(name=tc.name))
                 results[tc.id] = res
+                # 置位后主循环下一轮**不发工具**（硬约束，见 DENIED_BY_USER_FEEDBACK 注释）
+                ctx.user_denied = True
                 self._trace_tool(tc, res, OUTCOME_DENIED_BY_USER)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
                 return
