@@ -75,6 +75,11 @@ P1b 最大的风险不是做不出来，是**把偏了的取样固化成回归�
 ## 一键开工 Prompt
 
 ```
+先检查当前分支：`git branch --show-current`。
+- 如果在 `main` 上：**先起一条新分支**再动手，不要直接在 main 上改。
+  `git checkout -b p1b-unattended`
+- 如果已经在别的分支上：确认那是本任务的分支再继续；不是的话先问我。
+
 开始做 RhineCode 端到端驱动设施的 P1b（无人值守回归）。
 
 第一步：读 docs/c11/testing/p1-driver/spec.md 的**末节**——P1b 范围清单、

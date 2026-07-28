@@ -58,6 +58,11 @@ RhineCode 现有的全部工具都是**本地的**：读文件、跑命令、编
 ## 一键开工 Prompt
 
 ```
+先检查当前分支：`git branch --show-current`。
+- 如果在 `main` 上：**先起一条新分支**再动手，不要直接在 main 上改。
+  `git checkout -b web-fetch`
+- 如果已经在别的分支上：确认那是本任务的分支再继续；不是的话先问我。
+
 给 RhineCode 加网络访问工具，走完整 /spec 流程（spec → plan → task → checklist，
 每份都要我审批）。
 
