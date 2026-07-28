@@ -453,6 +453,50 @@ def seed_plan_skill(workspace: Path, user_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 探索性验收：用一份**不是我们写的** Skill
+# ---------------------------------------------------------------------------
+# 上一轮验收（场景 1–11）有一个结构性盲区：**每个被测 Skill 都是验收者自己写的**，
+# 而验收者知道契约（description 要短、要放 $ARGUMENTS、白名单该收多窄、
+# 动作型与指导型要分开），于是写出来的 Skill 天然是适配好的。
+# 43 项判据全过，却一条也碰不到「Skill 没适配好会怎样」。
+#
+# 这个预置刻意反过来：**原样搬一份外部 Skill 进来，一个字不改**。
+# 它的形态与我们的样板完全不同（指导型、英文长 description、无 $ARGUMENTS），
+# 正是真实用户会遇到的那种。
+FOREIGN_SKILL_ENV = "RHINE_E2E_FOREIGN_SKILL"
+_DEFAULT_FOREIGN_SKILL = Path(r"G:\Rhine-test\c11-p1a\.rhinecode\skills\frontend-design\SKILL.md")
+
+
+def seed_foreign_skill(workspace: Path, user_dir: Path) -> None:
+    """
+    原样搬入一份外部 Skill（目录型，项目级），**不做任何适配**。
+
+    源路径取自环境变量 `RHINE_E2E_FOREIGN_SKILL`，缺省是本机那份 frontend-design。
+    找不到就**明确抛错**——静默跳过会让这次验收变成「又测了一遍我们自己写的 Skill」，
+    也就是它本来要避开的那个盲区。
+
+    :raises FileNotFoundError: 源文件不存在
+    """
+    import os
+
+    src = Path(os.environ.get(FOREIGN_SKILL_ENV) or _DEFAULT_FOREIGN_SKILL)
+    if not src.is_file():
+        raise FileNotFoundError(
+            f"找不到外部 Skill 源文件：{src}\n"
+            f"本预置的全部意义就是「用一份不是我们写的 Skill」，"
+            f"找不到就没有意义了，故明确报错而不是退回内置样板。"
+            f"可用环境变量 {FOREIGN_SKILL_ENV} 指定其它路径。"
+        )
+
+    target = workspace / ".rhinecode" / "skills" / src.parent.name / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # 一个空项目：让模型从零开始，避免既有代码干扰观察
+    seeding.seed_files(workspace, {"README.md": "# 我的小项目\n\n还什么都没有。\n"})
+
+
+# ---------------------------------------------------------------------------
 # 场景 11：目录型 Skill 能力包
 # ---------------------------------------------------------------------------
 # 这条场景一箭双雕：
