@@ -1,6 +1,6 @@
 # 网络访问工具（web_fetch）Tasks
 
-> 状态：待批准（2026-07-29，**第 4 轮修订**：经三轮独立审查，31 个任务）
+> 状态：待批准（2026-07-29，**第 5 轮修订**：经四轮独立审查，31 个任务）
 >
 > 上游：[`spec.md`](spec.md)、[`plan.md`](plan.md)。
 
@@ -58,7 +58,7 @@
 | `rhinecode/permission/matching.py` | 新增 `match_domain` |
 | `rhinecode/permission/rules.py` | `_rule_matches` url 分支；`RuleSet.has_allow_for` |
 | `rhinecode/permission/adapter.py` | `_TOOL_MAP` 登记；填 `host`；新增 `to_allow_rule` |
-| `rhinecode/permission/engine.py` | 插入②′；④层 url 例外；持 `policy_ruleset` |
+| `rhinecode/permission/engine.py` | T7：`load_all` 三元组解包 + `policy_ruleset` 字段；T8：插入②′、④层 url 例外、**每条 return 填 `kind`/`host`** |
 | `rhinecode/permission/config.py` | domain 前缀校验（deny 降级）；错误改列表；返回分层 RuleSet |
 | `rhinecode/skills/validation.py` | `_TOOL_ALIASES` 加 WebFetch；`grants_for` 接警告出参；警告文案补 WebFetch |
 | `rhinecode/conversation.py` | **四件事**：三处 allow 规则构造；`startup_notice` 并入权限警告；`PermissionEngine.load` 传开关；**两个** `build_default_prompt` 调用点传开关 |
@@ -69,7 +69,7 @@
 | `tests/test_perm_config.py` | `load_all` 的 4 处 2 元组解包 |
 | `tests/test_config_bootstrap.py` | `load_all` 的 1 处 2 元组解包（`:123`） |
 | `rhinecode/trace/models.py` | 新增 `SCOPE_WEB_EXTRACT` |
-| `rhinecode/trace/reader.py` | `_LAYER_NAMES` 改为复用 `Layer.label()`（两处合一，消掉一个漏改不报错点） |
+| `rhinecode/trace/reader.py` | `_LAYER_NAMES` 加 `network`（**保持本地一份，刻意不复用 `Layer.label()`**——合一会让 trace 依赖 permission，破坏「叶子包只依赖标准库」） |
 | `rhinecode/config.py` | `Config` 新增 `web_fetch_enabled`；模板补注释 |
 | `rhinecode/bootstrap.py` | 装配 + 两个注入参数 + 关闭开关 |
 | `tests/e2e/host.py` | 同步 `build_app` 新增参数（第二个真实调用方） |
@@ -136,7 +136,8 @@
 **步骤：**
 1. `Layer` 新增 `NETWORK = "network"`，docstring 补一行。
    （中文层名的 `label()` 方法与 `DecisionResult` 的 `kind` / `host` 两个字段
-   由 T25 一并加——它们的唯一消费者是确认面板，放在那里改动更内聚。）
+   由 T25 一并加——它们的唯一消费者是确认面板，放在那里改动更内聚。
+   注意 `trace/reader.py` 的 `_LAYER_NAMES` **保持独立一份**，理由见 T25 步骤 2。）
 2. `PermissionRequest` 新增 `host: str = ""` 字段（**带默认值**，否则既有构造点全部报错），
    docstring 说明：仅 url 类填充，已归一化；三处消费者（规则匹配、确认面板、行为记录）。
 3. `kind` 文档补 `"url"`：specifier 是**完整 URL 原文**，主机名单独放在 `host`。
@@ -239,9 +240,18 @@
    「deny 全丢、allow 照常生效」，从偏严滑向偏松，违反 N1。
 4. `load_all` 返回改为 `(merged_ruleset, policy_ruleset, errors)`：
    `policy_ruleset` 只含 user + project 两层。加 `web_fetch_enabled` 参数，关闭时跳过校验（F4）。
-5. **⚠ `load_all` 现有 5 个 2 元组解包点必须一并改**：
-   `tests/test_perm_config.py`（第 50/56/63/70 行四处）、
-   `tests/test_config_bootstrap.py:123`（一处）。
+5. **⚠ `load_all` 现有 6 个 2 元组解包点必须一并改**，其中**一处在生产代码里**：
+   - **`rhinecode/permission/engine.py:92`**（`ruleset, errors = config.load_all(user_dir)`）
+     ——**本任务必须一并改掉它**，并同时给 `PermissionEngine` 加 `policy_ruleset` 字段
+     （构造函数新参数给默认值，缺省空 `RuleSet`，否则既有构造点全部报错）。
+   - `tests/test_perm_config.py`（第 50/56/63/70 行四处）
+   - `tests/test_config_bootstrap.py:123`（一处）
+
+   **为什么把 engine 的这半件事挪进 T7**：不挪的话，T7 单独完成时
+   `PermissionEngine.load` 一调就 `ValueError: too many values to unpack`，
+   **T7 自己给出的三条验证命令几乎全红**——而下一个任务 T8 才修它。
+   任务的验证必须在该任务完成时就能通过，否则「验证」形同虚设。
+   T8 因此只留「管线插入 + ④例外 + 填 kind/host」。
 6. 警告文案指明文件、原条目、正确写法（`WebFetch(domain:...)`）、该条被怎么处理了，
    并带上 spec F6a 那句「**要建立白名单，请写用户级或项目级**」。
 7. 测试：含 `allow: WebFetch(github.com)` 与 `deny: WebFetch(evil.com)` 的临时 YAML →
@@ -262,18 +272,29 @@
 **依赖：** T5、T7
 
 **步骤：**
-1. `PermissionEngine` 新增 `policy_ruleset` 字段；`load()` 从 `config.load_all` 的三元组取。
-   **构造函数新参数给默认值**（缺省为空 RuleSet），否则既有构造点全部报错。
+1. （`PermissionEngine` 的 `policy_ruleset` 字段与 `load()` 的三元组解包
+   **已在 T7 完成**——挪过去是为了让 T7 自己的验证命令跑得通，本任务从这里接手。）
 2. `merged = RuleSet(...)` 的构造提到 `decide()` 开头。
 3. ②沙箱之后插入②′：`if request.kind == "url": verdict = network.decide(request, merged,
    self.policy_ruleset)`，非 None 即返回；为 None 则**跳过③**直接进④。
 4. 非 url 请求走原有③层，行为逐字不变。
 5. ④层放行档加 url 例外：返回 ASK，reason 写明「放行模式对网络访问不生效」。
-6. **写 ⚠ 注释**：②′必须排在③之前，**理由是「硬校验必须先于任何 allow 规则」**——
+6. **`decide()` 的每一条 return 路径都要填 `kind=request.kind`，url 类另填
+   `host=request.host`。** 这里是「一条都不能漏」——漏掉的那条路径若恰好是
+   ④模式兜底的 ASK，面板就永远进不了 URL 专用分支（T25 整个机制变成死代码，
+   而且**在真机弹面板前完全看不出来**）。
+
+   涉及的 return 有两类：
+   - `engine.decide` 内部自己构造的（①②④各层）——逐条填；
+   - 从 `network.decide` 与 `merged.evaluate` 透传上来的——在 `decide()` 出口统一补，
+     或让那两处也填。**选一种写死在注释里，不要两处各写各的**。
+7. **写 ⚠ 注释**：②′必须排在③之前，**理由是「硬校验必须先于任何 allow 规则」**——
    晚于③会让 `allow: WebFetch(domain:*)` 把 `file://` 与 `127.0.0.1` 整个放过。
    注释里**不要**写成「白名单会失效」（那是错的，两种顺序下白名单结论相同，
    第 1 轮曾这样写，独立审查纠正）。
-7. 测试：
+8. 测试：
+   - **`decide()` 返回的 `DecisionResult` 每条路径都带 `kind`**，url 类另带 `host`
+     （逐条覆盖①②②′③④五层的返回；漏一条 T25 的面板分支就永不触发）
    - 三档模式对「无 user/project 域名规则」的 url 请求：严格→DENY、默认→ASK、**放行→ASK**
    - **对照组**：同一放行档下 `write_file` 仍为 ALLOW
    - **顺序护栏（形态已换）**：`allow: WebFetch(domain:*)` + `http://127.0.0.1/`，
@@ -614,9 +635,15 @@
 
 ## T25: 确认面板的 URL 展示
 
-**文件：** `rhinecode/permission/models.py`、`rhinecode/permission/network.py`、
-`rhinecode/trace/reader.py`、`rhinecode/tui/widgets.py`、`tests/test_web_bootstrap.py`（追加）
-**依赖：** T3、T5、T6
+**文件：** `rhinecode/permission/models.py`、`rhinecode/tui/widgets.py`、
+`tests/test_web_bootstrap.py`（追加）
+**依赖：** T3、**T8**、T6
+
+**⚠ 依赖必须是 T8 而不是 T5。** 面板只在判定为「确认」时弹，而对 url 请求，
+「确认」**只可能来自④模式兜底**——那两条 return 都在 `engine.decide` 里（T8），
+不在 `network.decide` 里。`network.decide` 在这条路上返回的是 `None`（本层不下结论），
+**根本没有构造 `DecisionResult` 的机会**。第 4 轮把依赖写成 T5 是空的。
+填 `kind` / `host` 这件事由 **T8 步骤 8** 负责。
 
 **为什么单独成任务：** spec F9/AC15 有 checklist 条目但第 2 轮的 plan/task 里
 **既无模块也无任务**，而现状是**主动违反**它——`ConfirmPanel.show_for` 走
@@ -648,27 +675,51 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
    而且同一个对象携带，天然保证「面板显示的主机名 = 判定时用的那一个」，
    不会出现两处各算各的。
 2. **中文层名归属定死**：在 `permission/models.py` 的 `Layer` 上加 `label()` 方法
-   （枚举值 → 中文名）。**`trace/reader.py:104` 的 `_LAYER_NAMES` 改为复用它**。
-   现在那张表是全仓唯一一份、藏在只读阅读器里；面板若自己抄一份，
-   就多出一个「漏改不报错」的成对维护点——而 `Layer` 枚举本来就已经是维护点之一。
-   顺手把两处合一，维护点从两个变回一个。
-3. `ConfirmPanel.show_for` 加 URL 类专用分支，判据用 **`decision.kind == "url"`**
-   （第 1 步已让面板拿得到）：**完整地址不截断、单独成行**；
-   主机名（`decision.host`）与层名（`decision.layer.label()`）各占一行。
-4. **⚠ 写进代码注释的死规矩**：完整 URL 进 markup 前一律用 `tui/widgets.py` 自己那版
+   （枚举值 → 中文名），**供面板使用**。
+   `trace/reader.py:104` 的 `_LAYER_NAMES` **保持本地一份，不复用 `label()`**。
+
+   **⚠ 这里第 4 轮做过一次错误决定，理由记在这**：当时想「两处合一，维护点从两个变回一个」，
+   让阅读器 import `Layer`。实测的后果是——`permission/__init__.py` re-export 了
+   `PermissionEngine` / `to_request`，所以**导入任何一个子模块都会先执行包 `__init__`**，
+   连带拉起整个 `permission` 包 + `rhinecode.tools` + **`yaml`**。
+   而 `trace/__init__.py:7` 写着「本包是**叶子包**：`models` 与 `recorder` 只依赖标准库」，
+   `CLAUDE.md` 的架构表与依赖方向总原则也各写了一遍。
+   **拿一个「漏改只显示英文原名」的软维护点，去换一条硬架构不变量，是净亏。**
+
+3. **改用测试护栏钉住两处一致**（测试代码不受叶子包约束）：
+   遍历 `Layer` 的全部成员断言 `_LAYER_NAMES[member.value] == member.label()`。
+   漏改当场红，trace 仍是纯标准库，成对维护点照旧写两处但不再「漏改不报错」。
+   （已确认 `tests/test_trace_reader.py` 现在**没有**任何一条断言层名文本，加这条不撞既有测试。）
+
+4. **同步 `permission/models.py` 的 docstring**：该文件开头写着「只定义枚举与 dataclass，
+   **不含任何行为逻辑**」。`label()` 是显示名映射、不含判定逻辑，但约定既然写了就要跟着改——
+   在 docstring 里补一句说明，别留给实现者临场判断这算不算违例。
+5. `ConfirmPanel.show_for` 加 URL 类专用分支，判据用
+   **`decision is not None and decision.kind == "url"`**：
+   **完整地址不截断、单独成行**；主机名（`decision.host`）与层名
+   （`decision.layer.label()`）各占一行。
+
+   **`is not None` 不可省**：`show_for(self, tool_call, tool, decision=None)` 的
+   `decision` 是可选参数，既有代码一律先判非空再取 `.reason`。这是**主线程布局路径**，
+   `AttributeError` 属于 CLAUDE.md 标注「没有任何 try/except 兜得住」的那一类。
+6. **⚠ 写进代码注释的死规矩**：完整 URL 进 markup 前一律用 `tui/widgets.py` 自己那版
    `escape`，**绝不要 `from rich.markup import escape`**。URL 天然含 `[`
    （IPv6 字面量 `http://[::1]/`、含 `[` 的查询串），rich 那版只转义「看起来像完整标签」的
    `[...]`，落单的 `[` 被整个放过，然后在 Textual 布局阶段抛 `MarkupError`——
    那是 CLAUDE.md 里标注「没有任何 try/except 兜得住、Textual 直接拆掉整个 app」的
    致命不变量。既有 `summarize_args` 结尾用的正是本地那版（`widgets.py:116`），照做。
-5. 测试：
+7. 测试。**⚠ 全部用「走一次真实 `engine.decide` 拿到的 `DecisionResult`」来喂面板，
+   不许手搓 `DecisionResult(kind="url", ...)`**——手搓的话，即使 `engine.decide`
+   一处都没填 `kind`，这些用例照样全绿，缺陷只在真机弹面板时才显形。
    - 一条 120 字符的 URL 在面板文本里**完整出现**（不含截断省略号）
    - 面板文本含主机名与中文层名
    - **`http://[::1]:8080/a?x=[1` 这类含未闭合方括号的地址不会抛 `MarkupError`**
      （直接调面板的文本构造函数断言不抛，并断言 `[` 已被转义）
+   - `decision=None` 时不抛异常（走既有的非 url 分支）
    - 非 url 类工具的面板文本**逐字等于**本次改动前
-   - **`Layer.label()` 与阅读器输出一致**（构造一条 `layer == "network"` 的记录，
-     断言阅读器输出等于 `Layer.NETWORK.label()`——钉住「两处合一」不被后人拆回去）
+   - **`Layer.label()` 与 `_LAYER_NAMES` 逐项一致**：遍历 `Layer` 全部成员断言
+     `_LAYER_NAMES[member.value] == member.label()`。这是替代「两处合一」的护栏——
+     两份表各自留在自己的包里（trace 保持纯标准库），靠这条测试钉住不漂移。
 
 **验证：** `python -m unittest tests.test_web_bootstrap` 通过；
 `python -m unittest discover -s tests -p "test_tui*"`、`-p "test_trace*"`、
@@ -779,7 +830,7 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 4. **在替身模块里加一行自校验**：
    `assert ipaddress.ip_address(STUB_ADDR).is_global and not ipaddress.ip_address(STUB_ADDR).is_multicast`。
    靠注释提醒不够——这次就是靠注释提醒失败的。让选错的人**当场红**。
-4. `host.py` 现有一条刻意的设计约束：**没有 `--workspace` / `--user-dir`**，
+5. `host.py` 现有一条刻意的设计约束：**没有 `--workspace` / `--user-dir`**，
    每次启动建全新临时目录（`host.py:346-349` 有注释）。这意味着「重启宿主后
    本地级规则还在」的场景**跑不起来**——checklist 场景 4 已相应改为进程内二次装配，
    本任务不需要为它开后门。
@@ -830,12 +881,11 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 
 ```
 第一段（权限层）
-  T1 ──┬──→ T4 ──→ T5 ──┐
-       │                │
-  T3 ──┘                ├──→ T8
-  T2 ──┬────────────────┘
-       │
-  T1 ──→ T7 ──┬──→ T8
+  T1 ──┐
+       ├──→ T4 ──┐
+  T3 ──┘         ├──→ T5 ──┐
+  T2 ────────────┘         ├──→ T8
+  T1 ──→ T7 ──┬────────────┘
               └──→ T9
   T2,T3 ──→ T6
 
