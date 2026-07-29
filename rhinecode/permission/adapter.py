@@ -7,11 +7,16 @@
 
 新增工具若要纳入权限控制：在 _TOOL_MAP 加一行映射即可；未映射工具自动落到 "other"
 分支（引擎只按工具名匹配整工具规则、并走模式兜底），不会漏过权限检查。
+
+⚠ **成对维护点**：新增一种 `kind` 时，除了 `_TOOL_MAP`，**同文件的 `to_allow_rule`
+也要跟着加分支**。漏改后者不报错——本次调用照常放行，要到下次启动才发现那条
+「永久放行」写下的规则是废的。
 """
 
 from typing import Callable, Optional
 
 from rhinecode.tools.base import Tool
+from rhinecode.permission import network
 from rhinecode.permission.models import PermissionMode, PermissionRequest
 
 # 单个工具的映射规则：给定参数字典，返回 (rule_name, specifier, kind)。
@@ -31,6 +36,10 @@ _TOOL_MAP: dict[str, _Mapper] = {
     "write_file": lambda a: ("Write", str(a.get("path") or ""), "write_path"),
     # edit_file：改文件归为 Edit。
     "edit_file": lambda a: ("Edit", str(a.get("path") or ""), "write_path"),
+    # web_fetch：完整 URL 进②′网络边界 + ③域名规则匹配。
+    # specifier 刻意用**完整 URL 原文**而非主机名——确认面板与行为记录里要留下
+    # 模型实际请求的那个地址；主机名另放在 PermissionRequest.host（见 to_request）。
+    "web_fetch": lambda a: ("WebFetch", str(a.get("url") or ""), "url"),
 }
 
 
@@ -54,6 +63,16 @@ def to_request(tool: Tool, args: Optional[dict], mode: PermissionMode) -> Permis
         rule_name, specifier, kind = mapper(a)
     else:
         rule_name, specifier, kind = tool.name, "", "other"
+
+    # url 类额外填主机名，一次算好供三处消费：规则匹配、确认面板展示、行为记录。
+    # 解析失败时留空串——后续 check_hard 会在②′层把这次请求拒掉，不必在这里报错。
+    host = ""
+    if kind == "url":
+        try:
+            _scheme, host, _port = network.split_url(specifier)
+        except ValueError:
+            host = ""
+
     return PermissionRequest(
         tool_name=tool.name,
         rule_name=rule_name,
@@ -61,4 +80,49 @@ def to_request(tool: Tool, args: Optional[dict], mode: PermissionMode) -> Permis
         kind=kind,
         is_read_only=tool.read_only,
         mode=mode,
+        host=host,
     )
+
+
+def to_allow_rule(request: PermissionRequest) -> tuple[str, str]:
+    """
+    把一次权限请求翻译成「本会话放行 / 永久放行」要登记的规则 (工具名, 模式)。
+
+    :param request: 规范化后的权限请求
+    :returns: (rule_name, pattern)；pattern 为空串表示「匹配该工具全部调用」
+
+    ## 这个函数为什么存在
+
+    确认面板选「本会话」或「永久」时，需要把本次调用翻译成一条等价的 allow 规则。
+    原先的写法是直接 `f"{rule_name}({specifier})"`，对命令类与路径类是对的，
+    但对 url 类会写出：
+
+        allow:
+          - "WebFetch(https://example.com/a?token=abc)"
+
+    三个问题一次凑齐：① 它不是合法的域名规则，下次启动会被加载期的校验处理掉——
+    用户点过的「永久放行」**重启后凭空失效**；② 就算不被处理掉也匹配不上任何东西
+    （`match_domain` 收到的模式是一整个 URL）；③ **查询参数被原样写进了配置文件**，
+    而 URL 里可能带令牌。
+
+    最难受的是**当场看不出来**：本次调用因为选了「永久」照常放行了，
+    问题要到下次启动才显形。
+
+    ## 各 kind 的翻译
+
+    - `url`：取**主机名**，返回 `domain:<host>`。**不带路径、查询参数与端口**
+      （spec F9）——域名规则本来就只匹配主机名，带上其余部分既不合法也会泄漏令牌。
+    - 其余：返回 specifier 原文，**逐字等于本函数存在之前的行为**。
+
+    ⚠ 与 `_TOOL_MAP` 是**成对维护点**：新增一种 kind 时两处都要加。
+
+    副作用：无（纯数据转换）。
+    """
+    if request.kind == "url":
+        # host 已由 to_request 归一化（小写、去末尾点）。取不到时退回空模式，
+        # 那等价于「放行该工具全部调用」——比写一条废规则安全性更差，
+        # 所以只在 host 确实非空时才生成 domain: 模式。
+        if request.host:
+            return request.rule_name, f"domain:{request.host}"
+        return request.rule_name, ""
+    return request.rule_name, request.specifier
