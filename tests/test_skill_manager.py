@@ -608,6 +608,54 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class LoadSkillDescriptionTest(unittest.TestCase):
+    """
+    `load_skill` 的工具描述——**模型决定要不要调它时读的就是这段**。
+
+    ## 为什么要给一段描述文本加测试
+
+    这段文字曾经在**主动劝阻**模型加载一半的 Skill：它写着
+    「只能加载共享模式的 Skill；独立模式的 Skill 需要由用户主动触发」，
+    而那是对齐改造**之前**的语义——F8 已把「在哪执行」与「谁能触发」拆成
+    正交两维，`context: fork` 的 Skill 模型同样可以自行发起。
+
+    这类错误**编译不报错、测试全绿、界面正常**，只是模型的行为悄悄少了一半，
+    而这恰恰是本项目「成对维护点」那一节反复强调的那类坑。所以钉住它。
+    """
+
+    @staticmethod
+    def _desc() -> str:
+        from rhinecode.tools.load_skill import LoadSkillTool
+
+        return LoadSkillTool.description
+
+    def test_does_not_claim_fork_skills_are_user_only(self) -> None:
+        """
+        不得再声称「独立/子对话模式只能由用户触发」——那是已废止的语义。
+        """
+        desc = self._desc()
+        self.assertNotIn("只能加载", desc)
+        self.assertIn("你同样可以自行发起", desc)
+
+    def test_is_directive_and_corrects_under_triggering(self) -> None:
+        """
+        与清单表头同口径的四句，缺一不可。
+
+        Anthropic 官方 skill-creator 的指导是描述该写得「有点 pushy」，
+        因为「Claude 有可测量的欠触发倾向」——实测确认过：用户说
+        「帮我做个前端页面」、清单里有前端 Skill，模型照默认做法做完、一次没加载。
+        """
+        desc = self._desc()
+        with self.subTest("① 命中就先调"):
+            self.assertIn("先调本工具", desc)
+        with self.subTest("② 替代默认做法"):
+            self.assertIn("而不是按你自己的默认做法做", desc)
+        with self.subTest("③ 用户不必点名"):
+            self.assertIn("用户不必明确说", desc)
+        with self.subTest("④ 拿不准就调"):
+            self.assertIn("倾向调用", desc)
+
+
 class LoadSkillToolTest(ManagerTestBase):
     """
     load_skill 工具的三态输出与权限语义（c11 T29，AC7/AC8）。

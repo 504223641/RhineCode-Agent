@@ -34,6 +34,7 @@ def _spec(
     resource_dir: Path = None,
     resource_files: tuple = (),
     model_invocable: bool = True,
+    source: SkillSource = SkillSource.USER,
 ) -> SkillSpec:
     return SkillSpec(
         command_name=name,
@@ -46,7 +47,7 @@ def _spec(
         model_invocable=model_invocable,
         user_invocable=True,
         model=None,
-        source=SkillSource.USER,
+        source=source,
         entry_path=Path("/tmp") / f"{name}.md",
         resource_dir=resource_dir,
         resource_files=resource_files,
@@ -76,12 +77,103 @@ class IndexTest(unittest.TestCase):
         self.assertEqual(render_index([]), "")
 
     def test_truncated_with_remaining_count(self) -> None:
-        """超上限被截断并标注还剩几个。"""
+        """连「全部只剩名字」都装不下时，才真丢，并标注还剩几个。"""
         many = [_spec(f"s{i:04d}", f"说明{i}") for i in range(400)]
         text = render_index(many)
-        self.assertLessEqual(len(text.splitlines()), 210)
+        self.assertLessEqual(len(text.splitlines()), 215)
         self.assertIn("另有", text)
         self.assertIn("未列出", text)
+
+    def test_header_is_directive_not_an_announcement(self) -> None:
+        """
+        表头必须是**指令**而不是**公告**（真实模型实测的核心修正）。
+
+        原文只有一句「以下 Skill 可用，用 load_skill 加载」——它陈述可用性，
+        却从不要求模型去用。实测后果：用户说「帮我做个前端页面」、清单里明明有
+        前端设计 Skill，模型照默认做法做完，一次都没加载。
+
+        Anthropic 官方 skill-creator 的原话是描述该写得「有点 pushy」，
+        因为「Claude 有可测量的欠触发倾向」。所以表头必须齐三个要件：
+        """
+        text = render_index([_spec("a", "说明")])
+        with self.subTest("① 动手前先查清单"):
+            self.assertIn("动手做任何事之前先扫一遍", text)
+        with self.subTest("② 命中则替代默认做法"):
+            # Claude Code 的原话是 "in place of your default approach"——
+            # 少了这半句，模型会把 Skill 当成「另一种可选做法」而不是「该走的路」。
+            self.assertIn("而不是按你自己的默认做法做", text)
+        with self.subTest("③ 点明代价不对称，直接纠偏"):
+            self.assertIn("倾向加载", text)
+            self.assertIn("不对称", text)
+
+    def test_header_covers_implicit_requests(self) -> None:
+        """
+        表头必须显式说明「用户不必点名 Skill」。
+
+        这是实际使用中最常见的漏触发场景，也是本轮修正的原始现象：
+        请求里没有「用某个 Skill」这类字样时，模型就不去匹配任务类型。
+        """
+        text = render_index([_spec("a", "说明")])
+        self.assertIn("用户不必明确说", text)
+        self.assertIn("任务类型是否匹配", text)
+
+
+class IndexBudgetDegradeTest(unittest.TestCase):
+    """
+    预算不够时**降级成只有名字，而不是整条丢掉**。
+
+    原实现按行截断，尾部那些 Skill 连名字都不出现——**对模型等于不存在**，
+    它既不会加载也不会向用户提起，而用户完全看不出发生了什么。
+
+    名字是模型唯一的入口：只要名字在，它至少能判断「这里像是有个相关的东西」
+    并去加载看看。所以宁可牺牲描述，不牺牲名字（与 Claude Code 的口径一致：
+    清单**永远包含每个 Skill 的名字**）。
+    """
+
+    @staticmethod
+    def _long(name: str, source: SkillSource) -> SkillSpec:
+        """造一条描述很长的定义，好让少量条目就把预算撑满。"""
+        return _spec(name, "说" * 300, source=source)
+
+    def test_every_name_survives_when_descriptions_do_not(self) -> None:
+        names = [f"s{i:03d}" for i in range(60)]
+        text = render_index([self._long(n, SkillSource.PROJECT) for n in names])
+        missing = [n for n in names if n not in text]
+        self.assertEqual(missing, [], f"这些 Skill 连名字都没了：{missing}")
+
+    def test_builtin_degrades_before_project(self) -> None:
+        """
+        降级顺序按来源层级从低到高：内置 → 用户级 → 项目级。
+
+        项目级是用户为这个仓库刻意添加的，最不该在模型眼里变模糊；
+        内置样板即使只剩名字，用户也能从 /help 与文档里知道它们是什么。
+        """
+        project = [f"p{i:02d}" for i in range(20)]
+        builtin = [f"b{i:02d}" for i in range(20)]
+        specs = [self._long(n, SkillSource.PROJECT) for n in project]
+        specs += [self._long(n, SkillSource.BUILTIN) for n in builtin]
+        text = render_index(specs)
+
+        # 项目级那批**一条描述都不该被削**——预算应当先从内置那批身上找回来。
+        for name in project:
+            with self.subTest(name=name):
+                self.assertIn(f"{name}：说", text, "项目级的描述不该先被削")
+
+        # 内置那批至少有一部分被削成只有名字（层内按名字升序削，b00 最先）。
+        self.assertNotIn("b00：说", text, "内置的描述该先被削")
+        # 但名字必须一个不少。
+        for name in builtin:
+            with self.subTest(name=name):
+                self.assertIn(name, text, "被削的 Skill 名字必须还在")
+
+    def test_degrade_notice_tells_model_to_try_loading(self) -> None:
+        """
+        被削成只有名字时，要告诉模型「名字看着相关就直接试」——
+        否则它面对一串没有说明的名字只会跳过。
+        """
+        text = render_index([self._long(f"s{i:03d}", SkillSource.BUILTIN) for i in range(40)])
+        self.assertIn("只列了名字", text)
+        self.assertIn("load_skill", text)
 
     def test_user_only_skill_carries_the_real_entry_command(self) -> None:
         """
