@@ -194,18 +194,22 @@ class SkillStartupTest(unittest.TestCase):
 
         这与 C11 的取舍**正好相反**（那时是 fail-fast 退出），理由是来源变了：
         白名单曾是自家格式、写错就是笔误；现在这份声明可能来自 Claude Code 或
-        Codex，里面出现 `Task` / `WebFetch` / `TodoWrite` 是**正常现象**，
-        不该让程序起不来。
+        Codex，里面出现 `Task` / `TodoWrite` 是**正常现象**，不该让程序起不来。
 
         这条是本次改造在启动路径上最重要的行为变化，必须有护栏钉住。
+
+        ⚠ **样例工具名换过一次**：本用例原先用的是 `WebFetch`，
+        而 web_fetch 扩展让它变成了**真工具**（`skills/validation.py` 的
+        `_TOOL_ALIASES` 里有它），于是不再产生「没有对应的工具类别」警告。
+        现改用 `TodoWrite`——挑样例时请确认它确实不在那张别名表里。
         """
-        self._write_skill("ext", **{"allowed-tools": "[WebFetch, Bash]"})
+        self._write_skill("ext", **{"allowed-tools": "[TodoWrite, Bash]"})
         code, err = self._run_main()
 
         self.assertIsNone(code, "不该退出")
         self.assertEqual(err, "")
         report = self._skill_report()
-        self.assertIn("WebFetch", report)
+        self.assertIn("TodoWrite", report)
         self.assertIn("没有对应的工具类别", report)
         # 认识的那条仍照常生效
         sm = self.captured["conversation_kwargs"]["skill_manager"]

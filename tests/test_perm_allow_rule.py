@@ -120,5 +120,82 @@ class ToAllowRuleLegacyKindsTests(unittest.TestCase):
         self._assert_legacy("mcp__srv__tool", {}, ("mcp__srv__tool", ""))
 
 
+class SkillGrantWebFetchTests(unittest.TestCase):
+    """
+    Skill 的 `allowed-tools` 能为 web_fetch 预授权（T9，spec F26 / AC34）。
+
+    `_TOOL_ALIASES` 是 CLAUDE.md 成对维护点明文要求的一处：新增工具若要在
+    `allowed-tools` 里可写，就得在那张表里加一行。
+    """
+
+    def _grants(self, declarations: list[str]):
+        from pathlib import Path
+
+        from rhinecode.skills.models import SkillSource, SkillSpec
+        from rhinecode.skills.validation import grants_for
+
+        spec = SkillSpec(
+            command_name="demo",
+            display_name="demo",
+            description="d",
+            when_to_use=None,
+            body="正文",
+            granted_tools=tuple(declarations),
+            forked=False,
+            model_invocable=True,
+            user_invocable=True,
+            model=None,
+            source=SkillSource.PROJECT,
+            entry_path=Path("/x/demo.md"),
+            resource_dir=None,
+            resource_files=(),
+        )
+        return grants_for([spec])
+
+    def test_webfetch_recognized(self) -> None:
+        rules, warnings = self._grants(["WebFetch(domain:github.com)"])
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].tool, "WebFetch")
+        self.assertEqual(rules[0].pattern, "domain:github.com")
+
+    def test_internal_tool_name_recognized(self) -> None:
+        rules, warnings = self._grants(["web_fetch"])
+        self.assertEqual(warnings, [])
+        self.assertEqual(rules[0].tool, "WebFetch")
+
+    def test_bad_domain_syntax_produces_warning(self) -> None:
+        """
+        漏写 `domain:` 前缀时必须有警告。
+
+        不接 `parse_rule_string` 的 warnings 出参的话，这条会顺利通过
+        「认不认得工具类别」那道警告（现在认得 WebFetch 了），然后被静默丢弃——
+        用户看到的现象是「我明明写了预授权，还是每次弹确认」，而 /skills 报告
+        里什么都没有。
+        """
+        rules, warnings = self._grants(["WebFetch(github.com)"])
+        self.assertEqual(rules, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("domain:", warnings[0])
+
+    def test_grant_source_is_turn_level(self) -> None:
+        """
+        预授权规则的来源层不是 user/project —— 因此**不建立域名白名单**。
+
+        这条钉住「`allowed-tools` 只放宽、从不收紧」这条既有安全承诺：
+        若它能建立白名单，一个声明了 WebFetch(domain:x) 的 Skill 会在执行期间
+        反向收紧其它域名的访问。
+        """
+        from rhinecode.permission.config import POLICY_SOURCES
+
+        rules, _warnings = self._grants(["WebFetch(domain:github.com)"])
+        self.assertNotIn(rules[0].source, POLICY_SOURCES)
+
+    def test_warning_text_lists_webfetch(self) -> None:
+        _rules, warnings = self._grants(["NoSuchTool"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("WebFetch", warnings[0])
+
+
 if __name__ == "__main__":
     unittest.main()
