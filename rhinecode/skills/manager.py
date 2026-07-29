@@ -47,6 +47,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+from rhinecode.skills.audit import audit_skills
 from rhinecode.skills.discovery import discover
 from rhinecode.skills.models import (
     ActivationResult,
@@ -721,6 +722,31 @@ class SkillManager:
         if notices:
             lines.extend(["", "字段提示（不影响运行，但与你的声明有出入）："])
             lines.extend(f"- {item}" for item in notices)
+
+        # 体检建议（作者期扩展 F1/F3）——**第四类反馈**，排在前三类之后。
+        #
+        # 前三类回答的都是「发生了什么」，只有这一段回答「那我该怎么改」。
+        # 排最后是因为它最不紧急：加载失败的 Skill 根本用不了，
+        # 而有建议的 Skill 是能用的，只是有更好的写法。
+        #
+        # ⚠️ **在锁外算**（spec N3）：上面的 `with self._lock` 早已退出，
+        # `_catalog` 是不可变快照、取引用即可。体检虽是纯函数，
+        # 但塞进临界区只会让临界区无谓变长，也破坏「临界区只做纯内存读写」的纪律。
+        #
+        # ⚠️ **每次现算、不缓存**（F4）：存起来就要考虑何时失效，
+        # 多一处「reload 之后忘了更新」的机会。
+        advices = audit_skills(catalog.skills, catalog.shadowed)
+        if advices:
+            lines.extend(["", "建议（不影响运行，但有更好的写法）："])
+            for advice in advices:
+                lines.append(f"- {advice.skill}：{advice.finding}")
+                lines.append(f"    建议：{advice.suggestion}")
+            # 指路（F13）。不给这一句的话，用户看完建议只知道「有问题」，
+            # 却不知道系统能替他改——而那正是本扩展另一半的价值所在。
+            lines.append("")
+            lines.append(
+                "（可以用 /skill-creator 让它按这些建议帮你改，每处改动都会先给你过目）"
+            )
 
         # 项目级 Skill 的信任模型告知（spec N8）。**从启动打印挪到了这里**：
         # 启动时 `print()` 发生在 Textual 接管屏幕之前，内容被 alternate screen

@@ -375,6 +375,97 @@ class ReloadTest(ManagerTestBase):
         self.assertIn("加载失败", report)
         self.assertIn("字段提示", report)
 
+    # ─────────────── 体检建议段（作者期扩展 F1/F3/F5/F13） ───────────────
+
+    def test_report_has_no_advice_section_when_all_clean(self) -> None:
+        """
+        全部合规 → 建议段**整段不出现**（F5）。
+
+        不是显示「无建议」——「渲染一个空段落」与「不渲染这个段落」在代码里
+        只差一个判断，在界面上却是「多一段噪音」与「干净」的区别。
+        """
+        _write(self.user_skills / "a.md", _skill_text("a", body="做事。\n$ARGUMENTS\n"))
+        self.assertNotIn("建议（", self._manager().report())
+
+    def test_report_shows_advice_with_both_finding_and_suggestion(self) -> None:
+        """
+        建议必须同时出现「发现了什么」与「建议怎么改」。
+
+        只有前半句的话，它与既有的「警告」没有区别——而「可操作」正是
+        新增这一整类反馈的全部理由。
+        """
+        _write(self.user_skills / "a.md",
+               _skill_text("a", body="正文里没有占位符\n"))
+        report = self._manager().report()
+        self.assertIn("建议（", report)
+        self.assertIn("占位符", report)
+        self.assertIn("建议：", report)
+        self.assertIn("不会丢", report)
+
+    def test_advice_section_comes_after_notices(self) -> None:
+        """
+        建议段排在「加载失败 / 警告 / 字段提示」三段**之后**（F3）。
+
+        用段标题在文本中的下标先后断言，**不逐字比对整段内容**——
+        措辞还要打磨，逐字比对会让这条护栏变成措辞的枷锁。
+        """
+        _write(self.user_skills / "bad.md", "---\nname: [坏\n---\n正文\n")
+        # model 在非 fork 上声明 → 产出一条字段提示；正文无占位符 → 产出一条建议
+        _write(self.user_skills / "w.md",
+               _skill_text("w", model="m", body="没有占位符的正文\n"))
+        report = self._manager().report()
+
+        self.assertLess(report.index("加载失败"), report.index("字段提示"))
+        self.assertLess(report.index("字段提示"), report.index("建议（"))
+
+    def test_report_points_at_skill_creator_when_advice_exists(self) -> None:
+        """
+        有建议时要指路（F13）。
+
+        不给这一句的话，用户看完只知道「有问题」，却不知道系统能替他改——
+        而那正是本扩展另一半的价值。
+        """
+        _write(self.user_skills / "a.md",
+               _skill_text("a", body="没有占位符的正文\n"))
+        self.assertIn("/skill-creator", self._manager().report())
+
+    def test_advice_is_recomputed_after_reload(self) -> None:
+        """
+        建议**每次现算、不缓存**（F4）。
+
+        把问题修掉再热更新，建议就该消失。缓存的话就要考虑何时失效，
+        而「reload 之后忘了更新」是这类缺陷最常见的形态。
+        """
+        path = self.user_skills / "a.md"
+        _write(path, _skill_text("a", body="没有占位符的正文\n"))
+        m = self._manager()
+        self.assertIn("占位符", m.report())
+
+        _write(path, _skill_text("a", body="修好了。\n$ARGUMENTS\n"))
+        m.reload()
+        self.assertNotIn("建议（", m.report())
+
+    def test_report_flags_overriding_a_builtin(self) -> None:
+        """
+        覆盖内置样板要提示——这条依赖 catalog 把「被覆盖那份」记了下来，
+        因为成品清单里它根本不存在。
+        """
+        builtin = Path(self._tmp.name) / "builtin"
+        _write(builtin / "commit.md", _skill_text("commit", "内置版"))
+        _write(self.user_skills / "commit.md",
+               _skill_text("commit", "我的版本", body="做事。\n$ARGUMENTS\n"))
+
+        m = SkillManager(
+            project_root=self.project_root,
+            user_dir=self.user_dir,
+            builtin_dir=builtin,
+            has_short_command=lambda n: n in self.short_commands,
+        )
+        m.startup()
+        report = m.report()
+        self.assertIn("内置样板", report)
+        self.assertIn("有意定制", report)
+
     def test_prompt_report_has_three_sections(self) -> None:
         _write(self.user_skills / "a.md",
                _skill_text("a", allowed_tools="[read_file]"))
