@@ -737,6 +737,14 @@ class Agent:
                 tool_call_id=tc.id,
                 kind=request.kind,
                 specifier=request.specifier,
+                # 主机名单独记一份（web_fetch 扩展 F23/AC31）。
+                #
+                # 只靠 reason 文案不够：②′层自己给出的拒绝会在文案里带上主机名，
+                # 但走③层 deny 规则命中时，reason 是
+                # 「命中 deny 规则 WebFetch(domain:*.example.com)（来源：user）」
+                # ——里面只有**规则的模式**，没有本次请求的主机名。
+                # 非 url 类为空串。
+                host=request.host,
                 is_read_only=request.is_read_only,
                 decision=decision.decision.value,
                 layer=decision.layer.value,

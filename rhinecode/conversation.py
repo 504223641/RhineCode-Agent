@@ -71,6 +71,7 @@ from rhinecode.permission import (
     PermissionMode,
     PermissionRequest,
     Rule,
+    to_allow_rule,
     to_request,
 )
 
@@ -239,7 +240,12 @@ class ConversationManager:
         self.plan_mode: bool = False
         # 权限决策引擎（c6）：启动时加载三层 YAML 规则，持有权限模式与会话级规则。
         # 取代 c5 的「会话级一刀切免确认」标志——本会话放行改为按规则登记（见 _run 的 ask 闭包）。
-        self._engine: PermissionEngine = PermissionEngine.load(user_dir=self._user_dir)
+        # web_fetch 扩展 F4 链路①：总开关要穿过这里才到得了 config.load_all
+        # ——`bootstrap.py` 对权限 load_all 是零调用，在装配层透传是做不到的。
+        self._engine: PermissionEngine = PermissionEngine.load(
+            user_dir=self._user_dir,
+            web_fetch_enabled=config.web_fetch_enabled,
+        )
         # 当前运行的取消信号；每次运行重建，置位即让循环尽快停止
         self._cancel_event: threading.Event = threading.Event()
 
@@ -297,9 +303,36 @@ class ConversationManager:
 
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
-        self.startup_notice: Optional[str] = self.memory_manager.startup(
-            resume_latest, self.history
-        )
+        memory_notice = self.memory_manager.startup(resume_latest, self.history)
+        # 权限规则的加载警告并入启动提示（web_fetch 扩展 F25）。
+        #
+        # `PermissionEngine.load_errors` 在此之前**全仓零消费者**——警告收集完就死在
+        # 那里。之所以并进 startup_notice 而不是新做一个 /perm 报告：前者是既有字段
+        # （TUI 挂载时写进聊天区）、零新增维护点，且**不需要用户主动敲命令就能看见**。
+        self.startup_notice: Optional[str] = self._compose_startup_notice(memory_notice)
+
+    def _compose_startup_notice(self, memory_notice: Optional[str]) -> Optional[str]:
+        """
+        把记忆系统的启动提示与权限规则的加载警告拼成一条启动提示。
+
+        :param memory_notice: `MemoryManager.startup()` 的返回（可能为 None）
+        :returns: 拼接后的提示；两者都为空时返回 None
+
+        由 `tui/app.py` 在界面挂载时写进聊天区。两者都可能为空，
+        拼接时不产生多余空行——空提示与「有提示但只有一行空白」在界面上
+        是两种观感，后者会让人以为出了什么事。
+
+        副作用：无。
+        """
+        parts: list[str] = []
+        if memory_notice:
+            parts.append(memory_notice)
+        errors = getattr(self._engine, "load_errors", None) or []
+        if errors:
+            parts.append("权限规则加载提示：\n" + "\n".join(f"- {e}" for e in errors))
+        if not parts:
+            return None
+        return "\n\n".join(parts)
 
     def _install_path_filters(self, registry: ToolRegistry) -> None:
         """
@@ -811,6 +844,10 @@ class ConversationManager:
             memory_index=self.memory_manager.memory_index(),
             skill_index="",   # 子对话不给清单——它不许再激活别的 Skill（F23）
             active_skills="",
+            # ⚠ web_fetch 扩展 F4 链路②的**第二个**调用点。漏传这里的表现是
+            # 「主对话有不可信约束、fork 子对话没有」——界面上完全看不出来，
+            # 只有被注入的页面恰好走进 fork 子对话时才显形。
+            untrusted_enabled=self._config.web_fetch_enabled,
         )
         sub_body, _degrade = render_active_body(spec, arguments)
         env_text = assembled.dynamic
@@ -1002,16 +1039,27 @@ class ConversationManager:
                 return True
             # 本会话 / 永久：构造与本次调用同口径的 allow 规则。
             req = to_request(tool, tool_call.arguments, self._engine.mode)
-            rule_string = f"{req.rule_name}({req.specifier})" if req.specifier else req.rule_name
+            # ⚠ 规则的**单一来源**是 adapter.to_allow_rule（web_fetch 扩展 T23）。
+            #
+            # 原先这里直接 f"{rule_name}({specifier})"，对命令类与路径类是对的，
+            # 但对 url 类会写出 `WebFetch(https://example.com/a?token=abc)`：
+            # ① 不是合法域名规则，下次启动被加载期处理掉——用户点过的「永久放行」
+            # **重启后凭空失效**；② 就算不被处理掉也匹配不上任何东西；
+            # ③ **查询参数里的令牌被原样写进配置文件**。
+            # 而本次调用因为选了「永久」照常放行了，问题要到下次启动才显形。
+            #
+            # 下面**三处**（会话级、永久级、永久写入失败的回退）都用它，别只改前两处。
+            grant_tool, grant_pattern = to_allow_rule(req)
+            rule_string = f"{grant_tool}({grant_pattern})" if grant_pattern else grant_tool
             if choice == ConfirmDecision.ALLOW_SESSION:
                 self._engine.add_session_rule(
-                    Rule(effect="allow", tool=req.rule_name, pattern=req.specifier, source="session")
+                    Rule(effect="allow", tool=grant_tool, pattern=grant_pattern, source="session")
                 )
                 return True
             if choice == ConfirmDecision.ALLOW_PERMANENT:
                 if not self._engine.persist_local_rule(rule_string):
                     self._engine.add_session_rule(
-                        Rule(effect="allow", tool=req.rule_name, pattern=req.specifier, source="session")
+                        Rule(effect="allow", tool=grant_tool, pattern=grant_pattern, source="session")
                     )
                 return True
             return False
@@ -1053,6 +1101,8 @@ class ConversationManager:
             memory_index=self.memory_manager.memory_index(),
             skill_index=self.skill_manager.index_text(),
             active_skills="",
+            # web_fetch 扩展 F4 链路②的第一个调用点（另一个在 _run_forked_skill）。
+            untrusted_enabled=self._config.web_fetch_enabled,
         )
         # 一次性动态提醒（c9：恢复会话的时间跨度提醒）：并入本次 dynamic，取走即清，
         # 不进持久历史、不被存档（它是「此刻的环境事实」）。

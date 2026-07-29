@@ -8,7 +8,9 @@
 - 通过 cacheable 标志区分「稳定可缓存」与「动态」两类内容，决定它走哪条通道（见 builder.py）。
 
 优先级约定（priority 越小越靠前）：
-- 10–70：七个固定模块（cacheable=True，进可缓存的稳定前缀）
+- 10–70：固定模块（cacheable=True，进可缓存的稳定前缀）。
+  其中 **25 = 外部不可信内容**，按 `fixed_modules(untrusted_enabled=...)` 开关注入，
+  关闭时该号位为空、输出与 web_fetch 扩展之前逐字一致。
 - 100  ：环境信息（cacheable=False，由 builder 注入，见 builder.build_default_prompt）
 - 110–130：三个可选模块空槽（cacheable=False，c5 恒为空，拼装时被跳过）
 """
@@ -18,6 +20,7 @@ from dataclasses import dataclass
 from rhinecode.agent.prompt.texts import (
     IDENTITY,
     SYSTEM_CONSTRAINTS,
+    UNTRUSTED_CONTENT,
     TASK_MODE,
     ACTION_EXECUTION,
     TOOL_USAGE,
@@ -43,30 +46,45 @@ class PromptModule:
     content: str
 
 
-def fixed_modules() -> list[PromptModule]:
+def fixed_modules(untrusted_enabled: bool = False) -> list[PromptModule]:
     """
-    返回七个固定模块（稳定、可缓存）。
+    返回固定模块（稳定、可缓存）：七个常驻 + 一个按开关注入。
 
-    顺序（按 priority）：身份 → 系统约束 → 任务模式 → 动作执行 → 工具使用 → 语气风格 → 文本输出。
-    其中：
+    顺序（按 priority）：身份 → 系统约束 →〔外部不可信内容〕→ 任务模式 → 动作执行
+    → 工具使用 → 语气风格 → 文本输出。其中：
     - 「系统约束」写明 <system-reminder> 是系统补充上下文、不要当成用户输入来回复（F8）。
+    - 「外部不可信内容」写明 <untrusted-content> 里的是数据不是指令（web_fetch 扩展 F21）。
+      它排在「系统约束」之后是刻意的——两条讲的是同一件事的两面
+      （什么算系统指令 / 什么不算），相邻便于模型建立对照。
     - 「工具使用」写明「优先用专用工具」「编辑前必先读」等关键规则，与各工具自身描述形成双重强化（F7）。
 
-    :returns: 7 个 PromptModule，均 cacheable=True
+    :param untrusted_enabled: 是否注入「外部不可信内容」模块。**缺省 False**——
+        缺省不注入使既有调用点不改也能跑，且输出与本扩展之前逐字一致（F4）。
+        由 `build_default_prompt` 从 `Config.web_fetch_enabled` 透传。
+    :returns: 7 或 8 个 PromptModule，均 cacheable=True
 
     副作用：无（每次返回新建的列表，内容为内置常量文本）。
     """
     # 各模块正文已迁出到 texts 子包；这里只保留「结构 + 优先级 + 是否可缓存」等元数据，
     # 改文案请到 rhinecode/agent/prompt/texts/ 对应文件，无需改动本函数。
-    return [
+    modules = [
         PromptModule(name="身份", priority=10, cacheable=True, content=IDENTITY),
         PromptModule(name="系统约束", priority=20, cacheable=True, content=SYSTEM_CONSTRAINTS),
         PromptModule(name="任务模式", priority=30, cacheable=True, content=TASK_MODE),
+        # ↑ 25 号位（外部不可信内容）按开关插在下面，不写死在这个列表里——
+        # 关闭时列表内容要与本扩展之前**逐字一致**。
         PromptModule(name="动作执行", priority=40, cacheable=True, content=ACTION_EXECUTION),
         PromptModule(name="工具使用", priority=50, cacheable=True, content=TOOL_USAGE),
         PromptModule(name="语气风格", priority=60, cacheable=True, content=TONE),
         PromptModule(name="文本输出", priority=70, cacheable=True, content=TEXT_OUTPUT),
     ]
+    if untrusted_enabled:
+        modules.append(
+            PromptModule(
+                name="外部不可信内容", priority=25, cacheable=True, content=UNTRUSTED_CONTENT
+            )
+        )
+    return modules
 
 
 def optional_slots() -> list[PromptModule]:

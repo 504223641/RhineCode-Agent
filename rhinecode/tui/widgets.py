@@ -919,6 +919,48 @@ class ConfirmPanel(OptionList):
         Binding("escape", "cancel", "取消", show=False),
     ]
 
+    # 判定层 → 面板上显示的中文名。与 trace/reader.py 的 _LAYER_NAMES 是同一批取值，
+    # 但**两处刻意不合一**：让 trace（只依赖标准库的叶子包）反向依赖 permission
+    # 会破坏它的架构不变量。一致性由 tests 里遍历 Layer 的断言钉住。
+    _LAYER_LABELS = {
+        "blacklist": "①危险命令黑名单",
+        "sandbox": "②路径沙箱",
+        "network": "②′网络边界",
+        "rule": "③可配置规则",
+        "mode": "④权限模式",
+    }
+
+    def _url_detail_lines(self, tool_call, decision) -> list[str]:
+        """
+        为 URL 类请求生成补充展示行：完整地址、主机名、命中层。
+
+        :param tool_call: 本次工具调用（从中取未经截断的原始地址）
+        :param decision: DecisionResult（提供 host 与 layer）
+        :returns: 已转义、可直接进 markup 的行文本列表
+
+        ⚠ **完整 URL 进 markup 前一律用本模块的 `escape`，绝不要
+        `from rich.markup import escape`。** URL 天然含 `[`
+        （IPv6 字面量 `http://[::1]/`、含 `[` 的查询串），而 rich 那版只转义
+        「看起来像完整标签」的 `[...]`，落单的 `[` 会被整个放过，
+        然后在 Textual 的布局阶段抛 MarkupError——那是没有任何 try/except
+        兜得住、会直接拆掉整个 app 的那一类。
+        """
+        args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        raw_url = str(args.get("url") or "")
+        lines: list[str] = []
+        if raw_url:
+            # **不截断**：这一行的全部价值就在于让用户看到完整地址。
+            lines.append(f"   [dim]完整地址：[/dim]{escape(raw_url)}")
+        host = getattr(decision, "host", "") or ""
+        if host:
+            lines.append(f"   [dim]主机名：[/dim]{escape(host)}")
+        layer = getattr(decision, "layer", None)
+        layer_value = getattr(layer, "value", layer)
+        if layer_value:
+            label = self._LAYER_LABELS.get(str(layer_value), str(layer_value))
+            lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
+        return lines
+
     def show_for(self, tool_call, tool, decision=None) -> None:
         """
         为一次工具调用填充并显示确认面板（c6 四态放行）。
@@ -946,6 +988,20 @@ class ConfirmPanel(OptionList):
                 disabled=True,
             )
         )
+        # URL 类专用补充行（web_fetch 扩展 F9）。
+        #
+        # **为什么需要它**：上面那行走 summarize_args，它把每个参数值截到 30 字符，
+        # 一条 `https://docs.example.com/reference/v2?token=abc` 只会显示成
+        # `url=https://docs.example.com/re…`。而用户正是靠面板上那个地址来决定
+        # 放不放行的——地址被截断意味着攻击者只要把恶意部分放在第 31 个字符之后，
+        # 人在回路这层就形同虚设。
+        #
+        # 判据用 `decision is not None and ...`：decision 是可选参数，
+        # 既有代码一律先判非空再取属性。这里是**主线程布局路径**，
+        # AttributeError 属于「没有任何 try/except 兜得住」的那一类。
+        if decision is not None and getattr(decision, "kind", "") == "url":
+            for line in self._url_detail_lines(tool_call, decision):
+                self.add_option(Option(line, disabled=True))
         self.add_option(Option("✅ 本次放行  [dim]仅执行本次[/dim]", id="yes"))
         self.add_option(Option("🟢 本会话放行  [dim]本会话内相同调用不再询问[/dim]", id="yes_session"))
         self.add_option(Option("💾 永久放行  [dim]写入本地配置，重启仍生效[/dim]", id="yes_permanent"))

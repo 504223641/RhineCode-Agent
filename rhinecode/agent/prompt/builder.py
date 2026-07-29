@@ -93,6 +93,7 @@ def build_default_prompt(
     memory_index: str = "",
     skill_index: str = "",
     active_skills: str = "",
+    untrusted_enabled: bool = False,
 ) -> AssembledPrompt:
     """
     构造 RhineCode 默认系统提示：7 固定模块 + 环境信息 + 可选槽位（c5 预留、c9 填充）。
@@ -130,7 +131,9 @@ def build_default_prompt(
     副作用：无。
     """
     builder = SystemPromptBuilder()
-    for m in fixed_modules():
+    # untrusted_enabled 缺省 False：既有调用点不改也能跑，且输出逐字等于
+    # web_fetch 扩展之前（spec F4）。
+    for m in fixed_modules(untrusted_enabled):
         builder.add(m)
     builder.add(
         PromptModule(name="环境信息", priority=100, cacheable=False, content=env.render())
