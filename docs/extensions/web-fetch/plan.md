@@ -767,7 +767,7 @@ tests/test_config_bootstrap.py ← 改：load_all 的 1 处 2 元组解包（`:1
 **`/skills reload` 那段** —— 现文写着「外部 Skill 里出现 `WebFetch` 这类名字是正常现象」
 （言下之意是认不出），WebFetch 变成真工具后这句话就错了，要改。
 
-**成对维护点** —— 新增四条：
+**成对维护点** —— 新增五条：
 
 - 新增禁止的地址范围 → `permission/network.py` 一处即可（判定期与连接期共用），
   **别在 `web/fetcher.py` 里另写一份**

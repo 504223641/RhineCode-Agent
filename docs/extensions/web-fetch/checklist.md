@@ -247,8 +247,15 @@
 - [ ] 🤖 抽取请求可与主对话请求**区分筛出**（验证：`python -m rhinecode.trace.reader
       <文件> --scope web_extract` 能单独列出它）— AC31
 - [ ] 🤖 阅读器把新的判定层显示为**中文层名**而非英文原名 — plan
+- [ ] 🤖 **`Layer.label()` 与 `_LAYER_NAMES` 逐项一致**（验证：遍历 `Layer` 全部成员断言
+      `_LAYER_NAMES[member.value] == member.label()`）— plan / task T25
 
-  > 钉住 `_LAYER_NAMES` 这个「漏改不报错」的成对维护点。
+  > 两份表**刻意不合一**：合一要让 `trace` import `permission`，而实测那会连带拉起
+  > 整个 `permission` 包 + `rhinecode.tools` + `yaml`，破坏「trace 是只依赖标准库的叶子包」
+  > 这条硬不变量。用一条测试断言换回「漏改当场红」，比合并划算。
+
+  > 钉住 `_LAYER_NAMES` 这个成对维护点。**注意它现在不再是「漏改不报错」**——
+  > 下一条的遍历断言会让漏改当场红。
 
 ---
 

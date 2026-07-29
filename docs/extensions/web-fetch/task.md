@@ -135,12 +135,17 @@
 
 **步骤：**
 1. `Layer` 新增 `NETWORK = "network"`，docstring 补一行。
-   （中文层名的 `label()` 方法与 `DecisionResult` 的 `kind` / `host` 两个字段
-   由 T25 一并加——它们的唯一消费者是确认面板，放在那里改动更内聚。
+   （中文层名的 `label()` 方法由 **T25** 加——面板是它唯一的消费者。
    注意 `trace/reader.py` 的 `_LAYER_NAMES` **保持独立一份**，理由见 T25 步骤 2。）
-2. `PermissionRequest` 新增 `host: str = ""` 字段（**带默认值**，否则既有构造点全部报错），
+2. **`DecisionResult` 新增 `kind: str = ""` 与 `host: str = ""`**（带默认值，
+   既有构造点不必改也能编译）。
+   **⚠ 必须在本任务加，不能挪到 T25**：**T8 就要开始填这两个字段**，而 T25 依赖 T8——
+   字段若排在 T25，就成了「T8 要用 → 字段在 T25 → T25 依赖 T8」的死循环，
+   T8 一开工就 `TypeError`，它自己的验证命令必红。
+   （判据沿用 T7 那条：**任务的验证必须在该任务完成时就能通过**。）
+3. `PermissionRequest` 新增 `host: str = ""` 字段（**带默认值**，否则既有构造点全部报错），
    docstring 说明：仅 url 类填充，已归一化；三处消费者（规则匹配、确认面板、行为记录）。
-3. `kind` 文档补 `"url"`：specifier 是**完整 URL 原文**，主机名单独放在 `host`。
+4. `kind` 文档补 `"url"`：specifier 是**完整 URL 原文**，主机名单独放在 `host`。
 
 **验证：** `python -m compileall rhinecode/permission` 通过；
 `python -m unittest discover -s tests -p "test_perm*"` 无回归。
@@ -205,7 +210,7 @@
 
 ## T7: 规则加载
 
-**文件：** `rhinecode/permission/config.py`、`tests/test_perm_rule_loading.py`（新建）
+**文件：** `rhinecode/permission/config.py`、**`rhinecode/permission/engine.py`**（`:92` 解包 + `policy_ruleset` 字段）、`tests/test_perm_rule_loading.py`（新建）、**`tests/test_perm_config.py`**、**`tests/test_config_bootstrap.py`**
 **依赖：** T1
 
 **步骤：**
@@ -238,6 +243,10 @@
 
    **第三行改了会削弱 fail-safe**：`deny: <非列表>` + `allow: [一堆]` 的文件会变成
    「deny 全丢、allow 照常生效」，从偏严滑向偏松，违反 N1。
+
+   **「一个字都不许动」指的是这三处的 `return` 行为，不含签名。**
+   `_load_layer` 本身要接 `web_fetch_enabled` 并透传给 `parse_rule_string`——
+   那是加参数，不是改控制流。
 4. `load_all` 返回改为 `(merged_ruleset, policy_ruleset, errors)`：
    `policy_ruleset` 只含 user + project 两层。加 `web_fetch_enabled` 参数，关闭时跳过校验（F4）。
 5. **⚠ `load_all` 现有 6 个 2 元组解包点必须一并改**，其中**一处在生产代码里**：
@@ -285,7 +294,9 @@
    而且**在真机弹面板前完全看不出来**）。
 
    涉及的 return 有两类：
-   - `engine.decide` 内部自己构造的（①②④各层）——逐条填；
+   - `engine.decide` 内部自己构造的（①黑名单、②沙箱、**只读简化分支**、④模式兜底）——逐条填。
+     只读简化分支对 url 走不到（`web_fetch` 是 `read_only=False`），但「一条都不能漏」
+     配一份不全的清单会自相矛盾，所以照样列进来；
    - 从 `network.decide` 与 `merged.evaluate` 透传上来的——在 `decide()` 出口统一补，
      或让那两处也填。**选一种写死在注释里，不要两处各写各的**。
 7. **写 ⚠ 注释**：②′必须排在③之前，**理由是「硬校验必须先于任何 allow 规则」**——
@@ -348,9 +359,12 @@
 1. `models.py` 新增 `SCOPE_WEB_EXTRACT = "web_extract"`，加进 `__all__`，
    在既有 scope 说明注释里补一段（与主对话共用同一个 Provider 实例）。
 2. `reader.py` 的 `_LAYER_NAMES` 加一行 `"network": "②′网络边界"`。
-   （**T25 会把这张表整个改成复用 `Layer.label()`**——本任务先按现状加一行即可，
-   两个任务都做完之后表就只剩一份。之所以不在这里直接合并：T25 才是需要中文层名的那一方，
-   合并的收益要到那时才成立。）
+   **⚠ `_LAYER_NAMES` 保持本地一份，刻意不复用 `Layer.label()`。**
+   合一要让 `trace` import `permission`，而实测 `import permission.models` 会连带拉起
+   整个 `permission` 包 + `rhinecode.tools` + `yaml`（`permission/__init__.py` re-export 了
+   `PermissionEngine`），破坏 `trace/__init__.py:7` 与 `CLAUDE.md` 两处写明的
+   「trace 是只依赖标准库的叶子包」。两处一致由 **T25 步骤 3** 的遍历断言钉住，
+   漏改当场红。（第 4 轮曾在这里写「T25 会把两表合一」，是错的，已撤回。）
 3. 在 `models.py` 注释里写明**不新增事件类型**的决定与理由。
 
 **验证：** `python -m unittest tests.test_trace_reader` 无回归；
@@ -667,8 +681,8 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 
 **步骤（改法定死，不留选择）：**
 
-1. **扩 `DecisionResult`，不透传 `PermissionRequest`。**
-   加两个带默认值的字段：`kind: str = ""` 与 `host: str = ""`，由 `engine.decide` 返回时填。
+1. **`DecisionResult` 的 `kind` / `host` 两个字段已由 T3 加好、由 T8 填好，本任务只消费。**
+   本任务在 `models.py` 里只加 `Layer.label()`。
    **为什么选这条而不是改回调签名**：`DecisionResult` 已经在链路上，改动面只有
    「构造点 + 面板」两处；改 `ConfirmCallback` 类型要连带动 `conversation.py:79` 的公开类型、
    `:998` 调用点、`tui/app.py` 的 `_confirm_tool` 与 `_show_confirm_panel` 四处。
@@ -720,6 +734,8 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
    - **`Layer.label()` 与 `_LAYER_NAMES` 逐项一致**：遍历 `Layer` 全部成员断言
      `_LAYER_NAMES[member.value] == member.label()`。这是替代「两处合一」的护栏——
      两份表各自留在自己的包里（trace 保持纯标准库），靠这条测试钉住不漂移。
+     **这一条放 `tests/test_trace_reader.py`**（它既不属 bootstrap 也不属 web，
+     放阅读器的测试里下一个人才找得到；T25 的验证命令已含 `-p "test_trace*"`）。
 
 **验证：** `python -m unittest tests.test_web_bootstrap` 通过；
 `python -m unittest discover -s tests -p "test_tui*"`、`-p "test_trace*"`、
@@ -742,7 +758,7 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
    `ConversationManager` **已持有整份 config**（`self._config`，赋值早于建引擎），
    不需要新的注入通道。
 2. **链路②（系统提示的不可信模块）**：
-   `build_default_prompt(..., untrusted_enabled: bool = False)`（`builder.py:133`）→
+   `build_default_prompt(..., untrusted_enabled: bool = False)`（签名在 `builder.py:90`、透传在 `:133`）→
    透传给 `fixed_modules`。
 3. **⚠ 链路②有两个调用点**：`conversation.py:808` 与 `conversation.py:1050`，**两处都要传**。
    漏一处的表现是「主对话有那条约束、fork 子对话没有」——**界面上完全看不出来**，
@@ -807,9 +823,12 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 **步骤：**
 1. `host.py` 是 `build_app` 的**第二个真实调用方**（CLAUDE.md 成对维护点有这条）。
    给它加上透传 `web_client_factory` / `web_resolver` 的能力，使端到端场景能离线跑。
-2. 决定 `web_fetch` 是否要进 `host.py` 的 `EXCLUDED_TOOLS`：**不进**——
-   它与被排除的两个 MCP 工具不同，不会写真实用户主目录、不会访问外部包索引，
-   且注入替身后完全受控。在注释里写明这个判断及理由。
+2. 决定 `web_fetch` 是否要进 `host.py` 的 `EXCLUDED_TOOLS`：**不进**。
+   理由写进注释——它与被排除的两个 MCP 工具不同，不会写真实用户主目录、
+   不会访问外部包索引；**更要紧的是 F7 兜底：url 类请求在任何权限模式下最多到「确认」，
+   驱动者必须显式应答才会真的发出去**。（不要把理由写成「注入替身后完全受控」——
+   `web_client_factory` 是可选参数，不注入时宿主拿的是真 httpx + 真域名解析，
+   那个理由站不住。）
 3. 提供一个可复用的离线替身：固定几个主机名（`a.test` / `b.test`）→ 固定响应。
 
    **⚠ 替身的 `resolver` 必须返回 `is_global` 为真的地址。**
@@ -864,7 +883,7 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 3. `CLAUDE.md` 已知后续工程项 **#5 的「网络请求限制」子项划掉**（已兑现）。
 4. `CLAUDE.md` `/skills reload` 那段现写着「外部 Skill 里出现 `WebFetch` 这类名字是正常现象」
    （言下之意认不出）——**WebFetch 现在是真工具，这句话已经错了**，改掉。
-5. `CLAUDE.md` 成对维护点新增四条（照 plan 末节逐字）。
+5. `CLAUDE.md` 成对维护点新增**五条**（照 plan 末节逐字）。
 6. `CLAUDE.md` 安全边界新增一条，含「缺省配置下白名单不存在」与
    「MCP 是第二条不受约束的外泄腿」两点。
 7. `docs/internals/capabilities.md` 新增「网络访问」小节：三档模式的实际表现、
@@ -895,15 +914,17 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 第三段（web 包）
   T12 ──┬──→ T13 ─┐
         ├──→ T14 ─┴──→ T15 ──→ T16 ──→ T17 ─┐
-        │                ↑                   │
-        │            T2 ──┘                  ├──→ T20 ←── T10
+        │                        ↑           │
+        │                   T2 ───┘           ├──→ T20 ←── T10
         ├──→ T18 ────────────────────────────┤
         └──→ T19 ────────────────────────────┘
 
 第四段（接线）
   T20 ─────────────→ T22 ──┐
   T6  ─────────────→ T23   │
-  T3,T5,T6 ────────→ T25（面板）
+  T3,T6 ──┬──────→ T25（面板）
+           │
+  T8 ──────┘
   T3  ─────────────→ T27（埋点）
   T7  ─────────────→ T24
   T7,T11,T21 ──────→ T26（开关链）──┐
@@ -918,7 +939,7 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 
 | 任务 | 依赖 | 为什么 |
 | --- | --- | --- |
-| T25 面板 | T3、T5、T6 | 要 `Layer.NETWORK`（T3）、要 `decide` 已在填 `kind`/`host`（T5）、要 `to_allow_rule` 的主机名口径（T6） |
+| T25 面板 | T3、**T8**、T6 | 要 `Layer.NETWORK` 与 `DecisionResult` 的两个字段（T3）、要 **`engine.decide` 已在每条 return 填 `kind`/`host`（T8）**、要 `to_allow_rule` 的主机名口径（T6）。**依赖是 T8 不是 T5**——`network.decide` 在「会弹面板」那条路上返回 `None`，根本没有构造 `DecisionResult` 的机会 |
 | T26 开关链 | T7、T11、T21 | `load_all` 要先加参（T7）、`Config` 要先有字段（T11）、`fixed_modules` 要先加参（T21） |
 | T27 埋点 | T3 | 要 `PermissionRequest.host` 先存在 |
 | T28 装配 | T11、T22、T26 | 要配置字段、要工具、要开关链已就位 |
