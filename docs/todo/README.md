@@ -17,7 +17,8 @@
 | 优先级 | 事项 | 建议分支 | 复杂度 | 一句话 |
 | --- | --- | --- | --- | --- |
 | [1](1-skill-authoring.md) | Skill 作者期 | `skill-authoring` | 中（1–2 天） | Skill 现在**可导入但不可创作**。唯一由真实使用暴露的缺口 |
-| [2](2-p1b-unattended.md) | P1b 无人值守回归 | `p1b-unattended` | 大（多天） | 代码不难，**难在取样方法** —— 做不好会把偏了的取样固化成回归测试 |
+| [2](2-web-search.md) | 网络搜索工具 | `web-search` | 中（1–2 天） | web_fetch 的另一半：现在模型只能「上网取」不能「上网找」。**权限管线现成，难点全在「往外发的是什么」** |
+| [3](3-p1b-unattended.md) | P1b 无人值守回归 | `p1b-unattended` | 大（多天） | 代码不难，**难在取样方法** —— 做不好会把偏了的取样固化成回归测试 |
 
 ## 与 CLAUDE.md「已知后续工程项」的分工
 
@@ -34,4 +35,4 @@
 - ~~保留区与余量随窗口缩放~~ —— `maintenance-1` 分支，已知项 #8
 - ~~Plan Mode 规划阶段工具阶段强校验~~ —— `maintenance-1` 分支，已知项 #2
 - ~~CLAUDE.md 测试章精简~~ —— `maintenance-1` 分支
-- ~~网络访问工具~~ —— `web-tool` 分支，走完整 /spec 流程（五轮独立审查、七轮修订），文档留在 `docs/extensions/web-fetch/`，兑现了 CLAUDE.md 已知项 #5 的「网络请求限制」
+- ~~网络访问工具~~ —— `web-tool` 分支，走完整 /spec 流程（五轮独立审查、七轮修订），文档留在 `docs/extensions/web-fetch/`，兑现了 CLAUDE.md 已知项 #5 的「网络请求限制」。**它的另一半（web_search）已登记为本清单第 2 条**
