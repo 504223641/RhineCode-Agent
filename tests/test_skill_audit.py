@@ -255,6 +255,28 @@ class BroadGrantTest(unittest.TestCase):
             audit_skills([S(granted_tools=("WebFetch(domain:github.com)",))]), ()
         )
 
+    def test_advice_warns_that_swapping_category_is_not_narrowing(self) -> None:
+        """
+        ⚠️ **本条来自真实模型实测。**
+
+        建议原本只说「加一个具体的参数模式收窄」。真实模型读到「收窄」二字后，
+        把裸写的 `Write` 改成了裸写的 `Edit`，并在汇总里自评
+        「✅ 改已有文件才免确认」——它以为换了个更窄的类别就算收窄了。
+        而裸写 `Edit` 仍然是「全部编辑免确认」，于是同一条建议换个工具名又冒出来。
+
+        收窄的**唯一**手段是括号里的参数模式，这一点必须写进建议正文，
+        不能指望读的人自己想到。
+        """
+        advice = audit_skills([S(granted_tools=("Write",))])[0]
+        self.assertIn("换成另一个工具类别不算收窄", advice.suggestion)
+
+    def test_bare_edit_is_also_broad(self) -> None:
+        """把 `Write` 换成 `Edit` 之后仍然命中——这是上面那条实测的直接形态。"""
+        self.assertEqual(
+            kinds(audit_skills([S(granted_tools=("Edit",))])),
+            [AdviceKind.BROAD_GRANT],
+        )
+
     def test_bare_webfetch_hits(self) -> None:
         """
         裸写 `WebFetch` 是最宽的一种——它连「放行档对网络不生效」那道降级
