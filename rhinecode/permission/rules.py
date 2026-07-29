@@ -14,7 +14,11 @@ import fnmatch
 from typing import Optional
 
 from rhinecode.permission.models import Decision, DecisionResult, Layer, PermissionRequest, Rule
-from rhinecode.permission.matching import match_command, match_path
+from rhinecode.permission.matching import match_command, match_domain, match_path
+
+# 域名规则的 specifier 前缀。`WebFetch(domain:example.com)` 里括号内容必须以它开头，
+# 否则该条在加载期就已按 spec F13 处理掉（allow 丢弃 / deny 降级为整工具拒绝）。
+_DOMAIN_PREFIX = "domain:"
 
 
 def _rule_matches(rule: Rule, request: PermissionRequest) -> bool:
@@ -45,6 +49,22 @@ def _rule_matches(rule: Rule, request: PermissionRequest) -> bool:
         if rule.tool != request.rule_name:
             return False
         return match_path(rule.pattern, request.specifier)
+    if request.kind == "url":
+        # 工具名精确相等（与 command/path 分支同口径，rule.tool 是固定的规则体系名 WebFetch）。
+        if rule.tool != request.rule_name:
+            return False
+        # 空模式 = 整工具规则，匹配该工具的一切调用（spec F12，`deny: WebFetch` 的写法）。
+        if rule.pattern == "":
+            return True
+        # 带模式时必须是 `domain:` 前缀。**其余写法一律不命中**——那是第二道保险：
+        # 加载期已按 spec F13 处理过（allow 丢弃、deny 降级为整工具拒绝），
+        # 能走到这里的只会是加载期被绕过的路径（如运行期直接构造 Rule），
+        # 此时「不命中」对 allow 是偏严、符合 fail-safe。
+        if not rule.pattern.startswith(_DOMAIN_PREFIX):
+            return False
+        # 注意用 request.host 而不是 specifier——后者是完整 URL，
+        # 主机名由 adapter 在规范化时一次填好（见 PermissionRequest.host 的说明）。
+        return match_domain(rule.pattern[len(_DOMAIN_PREFIX):], request.host)
     # other：没有可匹配的 specifier，只有「匹配该工具全部」的空模式规则才算命中；
     # 工具名用 fnmatch 通配（无 `*` 时等价精确匹配，向后兼容）。
     return rule.pattern == "" and fnmatch.fnmatch(request.rule_name, rule.tool)
@@ -94,3 +114,29 @@ class RuleSet:
             if rule.effect == "allow" and _rule_matches(rule, request):
                 return DecisionResult(Decision.ALLOW, Layer.RULE, "命中 " + _describe(rule))
         return None
+
+    def has_allow_for(self, rule_name: str) -> bool:
+        """
+        判断本规则集里是否存在针对某个工具的 allow 规则。
+
+        :param rule_name: 规则体系工具名（如 "WebFetch"）
+        :returns: 存在至少一条 effect="allow" 且 tool 等于该名字的规则时返回 True
+
+        **唯一用途是判断「域名白名单是否已被建立」**（web_fetch 扩展 spec F6 第 3 条）：
+        用户一旦写下任何一条放行域名规则，就等于声明「只许访问这些」，
+        此后未命中即拒——而③规则层未命中时是「不下结论、交由④兜底」，做不到这件事。
+
+        ⚠ **调用方必须传只含用户级 + 项目级两层的 RuleSet**（spec F6a）。
+        本地级（「永久放行」自动写入的授权记录）、会话级、本次执行级（Skill 预授权）
+        都只是「我批准这一次/这一个」，不是「我只允许这些」；把它们算进来会造成
+        两个后果：用户点一次「永久放行」就把自己锁死；Skill 的 `allowed-tools`
+        反向收紧其它域名，违反「只放宽从不收紧」这条既有承诺。
+
+        本方法不认工具名通配（不像 `_rule_matches` 的 other 分支走 fnmatch）——
+        「白名单是否建立」是个精确问题，模糊匹配只会让它更难解释。
+
+        副作用：无。
+        """
+        return any(
+            rule.effect == "allow" and rule.tool == rule_name for rule in self.rules
+        )
