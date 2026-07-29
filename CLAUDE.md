@@ -306,6 +306,8 @@ python -m unittest discover -s tests      # 1169 项，skipped 4
 
 12. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
 
+13. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
+
 ## 代码注释规范
 
 为了降低项目理解成本，所有新增或修改的代码都必须包含充分、清晰、准确的中文注释。注释目标是：让第一次接触本项目的开发者，仅通过阅读代码和注释，就能理解代码的设计意图、执行流程、关键边界条件，并能够复现或安全修改相关逻辑。
