@@ -1,7 +1,7 @@
 ---
 name: skill-creator
 description: 创建、适配或按体检建议修复 Skill 定义文件
-when_to_use: 用户说「把这套流程做成 Skill」「帮我写个 Skill」「我下了个 Skill 帮我适配」「按 /skills 的建议修一下」时
+when_to_use: 用户提到 Skill 文件的创建、适配或修改时**一律先加载本 Skill**，不要凭先验直接动手。覆盖：「把这套流程做成 Skill」「帮我写个 Skill」「我从别处下了个 Skill / 从别的工具拿来一个 Skill，帮我适配」「这个 Skill 在这儿能用吗 / 能不能用」「按 /skills 的建议修一下」「Skill 的 frontmatter 该怎么写」。⚠️ 本系统的 Skill 字段有几处与其它 Agent 实现语义不同（其中一处相反），凭记忆判断必然出错
 # allowed-tools 是**预授权**（列出的操作本次执行内免确认），不是工具限制。
 # 只预授权只读调研——写文件与改文件**刻意不预授权**，那正是需要用户
 # 看一眼内容再点确认的那一步（与 commit 样板不预授权 `git commit` 同一取舍）。
