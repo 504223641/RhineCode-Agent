@@ -57,13 +57,21 @@ class PermissionEngine:
         file_ruleset: RuleSet,
         mode: PermissionMode = PermissionMode.DEFAULT,
         load_errors: list[str] | None = None,
+        policy_ruleset: RuleSet | None = None,
     ):
         """
         :param file_ruleset: 三层文件规则合并后的 RuleSet
         :param mode: 启动权限模式，默认「默认」档（spec F5）
         :param load_errors: 配置加载错误列表（可为 None）
+        :param policy_ruleset: **仅用户级 + 项目级**的规则集，用于判断「域名白名单
+            是否已被建立」（web_fetch 扩展 spec F6a）。**必须可选**——缺省为空规则集，
+            使既有构造点（大量测试直接 `PermissionEngine(RuleSet([...]))`）不改也能跑。
+
+            缺省为空的语义是安全的：白名单未建立 → ②′层不下结论 → 交由模式兜底，
+            与本扩展之前的行为一致。
         """
         self.file_ruleset = file_ruleset
+        self.policy_ruleset = policy_ruleset if policy_ruleset is not None else RuleSet([])
         self.session_rules: list[Rule] = []
         self.turn_rules: list[Rule] = []
         self.mode = mode
@@ -74,6 +82,8 @@ class PermissionEngine:
         cls,
         mode: PermissionMode = PermissionMode.DEFAULT,
         user_dir: Optional[Path] = None,
+        *,
+        web_fetch_enabled: bool = True,
     ) -> "PermissionEngine":
         """
         从三层 YAML 配置构建引擎（启动时调用）。
@@ -85,12 +95,17 @@ class PermissionEngine:
         :param user_dir: 用户级目录，透传给 `config.load_all()`。**必须可选**——
                          缺省等于现状（读真实主目录）。给定时用户级权限规则改从该目录读，
                          使装配层能把整套用户级内容重定向到临时目录（trace spec F23）。
+        :param web_fetch_enabled: 网络访问能力是否启用。关闭时跳过 WebFetch 的域名语法校验，
+                         使「关闭后行为与本扩展之前逐字一致」成立（web_fetch 扩展 spec F4）。
+                         由 `ConversationManager` 从 `Config.web_fetch_enabled` 传入。
         :returns: 已加载规则的 PermissionEngine
 
         副作用：读取三层配置文件（若存在）。
         """
-        ruleset, errors = config.load_all(user_dir)
-        return cls(ruleset, mode=mode, load_errors=errors)
+        ruleset, policy_ruleset, errors = config.load_all(
+            user_dir, web_fetch_enabled=web_fetch_enabled
+        )
+        return cls(ruleset, mode=mode, load_errors=errors, policy_ruleset=policy_ruleset)
 
     def decide(self, request: PermissionRequest) -> DecisionResult:
         """

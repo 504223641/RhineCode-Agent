@@ -47,27 +47,30 @@ class TempWorkspaceHomeTest(unittest.TestCase):
 
 class ConfigLoadTests(TempWorkspaceHomeTest):
     def test_missing_files_yield_empty(self) -> None:
-        ruleset, errors = config.load_all()
+        ruleset, policy, errors = config.load_all()
         self.assertEqual(ruleset.rules, [])
+        self.assertEqual(policy.rules, [])
         self.assertEqual(errors, [])
 
     def test_project_rules_loaded(self) -> None:
         self._write(config.project_config_path(), "allow:\n  - \"Bash(git *)\"\ndeny:\n  - \"Bash(git push *)\"\n")
-        ruleset, errors = config.load_all()
+        ruleset, policy, errors = config.load_all()
         self.assertEqual(errors, [])
         self.assertEqual(len(ruleset.rules), 2)
+        # 项目级属「策略层」，两条都该进 policy（web_fetch 扩展 spec F6a）
+        self.assertEqual(len(policy.rules), 2)
 
     def test_bad_yaml_degrades_without_crash(self) -> None:
         # 坏 YAML → 该层降级为空 + 收集可读错误，不崩溃、不放权（AC10）
         self._write(config.project_config_path(), "allow: [unclosed\n")
-        ruleset, errors = config.load_all()
+        ruleset, _policy, errors = config.load_all()
         self.assertEqual(ruleset.rules, [])
         self.assertEqual(len(errors), 1)
 
     def test_append_local_allow_persists(self) -> None:
         config.append_local_allow("Bash(git status)")
         self.assertTrue(config.local_config_path().exists())
-        ruleset, _ = config.load_all()
+        ruleset, _policy, _errors = config.load_all()
         req = PermissionRequest("run_command", "Bash", "git status", "command", False, PermissionMode.DEFAULT)
         result = ruleset.evaluate(req)
         self.assertIsNotNone(result)
