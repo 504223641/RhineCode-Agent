@@ -39,7 +39,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 **已实现的扩展**（不占章节号，文档在 `docs/extensions/`）：
 
 - **网络访问工具 `web_fetch`** ——给一个地址与一段「要提取什么」的说明，取回正文并按提问抽取要点。它同时在权限管线里新增了**②′网络边界层**（结构性硬校验 + 域名策略），并把抓回的内容当作不可信输入对待。行为细节见 [`docs/extensions/web-fetch/`](docs/extensions/web-fetch/spec.md)。
-- **Skill 作者期** ——对齐改造让 Skill **可导入**，这个扩展让它**可创作**。两件事：① **体检**（`skills/audit.py`，纯函数零 IO）七项检查，产出**可操作建议**（「建议改成 xxx」而非「警告：xxx」），并入 `/skills` 报告作为第四类反馈；② 内置 **`skill-creator`** 样板（目录型，带完整字段手册作随附资源），承担创作 / 适配外部 Skill / 按建议修复三种用途，全部落盘走完整权限管线。行为细节见 [`docs/extensions/skill-authoring/`](docs/extensions/skill-authoring/spec.md)。
+- **Skill 作者期** ——对齐改造让 Skill **可导入**，这个扩展让它**可创作**。两件事：① **体检**（`skills/audit.py`，纯函数零 IO）八项检查，产出**可操作建议**（「建议改成 xxx」而非「警告：xxx」），并入 `/skills` 报告作为第四类反馈；② 内置 **`skill-creator`** 样板（目录型，带完整字段手册作随附资源），承担创作 / 适配外部 Skill / 按建议修复三种用途，全部落盘走完整权限管线。另有 **R 系列增补**专治「Skill 写对了却没被自动加载」——清单表头从「公告」改成「指令」（照 Claude Code 口径：命中就先加载、**用它替代默认做法**、用户不必点名、拿不准就加载）、修掉 `load_skill` 一处**压制加载**的过期描述、内置样板说明改**触发词前置**、清单超预算时**保名字只砍描述**。⚠️ 「模型欠触发 Skill」是**已知的系统性偏差**（Anthropic 官方指导：描述要写得「有点 pushy」），不是本项目独有的 bug。行为细节见 [`docs/extensions/skill-authoring/`](docs/extensions/skill-authoring/spec.md)。
 
 另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成十五类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
 
@@ -106,6 +106,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
 - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）+ 若要在 `allowed-tools` 里可写，还要在 `skills/validation.py` 的 `_TOOL_ALIASES` 加一行
+- **改动 Skill 清单表头或 `load_skill` 的工具描述** → `skills/render.py` 的 `_INDEX_HEADER` + `tools/load_skill.py` 的 `description`。**两处必须同口径**（命中就先加载 / 替代默认做法 /用户不必点名 / 拿不准就加载）——它们是模型决定「要不要用 Skill」时读的**唯一两处文本**，一处强一处弱等于白改。⚠️ 那句「替代你自己的默认做法」不可省：少了它，模型会把 Skill 当成「另一种可选做法」而不是「该走的那条路」。两处各有护栏（`test_skill_render.py` / `test_skill_manager.py`）
 - **新增一项 Skill 体检检查** → `skills/models.py` 的 `AdviceKind`（枚举）+ `skills/audit.py`（判定与措辞）。**漏了枚举不报错**，只是那条新检查在测试里没法精确断言，用例只能退回 `assertIn("某个词", report)` 这种脆弱写法——而措辞恰恰是这类建议要反复打磨的东西，改一次碎一批测试，人的第一反应会是把断言放宽成谁都能过
 - **新增一个「只读」工具类别** → `skills/validation.py` 的 `_TOOL_ALIASES` + `skills/models.py` 的 `READ_ONLY_GRANT_TOOLS`。**漏改的后果是「多报一条预授权过宽」**——这是**刻意选的偏严方向**：反过来维护「有副作用清单」的话，将来新增一个有副作用的工具忘了登记就会**静默漏报**；现在这个方向下遗漏是可见的、用户会来问。仍要登记，否则下一个人会以为那条误报是 bug
 - **新增一种权限请求 `kind`** → `permission/adapter.py` 的 `_TOOL_MAP`（映射）+ **同文件的 `to_allow_rule`**（「本会话/永久放行」要登记成什么规则）。**漏改后者不报错**：本次调用照常放行，要到下次启动才发现那条永久规则是废的（url 类踩过——原写法会写出 `WebFetch(https://x/a?token=abc)`，既非法又把令牌写进配置文件）
