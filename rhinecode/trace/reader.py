@@ -320,6 +320,44 @@ def render_detail(record: dict) -> list[str]:
     return lines
 
 
+def _relax_stdio_encoding() -> None:
+    """
+    把 stdout / stderr 的编码错误处理放宽成 `replace`，避免整个阅读器被一个字符打死。
+
+    :returns: 无
+
+    **为什么必须有这一步**：Windows 控制台默认代码页是 GBK，而记录里的
+    `ui_message` 正文含 emoji（🔄「第 N 轮」、📦「已存盘」等）。GBK 编码不了它们，
+    于是 `print("\\n".join(lines))` **整条抛 UnicodeEncodeError**——
+    注意后果不是「少显示一个字符」，而是**一条时间线都读不出来**，
+    因为渲染好的几百行是一次性 print 出去的，一个字符编不了就全军覆没。
+    实测现场：
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\U0001f504'
+
+    **为什么用 `errors="replace"` 而不是强行改成 utf-8**：终端本身可能就渲染不了
+    emoji（改了编码只会显示成乱码方块），而阅读器的职责是「让人读到时间线」，
+    不是「像素级还原 emoji」。退化成 `?` 至少保证内容可读，
+    也不会因为改动终端编码而影响同一个控制台里后续的其它程序。
+
+    **为什么不在写入端做**：记录器（`writer.py`）永远写 UTF-8 文件，那一端没有问题；
+    问题只出在「把 UTF-8 内容打到一个非 UTF-8 终端」这个环节，因此修在读出端。
+
+    副作用：修改本进程 sys.stdout / sys.stderr 的错误处理策略。
+    `reconfigure` 是 Python 3.7+ 的 TextIOWrapper 方法；被重定向成
+    非 TextIOWrapper 的替身流（测试里常见）时该属性不存在，此时静默跳过——
+    观测设施不能因为自我保护动作失败而阻断读取。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            # 流已关闭或不支持重配置：跳过即可，不要让它冒泡打断读取。
+            continue
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """
     命令行入口。
@@ -327,6 +365,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     :param argv: 参数列表（缺省取 sys.argv[1:]，便于测试直接调用）
     :returns: 退出码（0 正常，1 文件不存在或指定序号找不到）
     """
+    # 必须在任何 print 之前：GBK 终端下 emoji 会让输出整条抛异常，见函数 docstring。
+    _relax_stdio_encoding()
+
     parser = argparse.ArgumentParser(
         prog="python -m rhinecode.trace.reader",
         description="RhineCode 行为记录阅读器（只读）",

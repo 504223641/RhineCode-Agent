@@ -132,6 +132,76 @@ class ChineseEncodingTest(ReaderTestBase):
         self.assertIn("帮我看看代码", out)
 
 
+class NonUtf8ConsoleTest(ReaderTestBase):
+    """
+    真实现场重演：Windows 控制台（代码页 GBK）读一份含 emoji 的记录。
+
+    记录里的 `ui_message` 正文天然带 emoji（🔄「第 N 轮」、📦「已存盘」），
+    而整条时间线是**一次性** print 出去的——GBK 编不了其中任何一个字符，
+    就会让**整份记录一行都读不出来**，而不是少显示一个字符。
+
+    现场报错（`G:\\Rhine-test\\web-tool-test` 的记录，2026-07-29）：
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\U0001f504'
+    """
+
+    def _gbk_console(self) -> tuple[io.TextIOWrapper, io.BytesIO]:
+        """造一个行为等价于 GBK 控制台的输出流（errors 严格，编不了就抛）。"""
+        buf = io.BytesIO()
+        return io.TextIOWrapper(buf, encoding="gbk", errors="strict", newline=""), buf
+
+    def _write_emoji_record(self) -> None:
+        self.path.write_text(
+            _line(1, "ui_message", source="system", text="🔄 第 2 轮") + "\n"
+            + _line(2, "ui_message", source="system", text="📦 已把 1 个大型工具结果存盘") + "\n",
+            encoding="utf-8",
+        )
+
+    def test_emoji_readable_on_gbk_console(self) -> None:
+        """修复后的正向断言：GBK 控制台下能读完，非 emoji 部分逐字保留。"""
+        self._write_emoji_record()
+        stream, buf = self._gbk_console()
+        with redirect_stdout(stream), redirect_stderr(io.StringIO()):
+            code = reader.main([str(self.path)])
+            stream.flush()
+
+        self.assertEqual(code, 0)
+        text = buf.getvalue().decode("gbk")
+        # emoji 退化成占位符是可以接受的；「读不出来」才是缺陷。
+        self.assertIn("第 2 轮", text)
+        self.assertIn("已把 1 个大型工具结果存盘", text)
+        self.assertIn("共 2 条事件", text)
+
+    def test_strict_gbk_would_have_crashed(self) -> None:
+        """
+        反证：不做 `errors="replace"` 放宽时，同样的内容确实会把 print 打死。
+
+        没有这条，上面那条正向断言无法区分「修复生效」与「本来就不会崩」。
+        """
+        stream, _ = self._gbk_console()
+        with self.assertRaises(UnicodeEncodeError):
+            stream.write("🔄 第 2 轮")
+            stream.flush()
+
+    def test_detail_mode_also_relaxed(self) -> None:
+        """--seq 展开走的是另一条 print 路径，同样必须挺过 GBK 控制台。"""
+        self._write_emoji_record()
+        stream, buf = self._gbk_console()
+        with redirect_stdout(stream), redirect_stderr(io.StringIO()):
+            code = reader.main([str(self.path), "--seq", "2"])
+            stream.flush()
+
+        self.assertEqual(code, 0)
+        self.assertIn("已把 1 个大型工具结果存盘", buf.getvalue().decode("gbk"))
+
+    def test_relax_tolerates_stream_without_reconfigure(self) -> None:
+        """
+        观测设施不得因自我保护动作失败而阻断读取：
+        流是 StringIO（无 `reconfigure`）时静默跳过，不抛。
+        """
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            reader._relax_stdio_encoding()  # 不抛即通过
+
+
 class FilterTest(ReaderTestBase):
     def test_type_filter(self) -> None:
         _, out, _ = self.run_reader("--type", "api_request")
