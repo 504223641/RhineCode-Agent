@@ -25,9 +25,30 @@ rhine = "rhinecode.__main__:main"
 where = ["."]
 include = ["rhinecode*"]
 
-# c11：把内置 Skill 样板打进分发包。
-# packages.find 只收集 .py，`.md` 不会自动进 wheel——不加这段的话
-# `pip install -e .`（开发模式直接读源码目录）一切正常，但真正 `pip install`
-# 之后 skills/builtin/ 会是空的，三个内置样板凭空消失，而且不报任何错。
+# 把内置 Skill 样板打进分发包。
+#
+# ⚠️ 这段是**冗余保险，不是必需品**——原注释（c11 时写的）声称「不加这段的话
+# 真正 pip install 之后 skills/builtin/ 会是空的」，作者期扩展做实测时发现
+# **那句话不成立**：本项目用纯 pyproject.toml 配置，而 setuptools>=61 在这种
+# 配置下 `include-package-data` **默认为真**，包目录内的非 .py 文件本来就会
+# 一并打包。
+#
+# 实测三组（每组都先 `rm -rf build`，否则 setuptools 会复用 build/lib/ 里
+# 上一次的产物，验的其实是上一次的配置——第一次就是这么得到假结论的）：
+#
+#   | 配置                                        | .md 进包吗 |
+#   |---------------------------------------------|-----------|
+#   | 有本段（两条模式）                           | 全部进    |
+#   | 有本段（仅 builtin/*.md，旧写法）            | 全部进    |
+#   | 整段删掉                                     | 全部进    |
+#   | 整段删掉 + include-package-data = false      | **一个都没有** |
+#
+# 最后一行才是真正的开关。保留本段的理由只有一条：**万一将来有人关掉
+# include-package-data，这里仍然兜得住**。因此它必须写全——
+# `*` 不跨目录分隔符，第一条只覆盖单文件型（builtin/commit.md），
+# 第二条才覆盖目录型（builtin/skill-creator/SKILL.md 与它的随附资源）。
+#
+# 不用 `**` 递归通配：它对 setuptools 版本有要求，而内置样板不会嵌套超过两层
+# （一个 Skill 一个目录，就到底了），两条显式模式在所有版本上都成立。
 [tool.setuptools.package-data]
-"rhinecode.skills" = ["builtin/*.md"]
+"rhinecode.skills" = ["builtin/*.md", "builtin/*/*.md"]

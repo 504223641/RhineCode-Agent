@@ -566,12 +566,12 @@ class ProjectNoticeTest(ManagerTestBase):
 
 
 class BuiltinSamplesTest(unittest.TestCase):
-    """三个内置样板开箱可见（AC28）。"""
+    """内置样板开箱可见（AC28）。"""
 
-    def test_three_builtin_skills_discovered(self) -> None:
+    def test_builtin_skills_discovered(self) -> None:
         catalog = discover(None, None, builtin_skills_dir())
         names = sorted(s.command_name for s in catalog.skills)
-        self.assertEqual(names, ["commit", "review", "test"])
+        self.assertEqual(names, ["commit", "review", "skill-creator", "test"])
         for spec in catalog.skills:
             self.assertIs(spec.source, SkillSource.BUILTIN)
         self.assertEqual(catalog.errors, ())
@@ -583,6 +583,25 @@ class BuiltinSamplesTest(unittest.TestCase):
         self.assertIs(modes["commit"], False)
         self.assertIs(modes["review"], True)
         self.assertIs(modes["test"], False)
+        # skill-creator 必须留在主对话：它的三种用途都要与用户往复确认
+        # （定命令名、逐条问建议采不采纳），而子对话一次性跑完、
+        # 只回流最后一条结论，用户既看不到中间过程也无从插话。
+        self.assertIs(modes["skill-creator"], False)
+
+    def test_skill_creator_is_directory_type_with_reference(self) -> None:
+        """
+        `skill-creator` 必须是**目录型**，字段手册作为随附资源存在。
+
+        塞进正文的话它自己就会触发「逼近注入上限」那条检查——
+        手册本身的体积已经越过阈值，而它只在模型真要动 frontmatter 时才用得上。
+        做成随附资源后按需读取，不占每次激活的上下文。
+        """
+        catalog = discover(None, None, builtin_skills_dir())
+        spec = {s.command_name: s for s in catalog.skills}["skill-creator"]
+        self.assertIsNotNone(spec.resource_dir)
+        self.assertIn("reference.md", spec.resource_files)
+        # 手册内容不在正文里——只有指向它的一句话
+        self.assertNotIn("域名规则必须带", spec.body)
 
 
 if __name__ == "__main__":
