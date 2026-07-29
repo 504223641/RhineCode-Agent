@@ -23,15 +23,16 @@
 | Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 |
 | Skills | `skills/` | Skill 定义的解析/发现/渲染/预授权翻译/激活编排（叶子包） |
 | Context | `context/` | 两层压缩：估算、工具结果存盘、LLM 摘要 |
+| Web | `web/` | 网络抓取与内容抽取（web_fetch 扩展，叶子包）：解码、HTML 转换、逐跳硬校验、抽取编排、结果渲染 |
 | Trace | `trace/` | 行为记录器（**跨阶段测试设施**，不占章节号，叶子包只依赖标准库） |
 | 驱动设施 | `tests/e2e/` | 端到端驱动（**跨阶段测试设施**，不进产品包，产品代码绝不反向依赖） |
 | 装配层 | `bootstrap.py` | `build_app` 按固定顺序组装应用，致命错误抛 `BootstrapError` |
 | Provider | `provider/` | `BaseProvider` 抽象与三个实现，`create_provider` 按 `protocol` 分发 |
 | Tools | `tools/` | `Tool` 抽象、注册中心、路径边界与各内置工具 |
 
-依赖方向总原则：上层可依赖下层，反之不可。`skills` / `trace` 是叶子包；
+依赖方向总原则：上层可依赖下层，反之不可。`skills` / `trace` / `web` 是叶子包；
 `commands` 不被 conversation/memory/context/provider 反向依赖；
-`tools/__init__.py` **必须保持为空**（否则 `tools ↔ skills`、`tools ↔ mcp` 的包级互依会成环）。
+`tools/__init__.py` **必须不 re-export 任何子模块**（否则 `tools ↔ skills`、`tools ↔ mcp`、`tools ↔ web` 三组包级互依都会成环）。`web` 与 `permission` 的唯一耦合点是一组纯函数（`check_hard` / `is_forbidden_address`）——判定期与连接期**共用同一份实现**，各写一套是典型的「改一处漏一处」且漏改不报错，只是某个地址悄悄能访问了。
 
 当前核心分层如下，上层尽量不感知下层具体实现，通过抽象接口和事件流解耦：
 

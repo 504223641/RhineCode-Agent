@@ -27,6 +27,7 @@ Skill 系统已**对齐 [Agent Skills 开放标准](https://agentskills.io)**（
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
 - **MCP 客户端**：启动时按配置连接外部 MCP Server（stdio 子进程 / Streamable HTTP），自动发现并注册其工具（以 `mcp__<server>__<tool>` 为基础命名，必要时规范化为安全 function name），Agent 调用时无感；也支持用户直接说“帮我添加 context7 MCP”，由 Agent 解析候选、写入配置并在当前会话中重载；多 Server 连接缓存与隔离，单个挂掉不影响其它；底部状态栏显示连接状态，`/mcp` 查看明细。
 - **记忆系统**：三层 RHINE.md 项目指令（用户级 → 项目 `.rhinecode` → 项目根，支持 `@include` 展开，`/init` 可让 Agent 探索项目自动生成）；每条消息即时 JSONL 存档，`/resume` 弹出交互式会话选择面板（上下键/回车/Esc，锁定会话与当前会话置灰跳过），载入后聊天区清空并回放全部历史、后续消息追加进该会话，`rhine --continue` 启动恢复同样回放；Agent Loop 自然停止后异步生成四类笔记（用户偏好/纠正反馈/项目知识/参考资料），索引注入系统提示、正文按需读取；多实例锁文件防护；`/memory` 查看全部状态。RHINE.md 与会话存档/恢复对所有 Provider 生效，自动笔记与 `/init` 仅 DeepSeek 工具模式。
+- **网络访问**：`web_fetch` 工具让模型能读取公开网页——你在对话里给一个地址（「抓一下 https://… 」），它取回正文并按你的提问抽取要点。**只取不发**（无请求体、无自定义头、无认证）。权限上新增**②′网络边界层**：协议与内网地址的硬校验不可被任何配置或模式放开；域名用 `WebFetch(domain:...)` 规则控制，**且该限制翻不过 `/perm` 的放行档**。抓回的内容一律被标注为外部不可信数据。可用 `web_fetch_enabled: false` 整体关闭。
 - **上下文管理（两层压缩）**：每轮请求前近似估算历史用量（锚点+增量）；第一层把过大的工具结果存盘、历史只留预览与路径；第二层在逼近窗口时调 LLM 把较早消息压成五段式结构化摘要、近期原文保留，并提示模型细节需重读文件；连续失败 3 次熔断，用户原文永不改写；`/context` 查用量、`/compact` 手动压缩，状态栏常驻用量指示。窗口大小由 `context_window` 配置（默认 65536）。
 - **五层防御权限系统**：每个工具执行前由 `permission/` 包的纯逻辑引擎按固定顺序计算决定——①危险命令黑名单（不可被任何配置/模式放开）→ ②路径沙箱 → ③可配置规则（`Tool(模式)`，deny 永远优先）→ ④权限模式（严格/默认/放行，`/perm` 切换）→ ⑤人在回路（确认面板四选项）。
 - **可配置权限规则**：三层 YAML（用户级、项目级、本地级）声明 allow/deny；跨层合并后 deny 优先求值。
@@ -92,6 +93,7 @@ api_key: YOUR_API_KEY
 | 字段 | 说明 |
 |------|------|
 | `debug_log` | 是否把每次请求的缓存命中/未命中 token 追加到 `.rhinecode_debug.log`，默认开启 |
+| `web_fetch_enabled` | 网络访问工具（`web_fetch`）的总开关，缺省 `true`。设为 `false` 后工具不注册、相关系统提示不注入、域名规则不做语法校验——行为与没有这个工具时一致。非法值会**报错退出**（与 `debug_log` 同口径，不像 `context_window` 那样静默回退） |
 | `context_window` | 上下文窗口上限（token），作为「历史是否逼近溢出、何时压缩」的判断基准；缺省 / 非法都回退默认 65536。只影响 RhineCode 的压缩时机，不改变模型真实上限，应贴近所用模型的实际上下文长度。首次生成的模板不含此项，想调整手动加一行即可 |
 
 ## 启动
@@ -187,6 +189,7 @@ DeepSeek 工具模式会向模型暴露以下工具：
 | `write_file` | 新建或覆盖项目内文件，并生成 diff | 否 |
 | `edit_file` | 用唯一匹配的原文片段精确替换；支持 `edits` 数组批量替换 | 否 |
 | `run_command` | 在项目工作目录下执行 shell 命令 | 否 |
+| `web_fetch` | 抓取一个公开 http/https 地址的内容，并按你给的提问抽取要点。只支持 GET——没有请求体、自定义头、cookie 或认证，因此抓不到需要登录的页面。跨主机重定向不自动跟随（返回目标地址，由模型再发一次）| 否 |
 | `mcp_resolve_server` | 解析用户给出的 MCP 名称、NPM 包名或 HTTP URL，返回候选配置、来源、置信度和风险提示 | 是 |
 | `mcp_add_server` | 将已解析的 MCP 配置写入用户级或项目级 `mcp.yaml`，并只重载目标 Server | 否 |
 
@@ -464,6 +467,7 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 - Skill 正文是「发给模型的文本」，可以指挥模型读写文件、执行命令。**项目级 Skill 随代码仓库分发**，因此每次启动都会提示「发现 N 个项目级 Skill」（刻意不做「只提示一次」的持久化，否则 `git pull` 新增的会被静默吞掉）；评审 `.rhinecode/skills/` 应与评审代码同等对待。
 - Skill **拿不到任何权限豁免**：它指挥的每个工具调用照样过五层管线，正文里写「直接执行 rm -rf /」也只会在黑名单层被拦下。
 - `allowed-tools` 是**预授权，不是安全边界**：它只放宽（列出的操作在本次执行内免确认），从不收紧，而且**翻不过前两层**——声明「放行全部命令」的 Skill 照样在黑名单层被拦，声明「放行全部写入」照样在沙箱层被拦。要**限制**模型能做什么，唯一手段是 `permissions.yaml` 的 deny 规则。授权在你发出下一条消息时失效。
+- **网络访问是第一个能主动向外发数据的能力**，三条要点：① 在此之前模型读到的敏感内容都烂在本地（没有工具能发出去），`web_fetch` 把「读文件」与「访问网络」凑齐后，「网页里藏一段伪装成系统指令的文本 → 骗模型读配置 → 拼进下一次抓取的地址」这条链才成立。防御是三道叠加：不可信标注 + 域名白名单 + 只取不发。② **缺省配置下白名单并不存在**——不写任何域名规则时唯一的实际拦截是每次弹确认；想要真边界，必须在**用户级或项目级** `permissions.yaml` 里写 `allow: WebFetch(domain:...)`（写在本地级不会建立白名单）。③ 域名策略只管 `web_fetch`：`run_command` 跑起来的 `curl`/`wget`与 MCP 工具都不受它约束。另：连接期的域名解析不受超时约束，DNS rebinding 的时间窗也未封死，均为已知边界。
 - 用户级与内置 Skill 目录经路径沙箱的**只读白名单**放行（目录型 Skill 的随附资源在工作区外，模型需按清单读取），只对读类判定生效，写入与 glob/grep 搜索面完全不动。
 
 ## 项目结构
@@ -493,7 +497,16 @@ rhinecode/
 │   ├── rules.py         # ③规则 deny 优先求值
 │   ├── config.py        # 三层 YAML 加载/容错/回写
 │   ├── adapter.py       # 工具调用规范化为 PermissionRequest（收口工具知识）
-│   └── engine.py        # PermissionEngine.decide 组装四层管线
+│   ├── network.py       # ②′网络边界层：硬校验 + 域名策略（判定期与连接期共用同一份实现）
+│   └── engine.py        # PermissionEngine.decide 组装决策管线
+├── web/                 # 网络抓取与抽取（web_fetch 扩展，叶子包）
+│   ├── models.py        # FetchOutcome / ExtractOutcome 值对象
+│   ├── decode.py        # 字节→文本：响应头 → 文档内 <meta> → 兜底 UTF-8
+│   ├── convert.py       # HTML→纯文本（标准库 HTMLParser，不引入新依赖）、截断
+│   ├── fetcher.py       # 抓取 + 逐跳硬校验 + 重定向控制 + 体量/时长上限
+│   ├── extract.py       # 预算计算（随 context_window 缩放）、抽取提示、结果解析
+│   ├── render.py        # 不可信标记 + 元信息渲染 + TUI 摘要
+│   └── manager.py       # WebFetchManager：本包唯一持 provider、唯一编排副作用
 ├── mcp/                 # MCP 客户端（c7，五层：配置→JSON-RPC→传输→会话→适配→编排）
 │   ├── config.py        # 两层 mcp.yaml 加载、${VAR} 展开、容错
 │   ├── auto_config.py   # MCP 名称/URL 自动解析与 mcp.yaml 安全写入
@@ -542,6 +555,7 @@ rhinecode/
 │   ├── registry.py      # 工具注册中心
 │   ├── mcp_config.py    # mcp_resolve_server / mcp_add_server 内置工具
 │   ├── load_skill.py    # load_skill 系统级工具（两阶段加载第二阶段，四态返回，system_serial 强制串行）
+│   ├── web_fetch.py     # web_fetch 网络抓取工具（委托 web/manager.py）
 │   ├── path_guard.py    # 项目工作目录路径守卫（沙箱层复用）
 │   ├── read_file.py
 │   ├── write_file.py
@@ -558,7 +572,7 @@ rhinecode/
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 869 项
+python -m unittest discover -s tests      # 1165 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
