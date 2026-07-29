@@ -9,8 +9,14 @@ Skill 系统包（c11）。
 **纯逻辑 + 单点接入**——不导入 Textual 与 Provider SDK，可在无终端无网络的
 测试进程中独立验证（spec N1）。
 
-包内六模块严格单向依赖：
-models → parser → discovery → render → validation → manager。
+包内七模块严格单向依赖：
+
+    models → parser → discovery → ┬→ render ─────┬→ audit → manager
+                                  └→ validation ─┘
+
+⚠️ `render` 与 `validation` 是**同层并列**，彼此不 import（前者只依赖 `models`，
+后者只依赖 `permission` + `models`）。这一点是「`audit` 同时依赖两者
+**不会成环**」的判断依据，不要把它们画成串联。
 """
 
 from rhinecode.skills.models import (
