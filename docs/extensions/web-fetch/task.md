@@ -1,6 +1,6 @@
 # 网络访问工具（web_fetch）Tasks
 
-> 状态：待批准（2026-07-29，**第 3 轮修订**：按第 2 轮独立审查修订，任务 28 → 31 个）
+> 状态：待批准（2026-07-29，**第 4 轮修订**：经三轮独立审查，31 个任务）
 >
 > 上游：[`spec.md`](spec.md)、[`plan.md`](plan.md)。
 
@@ -54,7 +54,7 @@
 
 | 文件 | 改什么 |
 | --- | --- |
-| `rhinecode/permission/models.py` | `Layer` 新增 `NETWORK`；`PermissionRequest` 新增 `host` |
+| `rhinecode/permission/models.py` | `Layer` 新增 `NETWORK` + `label()`；`PermissionRequest` 新增 `host`；`DecisionResult` 新增 `kind` / `host` |
 | `rhinecode/permission/matching.py` | 新增 `match_domain` |
 | `rhinecode/permission/rules.py` | `_rule_matches` url 分支；`RuleSet.has_allow_for` |
 | `rhinecode/permission/adapter.py` | `_TOOL_MAP` 登记；填 `host`；新增 `to_allow_rule` |
@@ -69,7 +69,7 @@
 | `tests/test_perm_config.py` | `load_all` 的 4 处 2 元组解包 |
 | `tests/test_config_bootstrap.py` | `load_all` 的 1 处 2 元组解包（`:123`） |
 | `rhinecode/trace/models.py` | 新增 `SCOPE_WEB_EXTRACT` |
-| `rhinecode/trace/reader.py` | `_LAYER_NAMES` 加 `network` |
+| `rhinecode/trace/reader.py` | `_LAYER_NAMES` 改为复用 `Layer.label()`（两处合一，消掉一个漏改不报错点） |
 | `rhinecode/config.py` | `Config` 新增 `web_fetch_enabled`；模板补注释 |
 | `rhinecode/bootstrap.py` | 装配 + 两个注入参数 + 关闭开关 |
 | `tests/e2e/host.py` | 同步 `build_app` 新增参数（第二个真实调用方） |
@@ -135,6 +135,8 @@
 
 **步骤：**
 1. `Layer` 新增 `NETWORK = "network"`，docstring 补一行。
+   （中文层名的 `label()` 方法与 `DecisionResult` 的 `kind` / `host` 两个字段
+   由 T25 一并加——它们的唯一消费者是确认面板，放在那里改动更内聚。）
 2. `PermissionRequest` 新增 `host: str = ""` 字段（**带默认值**，否则既有构造点全部报错），
    docstring 说明：仅 url 类填充，已归一化；三处消费者（规则匹配、确认面板、行为记录）。
 3. `kind` 文档补 `"url"`：specifier 是**完整 URL 原文**，主机名单独放在 `host`。
@@ -223,7 +225,8 @@
    两支都往 `warnings` append 一条中文说明。
 3. `_load_layer` 返回改为 `tuple[list[Rule], list[str]]`。
    **⚠ 这只是为了让「单条规则级」的警告能多条并存，控制流实质只动最后一处。**
-   现有代码里「出错即 return」共四处（`config.py:145-169`），**前三处一个字都不许动**：
+   现有代码里的**错误** return 共三处（`config.py:151/156/164`；另有 `:146` 文件不存在与
+   `:154` 空 YAML 两处正常返回，不在讨论范围），**这三处一个字都不许动**：
 
    | 位置 | 性质 | 本任务 |
    | --- | --- | --- |
@@ -296,7 +299,7 @@
    然后在 `parse_rule_string` 里被**静默丢弃**，一条警告都不产——用户看到的现象是
    「我明明写了预授权，还是每次弹确认」，而 `/skills` 报告里什么都没有。
    `grants_for` 本来就返回 `(rules, warnings)`，接得上，下游展示位现成。
-3. **改 `validation.py:120-121` 的警告文案**：现文是「（可用的类别：Read / Write / Edit / Bash，
+3. **改 `validation.py:121` 的警告文案**：现文是「（可用的类别：Read / Write / Edit / Bash，
    或 `mcp__` 开头的远端工具）」，加完 WebFetch 就不完整了。
    **这是「漏改不报错」的形态**——`tests/test_skill_startup.py` 只断言了前半句
    「没有对应的工具类别」，文案改不改都不会变红。
@@ -324,6 +327,9 @@
 1. `models.py` 新增 `SCOPE_WEB_EXTRACT = "web_extract"`，加进 `__all__`，
    在既有 scope 说明注释里补一段（与主对话共用同一个 Provider 实例）。
 2. `reader.py` 的 `_LAYER_NAMES` 加一行 `"network": "②′网络边界"`。
+   （**T25 会把这张表整个改成复用 `Layer.label()`**——本任务先按现状加一行即可，
+   两个任务都做完之后表就只剩一份。之所以不在这里直接合并：T25 才是需要中文层名的那一方，
+   合并的收益要到那时才成立。）
 3. 在 `models.py` 注释里写明**不新增事件类型**的决定与理由。
 
 **验证：** `python -m unittest tests.test_trace_reader` 无回归；
@@ -337,7 +343,7 @@
 **步骤：**
 1. `Config` 新增 `web_fetch_enabled: bool = True`，docstring 说明。
    **不加 `web_extract_model`**（plan 已砍：换模型的既有旁路叶子包复用不了，YAGNI）。
-2. 解析口径：`_parse_bool` 对非法值是**抛 ValueError**（`config.py:135-144`），
+2. 解析口径：`_parse_bool` 对非法值是**抛 ValueError**（`config.py:137-146`），
    与 `debug_log` 同处理——**不要写成「fail-safe 回退默认」**，那是 `_parse_int` 的口径，
    两者不同（第 1 轮混用了）。
 3. 配置模板补该项注释（默认注释掉），并**在权限配置模板 `_CONFIG_TEMPLATE`
@@ -463,9 +469,13 @@
 
 **步骤：**
 1. `content_budget(context_window) -> int`：`window // 4` 夹在 `[4_000, 100_000]`。
+   **入参单位是 token，返回值单位是字符**——注释里写死，别让读的人猜。
    **注释写明为什么不能是固定常量**：`CLAUDE.md` 已知项 #8 记录过同型缺陷
-   （`RETAIN_TOKENS` 固定值在小窗口下失效导致机制空转）。口径对齐
-   `context/summarize.py` 的 `retain_budget`。
+   （`RETAIN_TOKENS` 固定值在小窗口下失效导致机制空转）。
+
+   **形态**与 `context/summarize.py` 的 `retain_budget` 相同（按比例算再夹持），
+   但**单位与比例都不同**：那边返回 token、比例 0.16、只夹上限；这边返回**字符**、
+   比例 1/4、上下限都夹。**注释里别写「口径对齐」**——那会让人以为参数可以互相参照。
 2. 常量 `MAX_ANSWER_CHARS = 8_000`、`MAX_FALLBACK_CHARS = 8_000`；
    注释写明 8000 的依据（`CHARS_PER_TOKEN = 3.0` → 约 2700 token < `SINGLE_RESULT_TOKENS = 4000`）。
 3. `build_extract_request(page_text, source_url, ask) -> (system, messages)`：
@@ -527,7 +537,7 @@
 
 ---
 
-# 第四段：接线（T21–T28）
+# 第四段：接线（T21–T31）
 
 ## T21: 不可信内容的系统约束
 
@@ -604,8 +614,9 @@
 
 ## T25: 确认面板的 URL 展示
 
-**文件：** `rhinecode/tui/widgets.py`、`tests/test_web_bootstrap.py`（追加）
-**依赖：** T6
+**文件：** `rhinecode/permission/models.py`、`rhinecode/permission/network.py`、
+`rhinecode/trace/reader.py`、`rhinecode/tui/widgets.py`、`tests/test_web_bootstrap.py`（追加）
+**依赖：** T3、T5、T6
 
 **为什么单独成任务：** spec F9/AC15 有 checklist 条目但第 2 轮的 plan/task 里
 **既无模块也无任务**，而现状是**主动违反**它——`ConfirmPanel.show_for` 走
@@ -614,27 +625,54 @@
 `url=https://docs.example.com/re…`。用户正是靠面板上那个地址决定放不放行的，
 地址被截断意味着攻击者只要把恶意部分放在第 31 个字符之后，人在回路这层就形同虚设。
 
-**步骤：**
-1. `ConfirmPanel.show_for` 加一条 URL 类专用分支（按 `kind == "url"` 判定）：
-   **完整地址不截断、单独成行**；主机名与 `decision.layer` 的中文名各占一行。
-2. `decision.layer` 已在 `DecisionResult` 里现成；主机名取 `PermissionRequest.host`
-   （若面板拿不到 request，则由调用侧透传，或从完整 URL 现算——两种都可，
-   但**主机名必须与判定时用的那一个一致**，不要各算各的）。
-3. **⚠ 写进代码注释的死规矩**：完整 URL 进 markup 前一律用 `tui/widgets.py` 自己那版
+**⚠ 面板现在拿不到判定所需的信息，这是本任务的第一件事。** 实际调用链是：
+
+```
+conversation.py:79   ConfirmCallback = Callable[[ToolCall, Tool, DecisionResult], ConfirmDecision]
+conversation.py:998  choice = self.confirm_callback(tool_call, tool, decision)
+tui/app.py           _confirm_tool → _show_confirm_panel(tool_call, tool, decision)
+tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
+```
+
+面板只能拿到 `ToolCall`（name/arguments）与 `DecisionResult`。而 `DecisionResult`
+（`permission/models.py:76-79`）只有 `decision / layer / reason`——**没有 `kind`，也没有 `host`**，
+`PermissionRequest` 根本没进过这条链路。三个要展示的字段里只有 `layer` 是现成的。
+
+**步骤（改法定死，不留选择）：**
+
+1. **扩 `DecisionResult`，不透传 `PermissionRequest`。**
+   加两个带默认值的字段：`kind: str = ""` 与 `host: str = ""`，由 `engine.decide` 返回时填。
+   **为什么选这条而不是改回调签名**：`DecisionResult` 已经在链路上，改动面只有
+   「构造点 + 面板」两处；改 `ConfirmCallback` 类型要连带动 `conversation.py:79` 的公开类型、
+   `:998` 调用点、`tui/app.py` 的 `_confirm_tool` 与 `_show_confirm_panel` 四处。
+   而且同一个对象携带，天然保证「面板显示的主机名 = 判定时用的那一个」，
+   不会出现两处各算各的。
+2. **中文层名归属定死**：在 `permission/models.py` 的 `Layer` 上加 `label()` 方法
+   （枚举值 → 中文名）。**`trace/reader.py:104` 的 `_LAYER_NAMES` 改为复用它**。
+   现在那张表是全仓唯一一份、藏在只读阅读器里；面板若自己抄一份，
+   就多出一个「漏改不报错」的成对维护点——而 `Layer` 枚举本来就已经是维护点之一。
+   顺手把两处合一，维护点从两个变回一个。
+3. `ConfirmPanel.show_for` 加 URL 类专用分支，判据用 **`decision.kind == "url"`**
+   （第 1 步已让面板拿得到）：**完整地址不截断、单独成行**；
+   主机名（`decision.host`）与层名（`decision.layer.label()`）各占一行。
+4. **⚠ 写进代码注释的死规矩**：完整 URL 进 markup 前一律用 `tui/widgets.py` 自己那版
    `escape`，**绝不要 `from rich.markup import escape`**。URL 天然含 `[`
    （IPv6 字面量 `http://[::1]/`、含 `[` 的查询串），rich 那版只转义「看起来像完整标签」的
    `[...]`，落单的 `[` 被整个放过，然后在 Textual 布局阶段抛 `MarkupError`——
    那是 CLAUDE.md 里标注「没有任何 try/except 兜得住、Textual 直接拆掉整个 app」的
    致命不变量。既有 `summarize_args` 结尾用的正是本地那版（`widgets.py:116`），照做。
-4. 测试：
+5. 测试：
    - 一条 120 字符的 URL 在面板文本里**完整出现**（不含截断省略号）
    - 面板文本含主机名与中文层名
    - **`http://[::1]:8080/a?x=[1` 这类含未闭合方括号的地址不会抛 `MarkupError`**
      （直接调面板的文本构造函数断言不抛，并断言 `[` 已被转义）
    - 非 url 类工具的面板文本**逐字等于**本次改动前
+   - **`Layer.label()` 与阅读器输出一致**（构造一条 `layer == "network"` 的记录，
+     断言阅读器输出等于 `Layer.NETWORK.label()`——钉住「两处合一」不被后人拆回去）
 
 **验证：** `python -m unittest tests.test_web_bootstrap` 通过；
-`python -m unittest discover -s tests -p "test_tui*"` 无回归。
+`python -m unittest discover -s tests -p "test_tui*"`、`-p "test_trace*"`、
+`-p "test_perm*"` 均无回归。
 
 ## T26: F4 开关的两条传递链
 
@@ -722,11 +760,25 @@
    它与被排除的两个 MCP 工具不同，不会写真实用户主目录、不会访问外部包索引，
    且注入替身后完全受控。在注释里写明这个判断及理由。
 3. 提供一个可复用的离线替身：固定几个主机名（`a.test` / `b.test`）→ 固定响应。
-   **⚠ 替身的 `resolver` 必须返回全局可路由地址**，例如 `203.0.113.10` / `203.0.113.11`
-   （TEST-NET-3，实测 `is_global=True`）。
+
+   **⚠ 替身的 `resolver` 必须返回 `is_global` 为真的地址。**
    **返回 `127.0.0.1` 或 `::1` 会被连接期硬校验一律拒掉，端到端场景 1–4 全部失败**，
-   而且失败文案是「地址解析到了不允许访问的目标」，排查起来非常绕。
-   这一条要写进替身模块的 docstring，别让后来的人再踩一次。
+   失败文案还恰好是「地址解析到了不允许访问的目标」，排查起来非常绕。
+
+   **不要用 `203.0.113.x` / `198.51.100.x` / `192.0.2.x`（TEST-NET 三段）**——
+   Python 3.11 的 `ipaddress` 把它们归进 IANA 特殊用途注册表，
+   `is_private=True` / **`is_global=False`**，同样会被拒。
+   （文档第 3 轮曾写「TEST-NET-3 实测 `is_global=True`」，那是**错的**，
+   第 3 轮审查实测纠正。留这句话在这里，是因为「测试地址当然该用 TEST-NET」
+   是个很自然的直觉，下一个人极可能再想一次。）
+
+   可用的：`93.184.216.34`、`8.8.8.8`、`1.1.1.1`（实测 `is_global=True`）。
+   **别选 `233.252.0.1`**——它 `is_global=True` 但 `is_multicast=True`，会被补判拦下。
+   反正 `client_factory` 是替身、不会真连，地址只是用来过校验的。
+
+4. **在替身模块里加一行自校验**：
+   `assert ipaddress.ip_address(STUB_ADDR).is_global and not ipaddress.ip_address(STUB_ADDR).is_multicast`。
+   靠注释提醒不够——这次就是靠注释提醒失败的。让选错的人**当场红**。
 4. `host.py` 现有一条刻意的设计约束：**没有 `--workspace` / `--user-dir`**，
    每次启动建全新临时目录（`host.py:346-349` 有注释）。这意味着「重启宿主后
    本地级规则还在」的场景**跑不起来**——checklist 场景 4 已相应改为进程内二次装配，
@@ -799,20 +851,30 @@
         └──→ T19 ────────────────────────────┘
 
 第四段（接线）
-  T21（独立）───────────────┐
-  T20 ──→ T22 ──────────┐  │
-  T6  ──→ T23           │  │
-  T6  ──→ T25（面板）    │  │
-  T3  ──→ T27（埋点）    │  │
-  T7  ──┬─→ T24         │  │
-        └─→ T26（开关链）←┴──┘   ← 还依赖 T11、T21
-                    │
-  T11 ──┬───────────┴──→ T28（装配）──→ T29（驱动设施）
-  T22 ──┘
+  T20 ─────────────→ T22 ──┐
+  T6  ─────────────→ T23   │
+  T3,T5,T6 ────────→ T25（面板）
+  T3  ─────────────→ T27（埋点）
+  T7  ─────────────→ T24
+  T7,T11,T21 ──────→ T26（开关链）──┐
+                                    ├──→ T28（装配）──→ T29（驱动设施）
+                              T11 ──┘        ↑
+                                             └── T22
+
                               全部 ──→ T30 ──→ T31
 ```
 
+**逐条列一遍依赖，图与正文以这份为准：**
+
+| 任务 | 依赖 | 为什么 |
+| --- | --- | --- |
+| T25 面板 | T3、T5、T6 | 要 `Layer.NETWORK`（T3）、要 `decide` 已在填 `kind`/`host`（T5）、要 `to_allow_rule` 的主机名口径（T6） |
+| T26 开关链 | T7、T11、T21 | `load_all` 要先加参（T7）、`Config` 要先有字段（T11）、`fixed_modules` 要先加参（T21） |
+| T27 埋点 | T3 | 要 `PermissionRequest.host` 先存在 |
+| T28 装配 | T11、T22、T26 | 要配置字段、要工具、要开关链已就位 |
+| T29 驱动设施 | T28 | 它同步的是 `build_app` 的新参数 |
+
 **并行余地：** T10 / T11 / T21 三个任务彼此独立、也不依赖任何前置，可以最先做或插空做。
-T25（面板）与 T27（埋点）只依赖第一段，也可以提前做。
+T27（埋点）只依赖 T3，也可以提前做。
 
 **提交节奏：** 每个任务（或一组紧邻的相关任务）完成并验证通过后立刻提交一个 commit，不攒着。

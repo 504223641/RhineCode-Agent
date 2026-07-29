@@ -1,7 +1,6 @@
 # 网络访问工具（web_fetch）Checklist
 
-> 状态：待批准（2026-07-29，**第 3 轮修订**：按第 2 轮独立审查修订，
-> 含两条假护栏的更正与端到端场景形态的更正）
+> 状态：待批准（2026-07-29，**第 4 轮修订**：经三轮独立审查）
 >
 > 上游：[`spec.md`](spec.md)、[`plan.md`](plan.md)、[`task.md`](task.md)。
 >
@@ -22,9 +21,14 @@
 >
 > ① 本地起一个 HTTP server 让它抓 `127.0.0.1` **行不通**——那个地址会被 F5 硬校验拒。
 >
-> ② 替身的 `resolver` **必须返回全局可路由地址**（如 `203.0.113.10`，TEST-NET-3）。
-> 返回 `127.0.0.1` 同样会被**连接期**硬校验一律拒掉，全部场景失败，
-> 而失败文案是「地址解析到了不允许访问的目标」，看起来像功能坏了。
+> ② 替身的 `resolver` **必须返回 `is_global` 为真的地址**（如 `93.184.216.34` / `8.8.8.8`）。
+> 返回 `127.0.0.1` 会被**连接期**硬校验一律拒掉，全部场景失败，
+> 失败文案还恰好是「地址解析到了不允许访问的目标」，看起来像功能坏了。
+>
+> **别用 TEST-NET 三段**（`203.0.113.x` / `198.51.100.x` / `192.0.2.x`）——
+> Python 3.11 把它们判为 `is_private=True` / `is_global=False`，一样会被拒。
+> 「测试地址当然用 TEST-NET」是个很强的直觉，本文档第 3 轮就是这么写错的。
+> 替身模块里有一行 `assert ...is_global` 自校验，选错会当场红。
 
 ---
 
@@ -143,6 +147,13 @@
   > 后者违反 N1，所以 deny 走「看不懂拦什么就拦全部」。
 
 - [ ] 🤖 两者各产生一条可读警告，**同文件其它规则照常生效**，程序不退出 — AC19
+- [ ] 🤖 **反证：`deny` 写成非列表时，该层的 `allow` 规则也不得生效**（整层降级为空）— plan / task T7
+
+  > 这条钉住的是加载容错改动里最容易改坏的一处。`_load_layer` 现有的三处
+  > 整文件/整字段级 return 必须保留「整层降级」；若顺手改成「记下警告后继续」，
+  > 一个 `deny: <非列表>` + `allow: [一堆]` 的文件会变成「deny 全丢、allow 照常生效」——
+  > **从偏严滑向偏松，违反 N1，而功能上完全看不出来**。
+  > 既有测试挡不住它（只覆盖了坏 YAML 那一处，且断言是 `len(errors) == 1`，改成累加后仍是 1）。
 - [ ] 🤖 该警告**用户在界面上实际看得到**（验证：断言 `startup_notice` 含该文本；
       再用 `scripted` 模式起宿主，从 trace 的界面消息事件里读到它）— AC33
 
@@ -294,7 +305,7 @@
 
   > F4 说的是「逐字一致」，多出一条警告就不叫逐字一致。
 
-- [ ] 🤖 `exclude_tools` 能把该工具摘掉（保证端到端驱动设施的隔离手段对新工具同样有效）— plan T25
+- [ ] 🤖 `exclude_tools` 能把该工具摘掉（保证端到端驱动设施的隔离手段对新工具同样有效）— plan T28
 
 ---
 
@@ -320,14 +331,22 @@
   > 后者依赖 import hook 时序，直接、确定的写法更可靠。
 
 - [ ] 🤖 `import rhinecode.web` **不会连带拉起编排层**（验证：**独立子进程**里
-      `python -c "import rhinecode.web, sys; assert 'rhinecode.provider.factory'
-      not in sys.modules and 'rhinecode.conversation' not in sys.modules"`）— plan
+      `python -c "import rhinecode.web, sys; assert 'rhinecode.web.manager' not in sys.modules
+      and 'httpx' not in sys.modules"`）— plan
 
-  > **这条在第 2 轮是个假护栏，形态已换。** 当时写的是「断言 `sys.modules` 不含
-  > openai/anthropic」，但实测 `provider/base.py` 只 import `abc`/`dataclasses`/`typing`，
-  > **re-export 与否都不会拉起 SDK**——两种实现都通过，什么也没钉住。
-  > 而且在全量 `discover` 里进程早已因别的测试导过 `provider.factory`，
-  > 那条断言还会**假红**，红不红取决于测试执行顺序。故必须在独立子进程里跑。
+  > **这条断言对象换过两次，两次都是因为它钉不住东西：**
+  >
+  > 第 2 轮写「`sys.modules` 不含 openai/anthropic」——实测 `provider/base.py` 只 import
+  > `abc`/`dataclasses`/`typing`，**re-export 与否都不会拉起 SDK**。
+  >
+  > 第 3 轮改成「不含 `provider.factory` / `conversation`」——但 `web/manager.py`
+  > 本来就不 import 这两个，**同样两种实现都通过**。
+  >
+  > 现在断言的是**真的会因 re-export 而出现**的两个模块：`web.manager` 本身，
+  > 以及它经 `web/fetcher.py` 拉起的 `httpx`。这两个可证伪，也正对应 plan 说的「轻」。
+  >
+  > 子进程隔离这一半从第 3 轮起就是对的、必须保留——全量 `discover` 里进程早已因别的
+  > 测试导过一堆模块，在主进程里跑这条会**假红**，红不红取决于测试执行顺序。
 
 - [ ] 🤖 `build_app` 的两个真实调用方**行为一致**：`tests/e2e/host.py` 也能透传注入参数
       （验证：`test_e2e_host` 中的用例用替身跑通一次抓取）— plan / task T29
@@ -350,8 +369,9 @@
 
 ## 十、端到端场景
 
-前四个场景我用 `scripted` 模式的端到端驱动设施跑（假模型 + 注入的离线网络替身），
-最后一个必须你在真实模型下跑。
+场景 1–3 用 `scripted` 模式的端到端驱动设施跑（假模型 + 注入的离线网络替身）；
+**场景 4 是进程内集成测试**（见该场景下的说明——它要二次装配，宿主的瘦客户端没有那条指令）；
+场景 5 必须你在真实模型下跑。
 
 - [ ] 🤖 **场景 1（正常路径）**：起宿主 → 模型对替身提供的一个地址发起抓取 → 默认档弹确认 →
       应答「本次」→ 工具结果含页面正文、被不可信标记包裹、Agent Loop 正常收尾

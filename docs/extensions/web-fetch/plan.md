@@ -1,6 +1,6 @@
 # 网络访问工具（web_fetch）Plan
 
-> 状态：待批准（2026-07-29，**第 2 轮修订**：已按独立审查的阻塞级与重要问题修订）
+> 状态：待批准（2026-07-29，**第 4 轮修订**：经三轮独立审查）
 >
 > 上游：[`spec.md`](spec.md)（已批准）。本文档与语言相关，按项目技术栈（Python 3.11+ / httpx / Textual）编写。
 
@@ -15,7 +15,7 @@
 | `rhinecode/tools/web_fetch.py` | 既有层，加一个文件 | `Tool` 实现 |
 | `rhinecode/agent/prompt/` | 既有层，加一段文案 + 一个开关参数 | 「外部不可信内容」的系统约束（F21） |
 | `rhinecode/agent/loop.py` | 既有层，改一行埋点 | 权限判定事件补 `host` 字段（F23） |
-| `rhinecode/tui/widgets.py` | 既有层，改确认面板 | URL 类请求的专用展示：完整地址不截断 + 主机名 + 命中层（F9） |
+| `rhinecode/tui/widgets.py` | 既有层，改确认面板 | URL 类请求的专用展示：完整地址不截断 + 主机名 + 命中层（F9）。**连带扩 `DecisionResult` 与合并中文层名表**，见下 |
 | `rhinecode/conversation.py` | 既有层，改**四处** | 放行规则构造（F9）+ 加载警告并入启动提示（F25）+ 两条开关传递链（F4） |
 
 一句话概括分工：**`permission` 决定「能不能去」，`web` 负责「去了之后怎么办」。**
@@ -46,7 +46,7 @@ tools/web_fetch.py  ──→  web/  ──→  permission/network.py  ──→
 Provider 实现与 `factory.py` 里。独立审查实测指出后已改正。对应的护栏断言形态也随之改了，
 见 checklist 第八节。）
 
-## 三处对 spec 的实现层细化
+## 四处对 spec 的实现层细化
 
 ### 一、硬校验的两个执行时机（spec F5a）
 
@@ -374,7 +374,7 @@ Edit / Bash，或 `mcp__` 开头的远端工具）」，加完 WebFetch 就不�
 这是个「漏改不报错」的形态——`tests/test_skill_startup.py` 只断言了前半句
 「没有对应的工具类别」，文案改不改都不会变红。
 
-### `conversation.py` — 两处改动
+### `conversation.py` — 四处改动
 
 **① 放行规则构造（F9）。** 现在的写法（`conversation.py:1003-1016`）：
 
@@ -401,7 +401,33 @@ rule_string = f"{req.rule_name}({req.specifier})" if req.specifier else req.rule
 `PermissionEngine.load` 传 `web_fetch_enabled`；`build_default_prompt`
 的**两个调用点**（`conversation.py:808` 与 `1050`）都传 `untrusted_enabled`。
 
-### `tui/widgets.py` — 确认面板的 URL 展示（F9）
+### 确认面板的 URL 展示（F9）—— 涉及三个文件
+
+**面板拿不到判定信息，所以这件事不止改 `widgets.py`。** 实际调用链：
+
+```
+conversation.py:79   ConfirmCallback = Callable[[ToolCall, Tool, DecisionResult], ConfirmDecision]
+tui/widgets.py:922   ConfirmPanel.show_for(tool_call, tool, decision)
+```
+
+面板只有 `ToolCall` 与 `DecisionResult`，而后者（`permission/models.py:76-79`）
+只有 `decision / layer / reason`——**没有 `kind`、没有 `host`**。
+
+**改法（定死）：**
+
+1. **`permission/models.py`**：`DecisionResult` 加 `kind: str = ""` 与 `host: str = ""`
+   （带默认值，既有构造点不动）；`Layer` 加 `label()` 返回中文层名。
+
+   选「扩 `DecisionResult`」而不是「改回调签名」：前者改动面是「构造点 + 面板」两处，
+   后者要动 `conversation.py:79` 的公开类型 + `:998` 调用点 + `tui/app.py` 的
+   `_confirm_tool` 与 `_show_confirm_panel` 四处。而且同一个对象携带，
+   天然保证面板显示的主机名就是判定时用的那一个。
+
+2. **`trace/reader.py`**：`_LAYER_NAMES`（`:104`）改为复用 `Layer.label()`。
+   那张表现在是全仓唯一一份、藏在只读阅读器里；面板若自己抄一份就多一个
+   「漏改不报错」的维护点。合一之后，`Layer` 的维护点从两处变回一处。
+
+3. **`tui/widgets.py`**：`ConfirmPanel.show_for` 加分支（判据 `decision.kind == "url"`）。
 
 **现状是主动违反 spec F9 的**：`ConfirmPanel.show_for` 走 `summarize_args`，
 而后者（`widgets.py:90-116`）把**每个参数值截到 30 字符**。一条
