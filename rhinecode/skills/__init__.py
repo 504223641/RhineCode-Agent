@@ -28,9 +28,15 @@ from rhinecode.skills.models import (
 )
 from rhinecode.skills.manager import SkillManager
 
+# ⚠️ 这里的每一项都必须真能从本模块取到。曾经有一项 `SkillMode` 是
+# 对齐改造的残留——那个枚举随 `mode: shared/isolated` 一起删除了
+# （执行模式改由 `context: fork` 表达），但 `__all__` 忘了跟着改，
+# 于是 `from rhinecode.skills import *` 会当场 AttributeError。
+#
+# 它一直没被发现，是因为**项目内没有任何地方用星号导入**——
+# 这个列表实际上只在「有人第一次尝试星号导入」时才被求值。
 __all__ = [
     "SkillManager",
-    "SkillMode",
     "SkillSource",
     "SkillSpec",
     "SkillCommandInfo",

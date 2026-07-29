@@ -713,3 +713,33 @@ class LoadSkillToolTest(ManagerTestBase):
         result = LoadSkillTool(Boom()).execute({"name": "x"})
         self.assertFalse(result.ok)
         self.assertIn("炸了", result.output)
+
+
+class PackageExportsTest(unittest.TestCase):
+    """
+    包的 `__all__` 必须与真实可导出的名字一致。
+
+    ## 为什么需要这条
+
+    `__all__` 里曾有一项 `SkillMode`——那个枚举随对齐改造删除了
+    （执行模式改由 `context: fork` 表达），但列表忘了跟着改，
+    于是 `from rhinecode.skills import *` 当场 `AttributeError`。
+
+    它一直没被发现，是因为**项目内没有任何地方用星号导入**：
+    这个列表实际上只在「有人第一次尝试星号导入」时才被求值，
+    在那之前它可以错任意久而不被察觉。
+
+    所以护栏不能靠「哪里用到了」，只能主动求值一次。
+    """
+
+    def test_all_names_are_importable(self) -> None:
+        import rhinecode.skills as pkg
+
+        missing = [n for n in pkg.__all__ if not hasattr(pkg, n)]
+        self.assertEqual(missing, [], f"__all__ 里这些名字取不到：{missing}")
+
+    def test_star_import_works(self) -> None:
+        """直接把星号导入跑一遍——这是上面那条失效形态的真实现场。"""
+        namespace: dict = {}
+        exec("from rhinecode.skills import *", namespace)
+        self.assertIn("SkillManager", namespace)
