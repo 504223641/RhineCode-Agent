@@ -572,7 +572,7 @@ rhinecode/
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1165 项，skipped 4
+python -m unittest discover -s tests      # 1169 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
