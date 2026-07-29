@@ -1,13 +1,14 @@
 """
-匹配算法层：被①黑名单与③规则共用的「命令拆分 + 命令模式匹配 + 路径模式匹配」。
+匹配算法层：被①黑名单、②′网络边界与③规则共用的模式匹配算法。
 
 本模块是纯字符串/正则运算，无任何外部依赖与副作用，可被单测充分覆盖（spec N5）。
-三个公开函数：
-- split_commands：把复合命令拆成子命令（防 `safe && rm -rf` 整条蒙混过关，spec F2）。
-- match_command：命令模式匹配（前缀 + glob + 词边界，对应 Bash 规则，spec F4）。
-- match_path：文件路径模式匹配（gitignore 风格，对应 Read/Edit/Write 规则，spec F4）。
+四个公开函数：
+- split_commands：把复合命令拆成子命令（防 `safe && rm -rf` 整条蒙混过关，c6 spec F2）。
+- match_command：命令模式匹配（前缀 + glob + 词边界，对应 Bash 规则，c6 spec F4）。
+- match_path：文件路径模式匹配（gitignore 风格，对应 Read/Edit/Write 规则，c6 spec F4）。
+- match_domain：域名模式匹配（对应 WebFetch(domain:...) 规则，web_fetch 扩展 spec F11）。
 
-跨平台（spec N8）：match_path 先把反斜杠归一化为正斜杠，并以大小写不敏感匹配，
+跨平台（c6 spec N8）：match_path 先把反斜杠归一化为正斜杠，并以大小写不敏感匹配，
 以适配 Windows 路径语义。
 """
 
@@ -165,3 +166,70 @@ def match_path(pattern: str, path: str) -> bool:
     anchored = norm_pattern.lstrip("/")
     body = _path_body_to_regex(anchored)
     return re.fullmatch(body, norm_path, re.IGNORECASE) is not None
+
+
+def _normalize_domain(text: str) -> str:
+    """
+    把域名模式或主机名归一化为匹配用形式：去两侧空白、转小写、去掉末尾的 `.`。
+
+    末尾点要去掉，是因为 `example.com.` 与 `example.com` 在 DNS 里指同一个域
+    （前者是「完全限定域名」的书写形式）。不归一化的话，一条 `allow` 规则会被
+    多写/少写一个点绕过。
+
+    :param text: 域名模式或主机名
+    :returns: 归一化后的字符串
+    """
+    return text.strip().lower().rstrip(".")
+
+
+def match_domain(pattern: str, host: str) -> bool:
+    """
+    判断一个主机名是否匹配给定的域名模式（WebFetch 规则，spec F11）。
+
+    :param pattern: 规则模式，即 `WebFetch(domain:<模式>)` 里去掉 `domain:` 前缀后的部分；
+                    空串表示「匹配该工具的所有调用」（与 match_command / match_path 同口径）
+    :param host: 待匹配的主机名（不含协议、端口、路径与查询参数）
+    :returns: 命中返回 True
+
+    匹配语义（逐条对齐 Claude Code，便于用户迁移既有配置）：
+
+    | 模式             | 匹配                                   | 不匹配                          |
+    |------------------|----------------------------------------|---------------------------------|
+    | `example.com`    | `example.com`                          | `api.example.com`               |
+    | `*.example.com`  | `api.example.com`、`a.b.example.com`   | 裸域 `example.com` 本身         |
+    | `*`              | 一切主机名                             | —                               |
+    | `example.*`      | `example.org`（`*` 取到 `org`）        | `example.evil.com`（需跨越一点）|
+
+    **最后一行是安全要求而非风格选择。** 若非前导位置的 `*` 允许跨点匹配，
+    一条本意为「放行 example 各国域名」的 `example.*` 会连带放行攻击者可以自行注册的
+    `example.evil.com`。因此除**前导 `*.`** 与**单独一个 `*`** 这两种写法外，
+    `*` 一律只匹配「两个点之间」的一段文本（正则用 `[^.]*`，与 match_path 里
+    单个 `*` 不跨 `/` 是同一手法）。
+
+    大小写不敏感，模式与主机名末尾的 `.` 都先行去除（见 _normalize_domain）。
+
+    副作用：无。
+    """
+    if pattern == "":
+        return True
+
+    norm_pattern = _normalize_domain(pattern)
+    norm_host = _normalize_domain(host)
+
+    # 归一化后模式为空（例如原文只有一个 "."）视为匹配全部，与空模式同口径。
+    if norm_pattern == "" or norm_pattern == "*":
+        return True
+
+    # 前导 `*.`：匹配任意深度子域，但**不匹配裸域本身**。
+    # 用 endswith("." + 基域) 而不是正则，是因为这条语义与「段数」无关，
+    # 只要求「以 .<基域> 结尾」，写成字符串判断比正则更难写错。
+    if norm_pattern.startswith("*."):
+        base = norm_pattern[2:]
+        if base == "":
+            return True
+        return norm_host.endswith("." + base)
+
+    # 其余：把模式按 `*` 切段，逐段转义后用 `[^.]*` 连接（不跨点），整体锚定匹配。
+    parts = [re.escape(seg) for seg in norm_pattern.split("*")]
+    body = "[^.]*".join(parts)
+    return re.fullmatch(body, norm_host) is not None
