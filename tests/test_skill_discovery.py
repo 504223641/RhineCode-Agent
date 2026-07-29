@@ -192,6 +192,44 @@ class LayerPriorityTest(DiscoveryTestBase):
         catalog = self._discover()
         self.assertIs(catalog.skills[0].source, SkillSource.USER)
 
+    def test_shadowed_records_the_layer_that_lost(self) -> None:
+        """
+        被覆盖那份要在**丢弃之前**被记下来（作者期扩展 F2a）。
+
+        三层同名 → 项目级生效，用户级与内置各记一条。
+        没有这份记录，体检就报不出「你覆盖了一个内置样板」——
+        因为成品清单里连它存在过的痕迹都没有。
+        """
+        _write(self.project_skills / "s.md", _skill_text("s", "项目级"))
+        _write(self.user_skills / "s.md", _skill_text("s", "用户级"))
+        _write(self.builtin_dir / "s.md", _skill_text("s", "内置"))
+
+        catalog = self._discover()
+        self.assertEqual(
+            sorted(catalog.shadowed, key=lambda item: item[1].value),
+            [("s", SkillSource.BUILTIN), ("s", SkillSource.USER)],
+        )
+
+    def test_shadowed_empty_when_no_name_collision(self) -> None:
+        """各层名字互不相同 → 没有任何覆盖。"""
+        _write(self.project_skills / "a.md", _skill_text("a"))
+        _write(self.user_skills / "b.md", _skill_text("b"))
+        _write(self.builtin_dir / "c.md", _skill_text("c"))
+        self.assertEqual(self._discover().shadowed, ())
+
+    def test_shadowed_distinguishes_which_layer_was_covered(self) -> None:
+        """
+        只盖了用户级、没盖内置 → 记录里**不能**出现内置层。
+
+        体检对这两种情况的处理不同（只报覆盖内置），所以记录必须分得清是哪一层，
+        不能只记一个「这个名字被覆盖过」的布尔。
+        """
+        _write(self.project_skills / "s.md", _skill_text("s", "项目级"))
+        _write(self.user_skills / "s.md", _skill_text("s", "用户级"))
+
+        catalog = self._discover()
+        self.assertEqual(catalog.shadowed, (("s", SkillSource.USER),))
+
     def test_override_is_wholesale_not_field_merge(self) -> None:
         """
         覆盖是整份替换，不做字段合并（AC3）。

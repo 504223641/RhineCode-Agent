@@ -210,6 +210,12 @@ def discover(
 
     chosen: dict[str, SkillSpec] = {}
     all_errors: list[SkillLoadError] = []
+    # 被覆盖掉的那些定义（作者期扩展 F2a）：`(命令名, 被覆盖那份所在的层)`。
+    #
+    # ⚠️ **必须在丢弃之前当场记**——这是该信息唯一还存在的时刻。低优先层那份
+    # 一旦落空，就再没有任何引用，成品清单里连它存在过的痕迹都没有，
+    # 「这个名字曾经盖掉过谁」无从推断。
+    shadowed: list[tuple[str, SkillSource]] = []
     # (来源层, Skill 名) → 警告列表。带上来源层是因为同名 Skill 可能在多层都存在，
     # 只有最终胜出的那一份的警告才该发出去。
     warning_index: dict[tuple[SkillSource, str], list[str]] = {}
@@ -218,8 +224,16 @@ def discover(
         specs, errors, warnings_by_name = _scan_layer(directory, source)
         all_errors.extend(errors)
         for spec in specs:
-            # setdefault：高优先层已占用的名字，低优先层直接落空，静默丢弃。
-            chosen.setdefault(spec.command_name, spec)
+            # 高优先层已占用的名字，低优先层直接落空、静默丢弃——
+            # **加载行为与之前逐字相同**，只是在丢弃之前多记一笔（F2a）。
+            #
+            # 原本这里是 `chosen.setdefault(...)`。改成显式判断不是为了改行为，
+            # 而是因为 setdefault 吞掉了「这次到底放没放进去」这个信息，
+            # 而那恰恰是要记的东西。
+            if spec.command_name in chosen:
+                shadowed.append((spec.command_name, source))
+                continue
+            chosen[spec.command_name] = spec
         for name, items in warnings_by_name.items():
             warning_index[(source, name)] = items
 
@@ -234,4 +248,5 @@ def discover(
         skills=tuple(ordered),
         errors=tuple(all_errors),
         warnings=tuple(all_warnings),
+        shadowed=tuple(shadowed),
     )
