@@ -95,6 +95,41 @@ class ActivationStatus(Enum):
     NOT_MODEL_INVOCABLE = "not_model_invocable"
 
 
+class AdviceKind(Enum):
+    """
+    体检的七项检查各一个成员（作者期扩展 F2）。
+
+    ## 为什么要枚举，而不是只留一段建议文本
+
+    测试要能断言「这次命中的是哪一条」。只有文本的话，用例只能写
+    `assertIn("过长", report)`——而**措辞恰恰是本扩展要反复打磨的东西**
+    （F1 要求建议必须可操作，措辞不好就得改）。改一次措辞碎一批测试，
+    人的第一反应会是把断言放宽成谁都能过，护栏于是名存实亡。
+
+    有了枚举，措辞怎么改都不影响判定类的断言，两件事各归各的。
+
+    ## ⚠️ 成对维护点
+
+    新增一项检查 → **本枚举** + `audit.py` 的判定与措辞。漏了枚举不报错，
+    只是那条新检查在测试里没法精确断言。
+    """
+
+    # 说明字段超过 DESCRIPTION_MAX_CHARS
+    DESCRIPTION_TOO_LONG = "description_too_long"
+    # 声明了 when_to_use 却没显式写 description
+    MISSING_DESCRIPTION = "missing_description"
+    # 正文里没有 $ARGUMENTS
+    NO_PLACEHOLDER = "no_placeholder"
+    # 预授权给得过宽（有副作用类别无模式/纯通配；MCP 名字带通配符）
+    BROAD_GRANT = "broad_grant"
+    # allowed-tools 有声明，但一条都没能翻译成规则
+    GRANTS_ALL_DROPPED = "grants_all_dropped"
+    # 渲染后的注入段逼近或超过单个 Skill 的注入上限
+    NEAR_INJECTION_LIMIT = "near_injection_limit"
+    # 非内置层的 Skill 覆盖掉了同名内置样板
+    OVERRIDES_BUILTIN = "overrides_builtin"
+
+
 # ────────────────────────────── 常量 ──────────────────────────────
 
 # `/skills` 的子命令词。命令名不得取这些值，否则 `/skills run` 之类的子命令解析
@@ -157,6 +192,34 @@ MCP_PREFIX = "mcp__"
 # 独立模式子对话的迭代上限（spec N6）。子任务应当聚焦，给它一份独立且更小的预算，
 # 避免一个跑偏的 Skill 把主对话的 25 轮额度也一并耗光。
 SKILL_MAX_ITERATIONS = 15
+
+# ─────────────────── 体检阈值（作者期扩展 F2） ───────────────────
+
+# 说明字段的建议上限（F2-1）。**按字符数而不是字节数**——按字节算的话，
+# 一句中文说明会比同样信息量的英文早三倍命中，而这个阈值的目的是
+# 「别把状态列表和命令菜单撑成多行」，那是按显示宽度算的，与编码无关。
+#
+# 注意它**不是**硬限制：超了照常加载、照常可用，只是给一条建议。
+DESCRIPTION_MAX_CHARS = 100
+
+# 「逼近注入上限」的比例（F2-6）。达到 BODY_MAX_* 的这个比例就提醒，
+# 留出的余量让作者有机会在真被截断之前拆分。
+NEAR_LIMIT_RATIO = 0.8
+
+# 判定「预授权是否过宽」时的**只读白名单**（F2-4）。
+#
+# ⚠️ 方向是刻意选的：**维护「只读」清单，不在其中的一律视为有副作用**。
+# 反过来维护一份「有副作用清单」的话，将来新增一个有副作用的工具、
+# 忘了往里登记，就会**静默漏报**——没人会发现。
+# 现在这个方向下，忘了登记只会**多报一条建议**：用户看得见、会来问，
+# 且不造成任何实际损害。**让遗漏偏向可见的一侧。**
+#
+# 现在只有一个成员，是因为 `validation._TOOL_ALIASES` 把标准里的
+# `Glob` / `Grep` 也都映射到了 `Read`——本系统的只读检索就这一个类别。
+#
+# ⚠️ 成对维护点：新增一个**只读**工具类别 → `validation.py` 的 `_TOOL_ALIASES`
+# + 本集合。漏改的后果是「多报一条预授权过宽」（见上，是刻意选的偏严方向）。
+READ_ONLY_GRANT_TOOLS = frozenset({"Read"})
 
 
 def builtin_skills_dir() -> Path:
@@ -225,6 +288,25 @@ class SkillSpec:
     :param notices: 解析期产出的告知性提示（旧字段语义变更、无对应能力的标准字段）。
                     **不是加载失败**——这些 Skill 照常可用，只是有些声明的效果与作者
                     预期不同，必须让用户看见。随 spec 一路带到状态报告
+    :param description_explicit: `description` 是**作者自己写的**（真），
+                    还是由正文第一段自动回填的（假）。
+
+                    **这不是 frontmatter 字段，是解析期的派生事实**，
+                    存在的唯一理由是让体检判得出「声明了 when_to_use 却漏了
+                    description」（作者期扩展 F2a）——`description` 经解析后
+                    **永不为空**（未写时回填），按「是不是空的」判永远命不中。
+
+                    体检也**不许**自己重新提取一遍正文第一段再比对：那既是启发式
+                    （作者手写的说明恰好等于第一段时会误报），又等于把解析规则
+                    复制成两份，日后必然分叉。
+
+                    ⚠️ 默认取 `True` 而非 `False`：该默认只对**手工构造**的定义生效
+                    （解析器两条路径都显式赋值）。取 `False` 会让任何一个带
+                    `when_to_use`、却没设本字段的手工定义**误报**一条
+                    「你忘了写说明」；取 `True` 最坏是漏报。
+                    **建议系统里误报比漏报贵**——一条错的建议会让用户跑去改一个
+                    本来没问题的地方。代价是「解析器忘了赋值」会变成静默漏报，
+                    由 `tests/test_skill_parser.py` 钉住两条路径各自的取值。
     """
 
     command_name: str
@@ -242,6 +324,42 @@ class SkillSpec:
     resource_dir: Optional[Path]
     resource_files: tuple[str, ...]
     notices: tuple[str, ...] = ()
+    description_explicit: bool = True
+
+
+@dataclass(frozen=True)
+class SkillAdvice:
+    """
+    一条体检建议（作者期扩展 F1）——**第四类反馈**。
+
+    既有三类各司其职，但都不回答「那我该怎么改」：
+
+    | 类别 | 它说的是 |
+    |---|---|
+    | `SkillLoadError` | 这份文件我看见了但没能用上，原因是…… |
+    | catalog 的 warnings | 这次运行过程中发生了什么 |
+    | `SkillSpec.notices` | 你的某个声明与实际行为有出入 |
+    | **本类** | **这份 Skill 能用，但有更好的写法，建议改成……** |
+
+    ## 为什么拆成三段而不是一个 text 字段
+
+    F1 要求每条建议必须同时说清「哪个 Skill / 发现了什么 / 建议怎么改」。
+    拆成字段让这三样在**类型层面**被强制——写一条新建议时漏掉「怎么改」
+    根本构造不出对象；合成一个字符串则全靠自觉，而「可操作」正是这一类反馈
+    存在的**全部理由**：一条只说「预授权过宽」却不给出带模式写法的建议，
+    与既有的警告没有区别，那本扩展就白做了。
+
+    :param kind: 判定类别。供测试精确断言「命中的是哪一条」，
+                 使措辞的调整不会碎掉一批用例
+    :param skill: 命令名
+    :param finding: 发现了什么（陈述现状）
+    :param suggestion: 建议怎么改（**必须可操作**，能给出替代写法时必须给）
+    """
+
+    kind: AdviceKind
+    skill: str
+    finding: str
+    suggestion: str
 
 
 @dataclass(frozen=True)
@@ -274,11 +392,28 @@ class SkillCatalog:
     :param skills: 已按 name 排序、跨层覆盖后每个名字唯一
     :param errors: 加载失败的记录，按发现顺序
     :param warnings: 非致命提示（如共享模式声明了 model，F22），按发现顺序
+    :param shadowed: **被跨层覆盖掉的那些定义**，每个元素是
+                     `(命令名, 被覆盖那份所在的层)`（作者期扩展 F2a）。
+
+                     ⚠️ **必须在扫描时当场记**，因为那是这个信息**唯一还存在**
+                     的时刻：`discover` 一旦把低优先层那份丢弃，就再没有任何引用，
+                     成品清单 `skills` 里连它存在过的痕迹都没有——覆盖这件事
+                     **无从推断**，只能在丢弃之前记下来。
+
+                     用途是让体检报出「你覆盖了一个内置样板」。跨层覆盖本身是
+                     **整份替换且完全静默**的正常用法（项目定制版盖掉内置样板），
+                     所以它不记错误、不发警告；但**无意撞名**时后果很重——
+                     内置样板凭空消失、对应命令行为完全变了，而现场唯一的线索
+                     只是状态列表里一个来源标签。
+
+                     **记全部层而不只记内置**：多记两个元组不花什么代价，
+                     将来若要放宽到「项目级盖用户级也提示」，数据已经在了。
     """
 
     skills: tuple[SkillSpec, ...]
     errors: tuple[SkillLoadError, ...]
     warnings: tuple[str, ...]
+    shadowed: tuple[tuple[str, SkillSource], ...] = ()
 
 
 @dataclass(frozen=True)
