@@ -61,13 +61,22 @@ class WebFetchManager:
         self._client_factory = client_factory
         self._resolver = resolver
 
-    def fetch_and_extract(self, url: str, ask: str) -> tuple[str, str]:
+    def fetch_and_extract(self, url: str, ask: str) -> tuple[bool, str, str]:
         """
         抓取一个地址并按提问抽取要点。
 
         :param url: 目标地址（已通过权限判定）
         :param ask: 「要从这页提取什么」
-        :returns: `(回灌模型的完整文本, TUI 单行摘要)`
+        :returns: `(抓取是否成功, 回灌模型的完整文本, TUI 单行摘要)`
+
+        **第一项不是「本函数有没有出错」，而是「这次抓取有没有拿到内容」。**
+        它决定 `ToolResult.ok`，进而决定 TUI 把这一行显示成绿色还是红色。
+        不区分的话，一次被连接期守卫拦下的抓取会显示成**绿色成功**、
+        只是正文里写着「抓取失败」——界面在撒谎。
+
+        跨主机重定向算「没拿到内容」（`ok=False`）：本次确实没抓到东西，
+        模型需要对新地址再发一次。二进制内容算**成功**——我们如实回报了
+        它的类型与体量，那就是这次调用能给出的全部信息。
 
         **对普通异常永不抛出**：抓取失败、抽取失败都转成可读的结果文本。
 
@@ -85,13 +94,14 @@ class WebFetchManager:
 
         # 抓取没拿到正文的三种情形，都不进抽取——既是正确性，也省一次 API 调用。
         if (not outcome.ok) or outcome.redirect_to or outcome.binary:
-            return render.render(outcome), render.summary(outcome)
+            got_content = outcome.ok and not outcome.redirect_to
+            return got_content, render.render(outcome), render.summary(outcome)
 
         budget = extract_mod.content_budget(self._context_window)
         page_text, _cut = truncate(outcome.text, budget)
 
         extracted = self._extract(page_text, outcome.source_url, ask)
-        return render.render(outcome, extracted), render.summary(outcome, extracted)
+        return True, render.render(outcome, extracted), render.summary(outcome, extracted)
 
     # ------------------------------------------------------------------ #
     # 抽取

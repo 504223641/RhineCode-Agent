@@ -6,7 +6,7 @@ from rhinecode.tools.web_fetch import WebFetchTool
 
 
 class _StubManager:
-    def __init__(self, result=("输出正文", "摘要"), raises=None):
+    def __init__(self, result=(True, "输出正文", "摘要"), raises=None):
         self.result = result
         self.raises = raises
         self.calls: list[tuple[str, str]] = []
@@ -65,7 +65,7 @@ class SchemaTests(unittest.TestCase):
 
 class ExecuteTests(unittest.TestCase):
     def test_happy_path(self) -> None:
-        m = _StubManager(("正文", "抓取 a.test · 1.0K · 抽取成功"))
+        m = _StubManager((True, "正文", "抓取 a.test · 1.0K · 抽取成功"))
         r = WebFetchTool(m).execute({"url": "https://a.test/x", "prompt": "讲了什么"})
         self.assertTrue(r.ok)
         self.assertEqual(r.output, "正文")
@@ -116,6 +116,31 @@ class ExecuteTests(unittest.TestCase):
     def test_non_dict_args(self) -> None:
         r = WebFetchTool(_StubManager()).execute(None)  # type: ignore[arg-type]
         self.assertFalse(r.ok)
+
+
+class ResultOkReflectsFetchOutcomeTests(unittest.TestCase):
+    """
+    `ToolResult.ok` 必须反映「这次抓取有没有拿到内容」，不是「函数有没有抛异常」。
+
+    ⚠ **这条是真实模型端到端跑场景 6 时发现的缺陷。** 当时那台机器的 DNS 把公网域名
+    解析成 10.x 内网地址，连接期守卫正确拦下了——**而工具层报了 ok=True**，
+    TUI 会把一次失败的抓取显示成绿色成功、只是正文里写着「抓取失败」。界面在撒谎。
+    """
+
+    def test_failed_fetch_reports_not_ok(self) -> None:
+        m = _StubManager((False, "[web_fetch] 抓取失败：…", "抓取 x.test 失败"))
+        r = WebFetchTool(m).execute({"url": "https://x.test/a", "prompt": "q"})
+        self.assertFalse(r.ok, "抓取失败时 ToolResult.ok 必须是 False")
+
+    def test_cross_host_redirect_reports_not_ok(self) -> None:
+        # 跨主机重定向本次确实没抓到内容，模型需要对新地址再发一次。
+        m = _StubManager((False, "[web_fetch] 未抓取：… 重定向到了另一个主机", "…未抓取"))
+        r = WebFetchTool(m).execute({"url": "https://a.test/1", "prompt": "q"})
+        self.assertFalse(r.ok)
+
+    def test_successful_fetch_reports_ok(self) -> None:
+        m = _StubManager((True, "正文", "摘要"))
+        self.assertTrue(WebFetchTool(m).execute({"url": "https://a.test/x", "prompt": "q"}).ok)
 
 
 if __name__ == "__main__":

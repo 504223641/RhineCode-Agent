@@ -93,8 +93,13 @@ class WebFetchTool(Tool):
             )
 
         try:
-            output, summary = self._manager.fetch_and_extract(url, ask)
+            ok, output, summary = self._manager.fetch_and_extract(url, ask)
         except Exception as exc:  # noqa: BLE001 —— Tool.execute 契约：不向上抛
             return ToolResult(ok=False, output=f"网络抓取失败：{exc}")
 
-        return ToolResult(ok=True, output=output, summary=summary)
+        # ⚠ `ok` 来自「这次抓取有没有拿到内容」，不是「本函数有没有抛异常」。
+        # 一次被连接期守卫拦下的抓取若报成 ok=True，TUI 会把它显示成**绿色成功**、
+        # 只是正文里写着「抓取失败」——界面在撒谎。这个缺陷是真实模型端到端跑
+        # 场景 6 时发现的：那台机器的 DNS 把公网域名解析成 10.x，守卫正确拦下了，
+        # 而工具层却报了成功。
+        return ToolResult(ok=ok, output=output, summary=summary)

@@ -117,7 +117,7 @@ class HappyPathTests(unittest.TestCase):
     def test_extraction_result_reaches_output(self) -> None:
         url = "https://a.test/x"
         p = _StubProvider(answer="这页在讲 A")
-        out, summary = _manager(p, _html_route(url)).fetch_and_extract(url, "讲了什么")
+        _ok, out, summary = _manager(p, _html_route(url)).fetch_and_extract(url, "讲了什么")
         self.assertIn("这页在讲 A", out)
         self.assertIn("<untrusted-content", out)
         self.assertIn("抽取成功", summary)
@@ -152,7 +152,7 @@ class NoProviderCallTests(unittest.TestCase):
 
     def test_fetch_failure_skips_extraction(self) -> None:
         p = _StubProvider()
-        out, _s = _manager(p, {}).fetch_and_extract("https://a.test/x", "q")
+        _ok, out, _s = _manager(p, {}).fetch_and_extract("https://a.test/x", "q")
         self.assertEqual(p.calls, [], "抓取失败时不该调 provider")
         self.assertIn("抓取失败", out)
 
@@ -161,7 +161,7 @@ class NoProviderCallTests(unittest.TestCase):
         routes = {url: _StubResponse(status_code=302,
                                      headers={"location": "https://b.test/2"})}
         p = _StubProvider()
-        out, _s = _manager(p, routes).fetch_and_extract(url, "q")
+        _ok, out, _s = _manager(p, routes).fetch_and_extract(url, "q")
         self.assertEqual(p.calls, [])
         self.assertIn("https://b.test/2", out)
 
@@ -170,14 +170,14 @@ class NoProviderCallTests(unittest.TestCase):
         routes = {url: _StubResponse(headers={"content-type": "application/pdf",
                                               "content-length": "999"})}
         p = _StubProvider()
-        out, _s = _manager(p, routes).fetch_and_extract(url, "q")
+        _ok, out, _s = _manager(p, routes).fetch_and_extract(url, "q")
         self.assertEqual(p.calls, [])
         self.assertIn("二进制", out)
 
     def test_blank_page_skips_extraction(self) -> None:
         url = "https://a.test/empty"
         p = _StubProvider()
-        out, _s = _manager(p, _html_route(url, "<div></div>")).fetch_and_extract(url, "q")
+        _ok, out, _s = _manager(p, _html_route(url, "<div></div>")).fetch_and_extract(url, "q")
         self.assertEqual(p.calls, [])
         self.assertIn("降级", out)
 
@@ -188,7 +188,7 @@ class DegradationTests(unittest.TestCase):
     def test_provider_exception_degrades(self) -> None:
         url = "https://a.test/x"
         p = _StubProvider(raises=RuntimeError("上游超时"))
-        out, summary = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
+        _ok, out, summary = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
         self.assertIn("抽取：降级", out)
         self.assertIn("页面原文节选", out)
         self.assertIn("页面正文", out, "降级时要退回本地转换的正文")
@@ -197,21 +197,58 @@ class DegradationTests(unittest.TestCase):
     def test_error_chunk_degrades(self) -> None:
         url = "https://a.test/x"
         p = _StubProvider(error_chunk=True)
-        out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
+        _ok, out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
         self.assertIn("抽取：降级", out)
 
     def test_empty_answer_degrades(self) -> None:
         url = "https://a.test/x"
         p = _StubProvider(answer="   ")
-        out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
+        _ok, out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
         self.assertIn("抽取：降级", out)
 
     def test_degraded_body_still_wrapped(self) -> None:
         """降级路径的正文同样被不可信标记包裹——「抽取不是消毒」。"""
         url = "https://a.test/x"
         p = _StubProvider(raises=RuntimeError("x"))
-        out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
+        _ok, out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
         self.assertIn("<untrusted-content", out)
+
+
+class OkFlagTests(unittest.TestCase):
+    """
+    第一项返回值 = 「这次抓取有没有拿到内容」（真实模型端到端跑出来的缺陷）。
+
+    它决定 ToolResult.ok，进而决定 TUI 显示绿色还是红色。
+    """
+
+    def test_success(self) -> None:
+        ok, _o, _s = _manager(_StubProvider(), _html_route("https://a.test/x"))             .fetch_and_extract("https://a.test/x", "q")
+        self.assertTrue(ok)
+
+    def test_fetch_failure(self) -> None:
+        ok, _o, _s = _manager(_StubProvider(), {}).fetch_and_extract("https://a.test/x", "q")
+        self.assertFalse(ok)
+
+    def test_cross_host_redirect_is_not_ok(self) -> None:
+        url = "https://a.test/1"
+        routes = {url: _StubResponse(status_code=302, headers={"location": "https://b.test/2"})}
+        ok, _o, _s = _manager(_StubProvider(), routes).fetch_and_extract(url, "q")
+        self.assertFalse(ok, "跨主机重定向本次没抓到内容")
+
+    def test_binary_is_ok(self) -> None:
+        """二进制算成功——我们如实回报了类型与体量，那就是这次调用能给的全部信息。"""
+        url = "https://a.test/f.pdf"
+        routes = {url: _StubResponse(headers={"content-type": "application/pdf",
+                                              "content-length": "9"})}
+        ok, _o, _s = _manager(_StubProvider(), routes).fetch_and_extract(url, "q")
+        self.assertTrue(ok)
+
+    def test_degraded_extraction_is_still_ok(self) -> None:
+        """抽取降级不算抓取失败——页面拿到了，只是没能按提问压缩。"""
+        url = "https://a.test/x"
+        p = _StubProvider(raises=RuntimeError("x"))
+        ok, _o, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
+        self.assertTrue(ok)
 
 
 class BudgetTests(unittest.TestCase):
@@ -281,7 +318,7 @@ class NeverRaisesTests(unittest.TestCase):
         url = "https://a.test/x"
         for exc in (RuntimeError("x"), ValueError("y"), OSError("z"), TypeError("w")):
             p = _StubProvider(raises=exc)
-            out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
+            _ok, out, _s = _manager(p, _html_route(url)).fetch_and_extract(url, "q")
             self.assertIn("降级", out, repr(exc))
 
     def test_keyboard_interrupt_propagates(self) -> None:
