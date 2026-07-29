@@ -58,6 +58,7 @@ from tests.e2e import discovery, fingerprint, protocol, sandbox
 from tests.e2e.control import DriverCore, ExternalResponder, SessionState
 from tests.e2e.discovery import HostInfo
 from tests.e2e.scripted import ScriptedProvider
+from tests.e2e.webstub import stub_client_factory, stub_resolver
 
 
 # 装配时一并摘掉的两个工具（spec F8 第二条 / F19）：
@@ -65,6 +66,15 @@ from tests.e2e.scripted import ScriptedProvider
 # - `mcp_resolve_server`：`read_only=True` 却会访问外部包索引，而**只读且被放行的
 #   工具根本不弹面板**——应答者拦不住它，确定性形态下它是唯一的真实外网出口。
 EXCLUDED_TOOLS = frozenset({"mcp_add_server", "mcp_resolve_server"})
+
+# ⚠ **`web_fetch` 刻意不进 EXCLUDED_TOOLS。**
+#
+# 它与上面两个不同：不写真实用户主目录、不访问外部包索引。
+# 而真正的兜底是 spec F7——URL 类请求在**任何**权限模式下最多到「交人工确认」，
+# 驱动者必须显式应答才会真的发出去。
+#
+# （不要把理由写成「注入替身后完全受控」：`--web-stub` 是可选的，
+#  不加时宿主拿的是真 httpx + 真域名解析，那个理由站不住。）
 
 # 装配失败后继续服务的宽限窗口（秒），让客户端有机会读到那段成文文案
 FATAL_GRACE_SECONDS = 60.0
@@ -335,6 +345,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", default=None, help="预置函数，形如 MOD:FUNC，签名 (workspace, user_dir)")
     parser.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
+    parser.add_argument(
+        "--web-stub",
+        action="store_true",
+        help="把 web_fetch 的 HTTP 客户端与域名解析换成离线替身（端到端场景用）",
+    )
     parser.add_argument("--config", default=None,
                         help="配置文件路径。live 模式必须含有效凭据；scripted 模式也认它"
                              "（用于调 context_window 等构造场景），但 api_key 会被换成假值")
@@ -431,12 +446,18 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
         provider_factory = lambda cfg: provider  # noqa: E731
 
     try:
+        # 网络替身：`--web-stub` 时把 HTTP 客户端与域名解析都换成离线替身，
+        # 使端到端场景不发出任何真实请求（spec N5）。缺省 None = 用真实实现。
+        web_client_factory = stub_client_factory() if args.web_stub else None
+        web_resolver = stub_resolver if args.web_stub else None
         result = build_app(
             make_config(args),
             user_dir=user_dir,
             recorder=recorder,
             provider_factory=provider_factory,
             exclude_tools=EXCLUDED_TOOLS,
+            web_client_factory=web_client_factory,
+            web_resolver=web_resolver,
         )
     except BootstrapError as e:
         # 装配期致命错误：进 fatal 态并**继续服务一个有界的宽限窗口**，
