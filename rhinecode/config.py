@@ -44,6 +44,13 @@ api_key: YOUR_API_KEY
 # model: gpt-4o
 # base_url: https://api.openai.com/v1
 # api_key: sk-...
+
+# ---- 可选项（不写即用缺省值）----
+
+# 网络访问工具（web_fetch）的总开关，缺省启用。
+# 关掉之后：工具不注册、系统提示不含「外部不可信内容」约束、
+# 权限规则里的 WebFetch(domain:...) 不做语法校验——行为与没有这个工具时一致。
+# web_fetch_enabled: false
 """
 
 
@@ -98,6 +105,12 @@ class Config:
     - context_window：上下文窗口上限（token），作为「历史是否逼近溢出」的判断基准（c8 F1）。
                  可选字段，缺省 65536；不同模型/账号窗口不同，可按需调大调小。非法或 <=0 时
                  由 load() 回退默认值，不阻断启动（fail-safe）。
+    - web_fetch_enabled：网络访问工具的总开关（web_fetch 扩展 F4）。可选字段，缺省 True。
+                 设为 false 后：工具不注册、不出现在模型可见的工具清单里、系统提示不含
+                 「外部不可信内容」那条约束、权限规则里的 `WebFetch(domain:...)` 不做语法
+                 校验也不产生警告——**行为与本扩展之前逐字一致**。
+                 非法值抛 ValueError（与 debug_log 同口径，见 _parse_bool；
+                 注意这与 context_window 的「回退默认」是**两种**口径）。
     """
     protocol: str
     model: str
@@ -107,6 +120,8 @@ class Config:
     debug_log: bool = True
     # 上下文窗口上限（token）：c8 两层压缩据此判断是否逼近溢出；非必填，老配置不写也能加载。
     context_window: int = 65536
+    # 网络访问工具总开关：缺省启用；非必填，老配置不写也能加载（web_fetch 扩展 F4）。
+    web_fetch_enabled: bool = True
 
 
 def _parse_int(value: Any, field_name: str, default: int) -> int:
@@ -184,6 +199,12 @@ def load(path: str) -> Config:
     # context_window 为可选项：缺省 65536，非法/非正值回退默认（c8 F1，见 _parse_int）。
     context_window = _parse_int(data.get("context_window", 65536), "context_window", 65536)
 
+    # web_fetch_enabled 为可选项：缺省 True。走 _parse_bool（非法值**抛错**），
+    # 与 debug_log 同口径——一个开关被写成 "maybe" 是明确的配置错误，
+    # 静默回退会让用户以为自己关掉了网络访问而实际上没关。
+    # 注意这与上一行 context_window 的「回退默认」是两种口径，别混。
+    web_fetch_enabled = _parse_bool(data.get("web_fetch_enabled", True), "web_fetch_enabled")
+
     return Config(
         protocol=data["protocol"],
         model=data["model"],
@@ -191,4 +212,5 @@ def load(path: str) -> Config:
         api_key=data["api_key"],
         debug_log=debug_log,
         context_window=context_window,
+        web_fetch_enabled=web_fetch_enabled,
     )

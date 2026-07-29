@@ -51,6 +51,7 @@ _TOOL_ALIASES: dict[str, str] = {
     "bash": "Bash",
     "glob": "Read",
     "grep": "Read",
+    "webfetch": "WebFetch",
     # 本系统的内部工具名
     "read_file": "Read",
     "write_file": "Write",
@@ -58,6 +59,7 @@ _TOOL_ALIASES: dict[str, str] = {
     "run_command": "Bash",
     "glob_files": "Read",
     "grep_content": "Read",
+    "web_fetch": "WebFetch",
 }
 
 
@@ -118,14 +120,21 @@ def grants_for(specs: Iterable[SkillSpec]) -> tuple[list[Rule], list[str]]:
                 warnings.append(
                     f"Skill `{spec.command_name}` 的 allowed-tools 声明了 `{item}`，"
                     f"本系统没有对应的工具类别，该项被忽略"
-                    f"（可用的类别：Read / Write / Edit / Bash，或 mcp__ 开头的远端工具）"
+                    f"（可用的类别：Read / Write / Edit / Bash / WebFetch，或 mcp__ 开头的远端工具）"
                 )
                 continue
 
+            # ⚠ 把 warnings 传下去：域名规则写坏（如漏掉 `domain:` 前缀）时，
+            # parse_rule_string 会静默丢弃该条。不接这个出参的话，一个写成
+            # `WebFetch(github.com)` 的 Skill 会顺利通过上面那道「认不认得工具类别」
+            # 的警告（现在认得 WebFetch 了），然后无声无息地少了一条预授权——
+            # 用户看到的现象是「我明明写了预授权，还是每次弹确认」，而 /skills
+            # 报告里什么提示都没有。
             rule = parse_rule_string(
                 f"{mapped}({pattern})" if pattern else mapped,
                 effect="allow",
                 source=GRANT_SOURCE,
+                warnings=warnings,
             )
             if rule is not None and rule not in seen:
                 seen.add(rule)

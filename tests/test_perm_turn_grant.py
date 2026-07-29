@@ -132,14 +132,18 @@ class GrantTranslationTest(unittest.TestCase):
         无法识别的项**跳过 + 警告，不 fail-fast**。
 
         这与 C11「内置工具名笔误就 fail-fast」的取舍相反，理由是来源不同：
-        外部 Skill 里出现 `Task` / `WebFetch` / `TodoWrite` 是正常现象，
-        不该让程序起不来。
+        外部 Skill 里出现 `Task` / `TodoWrite` 是正常现象，不该让程序起不来。
+
+        ⚠ **样例工具名换过一次**：本用例原先用的是 `WebFetch`，
+        而 web_fetch 扩展让它变成了**真工具**（`skills/validation.py` 的
+        `_TOOL_ALIASES` 里有它），于是它会被正常翻译成一条规则、不再产生警告。
+        现改用 `TodoWrite`——挑样例时请确认它确实不在那张别名表里。
         """
-        rules, warnings = grants_for([_spec("WebFetch", "Bash")])
+        rules, warnings = grants_for([_spec("TodoWrite", "Bash")])
         self.assertEqual(len(rules), 1, "认识的那条仍要照常解析")
         self.assertEqual(rules[0].tool, "Bash")
         self.assertEqual(len(warnings), 1)
-        self.assertIn("WebFetch", warnings[0])
+        self.assertIn("TodoWrite", warnings[0])
 
     def test_never_produces_deny(self) -> None:
         """

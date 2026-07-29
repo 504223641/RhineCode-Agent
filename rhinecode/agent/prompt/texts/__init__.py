@@ -2,8 +2,8 @@
 提示词文案子包（c5 重构）。
 
 集中存放所有 prompt 中文文案，按「不同 prompt 拆到不同 .py」组织，与逻辑代码分离：
-- 七个固定模块各一个文件（identity / system_constraints / task_mode / action_execution /
-  tool_usage / tone / text_output）；
+- 八个固定模块各一个文件（identity / system_constraints / **untrusted** / task_mode /
+  action_execution / tool_usage / tone / text_output）；其中 untrusted 按开关注入；
 - plan       ：Plan Mode 完整/精简文案；
 - environment：环境信息渲染模板。
 
@@ -13,6 +13,7 @@
 
 from rhinecode.agent.prompt.texts.identity import IDENTITY
 from rhinecode.agent.prompt.texts.system_constraints import SYSTEM_CONSTRAINTS
+from rhinecode.agent.prompt.texts.untrusted import UNTRUSTED_CONTENT
 from rhinecode.agent.prompt.texts.task_mode import TASK_MODE
 from rhinecode.agent.prompt.texts.action_execution import ACTION_EXECUTION
 from rhinecode.agent.prompt.texts.tool_usage import TOOL_USAGE
@@ -28,6 +29,7 @@ from rhinecode.agent.prompt.texts.environment import ENVIRONMENT_TEMPLATE
 __all__ = [
     "IDENTITY",
     "SYSTEM_CONSTRAINTS",
+    "UNTRUSTED_CONTENT",
     "TASK_MODE",
     "ACTION_EXECUTION",
     "TOOL_USAGE",

@@ -31,6 +31,15 @@ _CONFIG_DIR_NAME = ".rhinecode"
 _CONFIG_FILE = "permissions.yaml"
 _LOCAL_FILE = "permissions.local.yaml"
 
+# 网络访问工具的规则体系名与域名模式前缀（web_fetch 扩展 spec F10）。
+# 与 rules.py 的 _DOMAIN_PREFIX 是同一个字面量——两处都要认，改一处必须同步另一处。
+WEB_FETCH_RULE_NAME = "WebFetch"
+DOMAIN_PREFIX = "domain:"
+
+# 「策略层」= 手写进配置的层级。只有这两层的 allow 域名规则才建立白名单（spec F6a）。
+# 本地级是「永久放行」自动写入的授权记录，不算策略声明。
+POLICY_SOURCES: frozenset[str] = frozenset({"user", "project"})
+
 # 首次运行自动生成的权限配置模板。内容**全部注释**：yaml.safe_load 一个全注释文件得到 None，
 # _load_layer 对 None 返回空规则集，因此「有此模板」与「无文件」对权限系统完全等价——
 # 生成它只为方便用户发现和编辑，绝不改变运行时行为（fail-safe 不变）。
@@ -47,6 +56,20 @@ _CONFIG_TEMPLATE = """\
 #   - "Read(src/**)"      # 放行读取 src 目录（gitignore 风格路径）
 # deny:
 #   - "Bash(git push *)"  # 拒绝 push（deny 优先于任何 allow）
+#
+# 网络访问（web_fetch）的域名规则写成 WebFetch(domain:模式)：
+#
+# allow:
+#   - "WebFetch(domain:github.com)"    # 精确，不含子域
+#   - "WebFetch(domain:*.python.org)"  # 任意深度子域，但不含裸域本身
+# deny:
+#   - "WebFetch(domain:*.evil.com)"
+#
+# ⚠ 在**本文件或用户级** permissions.yaml 里写下任何一条 allow 域名规则，
+#   就等于声明「只许访问这些」——此后未列出的域名一律被直接拒绝，
+#   且 /perm 切到放行档也翻不过来。
+#   本地级 permissions.local.yaml（确认面板选「永久放行」自动写入的那份）
+#   **只放行、不建立白名单**，所以在那里加一条不会锁住其它域名。
 """
 
 
@@ -100,7 +123,14 @@ def scaffold_user_config(path: Path) -> bool:
     return True
 
 
-def parse_rule_string(text: str, effect: str, source: str) -> Optional[Rule]:
+def parse_rule_string(
+    text: str,
+    effect: str,
+    source: str,
+    *,
+    warnings: Optional[list[str]] = None,
+    web_fetch_enabled: bool = True,
+) -> Optional[Rule]:
     """
     把一条配置里的规则字符串解析成 Rule。
 
@@ -111,9 +141,32 @@ def parse_rule_string(text: str, effect: str, source: str) -> Optional[Rule]:
     :param text: 规则字符串
     :param effect: 该规则的效果，"allow" 或 "deny"（由它来自哪个 YAML 键决定）
     :param source: 来源层（user/project/local/session），仅用于原因展示与调试
+    :param warnings: 可选的**出参**列表；本函数发现问题时往里 append 一条中文说明。
+                     传 None 表示调用方不收集警告。
+    :param web_fetch_enabled: 网络访问能力是否启用。关闭时跳过 WebFetch 的 domain 语法校验，
+                              使「关闭后行为与本扩展之前逐字一致」成立（spec F4）。
     :returns: 解析出的 Rule；text 为空或非法时返回 None（调用方跳过该条）
 
-    副作用：无。
+    ## ⚠ 返回类型必须保持 Optional[Rule]，警告走出参
+
+    本函数有**三个**调用方：`config._load_layer`、`engine.persist_local_rule`、
+    `skills/validation.grants_for`。后两处的写法都是
+    `rule = parse_rule_string(...)` 紧跟 `if rule is not None: ...append(rule)`。
+    若把返回改成 `(Rule|None, warning|None)` 元组，元组恒非 None，会把**元组本身**
+    塞进 session_rules / turn_rules，下一次规则求值访问 `.effect` 时 AttributeError。
+    用出参 + 默认值，「后两处不改也能跑」才成立。
+
+    ## WebFetch 域名规则的语法校验（spec F13）
+
+    `WebFetch(...)` 的括号内容必须以 `domain:` 开头。写坏时**按效果分两支处理，
+    两支都偏严**（N1 fail-safe）：
+
+    | 写坏的是 | 怎么处理 | 为什么 |
+    |---|---|---|
+    | allow | **整条丢弃** | 丢弃一条放行 = 少放行一些，偏严 |
+    | deny  | **降级为整工具拒绝**（等价 `deny: WebFetch`） | 丢弃一条拒绝 = 少拦一些，偏松，不可接受。用户意图明确是「要拦」，看不懂拦什么就拦全部 |
+
+    副作用：可能往 `warnings` 追加元素。
     """
     text = (text or "").strip()
     if not text:
@@ -127,75 +180,143 @@ def parse_rule_string(text: str, effect: str, source: str) -> Optional[Rule]:
         pattern = ""
     if not tool:
         return None
+
+    if web_fetch_enabled and tool == WEB_FETCH_RULE_NAME and pattern:
+        if not pattern.startswith(DOMAIN_PREFIX):
+            if effect == "deny":
+                if warnings is not None:
+                    warnings.append(
+                        f"权限规则 `{text}`（来源：{source}）的括号内容无法识别："
+                        f"域名规则必须写成 `{WEB_FETCH_RULE_NAME}({DOMAIN_PREFIX}模式)`。"
+                        f"这是一条 deny 规则，为避免「看不懂就少拦」，已**降级为拒绝该工具的全部调用**。"
+                    )
+                return Rule(effect=effect, tool=tool, pattern="", source=source)
+            if warnings is not None:
+                warnings.append(
+                    f"权限规则 `{text}`（来源：{source}）的括号内容无法识别："
+                    f"域名规则必须写成 `{WEB_FETCH_RULE_NAME}({DOMAIN_PREFIX}模式)`，"
+                    f"该条已被丢弃。"
+                    f"（提示：要建立域名白名单，请写在**用户级或项目级**配置里——"
+                    f"本地级只放行、不建立白名单。）"
+                )
+            return None
+
     return Rule(effect=effect, tool=tool, pattern=pattern, source=source)
 
 
-def _load_layer(path: Path, source: str) -> tuple[list[Rule], Optional[str]]:
+def _load_layer(
+    path: Path, source: str, *, web_fetch_enabled: bool = True
+) -> tuple[list[Rule], list[str]]:
     """
-    加载单层配置文件，返回 (规则列表, 错误信息或 None)。
-
-    容错（fail-safe）：
-    - 文件不存在 → ([], None)：视为该层无规则，正常情况。
-    - 读取/解析异常或结构非法 → ([], 可读错误)：该层降级为空，不抛异常、不放权。
+    加载单层配置文件，返回 (规则列表, 消息列表)。
 
     :param path: 配置文件路径
     :param source: 来源层标记，写入每条 Rule 的 source
-    :returns: (该层解析出的规则, 错误信息)；无错误时第二项为 None
+    :param web_fetch_enabled: 透传给 parse_rule_string，关闭时跳过域名语法校验（spec F4）
+    :returns: (该层解析出的规则, 消息列表)；无消息时第二项为空列表
+
+    ## ⚠ 三处「整层降级」的行为一个字都不许动
+
+    返回类型从「单个错误」改成「消息列表」，**只是为了让「单条规则级」的警告能多条并存**，
+    控制流实质只影响最后一处。现有的错误 return 共三处，性质完全不同：
+
+    | 位置 | 性质 | 行为 |
+    |---|---|---|
+    | YAML 解析失败 | 整文件级 | **整层降级为空并 return** |
+    | 顶层非映射 | 整文件级 | **整层降级为空并 return** |
+    | allow/deny 非列表 | 整字段级 | **整层降级为空并 return** |
+    | 单条规则解析失败 | 单条级 | 跳过该条、继续解析其余（本来就是这样，只是补了警告出口） |
+
+    **第三行尤其危险**：若把它改成「记下警告后 continue」，一个写成
+    `deny: <不是列表>` + `allow: [一堆规则]` 的文件会变成「deny 全丢、allow 照常生效」——
+    从「整层降级为空（少放行，偏严）」滑向「只丢拒绝规则（偏松）」，直接违反 N1。
+    护栏见 `tests/test_perm_rule_loading.py` 里那条反证。
     """
     if not path.exists():
-        return [], None
+        return [], []
     try:
         raw = path.read_text(encoding="utf-8")
         data = yaml.safe_load(raw)
     except Exception as exc:  # noqa: BLE001 —— 任何读/解析异常都按降级处理
-        return [], f"配置文件解析失败（{path}）：{exc}"
+        return [], [f"配置文件解析失败（{path}）：{exc}"]
 
     if data is None:
-        return [], None
+        return [], []
     if not isinstance(data, dict):
-        return [], f"配置文件格式应为映射（allow/deny 列表）：{path}"
+        return [], [f"配置文件格式应为映射（allow/deny 列表）：{path}"]
 
     rules: list[Rule] = []
+    warnings: list[str] = []
     for effect in ("allow", "deny"):
         items = data.get(effect)
         if items is None:
             continue
         if not isinstance(items, list):
-            return [], f"配置项 {effect} 应为列表：{path}"
+            # 整字段级失败 → 整层降级为空。**不要改成 continue**（见上方表格）。
+            return [], [f"配置项 {effect} 应为列表：{path}"]
         for item in items:
-            rule = parse_rule_string(str(item), effect, source)
+            rule = parse_rule_string(
+                str(item),
+                effect,
+                source,
+                warnings=warnings,
+                web_fetch_enabled=web_fetch_enabled,
+            )
             if rule is not None:
                 rules.append(rule)
-    return rules, None
+    return rules, warnings
 
 
-def load_all(user_dir: Optional[Path] = None) -> tuple[RuleSet, list[str]]:
+def load_all(
+    user_dir: Optional[Path] = None, *, web_fetch_enabled: bool = True
+) -> tuple[RuleSet, RuleSet, list[str]]:
     """
-    加载三层配置并合并成一个 RuleSet。
+    加载三层配置，返回「全量规则集 + 策略规则集 + 消息列表」。
 
     逐层加载用户级 / 项目级 / 本地级，把各层规则汇总进同一个 RuleSet（合并后由
-    rules.py 以 deny 优先求值，层级不决定优先级）。任一层的加载错误收集进列表一并返回，
-    供上层（ConversationManager）以系统提示展示，但不阻断启动（fail-safe）。
+    rules.py 以 deny 优先求值，层级不决定优先级）。任一层的加载错误/警告收集进列表
+    一并返回，供上层以启动提示展示，但不阻断启动（fail-safe）。
 
     :param user_dir: 用户级目录，透传给 `user_config_path()`。**必须可选**——
                      缺省等于现状（读真实主目录）。既有测试全部走
                      `mock.patch(Path.home)` + 无参调用，改成必选会让它们成批失败。
-    :returns: (合并后的 RuleSet, 错误信息列表)；无错误时列表为空
+    :param web_fetch_enabled: 网络访问能力是否启用；关闭时跳过域名语法校验（spec F4）
+    :returns: (全量 RuleSet, **策略** RuleSet, 消息列表)
+
+    ## 为什么返回两个 RuleSet
+
+    第一个是全量的，用于「这次请求有没有被某条规则命中」——所有层级一视同仁、
+    deny 优先，这是 c6 的既有哲学，不变。
+
+    第二个**只含用户级 + 项目级**，唯一用途是判断「域名白名单是否已被建立」
+    （web_fetch 扩展 spec F6a）。这是本项目对「层级不决定优先级」这条哲学的
+    **唯一一处例外**，理由：
+
+    - 用户级 / 项目级 YAML 是**人手写下的策略声明**。在那里写「放行 github.com」，
+      合理的解读就是「我只打算让它访问这些」。
+    - 本地级是**「永久放行」自动写入的授权记录**（见 append_local_allow），
+      是「我批准这一个」，不是「我只允许这些」。
+
+    不做这个区分会造成一个设计级自锁：用户在确认面板点一次「永久放行」，
+    就等于建立了只含一个域名的白名单，此后其它所有域名从「弹确认」变成
+    「硬拒且永不再问」，而界面上没有任何恢复手段。
 
     副作用：读取文件系统上的三个配置文件（若存在）。
     """
     all_rules: list[Rule] = []
+    policy_rules: list[Rule] = []
     errors: list[str] = []
     for path, source in (
         (user_config_path(user_dir), "user"),
         (project_config_path(), "project"),
         (local_config_path(), "local"),
     ):
-        rules, err = _load_layer(path, source)
+        rules, msgs = _load_layer(path, source, web_fetch_enabled=web_fetch_enabled)
         all_rules.extend(rules)
-        if err is not None:
-            errors.append(err)
-    return RuleSet(all_rules), errors
+        if source in POLICY_SOURCES:
+            policy_rules.extend(rules)
+        errors.extend(msgs)
+    return RuleSet(all_rules), RuleSet(policy_rules), errors
 
 
 def append_local_allow(rule_string: str) -> None:

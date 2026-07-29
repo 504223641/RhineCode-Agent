@@ -36,6 +36,8 @@ from rhinecode.skills.manager import SkillManager
 from rhinecode.skills.models import builtin_skills_dir
 from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
+from rhinecode.tools.web_fetch import WebFetchTool
+from rhinecode.web.manager import WebFetchManager
 from rhinecode.tools.path_guard import clear_read_roots, workspace_root
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.trace import (
@@ -106,6 +108,8 @@ def build_app(
     recorder: Optional[TraceRecorderProtocol] = None,
     provider_factory: Optional[Callable[[Config], Any]] = None,
     exclude_tools: frozenset = frozenset(),
+    web_client_factory: Optional[Callable[[], Any]] = None,
+    web_resolver: Optional[Callable[[str], list]] = None,
 ) -> BuildResult:
     """
     按固定顺序装配一个完整的 RhineCode 应用。
@@ -127,6 +131,10 @@ def build_app(
     :param exclude_tools: 装配完成后要从工具注册中心摘掉的工具名集合；
                      缺省空集（等于现状）。用于把「会突破测试隔离」的工具拿掉，
                      摘除位置见下方那段窄窗口注释。
+    :param web_client_factory: 造 HTTP 客户端的工厂，透传给 `web_fetch` 工具。
+                     缺省 None（用真 `httpx.Client`）。**可注入是 spec N5 的硬要求**——
+                     端到端场景也要能离线跑，形态与 `provider_factory` 完全一致。
+    :param web_resolver: 主机名解析函数，同上（缺省用 `socket.getaddrinfo`）。
     :returns: BuildResult
 
     :raises BootstrapError: 三类致命配置错误（命令注册冲突 / Provider 初始化失败 /
@@ -177,6 +185,26 @@ def build_app(
     # MCPManager 创建后注入运行时依赖；只读的 mcp_resolve_server 已在
     # ToolRegistry.default() 中注册。
     tool_registry.register(MCPAddServerTool(mcp_manager, tool_registry))
+
+    # ④' 网络访问工具（web_fetch 扩展 F4）。位置卡在一个窄窗口里，两头都不能挪：
+    #
+    # **必须在第②步 Provider 之后**——manager 要持它，而且要持的是**已经被
+    # `TracingProvider` 包过的那一个**（第②'步）。拿到未包装的那个，抽取请求
+    # 就不会进行为记录，`--scope web_extract` 永远是空的。
+    #
+    # **必须在 `exclude_tools` 摘除与 `session_start` 快照之前**——摘除要能摘到它；
+    # 快照里的 `tool_names` 要与实际工具集一致（理由同下方那段窄窗口注释）。
+    #
+    # 它不能进 `ToolRegistry.default()`：那里造不出 provider（同 MCPAddServerTool）。
+    if cfg.web_fetch_enabled:
+        web_manager = WebFetchManager(
+            provider,
+            cfg.context_window,
+            recorder=recorder,
+            client_factory=web_client_factory,
+            resolver=web_resolver,
+        )
+        tool_registry.register(WebFetchTool(web_manager))
 
     # ── Skill 系统第一阶段（c11 T57）：扫盘 + 白名单严格校验 ──
     #

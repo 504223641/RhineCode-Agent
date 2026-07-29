@@ -49,16 +49,22 @@ class PermissionMode(str, Enum):
 
 class Layer(str, Enum):
     """
-    决定是由五层决策管线的哪一层做出的，用于构造结构化原因与调试展示（spec F8）。
+    决定是由决策管线的哪一层做出的，用于构造结构化原因与调试展示（spec F8）。
 
     - BLACKLIST：①危险命令黑名单
     - SANDBOX：②路径沙箱
+    - NETWORK：②′网络边界（仅 URL 类；硬校验 + 域名策略，web_fetch 扩展 spec F5/F6）
     - RULE：③可配置规则（也含只读简化分支的放行）
     - MODE：④权限模式兜底
+
+    ⚠ 新增枚举值时，`trace/reader.py` 的 `_LAYER_NAMES` 要跟着加一行——
+    那两份表**刻意不合一**（合一要让只依赖标准库的 trace 叶子包反向依赖本包），
+    一致性由 `tests/test_trace_reader.py` 里一条遍历本枚举的断言钉住。
     """
 
     BLACKLIST = "blacklist"
     SANDBOX = "sandbox"
+    NETWORK = "network"
     RULE = "rule"
     MODE = "mode"
 
@@ -72,11 +78,22 @@ class DecisionResult:
     :param layer: 在第几层定的论（用于原因展示与调试）
     :param reason: 面向「模型/用户」的中文可读原因，例如
                    「命中危险命令黑名单：递归强删」或「命中 deny 规则 Bash(git push *)（来源：user）」
+    :param kind: 本次请求的种类（透传自 PermissionRequest.kind）。**带默认值**，
+                 既有构造点不必改也能编译。唯一消费者是确认面板——它据此决定要不要走
+                 URL 类的专用展示（完整地址不截断 + 主机名 + 命中层）。
+    :param host: 本次请求的主机名（仅 url 类非空，透传自 PermissionRequest.host）。同上。
+
+    ⚠ **`engine.decide()` 的每一条 return 路径都必须显式填 `kind`（url 类另填 `host`）。**
+    「带默认值所以既有构造点不动」只保证编译过、不保证功能对：确认面板只在判定为
+    ASK 时弹，而对 url 请求 ASK 只可能来自④模式兜底——漏填的后果是 `kind` 恒为空串、
+    面板的 URL 专用分支**永不进入**，而这在真机弹面板之前完全看不出来。
     """
 
     decision: Decision
     layer: Layer
     reason: str
+    kind: str = ""
+    host: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,9 +134,18 @@ class PermissionRequest:
                  "command"（命令，进①黑名单 + ③命令匹配）、
                  "read_path"/"write_path"（文件路径，进②沙箱 + ③路径匹配）、
                  "glob"（glob 模式，进②沙箱 + ③路径匹配）、
+                 "url"（网络地址，进②′网络边界；specifier 是**完整 URL 原文**，
+                        主机名单独放在 host 字段）、
                  "other"（未映射工具，只按工具名进③ + ④兜底）
     :param is_read_only: 是否只读工具。True 走只读简化分支（spec F7）：③未命中即放行，不进④
     :param mode: 当前权限模式，供④层兜底使用
+    :param host: **仅 url 类填充**的主机名，已归一化（小写、去末尾点），由 adapter 一次填好。
+                 带默认值，其余种类留空串。
+
+                 之所以单独立一个字段而不是让各处自己从 specifier 里解析：三处都要它——
+                 规则匹配（`rules._rule_matches` 的 url 分支）、确认面板展示（spec F9）、
+                 行为记录（spec F23）。若让规则层去调 `network.py` 的解析函数，
+                 而 `network.py` 又要 import `rules.py` 拿 RuleSet，就成了真的循环导入。
     """
 
     tool_name: str
@@ -128,3 +154,4 @@ class PermissionRequest:
     kind: str
     is_read_only: bool
     mode: PermissionMode
+    host: str = ""

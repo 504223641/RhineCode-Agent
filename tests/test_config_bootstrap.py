@@ -120,8 +120,9 @@ class PermissionScaffoldTests(TempWorkspaceHome):
     def test_generated_template_loads_empty(self) -> None:
         # 关键不变量：生成的全注释模板经 load_all() 得到空规则集，行为与无文件一致。
         perm_config.scaffold_user_config(perm_config.user_config_path())
-        ruleset, errors = perm_config.load_all()
+        ruleset, policy, errors = perm_config.load_all()
         self.assertEqual(ruleset.rules, [])
+        self.assertEqual(policy.rules, [])
         self.assertEqual(errors, [])
 
 
