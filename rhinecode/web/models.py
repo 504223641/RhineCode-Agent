@@ -25,6 +25,11 @@ class FetchOutcome:
     :param bytes_truncated: **响应体字节**超限被截断。语义是「内容真的缺了一段」
     :param redirect_to: 跨主机重定向的目标地址；**非空表示本次没有抓取**，
                         由模型自行决定是否对新地址再发起一次调用（spec F8）
+    :param binary: 内容类型不是文本类，**正文未被读取**（spec F14）。
+                   此时 text 为空，由 render 说明「只回报类型与体量」
+    :param content_length: 服务器声明的响应体字节数；未声明时为 -1。
+                           只在 binary=True 时有展示价值——让用户/模型知道
+                           「跳过的是多大一个东西」
     :param error: ok=False 时的中文原因
 
     ## 两个截断标志为什么要分开
@@ -46,6 +51,8 @@ class FetchOutcome:
     text: str = ""
     bytes_truncated: bool = False
     redirect_to: Optional[str] = None
+    binary: bool = False
+    content_length: int = -1
     error: str = ""
 
 
