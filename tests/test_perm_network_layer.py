@@ -348,5 +348,210 @@ class NetworkDecideTests(unittest.TestCase):
         self.assertIn("不在允许范围内", listed.reason)
 
 
+# =============================================================================
+# 四、管线插入与模式例外（T8）
+# =============================================================================
+def _engine(file_rules=None, policy_rules=None, mode=PermissionMode.DEFAULT):
+    from rhinecode.permission.engine import PermissionEngine
+
+    return PermissionEngine(
+        RuleSet(list(file_rules or [])),
+        mode=mode,
+        policy_ruleset=RuleSet(list(policy_rules or [])),
+    )
+
+
+def _write_request(mode: PermissionMode) -> PermissionRequest:
+    """一次普通的写文件请求，用作「模式例外只作用于 URL 类」的对照组。"""
+    return PermissionRequest(
+        tool_name="write_file",
+        rule_name="Write",
+        specifier="out.txt",
+        kind="write_path",
+        is_read_only=False,
+        mode=mode,
+    )
+
+
+class ModeFallbackTests(unittest.TestCase):
+    """三档模式对「无任何 user/project 域名规则」的 url 请求（spec F7 / AC13）。"""
+
+    def _decide(self, mode: PermissionMode):
+        eng = _engine(mode=mode)
+        return eng.decide(_url_request("https://example.com/x", mode=mode))
+
+    def test_strict_denies(self) -> None:
+        r = self._decide(PermissionMode.STRICT)
+        self.assertEqual(r.decision, Decision.DENY)
+        self.assertEqual(r.layer, Layer.MODE)
+
+    def test_default_asks(self) -> None:
+        r = self._decide(PermissionMode.DEFAULT)
+        self.assertEqual(r.decision, Decision.ASK)
+
+    def test_permissive_still_asks(self) -> None:
+        """
+        **放行档对网络访问不生效**——这是判据「限制不可被权限模式放开」的一半。
+
+        放行档的语义是「灰色地带别再烦我」，对文件工具其后果被②路径沙箱兜住，
+        但 URL 类在未建立白名单时没有等价的兜底边界。
+        """
+        r = self._decide(PermissionMode.PERMISSIVE)
+        self.assertEqual(r.decision, Decision.ASK)
+        self.assertEqual(r.layer, Layer.MODE)
+        self.assertIn("放行模式对网络访问不生效", r.reason)
+
+    def test_permissive_control_group_write_file_still_allowed(self) -> None:
+        """
+        **对照组**：同一放行档下，一次写文件调用仍被直接放行。
+
+        证明这个例外只作用于 URL 类，没有污染其它工具的模式语义。
+        """
+        eng = _engine(mode=PermissionMode.PERMISSIVE)
+        r = eng.decide(_write_request(PermissionMode.PERMISSIVE))
+        self.assertEqual(r.decision, Decision.ALLOW)
+        self.assertEqual(r.layer, Layer.MODE)
+
+
+class PipelineOrderGuardTests(unittest.TestCase):
+    """
+    ⚠ **②′必须排在③之前** —— 本文件最重要的一条护栏。
+
+    ## 为什么护栏必须是这个形态
+
+    直觉上会写成「`allow: domain:github.com` + 请求 `example.com` → 断言 DENY」，
+    但把②′挪到③之后推演一遍：③无命中返回 None，接着②′的白名单判定照样给出
+    DENY/NETWORK —— **结论完全相同，那条断言在错序下照样通过**，什么也钉不住。
+
+    只有「**全域名 allow + 禁止地址**」能发现：
+    - 正确顺序：②′先跑，硬校验命中 → DENY/NETWORK
+    - 错误顺序：③先跑，`domain:*` 命中 → ALLOW/RULE，硬校验被整个跳过
+
+    ## 这两种形态的差别是实测出来的，不是推演出来的
+
+    实现完成后跑过一次「把②′挪到③之后」的模拟，结果：
+
+        形态A『白名单未命中』   错序结果 deny/network   → 断言仍通过（假护栏）
+        形态B『全域名allow+127.0.0.1』 错序结果 allow/rule → 断言会红（真护栏）
+
+    所以本类只用形态 B。**改动本用例前请先重跑一遍那个模拟**——
+    看起来更自然的写法很可能什么都钉不住。
+    """
+
+    def test_wildcard_allow_cannot_bypass_hard_check(self) -> None:
+        eng = _engine(
+            file_rules=[_allow("domain:*")],
+            policy_rules=[_allow("domain:*")],
+            mode=PermissionMode.PERMISSIVE,
+        )
+        for url in ("http://127.0.0.1/", "file:///C:/x", "http://user:pass@a.com/"):
+            r = eng.decide(_url_request(url, mode=PermissionMode.PERMISSIVE))
+            self.assertEqual(r.decision, Decision.DENY, url)
+            self.assertEqual(
+                r.layer,
+                Layer.NETWORK,
+                f"{url}：命中层必须是网络边界。若这里变成 RULE，说明②′被挪到了③之后",
+            )
+
+
+class WhitelistThroughEngineTests(unittest.TestCase):
+    """白名单语义经完整管线的表现（spec F6 / AC11）。"""
+
+    def test_listed_domain_allowed(self) -> None:
+        rules = [_allow("domain:github.com", "project")]
+        eng = _engine(file_rules=rules, policy_rules=rules)
+        r = eng.decide(_url_request("https://github.com/x"))
+        self.assertEqual(r.decision, Decision.ALLOW)
+
+    def test_unlisted_domain_denied_not_asked(self) -> None:
+        rules = [_allow("domain:github.com", "project")]
+        eng = _engine(file_rules=rules, policy_rules=rules)
+        r = eng.decide(_url_request("https://example.com/x"))
+        self.assertEqual(r.decision, Decision.DENY)
+        self.assertEqual(r.layer, Layer.NETWORK)
+
+    def test_unlisted_domain_denied_in_permissive_mode(self) -> None:
+        rules = [_allow("domain:github.com", "project")]
+        eng = _engine(file_rules=rules, policy_rules=rules, mode=PermissionMode.PERMISSIVE)
+        r = eng.decide(_url_request("https://example.com/x", mode=PermissionMode.PERMISSIVE))
+        self.assertEqual(r.decision, Decision.DENY)
+
+    def test_session_level_allow_does_not_lock_out_others(self) -> None:
+        """
+        会话级授权（模拟「本会话放行」）**只放行、不建立白名单**。
+
+        它进 file_rules 参与命中判断，但不进 policy_rules —— 于是其它域名
+        仍然走到模式兜底（ASK），而不是被硬拒。
+        """
+        eng = _engine(file_rules=[_allow("domain:github.com", "session")], policy_rules=[])
+        self.assertEqual(eng.decide(_url_request("https://github.com/x")).decision, Decision.ALLOW)
+        other = eng.decide(_url_request("https://example.com/x"))
+        self.assertEqual(other.decision, Decision.ASK)
+        self.assertEqual(other.layer, Layer.MODE)
+
+
+class VerdictCarriesKindAndHostTests(unittest.TestCase):
+    """
+    ⚠ `decide()` 的**每一条** return 路径都要带上 kind（url 类另带 host）。
+
+    漏填的后果是确认面板的 URL 专用分支永不进入、长地址仍被截断，
+    而这在真机弹面板之前完全看不出来。
+    """
+
+    def test_network_layer_verdict(self) -> None:
+        eng = _engine()
+        r = eng.decide(_url_request("http://127.0.0.1/"))
+        self.assertEqual(r.kind, "url")
+        self.assertEqual(r.host, "127.0.0.1")
+
+    def test_rule_layer_verdict(self) -> None:
+        rules = [_deny("domain:example.com")]
+        eng = _engine(file_rules=rules)
+        r = eng.decide(_url_request("https://example.com/x"))
+        self.assertEqual(r.kind, "url")
+        self.assertEqual(r.host, "example.com")
+
+    def test_mode_layer_verdict_all_three_modes(self) -> None:
+        for mode in (PermissionMode.STRICT, PermissionMode.DEFAULT, PermissionMode.PERMISSIVE):
+            eng = _engine(mode=mode)
+            r = eng.decide(_url_request("https://example.com/x", mode=mode))
+            self.assertEqual(r.kind, "url", mode)
+            self.assertEqual(r.host, "example.com", mode)
+
+    def test_non_url_kinds_carry_kind_too(self) -> None:
+        eng = _engine(mode=PermissionMode.PERMISSIVE)
+        r = eng.decide(_write_request(PermissionMode.PERMISSIVE))
+        self.assertEqual(r.kind, "write_path")
+        self.assertEqual(r.host, "")
+
+    def test_blacklist_layer_verdict(self) -> None:
+        eng = _engine()
+        req = PermissionRequest(
+            tool_name="run_command",
+            rule_name="Bash",
+            specifier="rm -rf /",
+            kind="command",
+            is_read_only=False,
+            mode=PermissionMode.DEFAULT,
+        )
+        r = eng.decide(req)
+        self.assertEqual(r.layer, Layer.BLACKLIST)
+        self.assertEqual(r.kind, "command")
+
+    def test_readonly_shortcut_verdict(self) -> None:
+        eng = _engine()
+        req = PermissionRequest(
+            tool_name="read_file",
+            rule_name="Read",
+            specifier="README.md",
+            kind="read_path",
+            is_read_only=True,
+            mode=PermissionMode.DEFAULT,
+        )
+        r = eng.decide(req)
+        self.assertEqual(r.decision, Decision.ALLOW)
+        self.assertEqual(r.kind, "read_path")
+
+
 if __name__ == "__main__":
     unittest.main()
