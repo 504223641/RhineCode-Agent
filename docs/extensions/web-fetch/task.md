@@ -68,6 +68,7 @@
 | `rhinecode/tui/widgets.py` | `ConfirmPanel` 的 URL 类专用展示（完整地址不截断 + 主机名 + 命中层） |
 | `tests/test_perm_config.py` | `load_all` 的 4 处 2 元组解包 |
 | `tests/test_config_bootstrap.py` | `load_all` 的 1 处 2 元组解包（`:123`） |
+| `tests/test_trace_reader.py` | 新增 `Layer.label()` ↔ `_LAYER_NAMES` 逐项一致断言（T25） |
 | `rhinecode/trace/models.py` | 新增 `SCOPE_WEB_EXTRACT` |
 | `rhinecode/trace/reader.py` | `_LAYER_NAMES` 加 `network`（**保持本地一份，刻意不复用 `Layer.label()`**——合一会让 trace 依赖 permission，破坏「叶子包只依赖标准库」） |
 | `rhinecode/config.py` | `Config` 新增 `web_fetch_enabled`；模板补注释 |
@@ -649,15 +650,15 @@
 
 ## T25: 确认面板的 URL 展示
 
-**文件：** `rhinecode/permission/models.py`、`rhinecode/tui/widgets.py`、
-`tests/test_web_bootstrap.py`（追加）
+**文件：** `rhinecode/permission/models.py`（只加 `Layer.label()`）、`rhinecode/tui/widgets.py`、
+`tests/test_web_bootstrap.py`（追加）、**`tests/test_trace_reader.py`**（层名一致性断言）
 **依赖：** T3、**T8**、T6
 
 **⚠ 依赖必须是 T8 而不是 T5。** 面板只在判定为「确认」时弹，而对 url 请求，
 「确认」**只可能来自④模式兜底**——那两条 return 都在 `engine.decide` 里（T8），
 不在 `network.decide` 里。`network.decide` 在这条路上返回的是 `None`（本层不下结论），
 **根本没有构造 `DecisionResult` 的机会**。第 4 轮把依赖写成 T5 是空的。
-填 `kind` / `host` 这件事由 **T8 步骤 8** 负责。
+填 `kind` / `host` 这件事由 **T8 步骤 6** 负责。
 
 **为什么单独成任务：** spec F9/AC15 有 checklist 条目但第 2 轮的 plan/task 里
 **既无模块也无任务**，而现状是**主动违反**它——`ConfirmPanel.show_for` 走
@@ -922,8 +923,7 @@ tui/widgets.py:922   ConfirmPanel.show_for(self, tool_call, tool, decision)
 第四段（接线）
   T20 ─────────────→ T22 ──┐
   T6  ─────────────→ T23   │
-  T3,T6 ──┬──────→ T25（面板）
-           │
+  T3,T6 ──┬─────→ T25（面板）
   T8 ──────┘
   T3  ─────────────→ T27（埋点）
   T7  ─────────────→ T24
