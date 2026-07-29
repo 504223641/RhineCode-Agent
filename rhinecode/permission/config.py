@@ -56,6 +56,20 @@ _CONFIG_TEMPLATE = """\
 #   - "Read(src/**)"      # 放行读取 src 目录（gitignore 风格路径）
 # deny:
 #   - "Bash(git push *)"  # 拒绝 push（deny 优先于任何 allow）
+#
+# 网络访问（web_fetch）的域名规则写成 WebFetch(domain:模式)：
+#
+# allow:
+#   - "WebFetch(domain:github.com)"    # 精确，不含子域
+#   - "WebFetch(domain:*.python.org)"  # 任意深度子域，但不含裸域本身
+# deny:
+#   - "WebFetch(domain:*.evil.com)"
+#
+# ⚠ 在**本文件或用户级** permissions.yaml 里写下任何一条 allow 域名规则，
+#   就等于声明「只许访问这些」——此后未列出的域名一律被直接拒绝，
+#   且 /perm 切到放行档也翻不过来。
+#   本地级 permissions.local.yaml（确认面板选「永久放行」自动写入的那份）
+#   **只放行、不建立白名单**，所以在那里加一条不会锁住其它域名。
 """
 
 

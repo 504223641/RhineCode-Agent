@@ -98,12 +98,19 @@ def _s_api_response(r: dict) -> str:
     )
 
 
-# 权限管线四个可命中层的中文名，与「五层防御」的心智模型对齐（第⑤层是人在回路，
+# 权限管线各可命中层的中文名，与「五层防御」的心智模型对齐（第⑤层是人在回路，
 # 它不由 decide 返回、而是 ASK 判定后由界面承载，故不在此表）。
 # 读 trace 时最常问的问题就是「这次是被哪一层拦的」，直接显示序号与名字最省事。
+#
+# ⚠ **本表与 `permission.models.Layer` 是成对维护点，但刻意不合一。**
+# 让本模块 import Layer 会连带拉起整个 permission 包 + rhinecode.tools + yaml
+# （因为 permission/__init__.py re-export 了 PermissionEngine），
+# 破坏「trace 是只依赖标准库的叶子包」这条架构不变量。
+# 两处一致由 tests/test_trace_reader.py 里一条遍历 Layer 的断言钉住，漏改当场红。
 _LAYER_NAMES = {
     "blacklist": "①黑名单",
     "sandbox": "②沙箱",
+    "network": "②′网络边界",
     "rule": "③规则",
     "mode": "④模式",
 }

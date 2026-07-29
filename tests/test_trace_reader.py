@@ -255,5 +255,76 @@ class DeliveryFormTest(unittest.TestCase):
         self.assertIn("--seq", proc.stdout)
 
 
+class LayerNamesConsistencyTest(unittest.TestCase):
+    """
+    `_LAYER_NAMES` ↔ `permission.models.Layer` 的一致性护栏（web_fetch 扩展 T10/T25）。
+
+    ## 为什么是「两份表 + 一条测试」而不是「合并成一份」
+
+    直觉上该让 `reader.py` 直接 import `Layer`、把两处合一，少一个成对维护点。
+    实测的后果是——`permission/__init__.py` re-export 了 `PermissionEngine`，
+    所以**导入任何一个子模块都会先执行包 `__init__`**，连带拉起整个 `permission`
+    包 + `rhinecode.tools` + **`yaml`**。而 `trace/__init__.py` 与 `CLAUDE.md`
+    都写着「trace 是只依赖标准库的叶子包」。
+
+    拿一条硬架构不变量去换一个「漏改只显示英文原名」的软维护点，是净亏。
+    所以两份表各留在自己的包里，靠这条测试钉住不漂移——**测试代码不受叶子包约束**，
+    它 import 谁都行。
+
+    效果上比合并还好一点：合并只能保证「取值一致」，这条还能保证「不漏行」。
+    """
+
+    def test_every_layer_has_a_chinese_name(self) -> None:
+        from rhinecode.permission.models import Layer
+        from rhinecode.trace.reader import _LAYER_NAMES
+
+        for member in Layer:
+            self.assertIn(
+                member.value,
+                _LAYER_NAMES,
+                f"Layer.{member.name} 没有对应的中文名——"
+                f"新增枚举值时要在 reader.py 的 _LAYER_NAMES 补一行",
+            )
+
+    def test_no_stale_entries(self) -> None:
+        from rhinecode.permission.models import Layer
+        from rhinecode.trace.reader import _LAYER_NAMES
+
+        known = {m.value for m in Layer}
+        for key in _LAYER_NAMES:
+            self.assertIn(key, known, f"_LAYER_NAMES 里的 {key!r} 已不是合法的 Layer 取值")
+
+    def test_network_layer_renders_in_chinese(self) -> None:
+        """新增的②′层在阅读器里显示中文名而非英文原名。"""
+        from rhinecode.trace.reader import summarize
+
+        line = summarize(
+            {
+                "type": "permission_decision",
+                "tool": "web_fetch",
+                "decision": "deny",
+                "layer": "network",
+                "reason": "网络边界拒绝：不允许访问非公网地址",
+            }
+        )
+        self.assertIn("②′网络边界", line)
+        self.assertNotIn("（network）", line)
+
+
+class WebExtractScopeTest(unittest.TestCase):
+    """抽取作用域常量已登记（web_fetch 扩展 T10，spec F23）。"""
+
+    def test_exported_from_package(self) -> None:
+        from rhinecode.trace import SCOPE_WEB_EXTRACT
+
+        self.assertEqual(SCOPE_WEB_EXTRACT, "web_extract")
+
+    def test_distinct_from_other_scopes(self) -> None:
+        from rhinecode.trace import SCOPE_MAIN, SCOPE_NOTES, SCOPE_SUMMARY, SCOPE_WEB_EXTRACT
+
+        scopes = {SCOPE_MAIN, SCOPE_SUMMARY, SCOPE_NOTES, SCOPE_WEB_EXTRACT}
+        self.assertEqual(len(scopes), 4, "作用域取值必须互不相同，否则 --scope 过滤会串")
+
+
 if __name__ == "__main__":
     unittest.main()

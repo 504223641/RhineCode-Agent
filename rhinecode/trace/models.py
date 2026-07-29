@@ -62,9 +62,18 @@ class TraceEventType(str, Enum):
 #   却发了两轮请求」的假象。
 # - SCOPE_NOTES：c9 的自动笔记调用。同样共用 Provider 实例，而且它跑在**独立的
 #   daemon 线程**上，可能与用户的下一条消息并发——不区分就会两条对话的事件交错。
+# - SCOPE_WEB_EXTRACT：web_fetch 扩展的抽取调用（把抓回的正文按提问压成答案）。
+#   同样共用 Provider 实例。不区分的话，一次抓取会在时间线上显示成「模型自己多发了
+#   一轮请求」，而读 trace 的人无从判断那一轮是谁发的。
+#
+# **刻意不为网络访问新增事件类型**：拒绝走既有的 permission_decision
+# （layer 字段自然带出 network），抽取走既有的 api_request + 本作用域。
+# 新增事件类型要同步改 reader.py 的 SUMMARIZERS，属于「漏改不报错」的成对维护点，
+# 能不加就不加。
 SCOPE_MAIN = "main"
 SCOPE_SUMMARY = "summary"
 SCOPE_NOTES = "notes"
+SCOPE_WEB_EXTRACT = "web_extract"
 
 
 def isolated_scope(name: str) -> str:
@@ -238,6 +247,7 @@ __all__ = [
     "SCOPE_MAIN",
     "SCOPE_SUMMARY",
     "SCOPE_NOTES",
+    "SCOPE_WEB_EXTRACT",
     "isolated_scope",
     "MAX_FIELD_CHARS",
     "MAX_MESSAGE_ITEMS",
