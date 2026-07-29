@@ -28,6 +28,7 @@ python -m unittest discover -s tests
 | 上下文管理 | `test_context_*.py` | 近似估算（无锚点/有锚点/越界兜底）、第一层存盘（挑大先存、user 不动、幂等、写盘失败保留原文）、第二层纯逻辑（边界 snap 到 user 不拆 tool 对、草稿丢弃、重构结构）、编排（摘要成功失效锚点、连续失败熔断与复位、`manual_compact` 无阈值）、**保留区与余量随窗口缩放**（含 64K 零回归与小窗口端到端判据） | 真实 LLM 摘要与 TUI 渲染 5 场景（`docs/c8/checklist.md`） |
 | 记忆系统 | `test_memory_*.py` | 锁原语（原子互斥/过期接管/touch 保鲜）、RHINE.md 三层加载与 `@include`（嵌套上限/防环/越界拦截/围栏代码块）、笔记 frontmatter 往返与索引双截断、会话存档（惰性建档/容错载入丢组/锁标记/过期清理）、编排（笔记请求 `tools=None`/锁被占跳过/高水位增量/`--continue` 顺延被锁会话）、沙箱只读白名单（读放行而写仍拒） | 真实 LLM 笔记质量与 TUI 6 场景（`docs/c9/checklist.md`） |
 | `/resume` 与回放 | `test_resume_replay.py` | `build_replay_items` 纯函数（配对、空 content 跳过、缺结果兜底、结果首行截断、双内容 user 优先 `display_content`）、领域入口三态、成功事件流首个为 `HISTORY` 且快照与存档一致 | SessionPanel 交互与回放视觉 |
+| 网络访问（web_fetch 扩展） | `test_perm_match_domain.py`、`test_perm_network_layer.py`、`test_perm_allow_rule.py`、`test_perm_rule_loading.py`、`test_web_*.py` | 域名通配四语义（含 `example.*` 不跨点的反证）、硬校验（协议/凭据/CGNAT/组播/6to4/IPv4-mapped 四类漏网）、白名单**来源层区分**（session/local 不建立白名单）、放行档例外与写文件对照组、**判定顺序护栏**、deny 写坏降级为整工具拒绝、`_load_layer` 三处整层降级的反证、字符集推断链（GBK 页面）、HTML 转换（script 的 CDATA 语义 vs svg 嵌套）、逐跳硬校验与同主机三元组、抽取预算随窗口缩放、抽取答案上限、降级路径同样被不可信标记包裹、`tools=None`、trace 作用域包住整个迭代、面板完整地址不截断且方括号真过 Textual 解析、开关两条传递链 | 真实模型下的注入抵抗（`docs/extensions/web-fetch/checklist.md` 场景 5） |
 | 斜杠命令 | `test_command_*.py`、`test_tui_keybindings.py` | 解析器（分类/首空白切分/参数原样保留/大小写不敏感）、注册表（五类冲突、`register_many` 原子性、隐藏命令可执行不可发现、候选只含规范名）、分发器（回显恰好一次、未知命令不进 AI、必需参数校验、处理异常不降级）、13 条规范命令与 8 别名、启动接线冲突退出码 1、Pilot 键盘（Tab 补全/菜单回车/参数区不拦截/高亮） | — |
 
 ## 逐条留存
