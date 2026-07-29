@@ -273,11 +273,21 @@ def parse_skill(
     display_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else command_name
 
     # description：缺省从正文第一段提取。**不再是必填**。
+    #
+    # ⚠️ 同时记下走的是哪条路（`description_explicit`，作者期扩展 F2a）。
+    # 这个标记**只能在这里产生**——出了本函数，`description` 永远是非空字符串，
+    # 再也分不出「作者自己写的」与「从正文回填的」。体检要靠它判
+    # 「声明了 when_to_use 却漏了 description」，而那是个笔误、值得提醒。
+    #
+    # 不能让体检自己重新提取一遍正文第一段再比对：那既是启发式（作者手写的说明
+    # 恰好等于第一段时会误报），又等于把这里的规则复制成两份，日后必然分叉。
     raw_desc = front.get("description")
     if isinstance(raw_desc, str) and raw_desc.strip():
         description = raw_desc.strip()
+        description_explicit = True
     else:
         description = _first_paragraph(body) or f"（无说明）{command_name}"
+        description_explicit = False
 
     # when_to_use：可选，拼在 description 之后进清单。
     raw_when = front.get("when_to_use")
@@ -351,6 +361,7 @@ def parse_skill(
             resource_dir=resource_dir,
             resource_files=resource_files,
             notices=tuple(notices),
+            description_explicit=description_explicit,
         ),
         None,
         # **warnings 恒为空**：本函数的告知全部走 `spec.notices` 这一条通路。

@@ -245,5 +245,61 @@ class BodyPreservationTest(unittest.TestCase):
         self.assertEqual(spec.display_name, "x")
 
 
+class DescriptionExplicitTest(unittest.TestCase):
+    """
+    `description_explicit`——解析期派生事实（作者期扩展 F2a）。
+
+    ## 这三条为什么必须存在
+
+    `description` 经解析后**永不为空**（未写时由正文第一段回填，
+    再兜底成「（无说明）名字」）。所以体检没法靠「是不是空的」判出
+    「作者漏写了说明字段」，只能靠本标记。
+
+    标记只在解析层产生，**出了 parse_skill 就再也算不出来**——
+    这三条用例钉住的正是「它有没有被正确赋值」，
+    因为漏赋值的后果是**静默漏报**（默认值 True，体检什么都不说）。
+    """
+
+    def test_explicit_description_marked_true(self) -> None:
+        """作者在 frontmatter 里写了说明 → 真。"""
+        spec, _, _ = P("---\ndescription: 我写的说明\n---\n正文第一段\n")
+        self.assertEqual(spec.description, "我写的说明")
+        self.assertTrue(spec.description_explicit)
+
+    def test_backfilled_description_marked_false(self) -> None:
+        """未写说明、由正文第一段回填 → 假。"""
+        spec, _, _ = P("---\nname: x\n---\n这是正文第一段\n")
+        self.assertEqual(spec.description, "这是正文第一段")
+        self.assertFalse(spec.description_explicit)
+
+    def test_no_frontmatter_marked_false(self) -> None:
+        """连 frontmatter 都没有 → 同样是回填 → 假。"""
+        spec, _, _ = P("只有正文\n")
+        self.assertFalse(spec.description_explicit)
+
+    def test_explicit_but_identical_to_first_paragraph_still_true(self) -> None:
+        """
+        ⚠️ **本条是整组里最重要的一条。**
+
+        作者显式写下的说明**恰好与正文第一段逐字相同**时，标记仍须为真。
+
+        它钉住的是「**不许**用『重新提取一遍正文第一段再比对』来代替这个标记」：
+        那种启发式在本场景下会把一份写得完全正确的 Skill 误判成「作者没写说明」，
+        然后给出一条毫无意义的建议。
+
+        没有这条用例，将来有人图省事把标记删掉改成比对，**测试会全绿**。
+        """
+        same = "一模一样的一句话"
+        spec, _, _ = P(f"---\ndescription: {same}\n---\n{same}\n")
+        self.assertEqual(spec.description, same)
+        self.assertTrue(spec.description_explicit)
+
+    def test_blank_description_falls_back_and_marked_false(self) -> None:
+        """写了但只有空白 → 视同没写（既有回填逻辑），标记为假。"""
+        spec, _, _ = P("---\ndescription: '   '\n---\n正文第一段\n")
+        self.assertEqual(spec.description, "正文第一段")
+        self.assertFalse(spec.description_explicit)
+
+
 if __name__ == "__main__":
     unittest.main()
