@@ -10,11 +10,13 @@
 
 | 位置 | 性质 | 做什么 |
 | --- | --- | --- |
-| `rhinecode/permission/` | 既有层，加一个模块 + 改五个 | ②′网络边界层的**判定逻辑**：硬校验、域名规则求值、白名单语义、模式例外 |
+| `rhinecode/permission/` | 既有层，加一个模块 + **改六个** | ②′网络边界层的**判定逻辑**：硬校验、域名规则求值、白名单语义、模式例外 |
 | `rhinecode/web/` | **新增叶子包** | 真实抓取、逐跳硬校验、HTML 解码与转换、抽取编排、结果渲染 |
 | `rhinecode/tools/web_fetch.py` | 既有层，加一个文件 | `Tool` 实现 |
-| `rhinecode/agent/prompt/` | 既有层，加一段文案 | 「外部不可信内容」的系统约束（F21） |
-| `rhinecode/conversation.py` | 既有层，改两处 | 放行规则构造（F9）+ 加载警告并入启动提示（F25） |
+| `rhinecode/agent/prompt/` | 既有层，加一段文案 + 一个开关参数 | 「外部不可信内容」的系统约束（F21） |
+| `rhinecode/agent/loop.py` | 既有层，改一行埋点 | 权限判定事件补 `host` 字段（F23） |
+| `rhinecode/tui/widgets.py` | 既有层，改确认面板 | URL 类请求的专用展示：完整地址不截断 + 主机名 + 命中层（F9） |
+| `rhinecode/conversation.py` | 既有层，改**四处** | 放行规则构造（F9）+ 加载警告并入启动提示（F25）+ 两条开关传递链（F4） |
 
 一句话概括分工：**`permission` 决定「能不能去」，`web` 负责「去了之后怎么办」。**
 两者唯一的耦合点是一组纯函数——硬校验（`check_hard` / `is_forbidden_address`），
@@ -24,8 +26,8 @@
 
 ```
 tools/web_fetch.py  ──→  web/  ──→  permission/network.py  ──→  permission/matching.py
-                          │
-                          └──→  provider/base.py
+                          ├──→  provider/base.py
+                          └──→  trace/            （scope 埋点，叶子包，不成环）
 ```
 
 `tools → web → permission → tools.path_guard` 在**包级别**看是一个环。它不成环，靠的仍是
@@ -34,8 +36,15 @@ tools/web_fetch.py  ──→  web/  ──→  permission/network.py  ──→
 这与既有的 `tools ↔ skills`、`tools ↔ mcp` 是同一个机制、同一条戒律。
 
 `web` 是叶子包：不被 `permission` / `agent` / `commands` / `context` / `memory` / `skills` 反向依赖。
-**`web/__init__.py` 只 re-export 值对象与常量，不 re-export `WebFetchManager`**——
-后者会连带拉起 provider SDK，让一句 `import rhinecode.web` 产生意外的重量级导入。
+
+**`web/__init__.py` 只 re-export 值对象与常量，不 re-export `WebFetchManager`。**
+理由是**叶子包的 `__init__` 不该拉起需要活 provider 的编排对象**——`import rhinecode.web`
+应当只是「拿两个值对象定义」这么轻的一件事，不该顺带把编排层的依赖树牵进来。
+
+（第 2 轮 plan 把理由写成「否则会连带拉起 provider SDK」，那是**事实错误**：
+`provider/base.py` 只 import `abc` / `dataclasses` / `typing`，SDK 只在三个具体
+Provider 实现与 `factory.py` 里。独立审查实测指出后已改正。对应的护栏断言形态也随之改了，
+见 checklist 第八节。）
 
 ## 三处对 spec 的实现层细化
 
@@ -75,6 +84,32 @@ spec 的「安全边界」已把 rebinding 列为已知边界，plan 不再声�
 `tui/app.py` 的 `query_report` 分支 + `conversation.py` 的领域方法**三处**
 （CLAUDE.md 的成对维护点里有这条），而 `startup_notice` 是既有字段、零新增维护点，
 且**不需要用户主动敲命令就能看见**——更符合 AC33 的要求。
+
+### 四、F4 整体开关的两条传递链
+
+**`bootstrap.py` 对权限 `load_all` 与 `fixed_modules` 都是零调用**（实测确认），
+所以「在装配层透传开关」是做不到的——第 2 轮 plan 那句话是错的。真实链路都要穿过协调层：
+
+```
+链路①（权限规则的 domain 语法校验）
+  cfg.web_fetch_enabled
+    → ConversationManager.__init__（已持有整份 config，早于建引擎）
+    → PermissionEngine.load(..., web_fetch_enabled=...)   engine.py:92
+    → config.load_all(user_dir, *, web_fetch_enabled=True)
+
+链路②（系统提示的不可信模块）
+  cfg.web_fetch_enabled
+    → ConversationManager
+    → build_default_prompt(..., untrusted_enabled=False)  builder.py:133
+    → fixed_modules(untrusted=False)
+```
+
+**链路②有两个调用点**：`conversation.py:808` 与 `conversation.py:1050`。
+**两处都要传**——漏一处的表现是「主对话有那条约束、fork 子对话没有」，
+而这在界面上完全看不出来，只有被注入的页面恰好走进 fork 子对话时才会显形。
+
+新参数一律给默认值（`web_fetch_enabled=True` / `untrusted_enabled=False`），
+使既有调用点不改也能跑、且行为逐字等于现状。
 
 ## 核心数据结构
 
@@ -270,17 +305,53 @@ def decide(self, request):
   新增 `RuleSet.has_allow_for`。
 - **matching**：新增 `match_domain`。
 - **config**：三件事——
-  1. `parse_rule_string` 对 `WebFetch(...)` 的括号内容做 `domain:` 前缀校验。
-     **写坏的 allow 丢弃、写坏的 deny 降级为 `Rule(effect="deny", tool="WebFetch", pattern="")`**
-     （spec F13，两支都偏严）。
-  2. `_load_layer` 的返回从「单个错误」改为「错误列表」（当前是 `tuple[list[Rule], Optional[str]]`
-     且出错即整层降级 return；要收集多条警告必须改返回类型与控制流）。
-  3. `load_all` 除返回合并 `RuleSet` 外，**另返回一个仅含 user + project 两层的 `RuleSet`**
-     供白名单判据使用。
 
-  **⚠ `parse_rule_string` 有三个调用方**，改签名要一并检查：`config._load_layer`、
-  `engine.persist_local_rule`（`engine.py:222`）、`skills/validation.grants_for`
-  （`validation.py:125`）。
+  **1. `parse_rule_string` 的签名与语义。** 对 `WebFetch(...)` 的括号内容做 `domain:` 前缀校验：
+  **写坏的 allow 丢弃、写坏的 deny 降级为 `Rule(effect="deny", tool="WebFetch", pattern="")`**
+  （spec F13，两支都偏严）。
+
+  **返回类型必须保持 `Optional[Rule]` 不变**，警告通过新增的**出参**回传：
+
+  ```python
+  def parse_rule_string(text, effect, source, *,
+                        warnings: Optional[list[str]] = None,
+                        web_fetch_enabled: bool = True) -> Optional[Rule]:
+  ```
+
+  ⚠ **这个签名形态是硬要求，不是风格选择。** `parse_rule_string` 有**三个**调用方：
+  `config._load_layer`、`engine.persist_local_rule`（`engine.py:222`）、
+  **`skills/validation.grants_for`（`validation.py:125`）**。后两处的写法都是
+  `rule = parse_rule_string(...)` 紧跟 `if rule is not None: ...append(rule)`——
+  若改成返回 `(Rule|None, warning|None)` 元组，元组恒非 None，会把**元组本身**塞进
+  `session_rules` / `turn_rules`，下一次规则求值访问 `.effect` 时 `AttributeError`。
+  用出参 + 默认值，「后两处不改也能跑」才是真话。
+
+  **2. `_load_layer` 的控制流——只改一处，另外三处一个字都不许动。**
+
+  现有代码里「出错即 return」共**四处**（`config.py:145-169`），性质完全不同：
+
+  | 位置 | 性质 | 本次是否改 |
+  | --- | --- | --- |
+  | `except Exception`（YAML 解析失败） | 整文件级 | **不改**，保持整层降级为空 |
+  | `not isinstance(data, dict)`（顶层非映射） | 整文件级 | **不改** |
+  | `not isinstance(items, list)`（allow/deny 非列表） | 整字段级 | **不改** |
+  | 单条 `parse_rule_string` 返回 None | 单条级 | 本来就是「跳过继续」，**只补一个警告出口** |
+
+  也就是说：返回类型改为 `tuple[list[Rule], list[str]]` **仅仅是为了让单条级的警告能多条并存**，
+  控制流实质上只动最后一行。
+
+  **⚠ 第三行最危险，必须显式保护。** 把它改成「记下警告后 `continue`」，会让一个写成
+  `deny: <不是列表>` + `allow: [一堆规则]` 的文件变成「deny 全丢、allow 照常生效」——
+  从「整层降级为空（少放行，偏严）」滑向「只丢拒绝规则（偏松）」，**直接违反 N1**。
+  而现有测试挡不住：`tests/test_perm_config.py` 只覆盖了第一行，且断言是 `len(errors) == 1`，
+  改成累加后仍然是 1。
+
+  **3. 分层返回。** `load_all` 除返回合并 `RuleSet` 外，**另返回一个仅含 user + project
+  两层的 `RuleSet`** 供白名单判据使用。
+
+  ⚠ `load_all` 现有 **5 个 2 元组解包点**（`tests/test_perm_config.py` 四处、
+  `tests/test_config_bootstrap.py:123` 一处），改返回三元组要一并改，
+  且**验证命令必须覆盖 `test_config*`**——只跑 `test_perm*` 扫不到第二个文件。
 
 ### `skills/validation.py`
 
@@ -290,6 +361,18 @@ def decide(self, request):
 
 按 spec F6a，该预授权进 `turn_rules`，**不进 `policy_ruleset`**，因此只放行、不建立白名单——
 「`allowed-tools` 只放宽从不收紧」这条既有承诺自动成立。
+
+**同时要把警告接出去。** `grants_for` 调 `parse_rule_string`，加了别名之后，一个写成
+`allowed-tools: [WebFetch(github.com)]`（漏 `domain:`）的 Skill 会顺利通过
+`_TOOL_ALIASES` 那道警告（现在认得 WebFetch 了），然后在 `parse_rule_string` 里被**静默丢弃**
+——一条警告都不产。用户看到的现象是「我明明写了预授权，还是每次弹确认」，
+而 `/skills` 报告里什么都没有。`grants_for` 本来就返回 `(rules, warnings)`，
+把上面那个 `warnings` 出参传下去合并即可，下游展示位现成。
+
+**另外 `validation.py:120-121` 的警告文案要跟着改**：现文是「（可用的类别：Read / Write /
+Edit / Bash，或 `mcp__` 开头的远端工具）」，加完 WebFetch 就不完整了。
+这是个「漏改不报错」的形态——`tests/test_skill_startup.py` 只断言了前半句
+「没有对应的工具类别」，文案改不改都不会变红。
 
 ### `conversation.py` — 两处改动
 
@@ -311,7 +394,45 @@ rule_string = f"{req.rule_name}({req.specifier})" if req.specifier else req.rule
 
 **② 加载警告并入启动提示（F25）。** `startup_notice`（`conversation.py:300`）
 当前只承载记忆系统的提示，改为「记忆提示 + 权限规则加载警告」拼接。
-`tui/app.py:215-216` 那侧不动。
+`tui/app.py:215-216` 那侧不动。警告来源是 `PermissionEngine.load_errors`——
+**该字段此前全仓零消费者**，本次是它的第一个消费者。
+
+**③④ 两条开关传递链**（见上文「三处对 spec 的实现层细化」第四节）：
+`PermissionEngine.load` 传 `web_fetch_enabled`；`build_default_prompt`
+的**两个调用点**（`conversation.py:808` 与 `1050`）都传 `untrusted_enabled`。
+
+### `tui/widgets.py` — 确认面板的 URL 展示（F9）
+
+**现状是主动违反 spec F9 的**：`ConfirmPanel.show_for` 走 `summarize_args`，
+而后者（`widgets.py:90-116`）把**每个参数值截到 30 字符**。一条
+`https://docs.example.com/reference/v2?token=abc` 会显示成
+`url=https://docs.example.com/re…`——既不是完整地址，也没有主机名，
+更没有「本次判定来自哪一层」。
+
+**改法：** 给 `ConfirmPanel.show_for` 加一条 URL 类专用分支——
+完整地址**不截断**单独成行，主机名与命中层的中文名各占一行。
+`decision.layer` 已在 `DecisionResult` 里现成，透传即可。
+
+**⚠ 必须写进代码注释的一条：** 完整 URL 进 markup 前**一律用 `tui/widgets.py`
+自己那版 `escape`，绝不要 `from rich.markup import escape`**。
+URL 天然含 `[`（IPv6 字面量 `http://[::1]/`、含 `[` 的查询串），而 rich 那版只转义
+「看起来像完整标签」的 `[...]`，落单的 `[` 会被整个放过，然后在 Textual 的布局阶段
+抛 `MarkupError` —— 那是 CLAUDE.md 里标注「没有任何 try/except 兜得住、
+Textual 直接拆掉整个 app」的致命不变量。既有的 `summarize_args` 结尾用的正是本地那版
+（`widgets.py:116` 的 `return escape(summary)`），新分支照做即可。
+
+### `agent/loop.py` — 权限判定埋点补主机名（F23/AC31）
+
+`PERMISSION_DECISION` 埋点现有字段是
+`tool / tool_call_id / kind / specifier / is_read_only / decision / layer / reason`
+（`agent/loop.py:734-744`），**没有 `host`**。
+
+只靠「拒绝原因文案带主机名」不够——那只覆盖②′层自己给出的 DENY；
+走③层 deny 规则命中时，reason 是「命中 deny 规则 WebFetch(domain:*.example.com)（来源：user）」，
+**里面没有本次请求的主机名**。
+
+**改法：** 加一个 `host=request.host` 字段。**必须继续走 `_safe_emit` 漏斗**——
+Agent Loop 是唯一会把异常变成「工具结果」回灌模型的地方，埋点异常会伪装成「你的工具坏了」。
 
 ### `web/fetcher.py` — 抓取 + 逐跳硬校验
 
@@ -363,8 +484,16 @@ rule_string = f"{req.rule_name}({req.specifier})" if req.specifier else req.rule
 
 **不持有 provider、不发请求**（与 `context/summarize.py` 对 `context/manager.py` 的分工同构）。
 
-- `content_budget(context_window: int) -> int` —— **喂给抽取模型的正文上限，按窗口比例算再夹上限**
-  （spec F17）。口径对齐 `context/summarize.py` 的 `retain_budget`。
+- `content_budget(context_window: int) -> int` —— **喂给抽取模型的正文上限**。
+  **入参单位是 token（`context_window` 的单位），返回值单位是字符。**
+  换算：`window // 4` 个字符 ≈ `window / 12` 个 token（按 `estimate.py` 的
+  `CHARS_PER_TOKEN = 3.0`），即正文约占窗口的 1/12——留足空间给提示与答案。
+
+  **写法是「按窗口比例算再夹上下限」**，与 `context/summarize.py` 的 `retain_budget`
+  **形态相同但参数不同**（那边返回 token、比例 0.16、只夹上限；这边返回字符、
+  比例 1/4、上下限都夹）。**不要写成「口径对齐 `retain_budget`」**——两者单位与比例都不同，
+  那句话会误导（第 2 轮曾这样写，独立审查指出）。
+
   **不得写成固定常量**：CLAUDE.md 已知项 #8 记录过同型缺陷（`RETAIN_TOKENS` 固定值
   在小窗口下失效导致机制空转）。
 - `build_extract_request(page_text, source_url, ask) -> tuple[str, list[Message]]` ——
@@ -418,6 +547,15 @@ WebFetchManager(provider, context_window: int, *, recorder=None,
 4. `render` 包上不可信标记与元信息。
 
 **trace**：第 2 步包在 `recorder.scope(SCOPE_WEB_EXTRACT)` 里（F23）。
+
+**⚠ `with` 必须包住整个流消费循环，而不只是 `stream_chat(...)` 那一行。**
+`stream_chat` 是**生成器函数**——调用它只是造出生成器对象，函数体一行都没跑；
+真正产出 `api_request` 事件是在**首次迭代**时。只包调用的话，作用域在迭代开始前就已退出，
+那条请求会被记成主作用域，`--scope web_extract` 返回空，看起来像「没记录到」
+而不是「记错作用域」，**AC31 后半句静默失效**。
+
+这条不是新发现——`context/manager.py:332-336` 有一段专门为此写的 ⚠ 注释，
+本模块照抄那个形态即可。
 
 ### `tools/web_fetch.py`
 
@@ -514,16 +652,22 @@ rhinecode/
 │   ├── render.py             ← 不可信标记 + 元信息 + 摘要
 │   └── manager.py            ← WebFetchManager
 ├── tools/web_fetch.py        ← 新增
-├── skills/validation.py      ← 改：_TOOL_ALIASES 加 WebFetch
+├── skills/validation.py      ← 改：_TOOL_ALIASES 加 WebFetch；grants_for 接警告；警告文案
 ├── conversation.py           ← 改：三处 allow 规则构造 + startup_notice 并入警告
+│                                 + 两条开关传递链（PermissionEngine.load / 两个 build_default_prompt 调用点）
+├── agent/loop.py             ← 改：PERMISSION_DECISION 埋点补 host（仍走 _safe_emit）
 ├── agent/prompt/texts/untrusted.py  ← 新增
 ├── agent/prompt/modules.py   ← 改：第八个固定模块 + 开关参数
+├── agent/prompt/builder.py   ← 改：build_default_prompt 加 untrusted_enabled 参数
+├── tui/widgets.py            ← 改：ConfirmPanel 的 URL 类专用展示（完整地址不截断）
 ├── trace/models.py           ← 改：新增 SCOPE_WEB_EXTRACT
 ├── trace/reader.py           ← 改：_LAYER_NAMES 加 network
 ├── config.py                 ← 改：Config 新增 web_fetch_enabled
-└── bootstrap.py              ← 改：装配 + 两个注入参数 + 关闭开关
+└── bootstrap.py              ← 改：装配 + 两个注入参数
 
-tests/e2e/host.py             ← 改：build_app 新增参数要同步（第二个真实调用方）
+tests/e2e/host.py             ← 改：build_app 新增参数要同步（第二个真实调用方）+ 离线替身
+tests/test_perm_config.py     ← 改：load_all 的 4 处 2 元组解包
+tests/test_config_bootstrap.py ← 改：load_all 的 1 处 2 元组解包（`:123`）
 ```
 
 ## 关键常量

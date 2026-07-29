@@ -1,6 +1,6 @@
 # 网络访问工具（web_fetch）Tasks
 
-> 状态：待批准（2026-07-29，**第 2 轮修订**：按独立审查修订，任务从 22 个拆成 28 个）
+> 状态：待批准（2026-07-29，**第 3 轮修订**：按第 2 轮独立审查修订，任务 28 → 31 个）
 >
 > 上游：[`spec.md`](spec.md)、[`plan.md`](plan.md)。
 
@@ -9,9 +9,13 @@
 | 段 | 任务 | 特点 |
 | --- | --- | --- |
 | **一、权限层**（T1–T9） | 纯逻辑，零 I/O | 全部可离线单测。做完这段，「限制」就已经成立了——即使工具还不存在 |
-| **二、基础设施**（T10–T11） | trace 与配置 | 无依赖、被后面两段依赖，**必须排在 `web` 包之前**（第 1 轮把它排在后面，导致 T20 引用了尚不存在的常量、import 阶段就炸） |
+| **二、基础设施**（T10–T11） | trace 与配置 | 无依赖、被后面两段依赖，**必须排在 `web` 包之前**（第 1 轮把它排在后面，导致编排任务引用了尚不存在的常量、import 阶段就炸） |
 | **三、`web` 包**（T12–T20） | 抓取与抽取 | 自下而上：值对象 → 解码 → 转换 → 抓取（拆三步）→ 抽取 → 渲染 → 编排 |
-| **四、接线**（T21–T28） | 集成 | 系统提示、工具、协调层、装配、驱动设施同步、回归、文档 |
+| **四、接线**（T21–T31） | 集成 | 系统提示、工具、协调层、**确认面板**、**开关传递链**、**埋点**、装配、驱动设施同步、回归、文档 |
+
+第 3 轮新增的三个任务（T25 面板 / T26 开关链 / T27 埋点）都属于同一类问题：
+**spec 有需求、checklist 有条目，但第 2 轮既无 plan 模块也无 task**。
+这类缺口的典型收场是实现者做到最后发现验收项跑不过，当场发明一条绕开审批的链路。
 
 **顺序是刻意的：先建边界，再建能力。** 反过来做的话，中间会存在一段
 「工具已经能上网、但域名限制还没写完」的时间窗——这段时间里任何一次调试运行都在裸奔。
@@ -56,9 +60,14 @@
 | `rhinecode/permission/adapter.py` | `_TOOL_MAP` 登记；填 `host`；新增 `to_allow_rule` |
 | `rhinecode/permission/engine.py` | 插入②′；④层 url 例外；持 `policy_ruleset` |
 | `rhinecode/permission/config.py` | domain 前缀校验（deny 降级）；错误改列表；返回分层 RuleSet |
-| `rhinecode/skills/validation.py` | `_TOOL_ALIASES` 加 WebFetch |
-| `rhinecode/conversation.py` | 三处 allow 规则构造；`startup_notice` 并入权限警告 |
+| `rhinecode/skills/validation.py` | `_TOOL_ALIASES` 加 WebFetch；`grants_for` 接警告出参；警告文案补 WebFetch |
+| `rhinecode/conversation.py` | **四件事**：三处 allow 规则构造；`startup_notice` 并入权限警告；`PermissionEngine.load` 传开关；**两个** `build_default_prompt` 调用点传开关 |
+| `rhinecode/agent/loop.py` | `PERMISSION_DECISION` 埋点补 `host`（仍走 `_safe_emit`） |
 | `rhinecode/agent/prompt/modules.py` | 第八个固定模块 + 开关参数 |
+| `rhinecode/agent/prompt/builder.py` | `build_default_prompt` 加 `untrusted_enabled` 参数 |
+| `rhinecode/tui/widgets.py` | `ConfirmPanel` 的 URL 类专用展示（完整地址不截断 + 主机名 + 命中层） |
+| `tests/test_perm_config.py` | `load_all` 的 4 处 2 元组解包 |
+| `tests/test_config_bootstrap.py` | `load_all` 的 1 处 2 元组解包（`:123`） |
 | `rhinecode/trace/models.py` | 新增 `SCOPE_WEB_EXTRACT` |
 | `rhinecode/trace/reader.py` | `_LAYER_NAMES` 加 `network` |
 | `rhinecode/config.py` | `Config` 新增 `web_fetch_enabled`；模板补注释 |
@@ -197,26 +206,52 @@
 **依赖：** T1
 
 **步骤：**
-1. `parse_rule_string` 对 `tool == "WebFetch"` 且 pattern 非空时校验 `domain:` 前缀。
-   **按效果分支**（spec F13）：allow 写坏 → 返回 None（丢弃）；
-   deny 写坏 → 返回 `Rule(effect="deny", tool="WebFetch", pattern="")`（**降级为整工具拒绝**）。
-   两支都回传一条中文警告。
-2. **⚠ `parse_rule_string` 有三个调用方**，改签名后逐个检查并适配：
-   `config._load_layer`、`engine.persist_local_rule`（`engine.py:222`）、
-   **`skills/validation.grants_for`（`validation.py:125`）**。
-   新增参数一律给默认值，使后两处不改也能跑。
-3. `_load_layer` 返回从 `tuple[list[Rule], Optional[str]]` 改为
-   `tuple[list[Rule], list[str]]`，并**改掉「出错即整层 return」的控制流**——
-   现在要能「跳过坏的一条、继续解析其余」。
+1. `parse_rule_string` 改签名——**返回类型保持 `Optional[Rule]` 不变**，警告走出参：
+   ```python
+   def parse_rule_string(text, effect, source, *,
+                         warnings: Optional[list[str]] = None,
+                         web_fetch_enabled: bool = True) -> Optional[Rule]:
+   ```
+   **⚠ 不许改成返回元组。** 三个调用方里有两个（`engine.py:222`、`validation.py:125`）
+   的写法是 `rule = parse_rule_string(...)` 紧跟 `if rule is not None: ...append(rule)`——
+   返回元组会让元组恒非 None，把**元组本身**塞进 `session_rules` / `turn_rules`，
+   下一次规则求值访问 `.effect` 时 `AttributeError`。用出参 + 默认值，
+   「后两处不改也能跑」才成立。
+2. 对 `tool == "WebFetch"` 且 pattern 非空时校验 `domain:` 前缀，**按效果分支**（spec F13）：
+   allow 写坏 → 返回 None（丢弃）；deny 写坏 → 返回
+   `Rule(effect="deny", tool="WebFetch", pattern="")`（**降级为整工具拒绝**）。
+   两支都往 `warnings` append 一条中文说明。
+3. `_load_layer` 返回改为 `tuple[list[Rule], list[str]]`。
+   **⚠ 这只是为了让「单条规则级」的警告能多条并存，控制流实质只动最后一处。**
+   现有代码里「出错即 return」共四处（`config.py:145-169`），**前三处一个字都不许动**：
+
+   | 位置 | 性质 | 本任务 |
+   | --- | --- | --- |
+   | `except Exception`（YAML 解析失败） | 整文件级 | **不改**，保持整层降级为空 |
+   | `not isinstance(data, dict)` | 整文件级 | **不改** |
+   | `not isinstance(items, list)`（allow/deny 非列表） | 整字段级 | **不改** |
+   | 单条 `parse_rule_string` 返回 None | 单条级 | 本来就是「跳过继续」，只补警告出口 |
+
+   **第三行改了会削弱 fail-safe**：`deny: <非列表>` + `allow: [一堆]` 的文件会变成
+   「deny 全丢、allow 照常生效」，从偏严滑向偏松，违反 N1。
 4. `load_all` 返回改为 `(merged_ruleset, policy_ruleset, errors)`：
-   `policy_ruleset` 只含 user + project 两层。加开关参数，关闭时跳过 domain 校验（F4）。
-5. 警告文案指明文件、原条目与正确写法（`WebFetch(domain:...)`），并说明该条被怎么处理了。
-6. 测试：含 `allow: WebFetch(github.com)` 与 `deny: WebFetch(evil.com)` 的临时 YAML →
+   `policy_ruleset` 只含 user + project 两层。加 `web_fetch_enabled` 参数，关闭时跳过校验（F4）。
+5. **⚠ `load_all` 现有 5 个 2 元组解包点必须一并改**：
+   `tests/test_perm_config.py`（第 50/56/63/70 行四处）、
+   `tests/test_config_bootstrap.py:123`（一处）。
+6. 警告文案指明文件、原条目、正确写法（`WebFetch(domain:...)`）、该条被怎么处理了，
+   并带上 spec F6a 那句「**要建立白名单，请写用户级或项目级**」。
+7. 测试：含 `allow: WebFetch(github.com)` 与 `deny: WebFetch(evil.com)` 的临时 YAML →
    前者被丢弃、后者降级为整工具 deny、两条警告都在、**同文件其它规则照常生效**、
    `policy_ruleset` 不含 local 层的规则、关闭开关时零警告。
+8. **反证测试（保护第三行不被改坏）**：`deny` 写成非列表时，
+   该层的 `allow` 规则**也不得生效**（整层降级为空）。
 
 **验证：** `python -m unittest tests.test_perm_rule_loading` 全通过；
-`python -m unittest discover -s tests -p "test_perm*"` 与 `-p "test_skill*"` 均无回归。
+`python -m unittest discover -s tests -p "test_perm*"`、`-p "test_config*"`、
+`-p "test_skill*"` **三个都要跑**且无回归。
+（**必须含 `test_config*`**——`test_config_bootstrap.py` 里那处解包只有它扫得到，
+漏跑会一路藏到全量回归。）
 
 ## T8: 管线插入与模式例外
 
@@ -255,8 +290,21 @@
 **步骤：**
 1. `_TOOL_ALIASES` 加两行：`"webfetch": "WebFetch"`（标准词汇）与
    `"web_fetch": "WebFetch"`（本系统内部工具名），与既有 `read_file`/`run_command` 同风格。
-2. 测试：`allowed-tools: [WebFetch(domain:x)]` 的 Skill 不再产生「本系统没有对应的工具类别」警告；
-   **且其产出的规则进 `turn_rules` 后不建立白名单**（复用 T5 的来源层用例形态断言）。
+2. **把 T7 的 `warnings` 出参接出去**：`grants_for` 调 `parse_rule_string` 时传入自己的
+   `warnings` 列表。**不接的后果**：加了别名之后，一个写成 `allowed-tools: [WebFetch(github.com)]`
+   （漏 `domain:`）的 Skill 会顺利通过 `_TOOL_ALIASES` 那道警告（现在认得 WebFetch 了），
+   然后在 `parse_rule_string` 里被**静默丢弃**，一条警告都不产——用户看到的现象是
+   「我明明写了预授权，还是每次弹确认」，而 `/skills` 报告里什么都没有。
+   `grants_for` 本来就返回 `(rules, warnings)`，接得上，下游展示位现成。
+3. **改 `validation.py:120-121` 的警告文案**：现文是「（可用的类别：Read / Write / Edit / Bash，
+   或 `mcp__` 开头的远端工具）」，加完 WebFetch 就不完整了。
+   **这是「漏改不报错」的形态**——`tests/test_skill_startup.py` 只断言了前半句
+   「没有对应的工具类别」，文案改不改都不会变红。
+4. 测试：
+   - `allowed-tools: [WebFetch(domain:x)]` 的 Skill 不再产生「本系统没有对应的工具类别」警告
+   - **其产出的规则进 `turn_rules` 后不建立白名单**（复用 T5 的来源层用例形态断言）
+   - **`allowed-tools: [WebFetch(github.com)]`（漏前缀）产生一条指明正确写法的警告**
+   - 新文案含 WebFetch
 
 **验证：** `python -m unittest discover -s tests -p "test_skill*"` 无回归 + 新用例通过。
 
@@ -289,7 +337,7 @@
 **步骤：**
 1. `Config` 新增 `web_fetch_enabled: bool = True`，docstring 说明。
    **不加 `web_extract_model`**（plan 已砍：换模型的既有旁路叶子包复用不了，YAGNI）。
-2. 解析口径：`_parse_bool` 对非法值是**抛 ValueError**（`config.py:137-146`），
+2. 解析口径：`_parse_bool` 对非法值是**抛 ValueError**（`config.py:135-144`），
    与 `debug_log` 同处理——**不要写成「fail-safe 回退默认」**，那是 `_parse_int` 的口径，
    两者不同（第 1 轮混用了）。
 3. 配置模板补该项注释（默认注释掉），并**在权限配置模板 `_CONFIG_TEMPLATE`
@@ -464,9 +512,16 @@
 3. **`tools=None` 是硬约束**，注释点明与 C8 摘要、C9 笔记同源。
 4. 抽取异常或空结果 → 降级到 `MAX_FALLBACK_CHARS`。
 5. provider 调用包在 `recorder.scope(SCOPE_WEB_EXTRACT)` 里。
+   **⚠ `with` 必须包住整个流消费循环，不能只包 `stream_chat(...)` 那一行。**
+   `stream_chat` 是生成器函数——调用它只造出生成器对象、函数体一行都没跑，
+   真正产出 `api_request` 事件是在**首次迭代**时。只包调用的话作用域在迭代开始前就退出了，
+   请求会被记成主作用域，`--scope web_extract` 返回空、看起来像「没记录到」，
+   **AC31 后半句静默失效**。照抄 `context/manager.py:332-336` 那段 ⚠ 注释的形态。
 6. 测试（provider 用替身）：`stream_chat` 收到的 `tools` 是 `None`；
    抽取抛异常 → 降级结果且含标注；**抓取失败时 provider 根本没被调用**；
-   recorder 替身收到 `SCOPE_WEB_EXTRACT`；`context_window` 变化时喂给抽取的正文长度随之变化。
+   `context_window` 变化时喂给抽取的正文长度随之变化；
+   **断言 recorder 替身收到的 `api_request` 事件的 scope 是 `web_extract`**
+   （不能只断言 `scope()` 被调用过——那在错误实现下照样通过）。
 
 **验证：** `python -m unittest tests.test_web_manager` 全通过。
 
@@ -547,10 +602,95 @@
 **验证：** `python -m unittest tests.test_perm_rule_loading` 全通过；
 `python -m unittest discover -s tests -p "test_conv*"` 无回归。
 
-## T25: 装配
+## T25: 确认面板的 URL 展示
+
+**文件：** `rhinecode/tui/widgets.py`、`tests/test_web_bootstrap.py`（追加）
+**依赖：** T6
+
+**为什么单独成任务：** spec F9/AC15 有 checklist 条目但第 2 轮的 plan/task 里
+**既无模块也无任务**，而现状是**主动违反**它——`ConfirmPanel.show_for` 走
+`summarize_args`，后者（`widgets.py:90-116`）把**每个参数值截到 30 字符**。
+一条 `https://docs.example.com/reference/v2?token=abc` 会显示成
+`url=https://docs.example.com/re…`。用户正是靠面板上那个地址决定放不放行的，
+地址被截断意味着攻击者只要把恶意部分放在第 31 个字符之后，人在回路这层就形同虚设。
+
+**步骤：**
+1. `ConfirmPanel.show_for` 加一条 URL 类专用分支（按 `kind == "url"` 判定）：
+   **完整地址不截断、单独成行**；主机名与 `decision.layer` 的中文名各占一行。
+2. `decision.layer` 已在 `DecisionResult` 里现成；主机名取 `PermissionRequest.host`
+   （若面板拿不到 request，则由调用侧透传，或从完整 URL 现算——两种都可，
+   但**主机名必须与判定时用的那一个一致**，不要各算各的）。
+3. **⚠ 写进代码注释的死规矩**：完整 URL 进 markup 前一律用 `tui/widgets.py` 自己那版
+   `escape`，**绝不要 `from rich.markup import escape`**。URL 天然含 `[`
+   （IPv6 字面量 `http://[::1]/`、含 `[` 的查询串），rich 那版只转义「看起来像完整标签」的
+   `[...]`，落单的 `[` 被整个放过，然后在 Textual 布局阶段抛 `MarkupError`——
+   那是 CLAUDE.md 里标注「没有任何 try/except 兜得住、Textual 直接拆掉整个 app」的
+   致命不变量。既有 `summarize_args` 结尾用的正是本地那版（`widgets.py:116`），照做。
+4. 测试：
+   - 一条 120 字符的 URL 在面板文本里**完整出现**（不含截断省略号）
+   - 面板文本含主机名与中文层名
+   - **`http://[::1]:8080/a?x=[1` 这类含未闭合方括号的地址不会抛 `MarkupError`**
+     （直接调面板的文本构造函数断言不抛，并断言 `[` 已被转义）
+   - 非 url 类工具的面板文本**逐字等于**本次改动前
+
+**验证：** `python -m unittest tests.test_web_bootstrap` 通过；
+`python -m unittest discover -s tests -p "test_tui*"` 无回归。
+
+## T26: F4 开关的两条传递链
+
+**文件：** `rhinecode/conversation.py`、`rhinecode/permission/engine.py`、
+`rhinecode/agent/prompt/builder.py`、`tests/test_web_bootstrap.py`（追加）
+**依赖：** T7、T11、T21
+
+**为什么单独成任务：** 第 2 轮 plan/task 写「在装配层把开关透传给
+`fixed_modules()` 与 `permission.config.load_all`」，但 **`bootstrap.py` 这两个都不调**
+（实测零命中）。AC4 的三条判据里有两条因此没有实现路径。真实链路都要穿过协调层。
+
+**步骤：**
+1. **链路①（权限规则的 domain 语法校验）**：
+   `PermissionEngine.load(..., web_fetch_enabled: bool = True)` →
+   透传给 `config.load_all`；`conversation.py:242` 建引擎时传 `config.web_fetch_enabled`。
+   `ConversationManager` **已持有整份 config**（`self._config`，赋值早于建引擎），
+   不需要新的注入通道。
+2. **链路②（系统提示的不可信模块）**：
+   `build_default_prompt(..., untrusted_enabled: bool = False)`（`builder.py:133`）→
+   透传给 `fixed_modules`。
+3. **⚠ 链路②有两个调用点**：`conversation.py:808` 与 `conversation.py:1050`，**两处都要传**。
+   漏一处的表现是「主对话有那条约束、fork 子对话没有」——**界面上完全看不出来**，
+   只有被注入的页面恰好走进 fork 子对话时才显形。
+4. 新参数一律给默认值（`web_fetch_enabled=True` / `untrusted_enabled=False`），
+   使既有调用点不改也能跑、行为逐字等于现状。
+5. 测试：
+   - `web_fetch_enabled=False` 时，写坏的域名规则**零警告**
+   - `web_fetch_enabled=False` 时，主对话与 **fork 子对话**的系统提示**都**不含不可信模块
+   - `web_fetch_enabled=True` 时，主对话与 fork 子对话的系统提示**都**含它
+     （这条专门钉住「两个调用点」，漏一处就红）
+
+**验证：** `python -m unittest tests.test_web_bootstrap` 通过；
+`python -m unittest discover -s tests -p "test_conv*"`、`-p "test_prompt*"`、
+`-p "test_perm*"` 均无回归。
+
+## T27: 权限判定埋点补主机名
+
+**文件：** `rhinecode/agent/loop.py`、`tests/test_perm_network_layer.py`（追加）
+**依赖：** T3
+
+**步骤：**
+1. `PERMISSION_DECISION` 埋点（`agent/loop.py:734-744`）加 `host=request.host` 字段。
+2. **必须继续走 `_safe_emit` 漏斗**——Agent Loop 是唯一会把异常变成「工具结果」回灌模型的
+   地方，埋点异常会伪装成「你的工具坏了」。
+3. **为什么不能只靠 reason 文案**：②′层自己给出的 DENY 文案里带主机名，但走③层
+   deny 规则命中时 reason 是「命中 deny 规则 WebFetch(domain:*.example.com)（来源：user）」，
+   **里面没有本次请求的主机名**——AC31 会在这条路径上落空。
+4. 测试：一次 url 类判定产出的事件含 `host` 字段且值正确；非 url 类的 `host` 为空串。
+
+**验证：** `python -m unittest tests.test_perm_network_layer` 通过；
+`python -m unittest discover -s tests -p "test_trace*"` 与 `-p "test_e2e*"` 无回归。
+
+## T28: 装配
 
 **文件：** `rhinecode/bootstrap.py`、`tests/test_web_bootstrap.py`（追加）
-**依赖：** T11、T22
+**依赖：** T11、T22、T26
 
 **步骤：**
 1. `build_app` 新增两个可选参数 `web_client_factory` / `web_resolver`（缺省 None）。
@@ -560,20 +700,20 @@
 3. **写位置注释**（沿用既有窄窗口注释风格）：必须在 Provider 之后（要拿到被
    `TracingProvider` 包过的那个，否则抽取请求不进记录）；必须在 `exclude_tools` 摘除与
    `session_start` 快照之前（摘除要能摘到它、快照要与实际工具集一致）。
-4. 关闭时：不造 manager、不注册工具，开关透传给 `fixed_modules()` 与 `permission.config.load_all`。
+4. 关闭时：不造 manager、不注册工具。**开关的两条传递链由 T26 负责**，
+   本任务只负责「不造 manager / 不注册工具」这一段（`bootstrap.py` 不调
+   `load_all` 与 `fixed_modules`，透不了那两个开关）。
 5. 测试：
    - 启用时 `tool_registry.names()` 含 `web_fetch`；关闭时不含
-   - 关闭时系统提示**逐字**等于关闭前
-   - 关闭时一条写坏的 `WebFetch(github.com)` 规则**不产生任何警告**（`startup_notice` 不含它）
    - `exclude_tools={"web_fetch"}` 能摘掉它
    - 注入的 `web_client_factory` 确实被工具用上（替身被调用）
 
 **验证：** `python -m unittest tests.test_web_bootstrap` 全通过。
 
-## T26: 驱动设施同步
+## T29: 驱动设施同步
 
 **文件：** `tests/e2e/host.py`
-**依赖：** T25
+**依赖：** T28
 
 **步骤：**
 1. `host.py` 是 `build_app` 的**第二个真实调用方**（CLAUDE.md 成对维护点有这条）。
@@ -581,14 +721,23 @@
 2. 决定 `web_fetch` 是否要进 `host.py` 的 `EXCLUDED_TOOLS`：**不进**——
    它与被排除的两个 MCP 工具不同，不会写真实用户主目录、不会访问外部包索引，
    且注入替身后完全受控。在注释里写明这个判断及理由。
-3. 提供一个可复用的离线替身（固定几个主机名 → 固定响应），供 checklist 的端到端场景使用。
+3. 提供一个可复用的离线替身：固定几个主机名（`a.test` / `b.test`）→ 固定响应。
+   **⚠ 替身的 `resolver` 必须返回全局可路由地址**，例如 `203.0.113.10` / `203.0.113.11`
+   （TEST-NET-3，实测 `is_global=True`）。
+   **返回 `127.0.0.1` 或 `::1` 会被连接期硬校验一律拒掉，端到端场景 1–4 全部失败**，
+   而且失败文案是「地址解析到了不允许访问的目标」，排查起来非常绕。
+   这一条要写进替身模块的 docstring，别让后来的人再踩一次。
+4. `host.py` 现有一条刻意的设计约束：**没有 `--workspace` / `--user-dir`**，
+   每次启动建全新临时目录（`host.py:346-349` 有注释）。这意味着「重启宿主后
+   本地级规则还在」的场景**跑不起来**——checklist 场景 4 已相应改为进程内二次装配，
+   本任务不需要为它开后门。
 
 **验证：** `python -m unittest tests.test_e2e_host` 无回归。
 
-## T27: 全量回归
+## T30: 全量回归
 
 **文件：** 无（只跑）
-**依赖：** T1–T26
+**依赖：** T1–T29
 
 **步骤：**
 1. `python -m compileall rhinecode tests`
@@ -596,14 +745,14 @@
 3. 有失败就修，修完重跑，**不跳过、不标记 skip**。
 
 **验证：** 编译无错；测试全绿；**`skipped` 仍为 4**（变了说明误伤了既有跳过条件）；
-测试总数**只增不减**，且新建的 11 个测试文件全部被 `discover` 收进
+测试总数**只增不减**，且新建的 **12** 个测试文件全部被 `discover` 收进
 （用 `python -m unittest discover -s tests -v` 的输出核对文件名）。
 
-## T28: 文档登记
+## T31: 文档登记
 
 **文件：** `CLAUDE.md`、`docs/internals/capabilities.md`、`docs/internals/testing.md`、
 `docs/extensions/README.md`
-**依赖：** T27
+**依赖：** T30
 
 **步骤：**
 1. `CLAUDE.md` 架构表 `Permission` 行 ⚠ 列补：②′必须排在③之前，
@@ -616,7 +765,8 @@
 6. `CLAUDE.md` 安全边界新增一条，含「缺省配置下白名单不存在」与
    「MCP 是第二条不受约束的外泄腿」两点。
 7. `docs/internals/capabilities.md` 新增「网络访问」小节：三档模式的实际表现、
-   白名单的来源层规则、阈值取值、降级路径、已知边界。
+   白名单的来源层规则（**含「要建立白名单请写用户级或项目级」这句明文**，
+   以及「本地级也可手编但不建立白名单」这处不直觉）、阈值取值、降级路径、已知边界。
 8. `docs/internals/testing.md` 新增测试覆盖清单。
 9. `docs/extensions/README.md` 状态列改为「已实现」。
 
@@ -649,14 +799,20 @@
         └──→ T19 ────────────────────────────┘
 
 第四段（接线）
-  T21（独立）
-  T20 ──→ T22 ──┬──→ T25 ←── T11
-  T6  ──→ T23   │
-  T7  ──→ T24   └──→ T26
-
-  全部 ──→ T27 ──→ T28
+  T21（独立）───────────────┐
+  T20 ──→ T22 ──────────┐  │
+  T6  ──→ T23           │  │
+  T6  ──→ T25（面板）    │  │
+  T3  ──→ T27（埋点）    │  │
+  T7  ──┬─→ T24         │  │
+        └─→ T26（开关链）←┴──┘   ← 还依赖 T11、T21
+                    │
+  T11 ──┬───────────┴──→ T28（装配）──→ T29（驱动设施）
+  T22 ──┘
+                              全部 ──→ T30 ──→ T31
 ```
 
 **并行余地：** T10 / T11 / T21 三个任务彼此独立、也不依赖任何前置，可以最先做或插空做。
+T25（面板）与 T27（埋点）只依赖第一段，也可以提前做。
 
 **提交节奏：** 每个任务（或一组紧邻的相关任务）完成并验证通过后立刻提交一个 commit，不攒着。
