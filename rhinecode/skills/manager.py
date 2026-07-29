@@ -89,9 +89,14 @@ class SkillManager:
     """
     Skill 系统的编排者。
 
-    生命周期：`__main__` 在启动早期构造它 → `startup()` 扫盘并做第一段白名单校验
-    → MCP 连接完成后 `bind_tools()` 做第二段剪枝 → 交给 `ConversationManager` 持有，
-    此后每轮请求调 `index_text()` / `active_text()`；Skill 被触发时调 `grants_for_spec()`。
+    生命周期：`__main__` 在启动早期构造它 → `startup()` 扫盘并收集预授权警告
+    → MCP 连接完成后 `bind_tools()` 记一条工具集快照（**只为 trace，不改状态**）
+    → 交给 `ConversationManager` 持有，此后每轮请求调 `index_text()` /
+    `active_text()`；Skill 被触发时调 `grants_for_spec()`。
+
+    ⚠️ 这两步**都不再做白名单校验或剪枝**（对齐改造 F13：收窄能力已整体移除）。
+    此处曾写着「第一段白名单校验 / 第二段剪枝」，那是已废止实现的描述——
+    照它去读代码会找不到对应的东西。
     """
 
     def __init__(
@@ -654,17 +659,15 @@ class SkillManager:
             f"请确认它们可信。"
         )
 
-    def report(self, registered: frozenset[str] = frozenset()) -> str:
+    def report(self) -> str:
         """
         `/skills` 的完整只读报告。
 
-        :param registered: 注册中心当前工具名，供作者期体检判断「白名单是否等于全集」。
-                           **有缺省值**是为了不打断既有调用点（测试里大量直接调
-                           `report()`）；不传时那一条检查自动跳过，其余三条照常。
         :returns: 多行报告文本
 
         遵守「持锁取快照 → 出锁渲染」：`has_short_command` 是跨层回调，
-        必须在锁外调用（加锁约定 ②）。
+        必须在锁外调用（加锁约定 ②）。体检同理放在锁外——它虽是纯函数，
+        但把它塞进临界区只会让临界区无谓变长。
 
         体检结果**每次现算**（而不是像 warnings 那样存在 `_runtime_warnings` 里）：
         它是纯函数、成本极低，而存起来就要考虑何时失效——多一处状态就多一处
