@@ -383,8 +383,14 @@ class ReloadTest(ManagerTestBase):
 
         不是显示「无建议」——「渲染一个空段落」与「不渲染这个段落」在代码里
         只差一个判断，在界面上却是「多一段噪音」与「干净」的区别。
+
+        ⚠️ description 必须带**触发线索**（「用户说……时用」），否则会命中
+        R5 那条弱提示。默认的「说明」二字不含时机词——这条固件正是被 R5 逼着改的。
         """
-        _write(self.user_skills / "a.md", _skill_text("a", body="做事。\n$ARGUMENTS\n"))
+        _write(
+            self.user_skills / "a.md",
+            _skill_text("a", "做事。用户说「做事」时用", body="做事。\n$ARGUMENTS\n"),
+        )
         self.assertNotIn("建议（", self._manager().report())
 
     def test_report_shows_advice_with_both_finding_and_suggestion(self) -> None:
@@ -437,11 +443,12 @@ class ReloadTest(ManagerTestBase):
         而「reload 之后忘了更新」是这类缺陷最常见的形态。
         """
         path = self.user_skills / "a.md"
-        _write(path, _skill_text("a", body="没有占位符的正文\n"))
+        desc = "做事。用户说「做事」时用"   # 带触发线索，免得命中 R5 那条弱提示
+        _write(path, _skill_text("a", desc, body="没有占位符的正文\n"))
         m = self._manager()
         self.assertIn("占位符", m.report())
 
-        _write(path, _skill_text("a", body="修好了。\n$ARGUMENTS\n"))
+        _write(path, _skill_text("a", desc, body="修好了。\n$ARGUMENTS\n"))
         m.reload()
         self.assertNotIn("建议（", m.report())
 

@@ -97,7 +97,7 @@ class ActivationStatus(Enum):
 
 class AdviceKind(Enum):
     """
-    体检的七项检查各一个成员（作者期扩展 F2）。
+    体检的八项检查各一个成员（作者期扩展 F2 + R5）。
 
     ## 为什么要枚举，而不是只留一段建议文本
 
@@ -128,6 +128,8 @@ class AdviceKind(Enum):
     NEAR_INJECTION_LIMIT = "near_injection_limit"
     # 非内置层的 Skill 覆盖掉了同名内置样板
     OVERRIDES_BUILTIN = "overrides_builtin"
+    # description 只说了「做什么」，没有任何「什么时候用」的线索（**弱提示**）
+    DESCRIPTION_LACKS_TRIGGER = "description_lacks_trigger"
 
 
 # ────────────────────────────── 常量 ──────────────────────────────
@@ -220,6 +222,33 @@ NEAR_LIMIT_RATIO = 0.8
 # ⚠️ 成对维护点：新增一个**只读**工具类别 → `validation.py` 的 `_TOOL_ALIASES`
 # + 本集合。漏改的后果是「多报一条预授权过宽」（见上，是刻意选的偏严方向）。
 READ_ONLY_GRANT_TOOLS = frozenset({"Read"})
+
+# 「description 里有没有触发线索」的判据词表（作者期扩展 R5，**弱提示**）。
+#
+# ## 这条检查为什么值得做
+#
+# 第一阶段清单里模型只看得到命令名 + description（+ when_to_use）。一个只写
+# 「做什么」的说明（如「按项目约定生成提交信息并提交」）**不含任何「什么时候用」
+# 的信号**，模型据此想不到该加载它——用户说「帮我提交一下」，它就自己动手了。
+#
+# 这不是猜测：Anthropic 官方 skill-creator 的指导是描述要写得「有点 pushy」，
+# 因为「Claude 有**可测量的欠触发倾向**」。实测也复现过（用户报的前端 Skill 场景）。
+#
+# ## 为什么只能是**弱提示**
+#
+# 「有没有触发线索」没法精确判定——只能看有没有出现这类词。因此必然有误报：
+# 一个写得很好的英文 description 可能一个中文词都不含。所以：
+#
+# 1. **命中条件收窄**：只在「**未声明** `when_to_use`」时才查（声明了说明作者
+#    已经想过触发问题，不该再唠叨）；
+# 2. **建议措辞必须自称弱提示并明说可忽略**——一条不确定的建议如果语气跟确定的
+#    一样硬，用户就会开始不信全部建议。
+TRIGGER_HINT_WORDS = (
+    # 中文：直接的时机词与人称
+    "时", "当", "用户", "若", "如果", "需要", "想", "适用", "场景", "用于",
+    # 英文：标准写法里最常见的触发句式
+    "when", "whenever", "use this", "trigger", "asks", "wants", "requests",
+)
 
 
 def builtin_skills_dir() -> Path:

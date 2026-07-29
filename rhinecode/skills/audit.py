@@ -66,6 +66,7 @@ from rhinecode.skills.models import (
     NEAR_LIMIT_RATIO,
     PLACEHOLDER,
     READ_ONLY_GRANT_TOOLS,
+    TRIGGER_HINT_WORDS,
     AdviceKind,
     SkillAdvice,
     SkillSource,
@@ -124,6 +125,7 @@ def _audit_one(
     out: list[SkillAdvice] = []
     out.extend(_check_description_length(spec))
     out.extend(_check_missing_description(spec))
+    out.extend(_check_trigger_hint(spec))
     out.extend(_check_placeholder(spec))
     out.extend(_check_grants(spec))
     out.extend(_check_injection_size(spec))
@@ -201,7 +203,75 @@ def _check_missing_description(spec: SkillSpec) -> list[SkillAdvice]:
     ]
 
 
-# ─────────────────────── 检查 3：正文没有占位符 ───────────────────────
+# ────────────── 检查 3：description 缺触发线索（**弱提示**） ──────────────
+
+
+def _check_trigger_hint(spec: SkillSpec) -> list[SkillAdvice]:
+    """
+    `description` 只说了「做什么」、没有任何「什么时候用」的线索时给建议（R5）。
+
+    ## 为什么这条重要
+
+    第一阶段清单里模型只看得到命令名 + `description`（+ `when_to_use`）。
+    一个只写「做什么」的说明——比如「按项目约定生成提交信息并提交」——
+    **不含任何时机信号**，模型据此想不到该加载它，于是自己动手做完。
+
+    这不是推测。Anthropic 官方 skill-creator 的指导是描述要写得「有点 pushy」，
+    理由是「Claude 有**可测量的欠触发倾向**」；本项目也实测复现过
+    （用户有个前端设计 Skill，请求只说「帮我创建个前端页面」，一次都没触发）。
+
+    ## ⚠️ 这是**弱提示**，判定必然有误报，故三处收窄
+
+    「有没有触发线索」没法精确判定，只能看有没有出现那类词。所以：
+
+    1. **只在未声明 `when_to_use` 时才查**——作者写了那个字段，说明他已经
+       想过触发问题，不该再唠叨；
+    2. **作者根本没写 `description` 时也不查**（见下，这条是被测试逼出来的）；
+    3. **建议措辞自称弱提示并明说可忽略**。一条不确定的建议若语气跟确定的
+       一样硬，用户会开始不信**全部**建议——那比不给这条建议损失更大。
+
+    ## 第 2 条收窄的来历：它与 AC2b 直接冲突过
+
+    AC2b 要求「一份没有 frontmatter、只有正文的 Skill **不因此触发任何建议**」——
+    那种写法是对齐改造刻意支持的，而且早先正因为「几乎每个简易 Skill 都会命中」
+    才砍掉了一整条检查（原「说明字段是自动提取的」）。
+
+    本检查一上线就把那条冲突撞出来了：无 frontmatter 的 Skill 既没有
+    `when_to_use`、其自动回填的说明也几乎不含时机词，于是**必然命中**——
+    等于把刚砍掉的噪音换个名字放回来。
+
+    所以按 `description_explicit` 再收一层：**作者压根没写说明**时不报。
+    这样本检查只针对「作者认真写了 description、但写成了纯『做什么』式」——
+    那是真正会照建议改的人，也正是当初立这条检查的那个场景
+    （`commit` 原来的说明「按项目约定生成提交信息并提交」就是这个形态）。
+    """
+    if spec.when_to_use or not spec.description_explicit:
+        return []
+    text = spec.description.casefold()
+    if any(word in text for word in TRIGGER_HINT_WORDS):
+        return []
+    return [
+        SkillAdvice(
+            kind=AdviceKind.DESCRIPTION_LACKS_TRIGGER,
+            skill=spec.command_name,
+            finding=(
+                "description 只说了「做什么」，没有「什么时候该用它」的线索，"
+                "也没有声明 when_to_use"
+            ),
+            suggestion=(
+                "把用户**会真的说出口**的那几个词写进 description，"
+                "形如「跑测试。用户说「跑测试」「test」「测试挂了」时用」。"
+                "模型在清单里只看得到这一句，只写「做什么」它想不到该加载。"
+                "触发词优先放 description 而不是 when_to_use——后者不是开放标准字段，"
+                "别的 Agent 工具只读 description。"
+                "（**这是弱提示**：判据只是「有没有出现时机类词语」，"
+                "你若确认模型能正确判断，忽略本条即可。）"
+            ),
+        )
+    ]
+
+
+# ─────────────────────── 检查 4：正文没有占位符 ───────────────────────
 
 
 def _check_placeholder(spec: SkillSpec) -> list[SkillAdvice]:
@@ -231,7 +301,7 @@ def _check_placeholder(spec: SkillSpec) -> list[SkillAdvice]:
     ]
 
 
-# ──────────────── 检查 4 与 5：预授权（共用一次翻译） ────────────────
+# ──────────────── 检查 5 与 6：预授权（共用一次翻译） ────────────────
 
 
 def _is_pure_wildcard(pattern: str) -> bool:
@@ -298,7 +368,7 @@ def _is_broad(rule: Rule) -> bool:
 
 def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
     """
-    预授权的两项检查（F2-4 过宽、F2-5 全军覆没），**共用一次翻译**。
+    预授权的两项检查（过宽、全军覆没），**共用一次翻译**。
 
     两项都建立在「声明翻译成了什么规则」之上，各调一次 `grants_for`
     只会做两遍同样的解析。
@@ -309,7 +379,7 @@ def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
     rules, _warnings = grants_for([spec])
     out: list[SkillAdvice] = []
 
-    # ── 检查 5：一条都没翻译出来 ──
+    # ── 全军覆没：一条都没翻译出来 ──
     #
     # 单条认不出已经由 grants_for 产出警告了，这里报的是**整体误解**：
     # 一条都没生效，说明作者对这个字段的写法有根本性的误会，
@@ -332,7 +402,7 @@ def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
             )
         ]
 
-    # ── 检查 4：过宽 ──
+    # ── 过宽 ──
     for rule in rules:
         if not _is_broad(rule):
             continue
@@ -371,7 +441,7 @@ def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
     return out
 
 
-# ─────────────────── 检查 6：逼近/超过注入上限 ───────────────────
+# ─────────────────── 检查 7：逼近/超过注入上限 ───────────────────
 
 
 def _check_injection_size(spec: SkillSpec) -> list[SkillAdvice]:
@@ -425,7 +495,7 @@ def _check_injection_size(spec: SkillSpec) -> list[SkillAdvice]:
     ]
 
 
-# ─────────────────── 检查 7：覆盖了内置样板 ───────────────────
+# ─────────────────── 检查 8：覆盖了内置样板 ───────────────────
 
 
 def _check_overrides_builtin(

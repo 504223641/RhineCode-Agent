@@ -190,6 +190,95 @@ class MissingDescriptionTest(unittest.TestCase):
         )
 
 
+class TriggerHintTest(unittest.TestCase):
+    """
+    检查 3：`description` 缺触发线索（**弱提示**，R5）。
+
+    这条来自用户报的真实场景：他有个前端设计 Skill，请求只说
+    「帮我创建个前端页面」、没点名 Skill，`load_skill` 就很难触发。
+    根因之一是 description 只写了「做什么」，模型据此想不到该加载。
+
+    Anthropic 官方 skill-creator 的指导是描述要写得「有点 pushy」，
+    因为「Claude 有可测量的欠触发倾向」——所以这条值得报。
+    """
+
+    def test_pure_what_it_does_hits(self) -> None:
+        """只说「做什么」、且没声明 when_to_use → 命中。"""
+        advices = audit_skills([S(description="生成一个前端页面", when_to_use=None)])
+        self.assertEqual(kinds(advices), [AdviceKind.DESCRIPTION_LACKS_TRIGGER])
+
+    def test_trigger_words_in_description_does_not_hit(self) -> None:
+        """description 自带时机线索 → 不命中（这正是我们希望作者写的形态）。"""
+        self.assertEqual(
+            audit_skills(
+                [S(description="做前端页面。用户说「写个页面」「做个前端」时用", when_to_use=None)]
+            ),
+            (),
+        )
+
+    def test_declared_when_to_use_suppresses_it(self) -> None:
+        """
+        ⚠️ **命中条件刻意收窄**：声明了 `when_to_use` 就不报，
+        哪怕 description 本身一个线索词都没有。
+
+        作者写了那个字段说明他已经想过触发问题，再唠叨一句只是噪音——
+        而这条本身是启发式、有误报，噪音的代价比漏报更高。
+        """
+        self.assertEqual(
+            audit_skills([S(description="生成一个前端页面", when_to_use="用户要做页面时")]),
+            (),
+        )
+
+    def test_auto_extracted_description_does_not_hit(self) -> None:
+        """
+        ⚠️ **本条是设计冲突留下的疤，不要「顺手」放宽它。**
+
+        作者压根没写 description（由正文第一段回填）时**不报**。
+
+        本检查一上线就与 AC2b 撞了：无 frontmatter 的 Skill 既没有 when_to_use、
+        其自动回填的说明也几乎不含时机词，于是**必然命中**——等于把早先因为
+        「几乎每个简易 Skill 都会中」而砍掉的那条检查换个名字放回来。
+
+        收窄之后本检查只针对「作者认真写了 description 却写成纯『做什么』式」，
+        那才是会照建议改的人。
+        """
+        self.assertEqual(
+            audit_skills(
+                [S(description="这是正文第一段", when_to_use=None, description_explicit=False)]
+            ),
+            (),
+        )
+
+    def test_english_trigger_phrasing_does_not_hit(self) -> None:
+        """外部 Skill 常见的英文写法也要认，否则一导入就一堆误报。"""
+        self.assertEqual(
+            audit_skills(
+                [S(description="Build a frontend page. Use when the user asks for a page.",
+                   when_to_use=None)]
+            ),
+            (),
+        )
+
+    def test_advice_declares_itself_weak(self) -> None:
+        """
+        ⚠️ 措辞必须**自称弱提示并明说可忽略**。
+
+        一条不确定的建议若语气跟确定的一样硬，用户会开始不信**全部**建议——
+        那比不给这条建议损失更大。
+        """
+        advice = audit_skills([S(description="生成一个前端页面", when_to_use=None)])[0]
+        self.assertIn("弱提示", advice.suggestion)
+        self.assertIn("忽略本条", advice.suggestion)
+
+    def test_advice_says_put_triggers_in_description(self) -> None:
+        """
+        建议要说清「触发词放 description 而不是只放 when_to_use」——
+        后者不是开放标准字段，别的 Agent 工具只读 description。
+        """
+        advice = audit_skills([S(description="生成一个前端页面", when_to_use=None)])[0]
+        self.assertIn("只读 description", advice.suggestion)
+
+
 class PlaceholderTest(unittest.TestCase):
     """检查 3：正文不含参数占位符。"""
 
