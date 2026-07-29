@@ -1,4 +1,4 @@
-# 2 · 网络搜索工具（web_search）
+# 1 · 网络搜索工具（web_search）
 
 > 状态：待开工 · **建议走完整 `/spec`** · 预计 1–2 天
 >
@@ -146,7 +146,7 @@ web_search("公司内部 xxx 系统 数据库连接超时 排查")
 （spec → plan → task → checklist），四份文档写完之后统一找一个子 agent 审查，
 过了再开工。
 
-背景与边界见 docs/todo/2-web-search.md。核心要点：
+背景与边界见 docs/todo/1-web-search.md。核心要点：
 
 这次**比 web_fetch 简单**——②′网络边界层、不可信标注、包结构、测试形态
 全部现成，照抄即可。但难点跟它完全不是同一处：
@@ -173,5 +173,5 @@ web_search 发的是**用户的问题本身**，发给第三方搜索服务商�
 
 验收沿用 web_fetch 那次的形态：离线替身 + **真实模型每个端到端场景至少 3 轮**。
 
-做完这条后把 docs/todo/2-web-search.md 删掉，并重排 docs/todo/ 下其余文档的序号。
+做完这条后把 docs/todo/1-web-search.md 删掉，并重排 docs/todo/ 下其余文档的序号。
 ```
