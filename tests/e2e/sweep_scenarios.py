@@ -19,9 +19,56 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 from tests.e2e import seeding
+
+
+# ---------------------------------------------------------------------------
+# 通用：把上一台宿主的工作区/用户目录「还原」进这一台
+# ---------------------------------------------------------------------------
+# **为什么需要它**：宿主每次启动都建**全新**的临时工作区与临时用户目录，
+# 所以凡是判据形如「重启之后 X 仍然生效」的场景（C9 的中断恢复、越用越懂你、
+# 隔天回来；C6 的永久放行重启后仍免确认）在 P1a 下**本来一条都验不了**——
+# 新宿主看到的是一个空目录，上一台留下的会话存档、笔记、本地规则全都不在。
+#
+# 这个函数把「重启」翻译成设施能做的事：先把上一台的目录树复制到一个暂存区，
+# 再让新宿主在装配**之前**把它还原回去。对产品而言，这与「同一个项目目录被
+# 第二次打开」完全等价——它读到的就是上次留下的文件。
+#
+# 暂存区路径经环境变量传入而不是写死：`--seed` 只接受 `(workspace, user_dir)`
+# 两个参数，没有别的通道可以把路径带进来。
+ENV_RESTORE_WORKSPACE = "RHINE_SWEEP_RESTORE_WS"
+ENV_RESTORE_USER_DIR = "RHINE_SWEEP_RESTORE_USER"
+
+
+def _restore_tree(src: str, dst: str) -> None:
+    """把 `src` 目录树的内容合并进已存在的 `dst`（同名覆盖）。src 不存在则静默跳过。"""
+    source = Path(src)
+    if not source.is_dir():
+        return
+    shutil.copytree(source, Path(dst), dirs_exist_ok=True)
+
+
+def seed_restore(workspace: str, user_dir: str) -> None:
+    """
+    从暂存区还原上一台宿主的工作区与用户目录，模拟「重启后重新打开同一个项目」。
+
+    暂存区路径来自环境变量 `RHINE_SWEEP_RESTORE_WS` / `RHINE_SWEEP_RESTORE_USER`，
+    未设置的那一侧不还原。
+
+    :param workspace: 本次宿主的临时工作区（项目根）
+    :param user_dir: 本次宿主的临时用户目录
+    副作用：向这两个目录复制文件（同名覆盖）。
+    """
+    ws_src = os.environ.get(ENV_RESTORE_WORKSPACE, "")
+    ud_src = os.environ.get(ENV_RESTORE_USER_DIR, "")
+    if ws_src:
+        _restore_tree(ws_src, workspace)
+    if ud_src:
+        _restore_tree(ud_src, user_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +131,40 @@ def seed_perm_rules(workspace: str, user_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# C7 MCP 客户端：场景 1（真实 stdio Server 接入）与场景 3（单 Server 失败隔离）
+# ---------------------------------------------------------------------------
+# 两条场景共用一份 mcp.yaml，因为场景 3 的判据正是「**在有一个正常 Server 的同时**
+# 另一个失败，前者不受影响」——分开预置就验不出隔离性。
+#
+# ⚠️ `command: npx` 在 Windows 上能用，靠的是产品侧 `mcp/transport.py:resolve_stdio_command`
+#    会兜底找 `npx.cmd`。这里刻意**不**写成 `npx.cmd`：写死了就绕过了那段逻辑，
+#    等于把一条真实的 Windows 兼容性判据从测试里摘掉了。
+_MCP_YAML = """mcpServers:
+  everything:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything"]
+  brokenserver:
+    command: this-command-does-not-exist-9d41f7
+    args: []
+"""
+
+
+def seed_mcp_servers(workspace: str, user_dir: str) -> None:
+    """
+    C7 场景 1 / 3 的预置：项目级 `mcp.yaml`，一个正常 Server + 一个必然失败的 Server。
+
+    正常的那个用官方 `@modelcontextprotocol/server-everything`（需要本机有 node/npx，
+    且该包已可获取）。失败的那个用一个确定不存在的可执行文件名，
+    这样「失败原因」是确定的（找不到命令），不会因环境差异飘。
+
+    :param workspace: 宿主的临时工作区（项目根）
+    :param user_dir: 宿主的临时用户目录（本函数不用）
+    副作用：写 `<workspace>/.rhinecode/mcp.yaml`。启动后会真的拉起一个 npx 子进程。
+    """
+    seeding.seed_files(workspace, {".rhinecode/mcp.yaml": _MCP_YAML})
+
+
+# ---------------------------------------------------------------------------
 # C9 记忆系统：场景 1（冷启动记忆注入，含 @include 展开）
 # ---------------------------------------------------------------------------
 # RHINE.md 里放一条**可观测且模型不会自发遵守**的指令，这样「注入有没有生效」
@@ -92,7 +173,7 @@ _RHINE_MD = """# 项目指令
 
 这是 Nebula 演示项目。
 
-@include docs/style.md
+具体的代码风格约定见 @docs/style.md
 
 ## 硬性要求
 
