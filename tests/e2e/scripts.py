@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.e2e import seeding
-from tests.e2e.scripted import done, stream_error, text, thinking, tool
+from tests.e2e.scripted import done, stream_error, text, thinking, tool, tool_pending
 
 
 # 一轮就结束：最简单的冒烟剧本
@@ -26,6 +26,19 @@ SAY_HELLO = [
 # 会触发一次工具确认面板（write_file 非只读，默认模式下无规则命中 → 问用户）
 CONFIRM_THEN_DONE = [
     [text("我来写个文件。"), tool("write_file", {"path": "x.txt", "content": "hi"}), done()],
+    [text("写完了。"), done()],
+]
+
+# 带「参数生成中」播报的写文件：真实 Provider 在拿到工具名的第一时间就播报，
+# 界面据此先挂一行状态，等确认通过后**同一行**转成执行态。
+# 用来复现「模型在生成一份长文件内容时界面完全静止」那个缺口的修复效果。
+PENDING_THEN_WRITE = [
+    [
+        text("我来写个文件。"),
+        tool_pending("write_file", "e2e_pending_1"),
+        tool("write_file", {"path": "x.txt", "content": "hi"}, call_id="e2e_pending_1"),
+        done(),
+    ],
     [text("写完了。"), done()],
 ]
 

@@ -717,8 +717,13 @@ class RhineApp(App):
         渲染策略：
         - PROGRESS：进入新一轮——重置正文/思考占位组件，使新一轮文本另起新块；第 2 轮起追加一行提示
         - THINKING / TEXT：增量更新对应占位组件（思考灰色斜体、正文 Markdown）
-        - TOOL_START：新建橘色工具行并计时；同时重置正文/思考占位（工具后的文本另起块）
-        - TOOL_RESULT：工具行定色（绿/红）+ 摘要
+        - TOOL_PENDING：模型刚开始生成该调用的参数（可能持续几十秒）——立刻建一行
+          橘色「参数生成中… Ns」，这是那段时间里界面上唯一的活体信号
+        - TOOL_START：进入执行态。若 TOOL_PENDING 已建过行则**原地复用**（补参数摘要、
+          重新起算耗时），否则新建；同时重置正文/思考占位（工具后的文本另起块）
+        - TOOL_RESULT：工具行定色（绿/红）+ 摘要；同时把它从待定表里摘掉
+        - 收尾：待定表里剩下的（取消/流出错导致没等到结果）统一标记为「未执行」，
+          不留永远转圈的橘色行
         - FINISHED：按结束原因追加系统行（自然完成不打扰）
         - ERROR：红色错误行
         - HISTORY：会话恢复成功（c9）——清空聊天区并整体回放携带的历史快照
@@ -807,20 +812,45 @@ class RhineApp(App):
                         ''.join(response_chunks),
                     )
 
-                elif etype == AgentEventType.TOOL_START:
-                    # 工具开始：重置文本占位（工具后的文本另起块），新建橘色工具行
+                elif etype == AgentEventType.TOOL_PENDING:
+                    # 模型刚开始吐这个调用，参数还在流里（可能要几十秒）。
+                    # 先建一行「参数生成中… Ns」，让界面立刻有活体信号；这一行随后
+                    # 由 TOOL_START 原地转成执行态，**不会**再多建一行。
                     reset_text_widgets()
                     tc = event.tool_call
-                    widget = self.call_from_thread(history_view.add_tool_widget, tc)
-                    tool_widgets[tc.id] = widget
+                    if tc.id not in tool_widgets:
+                        tool_widgets[tc.id] = self.call_from_thread(
+                            history_view.add_tool_widget, tc, True
+                        )
+
+                elif etype == AgentEventType.TOOL_START:
+                    # 工具开始：重置文本占位（工具后的文本另起块）。
+                    # 若 TOOL_PENDING 已经建过行，复用它并补上参数摘要；否则新建
+                    # （非 DeepSeek Provider、脚本化 Provider 都不产 TOOL_PENDING）。
+                    reset_text_widgets()
+                    tc = event.tool_call
+                    widget = tool_widgets.get(tc.id)
+                    if widget is None:
+                        tool_widgets[tc.id] = self.call_from_thread(
+                            history_view.add_tool_widget, tc
+                        )
+                    else:
+                        self.call_from_thread(widget.begin_running, tc)
 
                 elif etype == AgentEventType.TOOL_RESULT:
                     tc = event.tool_call
                     res = event.tool_result
-                    widget = tool_widgets.get(tc.id)
+                    # pop 而不是 get：留在字典里的都是「还没定色」的行，
+                    # finally 里据此把它们收尾（见下方 _settle_unfinished_tools）。
+                    widget = tool_widgets.pop(tc.id, None)
                     if widget is None:
                         widget = self.call_from_thread(history_view.add_tool_widget, tc)
-                        tool_widgets[tc.id] = widget
+                    elif widget.pending:
+                        # 有结果却从没进过执行态：权限拒绝 / 用户拒绝 / 规划阶段拦下
+                        # 这些路径**只产 TOOL_RESULT、不产 TOOL_START**。此时参数已经
+                        # 完整（就在 event.tool_call 里），补上再定色——否则标题只剩
+                        # 工具名，用户看不出被拒的到底是哪一次写入。
+                        self.call_from_thread(widget.begin_running, tc)
                     # 改文件类工具会在 res.diff 带上结构化差异，传给工具行渲染彩色 diff 块
                     self.call_from_thread(
                         widget.finish, res.ok, self._summarize_result(res), getattr(res, "diff", None)
@@ -887,9 +917,42 @@ class RhineApp(App):
             # 本调用只做内存写与一次 `emit`，不碰界面，故在 finally 里是安全的。
             reset_text_widgets()
             self.call_from_thread(self._set_streaming, False)
+            # **没等到结果的工具行必须在这里收尾**，否则留在界面上一直橘着、
+            # 计时器每秒还在跳，看起来程序卡在某个工具上了。
+            #
+            # 什么时候会有这种行：`TOOL_PENDING` 一旦播报就建了行，而它之后的
+            # `TOOL_RESULT` 并不保证到达——用户按 Esc 取消、底层流出错、或本轮
+            # 因取消而 break 掉剩下的调用，这几条路径都会让后面的调用一个事件都不再产。
+            #
+            # 放在 `_set_streaming(False)` **之后**：那是必须生效的状态复位
+            # （否则输入框一直处于忙碌态），而本清理只是视觉收尾，退出竞态下
+            # `call_from_thread` 抛异常时宁可丢清理也不能丢复位。
+            self._settle_unfinished_tools(tool_widgets)
             # 工具调用可能在本轮流式执行中通过 mcp_add_server 改变 MCP 连接状态；
             # 收尾时刷新状态栏，让新工具数量或失败信息立即反映到界面上。
             self.call_from_thread(self._refresh_status)
+
+    def _settle_unfinished_tools(self, tool_widgets: dict) -> None:
+        """
+        把本轮结束时仍未定色的工具行统一收尾为灰白的「未执行」。
+
+        `tool_widgets` 里只会剩「建了行但没等到 TOOL_RESULT」的调用——正常拿到结果的
+        在 TOOL_RESULT 分支就被 pop 掉了。因此这里的每一项都对应一次**真的没有跑**
+        的调用（取消 / 流出错 / 本轮提前 break）。
+
+        :param tool_widgets: 调用 id → ToolCallWidget，处理后被清空
+
+        副作用：更新界面组件、清空传入的字典。异常一律吞掉——本方法在 `finally` 里
+        被调用，而它只是视觉收尾，不能反过来把一次正常结束变成异常退出。
+        """
+        for widget in list(tool_widgets.values()):
+            try:
+                self.call_from_thread(widget.finish, False, "未执行（本轮已结束）")
+            except Exception:
+                # 应用退出竞态下 call_from_thread 会抛 RuntimeError；此时界面正在
+                # 拆除，收不收尾都无意义，继续处理剩下的即可。
+                pass
+        tool_widgets.clear()
 
     @staticmethod
     def _finish_line(stop_reason, message: str) -> str:

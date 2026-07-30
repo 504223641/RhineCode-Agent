@@ -303,16 +303,22 @@ _TOOL_LABELS = {
 
 class ToolCallWidget(Static):
     """
-    单个工具调用的展示行，自管理执行计时。
+    单个工具调用的展示行，自管理计时。
 
     标题统一用展示标签（_TOOL_LABELS，如 Read/Grep/Update）而非内部工具名（snake_case）。
 
-    三种视觉状态：
+    四种视觉状态：
+    - 参数生成中：橘色，"● 标签 参数生成中… Ns"（pending=True 时的初始态，见下）
     - 执行中：橘色，显示 "● 标签(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
     - 成功：绿色 "● 标签(参数摘要) 完成 (Ns)" + 下方 "⎿ 结果摘要"
     - 失败：红色 "● 标签(参数摘要) 失败 (Ns)" + 下方 "⎿ 错误摘要"
 
-    计时不依赖 Worker 线程：on_mount 中用 set_interval 在主线程每秒触发 _tick，
+    **为什么需要「参数生成中」这一态**：写文件类调用的参数里塞着整份文件内容，
+    模型生成这段 JSON 可能要几十秒，而真正的写盘往往只花几毫秒。若只有「执行中」态，
+    那一行会在肉眼看不见的时间里闪过（实测 tool_start 到 tool_result 相隔 2 毫秒），
+    用户看到的是一个几十秒完全静止的窗口，然后确认面板突然弹出来。
+
+    计时不依赖 Worker 线程：on_mount 中用 set_interval 在主线程每秒触发重绘，
     因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
     """
 
@@ -322,11 +328,15 @@ class ToolCallWidget(Static):
     _COLOR_FAIL = "#FF5F5F"
     _COLOR_BRANCH = "#808080"
 
-    def __init__(self, tool_call) -> None:
+    def __init__(self, tool_call, pending: bool = False) -> None:
         """
         :param tool_call: provider.base.ToolCall，提供工具名与参数用于展示
+        :param pending: True 表示「模型还在生成调用参数」，此时 tool_call.arguments
+                        通常为 None，本行先只显示工具名；等 TOOL_START 到达时由
+                        begin_running() 补上参数摘要并转入执行态
         """
         super().__init__(markup=True)
+        self._pending = pending
         self._name = tool_call.name
         # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
         self._label = escape(_TOOL_LABELS.get(self._name, self._name))
@@ -341,12 +351,47 @@ class ToolCallWidget(Static):
         # 每秒刷新一次耗时显示；定时器运行在主线程事件循环，不占用 Worker
         self._timer = self.set_interval(1.0, self._render_running)
 
+    @property
+    def pending(self) -> bool:
+        """
+        本行是否仍停在「参数生成中」阶段（即从未进入执行）。
+
+        供 TUI 的 Worker 判断该不该先补参数摘要再定色。只读一个 bool、不碰 Textual
+        任何 API，因此可以在 Worker 线程里直接读，无需 call_from_thread。
+        """
+        return self._pending
+
+    def begin_running(self, tool_call) -> None:
+        """
+        从「参数生成中」转入「执行中」：补上完整参数摘要并**重新起算耗时**。
+
+        由 TUI 的 Worker 在收到 TOOL_START 时通过 call_from_thread 调用（线程安全）。
+        对本来就是执行态的行调用它同样安全（幂等地刷新一次参数摘要）。
+
+        **为什么重置 self._start**：pending 阶段的计时覆盖「模型生成参数」，而这一行
+        最终定色时显示的 "(Ns)" 语义是**工具执行耗时**——沿用旧起点会把生成时间、
+        乃至用户盯着确认面板发呆的时间都算进去，一次 2 毫秒的写盘可能显示成 "(600s)"。
+        生成阶段花了多久用户刚才已经在屏幕上看着它涨了，不必再累计一遍。
+
+        :param tool_call: 参数已完整的同一次调用（id 与本行一致）
+        """
+        self._pending = False
+        self._args_summary = summarize_args(tool_call.arguments)
+        self._start = monotonic()
+        self._render_running()
+
     def _elapsed(self) -> int:
-        """返回从开始执行到现在的整数秒数。"""
+        """返回从当前阶段起算到现在的整数秒数。"""
         return int(monotonic() - self._start)
 
     def _render_running(self) -> None:
-        """以橘色渲染执行中状态，显示当前已耗时。"""
+        """以橘色渲染进行中状态（按阶段选文案），显示当前已耗时。"""
+        if self._pending:
+            # 参数还没到，写不出参数摘要，故不带括号——写成 "Write()" 像是无参调用。
+            self.update(
+                f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中… {self._elapsed()}s[/]"
+            )
+            return
         self.update(
             f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
         )
@@ -377,7 +422,10 @@ class ToolCallWidget(Static):
             self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
         else:
             # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
-            header = f"[{color}]● {self._label}({self._args_summary}) {result} ({elapsed}s)[/]"
+            # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
+            # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
+            title = self._label if self._pending else f"{self._label}({self._args_summary})"
+            header = f"[{color}]● {title} {result} ({elapsed}s)[/]"
             branch = RichText("  ⎿  ", style=self._COLOR_BRANCH)
             branch.append(summary, style=self._COLOR_BRANCH)
             self.update(RichGroup(RichText.from_markup(header), branch))
@@ -472,18 +520,20 @@ class HistoryView(ScrollableContainer):
         widget.update(RichGroup(label, body))
         self.scroll_end(animate=False)
 
-    def add_tool_widget(self, tool_call) -> "ToolCallWidget":
+    def add_tool_widget(self, tool_call, pending: bool = False) -> "ToolCallWidget":
         """
         在历史区末尾挂载一个工具调用展示行（ToolCallWidget），返回其引用。
 
-        Worker 线程在收到 tool_start 时通过 call_from_thread 调用本方法创建工具行
-        （此时即开始橘色计时）；收到 tool_result 时再对返回的引用调用 finish() 定色。
+        Worker 线程在收到 tool_pending 时先以 pending=True 建行（此时只有工具名），
+        收到 tool_start 时对返回的引用调用 begin_running() 补参数并转执行态，
+        收到 tool_result 时再调用 finish() 定色。两阶段共用同一行，不新建第二行。
 
         :param tool_call: provider.base.ToolCall，用于初始化展示内容
-        :returns: 新建的 ToolCallWidget，供后续 finish() 更新
+        :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
+        :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
         """
         container = self.query_one("#history-messages", Vertical)
-        widget = ToolCallWidget(tool_call)
+        widget = ToolCallWidget(tool_call, pending=pending)
         container.mount(widget)
         self.scroll_end(animate=False)
         return widget

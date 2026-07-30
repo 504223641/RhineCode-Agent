@@ -47,7 +47,9 @@ class StreamCollector:
         映射规则：
         - "text"：累积进 self.text，返回 AgentEvent(TEXT)（供逐字渲染）
         - "thinking"：不累积进 text（思考与正文分离），返回 AgentEvent(THINKING)
-        - "tool_call"：累积进 self.tool_calls，不产生展示事件（工具在执行时才以 TOOL_START 呈现），返回 None
+        - "tool_call"：累积进 self.tool_calls，不产生展示事件（完整调用的呈现由 TOOL_START 负责），返回 None
+        - "tool_pending"：**不累积**，只返回 AgentEvent(TOOL_PENDING) 让界面立刻显示
+          「这一步开始了」。它是纯展示锚点，参数生成期（可能几十秒）唯一的活体信号
         - "usage"：把原生 usage 转成 Usage 存入 self.usage，返回 AgentEvent(USAGE)
         - 其他（done / error）：交由循环处理，返回 None
 
@@ -67,6 +69,14 @@ class StreamCollector:
             if chunk.tool_call is not None:
                 self.tool_calls.append(chunk.tool_call)
             return None
+
+        if chunk.type == "tool_pending":
+            # **绝不累积进 self.tool_calls**：这只是「模型开始吐这个调用」的播报，
+            # arguments 恒为 None、参数还在流里。累积进去会让循环把它当成一次真实
+            # 调用去执行，同一个调用因此执行两遍（第二遍参数为 None → 结构化错误）。
+            if chunk.tool_call is None:
+                return None
+            return AgentEvent(type=AgentEventType.TOOL_PENDING, tool_call=chunk.tool_call)
 
         if chunk.type == "usage":
             self.usage = self._to_usage(chunk.usage)
