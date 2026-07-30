@@ -201,6 +201,277 @@ def seed_memory_project(workspace: str, user_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# C11 对齐改造：七条端到端场景共用的一批 Skill
+# ---------------------------------------------------------------------------
+# 全部预置成**项目级**（`<workspace>/.rhinecode/skills/`）。一次装好，
+# 一台宿主就能覆盖七条场景中的绝大部分——每起一次宿主要等 npx / 装配，
+# 分七次装七个 Skill 是纯粹的浪费。
+#
+# ⚠️ 命令名来自**路径**（目录名或文件名），不是 frontmatter 的 `name`。
+#    下面 `external-audit` 那个刻意让两者不一致，用来验这条。
+
+
+def _skill_dir(workspace: str, name: str) -> Path:
+    d = Path(workspace) / ".rhinecode" / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def seed_align_skills(workspace: str, user_dir: str) -> None:
+    """
+    C11 对齐改造七条端到端场景的预置：七个项目级 Skill + 一个可供审查的小项目。
+
+    逐个说明它们各自要验什么：
+
+    - `external-audit/`（目录型，Claude Code 原样格式）：场景 1。frontmatter 的
+      `name: Repository Audit Helper` 与目录名**刻意不同**，用来验「命令名来自路径、
+      显示名来自 frontmatter」。带随附资源 `checklist.md`，验目录型能力包。
+    - `changelog.md`（单文件）：场景 2。声明 `allowed-tools: Write` 预授权写操作，
+      SOP 要求它**先写一个文件（已授权）、再删一个文件（未授权）**，
+      于是同一次执行里能同时看到「免确认」与「照常弹面板」。
+    - `dangerous.md`：场景 3。声明 `allowed-tools: Bash` （放行全部命令），
+      SOP 直接要求跑一条递归删除，验预授权翻不过第①层黑名单。
+    - `deepreview.md`：场景 4。`context: fork`，描述写得足够具体，
+      让模型能在不点名的情况下自行匹配并发起。
+    - `manualonly.md`：场景 5 前半。`disable-model-invocation: true`。
+    - `modelonly.md`：场景 5 后半。`user-invocable: false`。
+    - `legacyfmt.md`：场景 6。用 C11 时代的 `allowed_tools`（下划线、收窄语义）。
+    - `nocap.md`：场景 7。同时声明六个无对应能力的字段。
+
+    :param workspace: 宿主的临时工作区（项目根）
+    :param user_dir: 宿主的临时用户目录（本函数不用）
+    副作用：写 `.rhinecode/skills/` 下八个 Skill 与若干被审查的样例文件。
+    """
+    # 场景 1：外部 Claude Code 格式的目录型 Skill，原样搬入不做任何修改
+    d = _skill_dir(workspace, "external-audit")
+    (d / "SKILL.md").write_text(
+        "---\n"
+        "name: Repository Audit Helper\n"
+        "description: Audit a repository for missing docs and risky files\n"
+        "when-to-use: Use when the user asks to audit, review repo hygiene, "
+        "or check what documentation is missing\n"
+        "allowed-tools: Read\n"
+        "---\n"
+        "\n"
+        "# Repository Audit\n"
+        "\n"
+        "严格按以下步骤执行，每一步都要在回复里写出步骤编号：\n"
+        "\n"
+        "1. 读取随附资源 `checklist.md`，它列出了本次审计的检查项。\n"
+        "2. 用 `glob_files` 列出项目根的全部文件。\n"
+        "3. 逐条对照 checklist 检查，**每条都要给出「通过 / 不通过」与依据**。\n"
+        "4. 最后输出一段「审计结论」，以 `AUDIT-DONE` 五个字符结尾。\n",
+        encoding="utf-8",
+    )
+    (d / "checklist.md").write_text(
+        "# 审计检查项\n\n"
+        "- A1：项目根是否有 README.md\n"
+        "- A2：项目根是否有 LICENSE\n"
+        "- A3：是否存在名为 secrets.txt 的敏感文件\n",
+        encoding="utf-8",
+    )
+
+    skills_root = Path(workspace) / ".rhinecode" / "skills"
+
+    # 场景 2：预授权的边界——声明的写操作免确认，未声明的操作照常弹面板
+    (skills_root / "changelog.md").write_text(
+        "---\n"
+        "description: 追加一条变更记录到 CHANGELOG.md\n"
+        "when-to-use: 用户说「记一条变更」「写 changelog」时用\n"
+        "allowed-tools: Write\n"
+        "---\n"
+        "\n"
+        "按顺序做两件事，不要跳过第 2 步：\n"
+        "\n"
+        "1. 用 `write_file` 把一行变更记录写进 `CHANGELOG.md`，内容是：`- $ARGUMENTS`。\n"
+        "2. 然后用 `run_command` 执行 `git status --short`，把输出贴给用户。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 3：预授权翻不过第①层黑名单
+    (skills_root / "dangerous.md").write_text(
+        "---\n"
+        "description: 清理构建产物目录\n"
+        "when-to-use: 用户说「清理构建产物」时用\n"
+        "allowed-tools: Bash\n"
+        "---\n"
+        "\n"
+        "用 `run_command` 执行 `rm -rf build` 清掉构建产物目录，然后报告结果。\n"
+        "这是本 Skill 唯一的动作，不要用别的方式代替。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 4：模型可自行发起的 fork Skill
+    (skills_root / "deepreview.md").write_text(
+        "---\n"
+        "description: 深度审查代码质量并只回流一段结论\n"
+        "when-to-use: 用户说「审查代码质量」「看看这段代码写得怎么样」"
+        "「帮我 review 一下代码」时用\n"
+        "context: fork\n"
+        "allowed-tools: Read\n"
+        "---\n"
+        "\n"
+        "读取项目里的 Python 源文件，从命名、错误处理、可读性三个角度各给一条评价，\n"
+        "最后用**不超过 5 行**输出结论，并以 `REVIEW-DONE` 五个字符结尾。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 5 前半：模型不能自行发起，只能建议用户手动触发
+    (skills_root / "manualonly.md").write_text(
+        "---\n"
+        "description: 发布新版本到生产环境\n"
+        "when-to-use: 用户说「发布」「上线」「deploy」时用\n"
+        "disable-model-invocation: true\n"
+        "---\n"
+        "\n"
+        "输出一句「发布流程已启动（演示）」即可，不要真的执行任何命令。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 5 后半：不注册短命令、不进补全，但模型可以自行发起
+    (skills_root / "modelonly.md").write_text(
+        "---\n"
+        "description: 统计项目里各类文件的数量\n"
+        "when-to-use: 用户问「项目里有多少个文件」「各类型文件各几个」时用\n"
+        "user-invocable: false\n"
+        "allowed-tools: Read\n"
+        "---\n"
+        "\n"
+        "用 `glob_files` 统计各扩展名的文件数量，输出一张小表，以 `COUNT-DONE` 结尾。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 6：C11 时代的旧格式（下划线键名 + 收窄语义）
+    (skills_root / "legacyfmt.md").write_text(
+        "---\n"
+        "description: 用旧格式写的 Skill，验迁移提示\n"
+        "when_to_use: 用户说「跑旧格式测试」时用\n"
+        "allowed_tools: Read\n"
+        "---\n"
+        "\n"
+        "先用 `glob_files` 列出项目根文件（这是**写在白名单之外**的工具），\n"
+        "再读其中任意一个文件，最后报告你实际调用了哪些工具，以 `LEGACY-DONE` 结尾。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 7：六个无对应能力的字段同时出现
+    (skills_root / "nocap.md").write_text(
+        "---\n"
+        "description: 同时声明六个本版本不支持的字段\n"
+        "when-to-use: 用户说「跑无能力字段测试」时用\n"
+        "background: true\n"
+        "agent: general-purpose\n"
+        "effort: high\n"
+        "hooks: on-save\n"
+        "paths: src/**\n"
+        "shell: /bin/zsh\n"
+        "---\n"
+        "\n"
+        "输出一句「无能力字段样本执行完毕」，以 `NOCAP-DONE` 结尾。\n",
+        encoding="utf-8",
+    )
+
+    # 供审查用的小项目（场景 1 / 4 要有东西可读）
+    seeding.seed_files(
+        workspace,
+        {
+            "README.md": "# Demo\n\n一个用于 Skill 复测的小项目。\n",
+            "app.py": _APP_PY,
+            "util.py": "def f(x):\n    return x*2\n",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Skill 作者期扩展：体检建议、覆盖提示、外部适配、不点名触发
+# ---------------------------------------------------------------------------
+def seed_authoring(workspace: str, user_dir: str) -> None:
+    """
+    Skill 作者期扩展端到端场景的预置。
+
+    四份 Skill 各自承担一条场景：
+
+    - `sloppy.md`：场景 1 / 5。**三处刻意写坏**——说明字段 200 余字符、
+      预授权裸写命令类 `Bash`、正文不含 `$ARGUMENTS`。用来验体检是否给出
+      **可操作**的三条建议，以及 `skill-creator` 能否照着建议改。
+    - `commit.md`：场景 2 前半。命名与内置样板撞名，验覆盖提示的措辞。
+    - `foreign.md`：场景 6。外部风格——下划线写法的预授权字段 + 一个本系统
+      不支持的标准字段（`background`）+ 一个本系统认不出的工具名（`TodoWrite`）。
+    - `frontend.md`：场景 8（R 系列核心）。说明字段里**带触发词**，
+      用来验「用户不点名 Skill，模型能否自行加载」。
+
+    :param workspace: 宿主的临时工作区（项目根）
+    :param user_dir: 宿主的临时用户目录（本函数不用）
+    副作用：写 `.rhinecode/skills/` 下四个 Skill 与一个小项目。
+    """
+    root = Path(workspace) / ".rhinecode" / "skills"
+    root.mkdir(parents=True, exist_ok=True)
+
+    # 场景 1 / 5：三处都写坏
+    root.joinpath("sloppy.md").write_text(
+        "---\n"
+        "description: 这个 Skill 用来处理项目中各种各样的日常维护任务，"
+        "包括但不限于清理临时文件、整理目录结构、检查依赖版本、更新文档、"
+        "同步配置、归档旧日志、以及其它一些零碎的杂活，总之就是维护相关的事情都可以用它\n"
+        "allowed-tools: Bash\n"
+        "---\n"
+        "\n"
+        "按顺序执行维护任务：先看看项目里有什么，再报告发现。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 2 前半：与内置样板 commit 撞名
+    root.joinpath("commit.md").write_text(
+        "---\n"
+        "description: 本项目定制的提交流程\n"
+        "when-to-use: 用户说「提交」时用\n"
+        "---\n"
+        "\n"
+        "用 `run_command` 跑 `git status`，然后把结果念给用户听，以 `CUSTOM-COMMIT` 结尾。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 6：外部风格，三处差异
+    root.joinpath("foreign.md").write_text(
+        "---\n"
+        "description: 整理待办事项清单\n"
+        "when_to_use: 用户说「整理待办」时用\n"
+        "allowed_tools: Read, TodoWrite\n"
+        "background: true\n"
+        "---\n"
+        "\n"
+        "读取项目里的 TODO 标记，整理成一张清单。\n",
+        encoding="utf-8",
+    )
+
+    # 场景 8：说明字段带触发词，验「不点名也能被模型自行加载」
+    root.joinpath("frontend.md").write_text(
+        "---\n"
+        "description: 做前端页面。用户说「写个页面」「做个前端」「创建前端页面」时用\n"
+        "when-to-use: 需要新建 HTML/CSS 页面时用；也适用于「帮我做个落地页」这类请求\n"
+        "allowed-tools: Read\n"
+        "---\n"
+        "\n"
+        "本项目的前端页面必须遵守以下约定，**不要按你自己的默认做法做**：\n"
+        "\n"
+        "1. 页面文件一律放在 `web/` 目录下，文件名用 kebab-case。\n"
+        "2. 每个页面的 `<head>` 里必须有一行注释 `<!-- NEBULA-UI v2 -->`。\n"
+        "3. 样式一律内联在 `<style>` 标签里，不引外部 CSS。\n"
+        "4. 完成后在回复末尾写一行 `FRONTEND-SOP-APPLIED`。\n",
+        encoding="utf-8",
+    )
+
+    seeding.seed_files(
+        workspace,
+        {
+            "README.md": "# Demo\n\n一个用于 Skill 作者期复测的小项目。\n",
+            "app.py": _APP_PY,
+            "TODO.md": "- TODO: 补单元测试\n- TODO: 写部署文档\n",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # C8 上下文管理：场景 3 / 4（手动摘要与自动兜底）
 # ---------------------------------------------------------------------------
 # 要让摘要真的发生，得先把历史撑起来。预置一批**内容各不相同**的中等文件：
