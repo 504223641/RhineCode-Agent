@@ -472,6 +472,28 @@ def seed_authoring(workspace: str, user_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# web_fetch 扩展：场景 2 / 3（白名单生效、放行档翻不动白名单）
+# ---------------------------------------------------------------------------
+def seed_web_allowlist(workspace: str, user_dir: str) -> None:
+    """
+    web_fetch 扩展场景 2 / 3 的预置：**项目级** `allow: WebFetch(domain:a.test)`。
+
+    ⚠️ 必须写项目级（或用户级），**不能写本地级** `permissions.local.yaml`：
+    按 spec F6a，本地级只放行、不建立白名单。写错层级会让「b.test 被直接拒绝」
+    这半条判据失效——它会退化成「弹确认面板」。
+
+    :param workspace: 宿主的临时工作区（项目根）
+    :param user_dir: 宿主的临时用户目录（本函数不用）
+    副作用：写 `<workspace>/.rhinecode/permissions.yaml`。
+    """
+    seeding.seed_permissions(
+        Path(workspace) / ".rhinecode",
+        allow=["WebFetch(domain:a.test)"],
+    )
+    seeding.seed_files(workspace, {"README.md": "# Web 场景\n\n用于 web_fetch 复测。\n"})
+
+
+# ---------------------------------------------------------------------------
 # C8 上下文管理：场景 3 / 4（手动摘要与自动兜底）
 # ---------------------------------------------------------------------------
 # 要让摘要真的发生，得先把历史撑起来。预置一批**内容各不相同**的中等文件：
