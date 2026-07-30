@@ -164,6 +164,10 @@ class DeepSeekProvider(BaseProvider):
             # 工具调用按 index 累积：index → {"id", "name", "arguments"(字符串拼接)}
             # 流式中首片携带 id 与 function.name，后续片仅追加 function.arguments 碎片
             tool_buffers: dict[int, dict] = {}
+            # 已经产出过 "tool_pending" 的 index 集合。
+            # 每个工具调用只**播报一次**：参数碎片会到达几十上百次，每次都播报会把
+            # 事件流淹掉（同 text 增量的量级），而界面只需要一个「这一步开始了」的锚点。
+            announced: set[int] = set()
 
             for chunk in stream:
                 # usage 块通常在流末尾、choices 为空，必须在「无 delta 就 continue」之前处理，
@@ -199,6 +203,23 @@ class DeepSeekProvider(BaseProvider):
                             if tc.function.arguments:
                                 # arguments 以字符串碎片到达，直接拼接，最后再 json 解析
                                 buf["arguments"] += tc.function.arguments
+
+                        # 拿到「id + 工具名」的第一时间播报一次 tool_pending，让界面
+                        # 立刻出现一行状态。**必须放在累积之后**：名字与 id 可能分散在
+                        # 前两个碎片里，放在累积前会拿到空值。
+                        #
+                        # 两个字段都非空才播报（而不是只看 name）——id 是界面把这行状态
+                        # 与后续 tool_start / tool_result 对上的唯一键，缺了它就会多出
+                        # 一行永远转圈的孤儿状态。协议上两者本来同片到达；万一没有，
+                        # 这里安静地退回旧行为（不播报），不做任何猜测。
+                        if idx not in announced and buf["id"] and buf["name"]:
+                            announced.add(idx)
+                            yield StreamChunk(
+                                type="tool_pending",
+                                tool_call=ToolCall(
+                                    id=buf["id"], name=buf["name"], arguments=None
+                                ),
+                            )
 
             # 流结束：把累积的工具调用解析并产出（按 index 顺序保持稳定）
             for idx in sorted(tool_buffers.keys()):

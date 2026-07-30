@@ -71,6 +71,12 @@ class StreamChunk:
     - "error"：发生异常，content 为可读错误描述，以红色显示
     - "tool_call"：Provider 解析出的一次完整工具调用（第一轮流结束后产出），
                    由协调层内部收集，不直接渲染；载荷在 tool_call 字段
+    - "tool_pending"：Provider 在流**进行中**发现「模型开始吐一个工具调用」时产出一次，
+                      此时只知道 id 与 name，`tool_call.arguments` 恒为 None。
+                      纯展示用途（让界面立刻显示「这一步开始了」），**不参与任何判定**，
+                      协调层也不把它累积进 tool_calls——完整调用仍由后续的 "tool_call" 承载。
+                      为什么需要它：写文件类调用的参数里塞着整份文件内容，这段 JSON
+                      可能生成几十秒，期间既无正文增量也未进入执行，界面会完全静止
     - "tool_start"：协调层在某工具开始执行时产出，TUI 据此新建橘色工具行并启动计时器；
                     载荷在 tool_call 字段
     - "tool_result"：协调层在某工具执行完成时产出，TUI 据此把工具行转绿/红并展示摘要；

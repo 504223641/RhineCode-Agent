@@ -119,6 +119,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
 - 新增状态栏展示字段 → `tui/widgets.py` `compose_status_text`（渲染）+ `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+- **工具行的「建行 / 定色」必须成对**，且 `_do_stream` 的 `tool_widgets` 表**只装还没定色的行**：`TOOL_PENDING` 建行、`TOOL_START` 复用（`get` 后 `begin_running`）、`TOOL_RESULT` **必须 `pop`**、`finally` 里 `_settle_unfinished_tools` 收尾剩下的。**把 `pop` 写成 `get` 不报错**：已经定成绿色「完成」的行会在收尾时被再收一次、覆写成「失败 · 未执行」——用户看到的是「明明写成功了却显示没执行」，而调用栈上什么线索都没有。护栏见 `tests/test_tui_tool_pending.py::DoStreamWiringTest`（含这条覆写的反证）
+- **`ToolCallWidget` 的 `(Ns)` 语义是「工具执行耗时」** → `begin_running` 必须重置 `_start`。漏了不报错，只是把「模型生成参数」与「用户盯着确认面板发呆」的时间一并算进去，一次 2 毫秒的写盘可能显示成 `(600s)`
 - 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
 - 新增 Skill 内置样板 → `rhinecode/skills/builtin/*.md` + `tests/test_skill_manager.py::BuiltinSamplesTest`（**它硬编码了样板名字清单，漏改当场红**）+ 跑一次体检确认新样板**自身零建议**（它是用户能看到的唯一范例，自己触发建议等于示范了不该学的写法；**刻意不建自动化断言**，理由见 `docs/extensions/skill-authoring/spec.md` F6）。
   ⚠️ **`pyproject.toml` 的 package-data 不是必须改的**——原先这里写着「漏改会让真安装后样板凭空消失」，作者期扩展**实测推翻了这句**：本项目用纯 pyproject.toml 配置，setuptools≥61 在这种配置下 `include-package-data` **默认为真**，包目录内的非 `.py` 文件本来就会一并打包（四组对照实测记在 `pyproject.toml` 的注释里）。那段 package-data 现在的定位是「万一有人关掉 `include-package-data` 时的兜底」。**验它必须先 `rm -rf build`**，否则 setuptools 复用上次产物，验的是上一次的配置
@@ -238,7 +240,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1241 项，skipped 4
+python -m unittest discover -s tests      # 1258 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」

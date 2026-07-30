@@ -69,6 +69,26 @@ def tool(name: str, args: Optional[dict] = None, call_id: Optional[str] = None) 
     return StreamChunk(type="tool_call", tool_call=ToolCall(id=cid, name=name, arguments=args or {}))
 
 
+def tool_pending(name: str, call_id: str) -> StreamChunk:
+    """
+    「模型开始吐一个工具调用」的播报块（参数还没生成完）。
+
+    真实 Provider 在拿到「id + 工具名」的第一时间产出它，界面据此立刻挂一行
+    「参数生成中… Ns」。剧本里要手工写出来——脚本化 Provider 只是原样吐出给定的块，
+    不会自己模拟碎片拼接。
+
+    ⚠️ **`call_id` 必须与随后那条 `tool()` 的 `call_id` 一致**，否则界面认不出这是
+    同一次调用，会先留下一行永远转不完的「参数生成中」，再另起一行执行——正是这个
+    机制要避免的形态。因此本参数**不给缺省值**（自增计数器会算出两个不同的 id）。
+
+    :param name: 工具名
+    :param call_id: 调用标识，与配对的 `tool()` 逐字相同
+    """
+    return StreamChunk(
+        type="tool_pending", tool_call=ToolCall(id=call_id, name=name, arguments=None)
+    )
+
+
 def stream_error(message: str) -> StreamChunk:
     """一块流错误（循环据此以「流错误」停止）。"""
     return StreamChunk(type="error", content=message)
