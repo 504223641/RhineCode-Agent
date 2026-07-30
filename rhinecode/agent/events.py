@@ -29,6 +29,14 @@ class AgentEventType(str, Enum):
 
     TEXT = "text"            # 模型正文文本增量
     THINKING = "thinking"    # 模型思考内容增量（Thinking Mode）
+    # 模型刚开始「吐」某个工具调用（拿到工具名的那一刻，参数还在流里）。
+    # 它与 TOOL_START 的区别是**阶段**不是重复：
+    #   TOOL_PENDING —— 模型正在生成调用参数，还没经过权限判定，什么都没执行
+    #   TOOL_START   —— 权限已放行、马上真正执行
+    # 为什么需要它：写文件类调用的 arguments 里塞着整份文件内容，生成这段 JSON
+    # 可能要几十秒。这段时间里既没有正文增量、也还没进入执行，界面上一个事件都
+    # 收不到，用户看到的是「完全静止的窗口」，无从判断程序是在干活还是卡住了。
+    TOOL_PENDING = "tool_pending"
     TOOL_START = "tool_start"    # 某工具开始执行
     TOOL_RESULT = "tool_result"  # 某工具执行完成
     USAGE = "usage"          # 一轮请求的 token 用量
@@ -123,6 +131,9 @@ class AgentEvent:
 
     用 type 区分种类，不同 type 下只有部分字段有意义：
     - TEXT / THINKING：text 为增量内容
+    - TOOL_PENDING：tool_call 为「刚拿到名字、参数仍在生成中」的调用，
+      因此 tool_call.arguments 恒为 None——**不要拿它做任何判定**，
+      它只是给界面一个「这一步开始了」的锚点
     - TOOL_START：tool_call 为开始执行的调用
     - TOOL_RESULT：tool_call 为对应调用，tool_result 为执行结果（tools.base.ToolResult）
     - USAGE：usage 为本轮用量
