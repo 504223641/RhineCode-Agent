@@ -23,12 +23,61 @@ from rhinecode.skills.models import (
     INDEX_MAX_BYTES,
     INDEX_MAX_LINES,
     PLACEHOLDER,
+    SkillSource,
     SkillSpec,
     TOTAL_MAX_BYTES,
     TOTAL_MAX_LINES,
 )
 
-# 模式的中文标签，清单与报告共用。
+# ────────────────────── 第一阶段清单的表头 ──────────────────────
+#
+# ## 为什么这段措辞是「指令」而不是「公告」
+#
+# 原文只有一句「以下 Skill 可用，用 `load_skill` 工具加载其完整指令。」——
+# 它**陈述可用性**，却从不要求模型去用。实测后果：用户说「帮我做个前端页面」、
+# 清单里明明有前端设计 Skill，模型照自己的默认做法做完，一次都没加载。
+#
+# 这不是本项目独有的偏差。Anthropic 官方 skill-creator 的指导原话是：
+# 描述要写得**「有点 pushy」**，因为「Claude 有**可测量的欠触发倾向**
+# （a measured tendency to under-trigger skills）」。
+#
+# 所以这里照 Claude Code 给 agent 的 Skill 工具描述的口径重写，三个要件：
+#
+# 1. **动手前先查清单**（而不是「清单在这儿」）；
+# 2. **命中则用它替代默认做法**——Claude Code 的原话是
+#    「call this tool first … to follow **in place of your default approach**」。
+#    没有这半句，模型会把 Skill 当成"另一种可选做法"而不是"该走的那条路"；
+# 3. **点明代价不对称**，直接纠偏：漏加载会产出不合项目约定的结果，
+#    多加载只是多读几百字。这条针对的正是上面那个已知偏差。
+#
+# 另外显式覆盖「用户没明说要用 Skill」这一情形——那是实际使用中最常见的
+# 漏触发场景，也是用户报上来的原始现象。
+_INDEX_HEADER = (
+    "以下是已为本项目/本用户配置好的 Skill。每一个都是**针对某一类任务的成套做法**，"
+    "记录着这个项目在这类任务上的既有约定。",
+    "",
+    "**动手做任何事之前先扫一遍这份清单。** 如果手上的任务属于其中某个 Skill 覆盖的类型，"
+    "**先用 `load_skill` 加载它，然后按它的流程做**——而不是按你自己的默认做法做。",
+    "",
+    "⚠️ **用户不必明确说「用某个 Skill」。** 判断依据是**任务类型是否匹配**，"
+    "不是用户有没有点名。他说「帮我做个前端页面」而清单里有前端相关的 Skill，那就是命中。",
+    "",
+    "⚠️ **拿不准要不要加载时，倾向加载。** 两边的代价不对称：漏加载 = 用你自己的默认做法"
+    "做出一个不符合本项目约定的结果，用户往往要到很后面才发现；多加载一次 = 多读几百字。",
+    "",
+    "标注「子对话」的会另开一条对话跑完并只回流结论（你同样可以自行发起）；"
+    "标注「仅用户可发起」的你不能加载，只能建议用户执行对应命令。",
+)
+
+# 清单预算不够时的**降级顺序权重**：数字越大越先被削成「只有名字」。
+#
+# 内置样板最先削——它们随程序分发，用户在 `/help` 与文档里都能看到；
+# 项目级最后削——那是用户为这个仓库刻意添加的东西，最不该在模型眼里变模糊。
+_SOURCE_DEGRADE_RANK = {
+    SkillSource.BUILTIN: 2,
+    SkillSource.USER: 1,
+    SkillSource.PROJECT: 0,
+}
 
 
 def _truncate(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
@@ -101,13 +150,10 @@ def render_index(
     if not items:
         return ""
 
-    lines = [
-        "以下 Skill 可用，用 `load_skill` 工具加载其完整指令。",
-        "标注「子对话」的会另开一条对话跑完并只回流结论；"
-        "标注「仅用户可发起」的你不能自行加载，只能建议用户执行对应命令。",
-        "",
-    ]
-    for spec in items:
+    lines = [*_INDEX_HEADER, ""]
+
+    def _entry(spec: SkillSpec, *, with_text: bool) -> str:
+        """渲染一行。`with_text=False` 时只留名字与标记（预算不够时的降级形态）。"""
         flags = []
         if spec.forked:
             flags.append("子对话")
@@ -117,19 +163,66 @@ def render_index(
             hint = entry_hint(spec) if entry_hint is not None else ""
             flags.append(f"仅用户可发起，请建议用户执行 {hint}" if hint else "仅用户可发起")
         suffix = f"（{'、'.join(flags)}）" if flags else ""
+        if not with_text:
+            return f"- {spec.command_name}{suffix}"
         text = spec.description
         if spec.when_to_use:
             text = f"{text} —— {spec.when_to_use}"
-        lines.append(f"- {spec.command_name}{suffix}：{text}")
+        return f"- {spec.command_name}{suffix}：{text}"
 
-    text = "\n".join(lines)
-    truncated, did = _truncate(text, INDEX_MAX_LINES, INDEX_MAX_BYTES)
+    # ── 预算不够时：**降级成只有名字，而不是整条丢掉** ──
+    #
+    # 原实现直接按行截断，尾部那些 Skill 连名字都不出现——**对模型等于不存在**，
+    # 它既不会加载也不会向用户提起，而用户完全看不出发生了什么。
+    #
+    # 名字是模型唯一的入口：只要名字在，模型至少能判断「这里像是有个相关的东西」
+    # 并去加载看看；描述没了只是命中率下降。所以宁可牺牲描述，不牺牲名字
+    # （与 Claude Code 的口径一致：清单**永远包含每个 Skill 的名字**）。
+    #
+    # 降级顺序按**来源层级从低到高**：内置 → 用户级 → 项目级。理由是项目级
+    # 是用户为这个仓库刻意添加的，最不该被削；内置样板即使只剩名字，
+    # 用户也能从 `/help` 与文档里知道它们是什么。
+    #
+    # ⚠️ 显示顺序仍按名字排（调用方已排好），**只有「谁被降级」按层级挑**——
+    # 否则每次超预算时列表顺序都会跳，用户没法在两次输出间对照。
+    degrade_order = sorted(
+        range(len(items)),
+        key=lambda i: (-_SOURCE_DEGRADE_RANK.get(items[i].source, 0), items[i].command_name),
+    )
+    with_text = [True] * len(items)
+
+    def _render(flags: list[bool]) -> str:
+        return "\n".join(
+            lines + [_entry(spec, with_text=flag) for spec, flag in zip(items, flags)]
+        )
+
+    text = _render(with_text)
+    degraded = 0
+    for idx in degrade_order:
+        fitted, did = _truncate(text, INDEX_MAX_LINES, INDEX_MAX_BYTES)
+        if not did:
+            break
+        with_text[idx] = False
+        degraded += 1
+        text = _render(with_text)
+
+    fitted, did = _truncate(text, INDEX_MAX_LINES, INDEX_MAX_BYTES)
     if did:
-        # 算出实际列出了几条，好让「另有 N 个」的数字是准的。
-        listed = sum(1 for line in truncated.splitlines() if line.startswith("- "))
-        remaining = len(items) - listed
-        truncated += f"\n（另有 {remaining} 个 Skill 未列出）"
-    return truncated
+        # 连「全部只有名字」都装不下——只能真丢了。这时才用条数兜底，
+        # 并如实说明「未列出」而不是假装完整。
+        listed = sum(1 for line in fitted.splitlines() if line.startswith("- "))
+        fitted += (
+            f"\n（另有 {len(items) - listed} 个 Skill 因清单预算未列出；"
+            f"用 `/skills` 可看到全部）"
+        )
+        return fitted
+
+    if degraded:
+        text += (
+            f"\n（其中 {degraded} 个因清单预算只列了名字，未附说明；"
+            f"名字看着可能相关就直接 `load_skill` 试，加载后才能看到它到底做什么）"
+        )
+    return text
 
 
 def substitute(body: str, arguments: str) -> str:

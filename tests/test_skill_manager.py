@@ -375,6 +375,104 @@ class ReloadTest(ManagerTestBase):
         self.assertIn("加载失败", report)
         self.assertIn("字段提示", report)
 
+    # ─────────────── 体检建议段（作者期扩展 F1/F3/F5/F13） ───────────────
+
+    def test_report_has_no_advice_section_when_all_clean(self) -> None:
+        """
+        全部合规 → 建议段**整段不出现**（F5）。
+
+        不是显示「无建议」——「渲染一个空段落」与「不渲染这个段落」在代码里
+        只差一个判断，在界面上却是「多一段噪音」与「干净」的区别。
+
+        ⚠️ description 必须带**触发线索**（「用户说……时用」），否则会命中
+        R5 那条弱提示。默认的「说明」二字不含时机词——这条固件正是被 R5 逼着改的。
+        """
+        _write(
+            self.user_skills / "a.md",
+            _skill_text("a", "做事。用户说「做事」时用", body="做事。\n$ARGUMENTS\n"),
+        )
+        self.assertNotIn("建议（", self._manager().report())
+
+    def test_report_shows_advice_with_both_finding_and_suggestion(self) -> None:
+        """
+        建议必须同时出现「发现了什么」与「建议怎么改」。
+
+        只有前半句的话，它与既有的「警告」没有区别——而「可操作」正是
+        新增这一整类反馈的全部理由。
+        """
+        _write(self.user_skills / "a.md",
+               _skill_text("a", body="正文里没有占位符\n"))
+        report = self._manager().report()
+        self.assertIn("建议（", report)
+        self.assertIn("占位符", report)
+        self.assertIn("建议：", report)
+        self.assertIn("不会丢", report)
+
+    def test_advice_section_comes_after_notices(self) -> None:
+        """
+        建议段排在「加载失败 / 警告 / 字段提示」三段**之后**（F3）。
+
+        用段标题在文本中的下标先后断言，**不逐字比对整段内容**——
+        措辞还要打磨，逐字比对会让这条护栏变成措辞的枷锁。
+        """
+        _write(self.user_skills / "bad.md", "---\nname: [坏\n---\n正文\n")
+        # model 在非 fork 上声明 → 产出一条字段提示；正文无占位符 → 产出一条建议
+        _write(self.user_skills / "w.md",
+               _skill_text("w", model="m", body="没有占位符的正文\n"))
+        report = self._manager().report()
+
+        self.assertLess(report.index("加载失败"), report.index("字段提示"))
+        self.assertLess(report.index("字段提示"), report.index("建议（"))
+
+    def test_report_points_at_skill_creator_when_advice_exists(self) -> None:
+        """
+        有建议时要指路（F13）。
+
+        不给这一句的话，用户看完只知道「有问题」，却不知道系统能替他改——
+        而那正是本扩展另一半的价值。
+        """
+        _write(self.user_skills / "a.md",
+               _skill_text("a", body="没有占位符的正文\n"))
+        self.assertIn("/skill-creator", self._manager().report())
+
+    def test_advice_is_recomputed_after_reload(self) -> None:
+        """
+        建议**每次现算、不缓存**（F4）。
+
+        把问题修掉再热更新，建议就该消失。缓存的话就要考虑何时失效，
+        而「reload 之后忘了更新」是这类缺陷最常见的形态。
+        """
+        path = self.user_skills / "a.md"
+        desc = "做事。用户说「做事」时用"   # 带触发线索，免得命中 R5 那条弱提示
+        _write(path, _skill_text("a", desc, body="没有占位符的正文\n"))
+        m = self._manager()
+        self.assertIn("占位符", m.report())
+
+        _write(path, _skill_text("a", desc, body="修好了。\n$ARGUMENTS\n"))
+        m.reload()
+        self.assertNotIn("建议（", m.report())
+
+    def test_report_flags_overriding_a_builtin(self) -> None:
+        """
+        覆盖内置样板要提示——这条依赖 catalog 把「被覆盖那份」记了下来，
+        因为成品清单里它根本不存在。
+        """
+        builtin = Path(self._tmp.name) / "builtin"
+        _write(builtin / "commit.md", _skill_text("commit", "内置版"))
+        _write(self.user_skills / "commit.md",
+               _skill_text("commit", "我的版本", body="做事。\n$ARGUMENTS\n"))
+
+        m = SkillManager(
+            project_root=self.project_root,
+            user_dir=self.user_dir,
+            builtin_dir=builtin,
+            has_short_command=lambda n: n in self.short_commands,
+        )
+        m.startup()
+        report = m.report()
+        self.assertIn("内置样板", report)
+        self.assertIn("有意定制", report)
+
     def test_prompt_report_has_three_sections(self) -> None:
         _write(self.user_skills / "a.md",
                _skill_text("a", allowed_tools="[read_file]"))
@@ -475,12 +573,12 @@ class ProjectNoticeTest(ManagerTestBase):
 
 
 class BuiltinSamplesTest(unittest.TestCase):
-    """三个内置样板开箱可见（AC28）。"""
+    """内置样板开箱可见（AC28）。"""
 
-    def test_three_builtin_skills_discovered(self) -> None:
+    def test_builtin_skills_discovered(self) -> None:
         catalog = discover(None, None, builtin_skills_dir())
         names = sorted(s.command_name for s in catalog.skills)
-        self.assertEqual(names, ["commit", "review", "test"])
+        self.assertEqual(names, ["commit", "review", "skill-creator", "test"])
         for spec in catalog.skills:
             self.assertIs(spec.source, SkillSource.BUILTIN)
         self.assertEqual(catalog.errors, ())
@@ -492,10 +590,77 @@ class BuiltinSamplesTest(unittest.TestCase):
         self.assertIs(modes["commit"], False)
         self.assertIs(modes["review"], True)
         self.assertIs(modes["test"], False)
+        # skill-creator 必须留在主对话：它的三种用途都要与用户往复确认
+        # （定命令名、逐条问建议采不采纳），而子对话一次性跑完、
+        # 只回流最后一条结论，用户既看不到中间过程也无从插话。
+        self.assertIs(modes["skill-creator"], False)
+
+    def test_skill_creator_is_directory_type_with_reference(self) -> None:
+        """
+        `skill-creator` 必须是**目录型**，字段手册作为随附资源存在。
+
+        塞进正文的话它自己就会触发「逼近注入上限」那条检查——
+        手册本身的体积已经越过阈值，而它只在模型真要动 frontmatter 时才用得上。
+        做成随附资源后按需读取，不占每次激活的上下文。
+        """
+        catalog = discover(None, None, builtin_skills_dir())
+        spec = {s.command_name: s for s in catalog.skills}["skill-creator"]
+        self.assertIsNotNone(spec.resource_dir)
+        self.assertIn("reference.md", spec.resource_files)
+        # 手册内容不在正文里——只有指向它的一句话
+        self.assertNotIn("域名规则必须带", spec.body)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoadSkillDescriptionTest(unittest.TestCase):
+    """
+    `load_skill` 的工具描述——**模型决定要不要调它时读的就是这段**。
+
+    ## 为什么要给一段描述文本加测试
+
+    这段文字曾经在**主动劝阻**模型加载一半的 Skill：它写着
+    「只能加载共享模式的 Skill；独立模式的 Skill 需要由用户主动触发」，
+    而那是对齐改造**之前**的语义——F8 已把「在哪执行」与「谁能触发」拆成
+    正交两维，`context: fork` 的 Skill 模型同样可以自行发起。
+
+    这类错误**编译不报错、测试全绿、界面正常**，只是模型的行为悄悄少了一半，
+    而这恰恰是本项目「成对维护点」那一节反复强调的那类坑。所以钉住它。
+    """
+
+    @staticmethod
+    def _desc() -> str:
+        from rhinecode.tools.load_skill import LoadSkillTool
+
+        return LoadSkillTool.description
+
+    def test_does_not_claim_fork_skills_are_user_only(self) -> None:
+        """
+        不得再声称「独立/子对话模式只能由用户触发」——那是已废止的语义。
+        """
+        desc = self._desc()
+        self.assertNotIn("只能加载", desc)
+        self.assertIn("你同样可以自行发起", desc)
+
+    def test_is_directive_and_corrects_under_triggering(self) -> None:
+        """
+        与清单表头同口径的四句，缺一不可。
+
+        Anthropic 官方 skill-creator 的指导是描述该写得「有点 pushy」，
+        因为「Claude 有可测量的欠触发倾向」——实测确认过：用户说
+        「帮我做个前端页面」、清单里有前端 Skill，模型照默认做法做完、一次没加载。
+        """
+        desc = self._desc()
+        with self.subTest("① 命中就先调"):
+            self.assertIn("先调本工具", desc)
+        with self.subTest("② 替代默认做法"):
+            self.assertIn("而不是按你自己的默认做法做", desc)
+        with self.subTest("③ 用户不必点名"):
+            self.assertIn("用户不必明确说", desc)
+        with self.subTest("④ 拿不准就调"):
+            self.assertIn("倾向调用", desc)
 
 
 class LoadSkillToolTest(ManagerTestBase):
@@ -603,3 +768,33 @@ class LoadSkillToolTest(ManagerTestBase):
         result = LoadSkillTool(Boom()).execute({"name": "x"})
         self.assertFalse(result.ok)
         self.assertIn("炸了", result.output)
+
+
+class PackageExportsTest(unittest.TestCase):
+    """
+    包的 `__all__` 必须与真实可导出的名字一致。
+
+    ## 为什么需要这条
+
+    `__all__` 里曾有一项 `SkillMode`——那个枚举随对齐改造删除了
+    （执行模式改由 `context: fork` 表达），但列表忘了跟着改，
+    于是 `from rhinecode.skills import *` 当场 `AttributeError`。
+
+    它一直没被发现，是因为**项目内没有任何地方用星号导入**：
+    这个列表实际上只在「有人第一次尝试星号导入」时才被求值，
+    在那之前它可以错任意久而不被察觉。
+
+    所以护栏不能靠「哪里用到了」，只能主动求值一次。
+    """
+
+    def test_all_names_are_importable(self) -> None:
+        import rhinecode.skills as pkg
+
+        missing = [n for n in pkg.__all__ if not hasattr(pkg, n)]
+        self.assertEqual(missing, [], f"__all__ 里这些名字取不到：{missing}")
+
+    def test_star_import_works(self) -> None:
+        """直接把星号导入跑一遍——这是上面那条失效形态的真实现场。"""
+        namespace: dict = {}
+        exec("from rhinecode.skills import *", namespace)
+        self.assertIn("SkillManager", namespace)

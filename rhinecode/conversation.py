@@ -628,13 +628,13 @@ class ConversationManager:
     # ------------------------------------------------------------------ #
     def skills_report(self) -> str:
         """
-        `/skills` 的只读状态报告。
+        `/skills` 的只读状态报告（含体检建议段）。
 
-        传入注册中心当前工具名，供作者期体检判断「白名单是否已等于全集」
-        （口径与 `skills_prompt_report` 一致）。
+        **不需要传注册中心的工具名**：体检只看 Skill 定义本身，不依赖当前注册了
+        哪些工具。曾经这里传过一份，那是上一轮作者期为「白名单是否已等于全集」
+        那套检查留的——收窄能力随对齐改造删除后，参数就成了死的。
         """
-        registered = self._registry.names() if self._registry else frozenset()
-        return self.skill_manager.report(registered)
+        return self.skill_manager.report()
 
     def skills_prompt_report(self) -> str:
         """`/skills prompt` 的只读注入内容报告。"""

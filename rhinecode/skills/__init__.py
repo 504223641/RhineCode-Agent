@@ -9,8 +9,14 @@ Skill 系统包（c11）。
 **纯逻辑 + 单点接入**——不导入 Textual 与 Provider SDK，可在无终端无网络的
 测试进程中独立验证（spec N1）。
 
-包内六模块严格单向依赖：
-models → parser → discovery → render → validation → manager。
+包内七模块严格单向依赖：
+
+    models → parser → discovery → ┬→ render ─────┬→ audit → manager
+                                  └→ validation ─┘
+
+⚠️ `render` 与 `validation` 是**同层并列**，彼此不 import（前者只依赖 `models`，
+后者只依赖 `permission` + `models`）。这一点是「`audit` 同时依赖两者
+**不会成环**」的判断依据，不要把它们画成串联。
 """
 
 from rhinecode.skills.models import (
@@ -22,9 +28,15 @@ from rhinecode.skills.models import (
 )
 from rhinecode.skills.manager import SkillManager
 
+# ⚠️ 这里的每一项都必须真能从本模块取到。曾经有一项 `SkillMode` 是
+# 对齐改造的残留——那个枚举随 `mode: shared/isolated` 一起删除了
+# （执行模式改由 `context: fork` 表达），但 `__all__` 忘了跟着改，
+# 于是 `from rhinecode.skills import *` 会当场 AttributeError。
+#
+# 它一直没被发现，是因为**项目内没有任何地方用星号导入**——
+# 这个列表实际上只在「有人第一次尝试星号导入」时才被求值。
 __all__ = [
     "SkillManager",
-    "SkillMode",
     "SkillSource",
     "SkillSpec",
     "SkillCommandInfo",

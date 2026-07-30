@@ -47,6 +47,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+from rhinecode.skills.audit import audit_skills
 from rhinecode.skills.discovery import discover
 from rhinecode.skills.models import (
     ActivationResult,
@@ -89,9 +90,14 @@ class SkillManager:
     """
     Skill 系统的编排者。
 
-    生命周期：`__main__` 在启动早期构造它 → `startup()` 扫盘并做第一段白名单校验
-    → MCP 连接完成后 `bind_tools()` 做第二段剪枝 → 交给 `ConversationManager` 持有，
-    此后每轮请求调 `index_text()` / `active_text()`；Skill 被触发时调 `grants_for_spec()`。
+    生命周期：`__main__` 在启动早期构造它 → `startup()` 扫盘并收集预授权警告
+    → MCP 连接完成后 `bind_tools()` 记一条工具集快照（**只为 trace，不改状态**）
+    → 交给 `ConversationManager` 持有，此后每轮请求调 `index_text()` /
+    `active_text()`；Skill 被触发时调 `grants_for_spec()`。
+
+    ⚠️ 这两步**都不再做白名单校验或剪枝**（对齐改造 F13：收窄能力已整体移除）。
+    此处曾写着「第一段白名单校验 / 第二段剪枝」，那是已废止实现的描述——
+    照它去读代码会找不到对应的东西。
     """
 
     def __init__(
@@ -654,17 +660,15 @@ class SkillManager:
             f"请确认它们可信。"
         )
 
-    def report(self, registered: frozenset[str] = frozenset()) -> str:
+    def report(self) -> str:
         """
         `/skills` 的完整只读报告。
 
-        :param registered: 注册中心当前工具名，供作者期体检判断「白名单是否等于全集」。
-                           **有缺省值**是为了不打断既有调用点（测试里大量直接调
-                           `report()`）；不传时那一条检查自动跳过，其余三条照常。
         :returns: 多行报告文本
 
         遵守「持锁取快照 → 出锁渲染」：`has_short_command` 是跨层回调，
-        必须在锁外调用（加锁约定 ②）。
+        必须在锁外调用（加锁约定 ②）。体检同理放在锁外——它虽是纯函数，
+        但把它塞进临界区只会让临界区无谓变长。
 
         体检结果**每次现算**（而不是像 warnings 那样存在 `_runtime_warnings` 里）：
         它是纯函数、成本极低，而存起来就要考虑何时失效——多一处状态就多一处
@@ -718,6 +722,31 @@ class SkillManager:
         if notices:
             lines.extend(["", "字段提示（不影响运行，但与你的声明有出入）："])
             lines.extend(f"- {item}" for item in notices)
+
+        # 体检建议（作者期扩展 F1/F3）——**第四类反馈**，排在前三类之后。
+        #
+        # 前三类回答的都是「发生了什么」，只有这一段回答「那我该怎么改」。
+        # 排最后是因为它最不紧急：加载失败的 Skill 根本用不了，
+        # 而有建议的 Skill 是能用的，只是有更好的写法。
+        #
+        # ⚠️ **在锁外算**（spec N3）：上面的 `with self._lock` 早已退出，
+        # `_catalog` 是不可变快照、取引用即可。体检虽是纯函数，
+        # 但塞进临界区只会让临界区无谓变长，也破坏「临界区只做纯内存读写」的纪律。
+        #
+        # ⚠️ **每次现算、不缓存**（F4）：存起来就要考虑何时失效，
+        # 多一处「reload 之后忘了更新」的机会。
+        advices = audit_skills(catalog.skills, catalog.shadowed)
+        if advices:
+            lines.extend(["", "建议（不影响运行，但有更好的写法）："])
+            for advice in advices:
+                lines.append(f"- {advice.skill}：{advice.finding}")
+                lines.append(f"    建议：{advice.suggestion}")
+            # 指路（F13）。不给这一句的话，用户看完建议只知道「有问题」，
+            # 却不知道系统能替他改——而那正是本扩展另一半的价值所在。
+            lines.append("")
+            lines.append(
+                "（可以用 /skill-creator 让它按这些建议帮你改，每处改动都会先给你过目）"
+            )
 
         # 项目级 Skill 的信任模型告知（spec N8）。**从启动打印挪到了这里**：
         # 启动时 `print()` 发生在 Textual 接管屏幕之前，内容被 alternate screen
