@@ -110,6 +110,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 - **新增 Hook 事件** → `hooks/models.py` 的 `HookEventType`（枚举）+ **同文件的 `EVENT_FIELDS`** + 该事件的负载构造点。**漏改 `EVENT_FIELDS` 不报错**，只是用户在条件里写对了字段名反而被判为非法、整条规则被丢弃——用户只会以为是自己写错了。（三个工具级事件的字段集是**开放**的，见 `OPEN_INPUT_EVENTS`：`tool_input` 的键取决于是哪个工具，加载期不可能枚举，故对它们放行未登记字段名；代价是那三个事件上的字段笔误加载期发现不了，只表现为「这条规则永远不命中」，排查靠 `/hooks` 里的触发次数恒为 0）
 - **新增 Hook 动作类型** → `hooks/models.py`（数据类）+ `hooks/parser.py`（校验分支）+ `hooks/actions.py`（执行器）+ **`hooks/report.py` 的 `describe_action`**。**漏改最后一处不报错**，只是 `/hooks` 与**项目级启动提示**里那条动作显示成「未知动作」——而项目级提示逐条展示命令原文正是 spec F9.1 的**全部安全价值**，显示不出内容等于那道防线没了
+- **命令类字段的匹配必须「整条 + 逐段」双重检查** → `hooks/conditions.py` 的 `_match_command_field`。`match_command` 是**整串匹配**、不拆复合命令（它自己的 docstring 明写「调用方按需先 `split_commands`」）。只调它的话，一条 `command: "git push *"` 的拦截规则会被 `git add x && git commit -m y && git push origin main` 整个绕过——**而这不是攻击者构造的**，是真实模型在一次普通「改完提交推上去」的请求里自然产出的形态（C12 验收期实测）。后果比「少拦一次」更糟：`/hooks` 里那条规则显示「触发：0 次」，用户会据此认定「模型压根没试过」。护栏见 `tests/test_hook_conditions.py::CompoundCommandTest`
 - **新增可 glob 匹配的 Hook 字段** → `hooks/models.py` 的 `FIELD_MATCH_KIND`。**漏改不报错**，只是该字段从「命令/路径语义匹配」悄悄退化成通用通配——词边界丢失后 `git *` 会连 `github-cli` 一起命中，而配置和界面上都看不出异常
 - **新增 `_interact` 的交互种类** → `tui/app.py` 的 `_NOTIFY_KINDS`。两套词汇**刻意不合一**（内部结算标识 vs 写进用户 `hooks.yaml` 的稳定契约，合并会让「改一个内部标识」变成「破坏用户配置」）。漏改不报错，只是那种面板弹出时 `notification` 的 `kind` 退回内部标识，用户按文档写的条件匹配不上
 - **Hook 的 `post_tool_use` / `post_tool_use_failure` 只能挂在 `OUTCOME_EXECUTED` 旁**（`agent/loop.py` 两处）。六种「压根没执行」的分支一个都不能挂——把「没跑」混进「跑了但失败」会让「统计工具失败率」这类用途直接失真，而且不报错。护栏见 `tests/test_hook_intercept.py::NoExecutionBranchesTest`
@@ -253,7 +254,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1467 项，skipped 4
+python -m unittest discover -s tests      # 1474 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -326,11 +327,31 @@ python -m unittest discover -s tests      # 1467 项，skipped 4
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、阈值（字段截断 4000 字符 / 消息条数 400）可配置化、采样与按类型开关（当前只有「全开」与「全关」两态）。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
 
-12. **Hook 系统后续项（C12 spec 明确不做）**：子 Agent 动作的真实运行（现为占位，等 SubAgent 章节对接）、`once` 标记的持久化、Hook 执行顺序的显式优先级、迭代级事件（Agent Loop 内单轮迭代不开放挂载点——那是引擎内部结构，暴露成配置契约会让循环结构的任何调整都成为破坏性变更）、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、Skill/MCP 形态的 Hook 动作、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果（Claude Code 的 `updatedInput` / `updatedToolOutput`）。
+12. **③可配置规则层对复合命令不拆段**（C12 验收期实测发现，2026-08-06 登记，**未修**）：
+    `permission/rules.py` 的 command 分支直接调 `match_command(rule.pattern, request.specifier)`，
+    对整串匹配、**不做 `split_commands`**。实测：
 
-13. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
+    ```
+    deny: Bash(git push *)
+      git push origin main                → deny  ✅
+      git status && git push origin main  → 未命中 ❌
+    ```
 
-14. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
+    ①危险命令黑名单**是拆的**（「复合命令逐段+整条双重检查」），③规则层不是。
+    于是用户手写的 `deny` 命令规则会被一个 `&&` 绕过，而**这不需要刻意规避**——
+    真实模型在一次普通请求里就自然产出了那种形态（C12 场景 9 首跑实测）。
+    危害：用户以为自己拦住了某类命令，实际没有，且界面上完全看不出来。
+
+    **C12 已在 Hook 侧补齐同一口径**（`hooks/conditions.py` 的 `_match_command_field`），
+    但**没有动权限层**——那会改变 C6 的规则语义（更多命令会被 deny 命中），
+    属于安全边界的行为变更，应当单独立项、单独评审。修的话要动
+    `permission/rules.py` 的 `_rule_matches` 一处，并补「整条 + 逐段」的护栏与反证。
+
+13. **Hook 系统后续项（C12 spec 明确不做）**：子 Agent 动作的真实运行（现为占位，等 SubAgent 章节对接）、`once` 标记的持久化、Hook 执行顺序的显式优先级、迭代级事件（Agent Loop 内单轮迭代不开放挂载点——那是引擎内部结构，暴露成配置契约会让循环结构的任何调整都成为破坏性变更）、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、Skill/MCP 形态的 Hook 动作、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果（Claude Code 的 `updatedInput` / `updatedToolOutput`）。
+
+14. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
+
+15. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
 
 ## 代码注释规范
 

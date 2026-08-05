@@ -177,6 +177,71 @@ class GlobAlgorithmTest(unittest.TestCase):
         self.assertFalse(evaluate(c, {"text": "hello world"}))
 
 
+class CompoundCommandTest(unittest.TestCase):
+    """
+    ⚠ 命令类字段必须**整条 + 逐段**双重检查（C12 验收期实测发现）。
+
+    ## 这条护栏防的是一次真实观测
+
+    真实模型（deepseek-v4-flash）在一次普通的「改完提交推上去」请求里，自然产出了
+
+        git add auth.py && git commit -m "..." && echo "..." && git push origin main
+
+    而 `match_command` 是**整串匹配**、不拆复合命令。于是一条
+
+        if: {all: [{tool: run_command}, {command: "git push *"}]}
+
+    的拦截规则**命中 0 条**，被一个 `&&` 整个绕过——而 `/hooks` 报告里只会显示
+    「触发：0 次」，用户会据此认定「模型压根没试过 push」。**规则静默失效。**
+
+    ①危险命令黑名单早就是逐段+整条双重检查的（防 `safe && rm -rf`）；
+    这里补齐的是同一个口径。
+    """
+
+    COMPOUND = "git add auth.py && git commit -m 'x' && git push origin main"
+
+    def test_glob_matches_a_segment_of_a_compound_command(self):
+        c = _cond(COMBINE_ALL, ("command", "git push *"))
+        self.assertTrue(evaluate(c, {"command": self.COMPOUND}))
+
+    def test_exact_matches_a_segment_too(self):
+        c = _cond(COMBINE_ALL, ("command", "git push origin main"))
+        self.assertTrue(evaluate(c, {"command": self.COMPOUND}))
+
+    def test_various_separators(self):
+        c = _cond(COMBINE_ALL, ("command", "git push *"))
+        for sep in ("&&", ";", "||", "|", "&"):
+            with self.subTest(sep=sep):
+                self.assertTrue(
+                    evaluate(c, {"command": f"echo hi {sep} git push origin main"})
+                )
+
+    def test_still_does_not_match_unrelated_compound(self):
+        """偏严不等于乱匹配：不含目标子命令的复合命令仍不该命中。"""
+        c = _cond(COMBINE_ALL, ("command", "git push *"))
+        self.assertFalse(evaluate(c, {"command": "npm ci && npm test && npm run build"}))
+
+    def test_word_boundary_survives_splitting(self):
+        """拆段之后词边界语义仍在——`git *` 不该命中 `github-cli`。"""
+        c = _cond(COMBINE_ALL, ("command", "git *"))
+        self.assertFalse(evaluate(c, {"command": "echo hi && github-cli list"}))
+
+    def test_negated_is_false_when_any_segment_matches(self):
+        """
+        `!git push *` 的语义是「这条命令里没有 push」。任一段是 push 即不成立——
+        取反发生在「整条+逐段」判定之后，语义自动正确。
+        """
+        c = _cond(COMBINE_ALL, ("command", "!git push *"))
+        self.assertFalse(evaluate(c, {"command": self.COMPOUND}))
+        self.assertTrue(evaluate(c, {"command": "npm ci && npm test"}))
+
+    def test_non_command_fields_are_unaffected(self):
+        """路径与通用字段不做拆分——`&&` 在它们里不是分隔符。"""
+        c = _cond(COMBINE_ALL, ("text", "a && b"))
+        self.assertTrue(evaluate(c, {"text": "a && b"}))
+        self.assertFalse(evaluate(c, {"text": "a"}))
+
+
 class CombineTest(unittest.TestCase):
     """`all` 与 `any` 的组合语义（AC5）。"""
 

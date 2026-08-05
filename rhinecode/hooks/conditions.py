@@ -38,7 +38,7 @@ from rhinecode.hooks.models import (
     Condition,
     Matcher,
 )
-from rhinecode.permission.matching import match_command, match_path
+from rhinecode.permission.matching import match_command, match_path, split_commands
 
 
 def stringify(value: Any) -> str:
@@ -114,6 +114,46 @@ def parse_matcher(field: str, raw: Any) -> tuple[Optional[Matcher], Optional[str
     return Matcher(field, negated, kind, text), None
 
 
+def _match_command_field(text: str, predicate) -> bool:
+    """
+    命令类字段的匹配：**整条 + 逐段双重检查**（与①危险命令黑名单同口径）。
+
+    :param text: 字段值（可能是一条复合命令）
+    :param predicate: 对单条命令做判定的函数
+    :returns: 整条命中、或任一子命令命中即为 True
+
+    ## ⚠ 这一半不能省，真实模型自己就会撞上
+
+    `match_command` 是**整串匹配**，不拆复合命令（它的 docstring 明写「调用方按需
+    先用 `split_commands` 拆段」）。只调它的话，一条
+
+        if: {all: [{tool: run_command}, {command: "git push *"}]}
+
+    的拦截规则会被
+
+        git add x && git commit -m "..." && git push origin main
+
+    整个绕过——而**这不是攻击者构造的**，是真实模型在一次普通「改完提交推上去」
+    的请求里自然产出的形态（C12 验收期实测，deepseek-v4-flash）。
+
+    后果比「少拦一次」更糟：`/hooks` 报告里那条规则显示「触发：0 次」，
+    用户会据此认定「模型压根没试过 push」，而它其实推了。**规则静默失效**。
+
+    ①黑名单早就是「逐段 + 整条」双重检查的（防 `safe && rm -rf`），
+    这里只是把同一口径补齐。方向偏严——对一个只能拦截/升级、不能放行的系统而言，
+    偏严永远是安全的那一侧。
+
+    副作用：无。
+    """
+    if predicate(text):
+        return True
+    segments = split_commands(text)
+    # 单段时 `split_commands` 返回的就是它自己（可能去了空白），上面已判过。
+    if len(segments) <= 1:
+        return False
+    return any(predicate(seg) for seg in segments)
+
+
 def _match_glob(matcher: Matcher, text: str) -> bool:
     """
     glob 形态的匹配，按字段类型选算法（spec F3.3）。
@@ -139,7 +179,9 @@ def _match_glob(matcher: Matcher, text: str) -> bool:
     """
     kind = FIELD_MATCH_KIND.get(matcher.field, MATCH_KIND_PLAIN)
     if kind == "command":
-        return match_command(matcher.pattern, text)
+        return _match_command_field(
+            text, lambda one: match_command(matcher.pattern, one)
+        )
     if kind == "path":
         return match_path(matcher.pattern, text)
     return fnmatch.fnmatchcase(text, matcher.pattern)
@@ -178,7 +220,12 @@ def _match_one(matcher: Matcher, fields: dict[str, Any]) -> bool:
     text = stringify(value)
 
     if matcher.kind == MATCHER_EXACT:
-        result = text == matcher.pattern
+        # 命令类字段同样走「整条 + 逐段」——一条写成 `command: "git push"` 的
+        # 精确规则，同样不该被 `git status && git push` 绕过。
+        if FIELD_MATCH_KIND.get(matcher.field) == "command":
+            result = _match_command_field(text, lambda one: one == matcher.pattern)
+        else:
+            result = text == matcher.pattern
     elif matcher.kind == MATCHER_REGEX:
         # `search` 而非 `fullmatch`：spec F3.3 明确正则是**非锚定**的，
         # 要整串匹配由用户自己写 `^...$`（与 Claude Code 的 matcher 同口径）。
