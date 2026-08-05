@@ -51,6 +51,9 @@ class Layer(str, Enum):
     """
     决定是由决策管线的哪一层做出的，用于构造结构化原因与调试展示（spec F8）。
 
+    - HOOK：⓪Hook 前置层（c12）。**排在①之前**，且只能收紧不能放宽——
+      它只在「Hook 把 ALLOW 升级为 ASK」时作为层标出现（拦截走另一条路径，
+      不产生 DecisionResult）
     - BLACKLIST：①危险命令黑名单
     - SANDBOX：②路径沙箱
     - NETWORK：②′网络边界（仅 URL 类；硬校验 + 域名策略，web_fetch 扩展 spec F5/F6）
@@ -62,6 +65,7 @@ class Layer(str, Enum):
     一致性由 `tests/test_trace_reader.py` 里一条遍历本枚举的断言钉住。
     """
 
+    HOOK = "hook"
     BLACKLIST = "blacklist"
     SANDBOX = "sandbox"
     NETWORK = "network"

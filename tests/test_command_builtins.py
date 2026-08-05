@@ -32,6 +32,8 @@ EXPECTED_TABLE = {
     "/init": (set(), CommandType.PROMPT),
     # c11 新增：Skill 管理命令，无别名、本地类型。
     "/skills": (set(), CommandType.LOCAL),
+    # c12 新增：Hook 只读报告，无别名、本地类型。
+    "/hooks": (set(), CommandType.LOCAL),
     "/clear": ({"/reset", "/new"}, CommandType.UI),
     "/exit": ({"/quit"}, CommandType.UI),
 }
@@ -43,9 +45,9 @@ class BuiltinMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = build_builtin_registry()
 
-    def test_exactly_thirteen_canonical_commands(self) -> None:
+    def test_exactly_fourteen_canonical_commands(self) -> None:
         """
-        内置命令恰好十三条（C10 的十二条 + c11 新增的 /skills）。
+        内置命令恰好十四条（C10 的十二条 + c11 的 /skills + c12 的 /hooks）。
 
         这条 len 断言是「批准表」的护栏——它保证任何人新增命令时必须
         显式更新 EXPECTED_TABLE 并同步这个数字，而不能悄悄加进去。
@@ -53,7 +55,7 @@ class BuiltinMetadataTests(unittest.TestCase):
         """
         names = [s.name for s in self.registry.visible_commands()]
         self.assertEqual(set(names), set(EXPECTED_TABLE))
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 14)
 
     def test_alias_mapping(self) -> None:
         """全部首批别名映射正确（spec F10/AC5）。"""

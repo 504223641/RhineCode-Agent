@@ -24,7 +24,7 @@ from typing import Any, Union
 
 class TraceEventType(str, Enum):
     """
-    行为记录的事件种类，共十五类（spec F11–F16）。
+    行为记录的事件种类，共十七类（spec F11–F16 十五类 + c12 Hook 两类）。
 
     继承 `str` 是为了让枚举成员可以直接当字符串用（`json.dumps` 能原样序列化、
     与阅读器的 `--type` 过滤参数可直接比较），与项目里 `AgentEventType`、
@@ -48,6 +48,8 @@ class TraceEventType(str, Enum):
     CONTEXT_COMPACTION = "context_compaction"    # F16：两层上下文压缩动作
     SKILL_STATE = "skill_state"                  # F16：Skill 激活态变化
     HISTORY_RESTORED = "history_restored"        # F16：会话历史被恢复
+    HOOK_DISPATCH = "hook_dispatch"              # c12：生命周期事件的分发（**零命中也记**）
+    HOOK_EXECUTE = "hook_execute"                # c12：单条 Hook 规则的执行结果
 
 
 # ---------------------------------------------------------------------------

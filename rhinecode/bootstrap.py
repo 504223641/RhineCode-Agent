@@ -29,6 +29,8 @@ from rhinecode.commands import CommandRegistrationError, build_builtin_registry
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.config import Config
 from rhinecode.conversation import ConversationManager
+from rhinecode.hooks import HookEventType, HookManager, NullHookManager
+from rhinecode.hooks import load_all as load_hooks
 from rhinecode.mcp import config as mcp_config
 from rhinecode.mcp.manager import MCPManager
 from rhinecode.provider.factory import create_provider
@@ -110,6 +112,7 @@ def build_app(
     exclude_tools: frozenset = frozenset(),
     web_client_factory: Optional[Callable[[], Any]] = None,
     web_resolver: Optional[Callable[[str], list]] = None,
+    hook_client_factory: Optional[Callable[[], Any]] = None,
 ) -> BuildResult:
     """
     按固定顺序装配一个完整的 RhineCode 应用。
@@ -135,6 +138,8 @@ def build_app(
                      缺省 None（用真 `httpx.Client`）。**可注入是 spec N5 的硬要求**——
                      端到端场景也要能离线跑，形态与 `provider_factory` 完全一致。
     :param web_resolver: 主机名解析函数，同上（缺省用 `socket.getaddrinfo`）。
+    :param hook_client_factory: 造 HTTP 客户端的工厂，透传给 Hook 的 `http` 动作。
+                     缺省 None（用真 `httpx.Client`）。形态同 `web_client_factory`。
     :returns: BuildResult
 
     :raises BootstrapError: 三类致命配置错误（命令注册冲突 / Provider 初始化失败 /
@@ -264,6 +269,32 @@ def build_app(
     # 整个盖住，用户要等到退出程序才在终端里看见——那时早已失去意义。
     # 三类信息全部改由 `/skills` 报告承载（见 SkillManager.report）。
 
+    # ④'' Hook 系统（c12）。
+    #
+    # **位置在协调层之前、MCP 连接之后**，两条理由：
+    # - 必须早于第 ⑤ 步：协调层要把它一路透传给 Agent 与 ContextManager；
+    # - 不必更早：Hook 与工具注册、Skill 扫盘、MCP 连接**完全无关**，
+    #   它只读自己的两层 YAML。放在这里让「加载配置 → 构造 → 注入」三步挨着，
+    #   读代码的人不必在四百行里来回找。
+    #
+    # 加载失败不阻断启动（fail-safe）：坏配置降级为空规则集 + 一条警告，
+    # 警告经协调层的 `_compose_startup_notice` 展示在首屏。
+    hook_rules, hook_warnings = load_hooks(user_dir=user_dir)
+    hook_manager: Any = (
+        HookManager(
+            hook_rules,
+            hook_warnings,
+            recorder=recorder,
+            client_factory=hook_client_factory,
+            user_path=str(user_dir / "hooks.yaml"),
+            project_path=str(workspace_root() / ".rhinecode" / "hooks.yaml"),
+        )
+        if (hook_rules or hook_warnings)
+        # 两层配置都没有内容时用空对象：全部分发变成零成本空操作，
+        # 且负载构造器一次都不会被执行（spec F13 缺省零行为）。
+        else NullHookManager()
+    )
+
     # ⑤ 协调层。resume_latest 透传 --continue：构造时经 MemoryManager 恢复最近会话（c9）。
     manager = ConversationManager(
         provider,
@@ -278,6 +309,7 @@ def build_app(
         # 一个 Provider。那条旁路在协调层内部，本函数第②步包住的那一层管不到它——
         # 不透传的话，一个指定了模型的 Skill 会绕过假模型、静默连上真实网络。
         provider_factory=provider_factory,
+        hook_manager=hook_manager,
     )
 
     # 把「跑一个 fork Skill」的能力回注给加载工具（对齐改造 F8）。
@@ -327,6 +359,18 @@ def build_app(
         },
     )
 
+    # ⑦' 会话级 Hook：`session_start`（c12 spec F2）。
+    #
+    # 排在 trace 的 `session_start` **之后**，理由相同——此刻工具清单、MCP 状态、
+    # Skill 都已就位，Hook 命令看到的是一个装配完成的系统。
+    if hook_manager.has_listeners(HookEventType.SESSION_START):
+        try:
+            hook_manager.dispatch(
+                HookEventType.SESSION_START, lambda: {"source": "startup"}
+            )
+        except Exception:  # noqa: BLE001 —— 自动化设施绝不能阻断启动
+            pass
+
     # ⑧ 启动恢复的历史事件。**启动恢复不经任何事件流**——它在 ConversationManager
     # 构造期间由 MemoryManager.startup 原地改写 history，一条事件都不产生。
     # 若不在这里单独补一条，trace 里会凭空出现一段历史而没有任何事件解释它的来源。
@@ -371,6 +415,15 @@ def build_app(
             turn_total=recorder.turn_total(),
             elapsed_seconds=round(recorder.elapsed(), 3),
         )
+        # 会话级 Hook：`session_end`（c12）。位置在 trace 的 session_end 之后、
+        # `recorder.close()` 之前——它自己的 `hook_execute` 事件还要写进同一份记录。
+        try:
+            if hook_manager.has_listeners(HookEventType.SESSION_END):
+                hook_manager.dispatch(
+                    HookEventType.SESSION_END, lambda: {"reason": reason}
+                )
+        except Exception:  # noqa: BLE001 —— 清理路径绝不能因它中断
+            pass
         try:
             manager.memory_manager.close()
         except Exception:

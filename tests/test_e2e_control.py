@@ -26,6 +26,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Optional
+from unittest import mock
 
 from rhinecode.bootstrap import build_app
 from rhinecode.config import Config
@@ -40,6 +41,25 @@ from tests.e2e.control import (
     run_on_main,
 )
 from tests.e2e.scripted import ScriptedProvider, done, text, tool
+
+
+def _history_text(app) -> str:
+    """
+    把聊天区全部 Static 行的可见文本拼接，供内容断言。
+
+    与 `tests/test_command_tui.py` 的同名辅助同口径——控制通道读不到聊天区正文
+    （它只暴露面板与 trace），所以「界面上真的出现了」这类断言必须直接查组件树。
+    """
+    from textual.widgets import Static as _Static
+
+    parts = []
+    for widget in app.query("#history-messages > *"):
+        if isinstance(widget, _Static):
+            try:
+                parts.append(widget.render().plain)
+            except Exception:
+                parts.append(str(widget.render()))
+    return "\n".join(parts)
 
 
 # 宿主装配时一并摘掉的两个工具：前者写真实用户主目录且不吃 user_dir，
@@ -758,6 +778,91 @@ class FinalTextRecordedTest(DriverFixture):
             # 剧本两轮各一段正文，恰好两条，且互不重复
             self.assertEqual(len(texts), 2, f"应恰好两条，实际 {texts}")
             self.assertEqual(len(set(map(str, texts))), 2, f"两条不得重复：{texts}")
+            await core.shutdown_on_main("test")
+
+
+class MemoryNotifyRecordedTest(DriverFixture):
+    """
+    **回归护栏**：笔记更新的低打扰通知必须产出 `ui_message` 事件
+    （全阶段复测观察 O5，`docs/e2e-sweep/c9.md` 发现一）。
+
+    背景与 `FinalTextRecordedTest` 是同一类问题：`_notify_memory` 原先直接调
+    `append_system`、绕过了 `_trace_ui_message`，于是 c9 的 AC19
+    「笔记变更时界面出现低打扰提示」在任何基于 trace 的验收里都是**盲区**——
+    「显示了没记」与「压根没显示」在记录上完全无法区分，判据判不了。
+
+    ⚠️ 必须从**别的线程**调用：`_notify_memory` 真实运行在笔记 daemon 线程上，
+    它内部靠 `call_from_thread` 把渲染调度回主线程。在主线程里直接调，
+    Textual 会拒绝（那正是这个方法存在的理由），验的也就不是真实路径了。
+    """
+
+    async def test_memory_notice_produces_ui_message(self):
+        app, _ = self.assemble([[text("好的。"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条笔记）")
+
+            systems = [
+                m.get("text")
+                for m in self.view().of_type("ui_message")
+                if m.get("source") == "system"
+            ]
+            self.assertTrue(
+                any("已更新记忆" in str(t) for t in systems),
+                "笔记通知必须产出 source=system 的 ui_message；"
+                f"实际只有：{systems}",
+            )
+            await core.shutdown_on_main("test")
+
+    async def test_notice_actually_rendered(self):
+        """记录里有的那一行，界面上也必须真的有——正向确认两者配套。"""
+        app, _ = self.assemble([[text("好的。"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条笔记）")
+            await pilot.pause()
+
+            self.assertIn(
+                "已更新记忆",
+                _history_text(app),
+                "通知必须真的出现在历史区里",
+            )
+            await core.shutdown_on_main("test")
+
+    async def test_no_phantom_record_when_render_fails(self):
+        """
+        **顺序护栏**：渲染失败时**不得**留下记录。
+
+        这条才是真正钉住「埋点排在 `call_from_thread` 之后」的用例。上面两条
+        都只覆盖正常路径——把埋点挪到渲染之前，它们照样全绿。
+
+        构造的是真实的退出竞态：应用正在关闭时 `call_from_thread` 会抛异常，
+        而 `_notify_memory` 的 `except Exception: pass` 会把它吞掉。若埋点排在
+        前面，这里就会留下一条**界面上从未出现过的** `ui_message`——观测设施
+        撒谎，而且因为异常被吞了，连个错都不报。
+        """
+        app, _ = self.assemble([[text("好的。"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("模拟应用正在退出")
+
+            with mock.patch.object(app, "call_from_thread", side_effect=boom):
+                # 不应抛出——异常必须被 _notify_memory 自己吞掉
+                await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条笔记）")
+
+            phantom = [
+                m.get("text")
+                for m in self.view().of_type("ui_message")
+                if "已更新记忆" in str(m.get("text"))
+            ]
+            self.assertEqual(
+                phantom,
+                [],
+                "渲染失败时不得留下记录，否则 trace 里会出现界面上从未有过的行；"
+                f"实际记到了：{phantom}",
+            )
             await core.shutdown_on_main("test")
 
 

@@ -843,10 +843,10 @@ class SkillStateHookTest(TraceHookBase):
         self.assertEqual(len(self.records(T.SKILL_STATE)), before)
 
 
-class FifteenTypesTest(TraceHookBase):
-    def test_all_fifteen_types_can_be_produced(self) -> None:
+class AllTypesTest(TraceHookBase):
+    def test_all_types_can_be_produced(self) -> None:
         """
-        AC9 的总清点：十五类事件均可产出且关键字段非空。
+        AC9 的总清点：全部事件类型均可产出且关键字段非空。
 
         这里用记录器直接产出各类型的代表性负载——分层的「谁来产」已由上面各类
         分别验证，本条只做「一个类型都没漏、每类都有可读内容」的清点。
@@ -867,13 +867,16 @@ class FifteenTypesTest(TraceHookBase):
             T.CONTEXT_COMPACTION: {"layer": "offload", "count": 1},
             T.SKILL_STATE: {"action": "activate", "skill": "demo"},
             T.HISTORY_RESTORED: {"origin": "startup", "message_count": 4},
+            # c12 Hook 两类
+            T.HOOK_DISPATCH: {"event": "pre_tool_use", "matched": 1, "executed": 1},
+            T.HOOK_EXECUTE: {"rule": "禁止 push", "action_type": "command", "ok": True},
         }
-        self.assertEqual(len(payloads), 15)
+        self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():
             self.rec.emit(t, **payload)
 
         got = self.records()
-        self.assertEqual(len(got), 15)
+        self.assertEqual(len(got), len(list(T)))
         self.assertEqual({r["type"] for r in got}, {t.value for t in T})
         for r in got:
             # 每条除四个固定字段外至少还有一个负载字段

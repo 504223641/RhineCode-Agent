@@ -41,7 +41,9 @@ from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.skills.manager import SkillManager
+from rhinecode.hooks import HookEventType, NullHookManager
 from rhinecode.trace import (
+    SCOPE_MAIN,
     NullRecorder,
     TraceEventType,
     TraceRecorderProtocol,
@@ -169,6 +171,7 @@ class ConversationManager:
         user_dir: Optional[Path] = None,
         recorder: "Optional[TraceRecorderProtocol]" = None,
         provider_factory: Optional[Callable[[Config], BaseProvider]] = None,
+        hook_manager=None,
     ):
         """
         初始化对话管理器。
@@ -212,6 +215,10 @@ class ConversationManager:
                          ——现象是「测试莫名其妙很慢、偶尔失败」，极难定位。
                          （与 trace P0 的记录旁路是同一处：那次也是 `_provider_for`
                          漏包 `TracingProvider` 导致换模型的请求整段不进记录。）
+        :param hook_manager: Hook 编排者（c12）。缺省用 `NullHookManager()`——
+                         **不传等于零回归**，全部分发变成空调用且不构造任何负载。
+                         与 `skill_manager` 同形态：由装配层构造并注入，本类绝不
+                         自行加载配置（那会给一整套既有测试引入读用户主目录的隐式 IO）。
         """
         self._provider = provider
         # 换模型旁路的工厂。**存 None 而不是在这里就 `or create_provider`**：
@@ -258,8 +265,10 @@ class ConversationManager:
         self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
         if registry is not None:
             self._install_path_filters(registry)
+        # Hook 编排者（c12）。Null Object 兜底，各分发点无需判空。
+        self._hooks = hook_manager if hook_manager is not None else NullHookManager()
         # ReAct 循环引擎：持有长期依赖，每条普通消息调用一次 run()
-        self._agent = Agent(provider, registry, recorder=self._recorder)
+        self._agent = Agent(provider, registry, recorder=self._recorder, hooks=self._hooks)
 
         # 上下文压缩器（c8）：仅在工具可用模式构造——压缩的主要对象是工具结果，
         # 且循环/工具只在该模式存在。长期持有，跨消息累积估算锚点与熔断状态。
@@ -272,6 +281,7 @@ class ConversationManager:
                 config.context_window,
                 workspace_root() / ".rhinecode" / "context",
                 recorder=self._recorder,
+                hook_manager=self._hooks,
             )
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
@@ -309,27 +319,76 @@ class ConversationManager:
         # `PermissionEngine.load_errors` 在此之前**全仓零消费者**——警告收集完就死在
         # 那里。之所以并进 startup_notice 而不是新做一个 /perm 报告：前者是既有字段
         # （TUI 挂载时写进聊天区）、零新增维护点，且**不需要用户主动敲命令就能看见**。
+        # Hook 的公共字段（session_id / cwd）绑定一次；会话切换时在 clear/_resume_stream
+        # 里重新绑定——不重绑的话，`/clear` 之后所有 Hook 负载里的 session_id 仍是旧档，
+        # 而那是排查「这条 hook 是哪次会话触发的」时唯一能对上的字段。
+        self._hooks.bind_context(
+            session_id=self.memory_manager.session_id, cwd=str(workspace_root())
+        )
         self.startup_notice: Optional[str] = self._compose_startup_notice(memory_notice)
+
+    def _dispatch_session(self, event: "HookEventType", **fields) -> None:
+        """
+        分发一个会话级事件（c12 spec F2）。
+
+        :param event: SESSION_START 或 SESSION_END
+        :param fields: 事件专有字段（`source` 或 `reason`）
+
+        三个会话切换点共用它：`/clear`、`/resume`、装配层的启动与退出。
+        写成一个方法而不是各处直接 `dispatch`，是为了让「先绑定再分发」这个顺序
+        只有一处——漏了重绑定不报错，只是负载里的 session_id 是旧的。
+
+        副作用：可能起子进程 / 发 HTTP 请求；异常一律吞掉。
+        """
+        if not self._hooks.has_listeners(event):
+            return
+        try:
+            self._hooks.dispatch(event, lambda: dict(fields))
+        except Exception:
+            pass
+
+    def hooks_report(self) -> str:
+        """`/hooks` 的报告文本（c12 F11）。纯只读，不改任何状态。"""
+        return self._hooks.report()
+
+    def hooks_project_notice(self) -> Optional[str]:
+        """项目级 Hook 规则的启动提示（c12 F9.1）；无项目级规则时返回 None。"""
+        return self._hooks.project_notice()
 
     def _compose_startup_notice(self, memory_notice: Optional[str]) -> Optional[str]:
         """
-        把记忆系统的启动提示与权限规则的加载警告拼成一条启动提示。
+        把记忆系统的启动提示、权限规则的加载警告与 **Hook 的加载警告**
+        拼成一条启动提示。
 
         :param memory_notice: `MemoryManager.startup()` 的返回（可能为 None）
-        :returns: 拼接后的提示；两者都为空时返回 None
+        :returns: 拼接后的提示；全部为空时返回 None
 
-        由 `tui/app.py` 在界面挂载时写进聊天区。两者都可能为空，
+        由 `tui/app.py` 在界面挂载时写进聊天区。各段都可能为空，
         拼接时不产生多余空行——空提示与「有提示但只有一行空白」在界面上
         是两种观感，后者会让人以为出了什么事。
+
+        ## ⚠ 为什么这些提示都不能用 print
+
+        启动阶段的 `print` 发生在 Textual 接管屏幕**之前**，会被 alternate screen
+        整个盖住——用户要等到退出程序才在终端里看见，那时早已失去意义
+        （C11 踩过，`bootstrap.py` 里有记载）。
 
         副作用：无。
         """
         parts: list[str] = []
+        # ⚠ **项目级 Hook 的逐条展示不在这里**——它经 `hooks_project_notice()` 单独
+        # 交给界面层的醒目通道（`show_warning`）。混进本方法会让它跟着走 `[dim]`，
+        # 比普通提示还不显眼，而它是「这些命令会直接执行」的警告。
         if memory_notice:
             parts.append(memory_notice)
         errors = getattr(self._engine, "load_errors", None) or []
         if errors:
             parts.append("权限规则加载提示：\n" + "\n".join(f"- {e}" for e in errors))
+        hook_warnings = self._hooks.warnings
+        if hook_warnings:
+            parts.append(
+                "Hook 规则加载提示：\n" + "\n".join(f"- {w}" for w in hook_warnings)
+            )
         if not parts:
             return None
         return "\n\n".join(parts)
@@ -391,11 +450,17 @@ class ConversationManager:
 
         :returns: 确认文本「对话历史已清空」
         """
+        # c12：先送 SESSION_END（此刻 session_id 还是旧档），清空并开新档后再送
+        # SESSION_START。顺序不可颠倒——颠倒会让两条事件都带着新档 ID，
+        # 「哪次会话结束了」这个信息就丢了。
+        self._dispatch_session(HookEventType.SESSION_END, reason="clear")
         self.history = []
         if self._context_manager is not None:
             self._context_manager.reset()
         self.memory_manager.on_clear()
         self.skill_manager.clear_active()
+        self._hooks.bind_context(session_id=self.memory_manager.session_id)
+        self._dispatch_session(HookEventType.SESSION_START, source="clear")
         return "对话历史已清空"
 
     def request_cancel(self) -> None:
@@ -565,6 +630,9 @@ class ConversationManager:
 
         副作用：可能切换会话锁、改写 self.history、发起摘要 LLM 调用。
         """
+        # c12：SESSION_END 必须在 resume_into 之前——它一成功，session_id 就已经
+        # 换成目标会话了，那时再送就带不出「离开的是哪一个」。
+        self._dispatch_session(HookEventType.SESSION_END, reason="resume")
         ok, message = self.memory_manager.resume_into(key, self.history)
         if ok:
             # c11 N4：切换会话必须清空 Skill 激活态，且要在产出 HISTORY 之前。
@@ -587,6 +655,8 @@ class ConversationManager:
                 message_count=len(self.history),
                 session_id=self.memory_manager.session_id,
             )
+            self._hooks.bind_context(session_id=self.memory_manager.session_id)
+            self._dispatch_session(HookEventType.SESSION_START, source="resume")
             # 浅拷贝快照：防止后续 before_request 对 history 的原地重构影响回放内容
             yield AgentEvent(type=AgentEventType.HISTORY, messages=list(self.history))
         if ok and self._context_manager is not None:
@@ -724,7 +794,12 @@ class ConversationManager:
             # 用户经斜杠命令触发是显式动作，`disable-model-invocation` 只挡模型，
             # 挡不到这里（对齐改造 F8：两个维度正交）。
             return self._wrap_events(
-                self._run_forked_skill(spec, arguments, display), extra_skill=spec
+                self._run_forked_skill(spec, arguments, display),
+                extra_skill=spec,
+                trigger="skill",
+                # 作用域必须显式传：子对话的 trace 作用域在**内层生成器**里才进入，
+                # `turn_start` 发生在那之前，现取只会拿到 `main`。
+                scope=isolated_scope(spec.command_name),
             )
 
         # 留在主对话：激活成功，把自包含文本作为一条普通用户消息提交，
@@ -865,6 +940,11 @@ class ConversationManager:
 
         def sub_dynamic() -> str:
             parts = [p for p in (env_text, sub_body, plan_bridge) if p]
+            # c12 注入通道（子对话侧）。**两处都要接**——只接主对话的话，
+            # 一条挂在 `turn_start` 上的注入型 Hook 在 Skill 子对话里会静默失效。
+            injected = self._hooks.consume_injections()
+            if injected:
+                parts.append(injected)
             return "\n\n".join(parts)
 
         # ── 5. 驱动子 Agent ──
@@ -998,6 +1078,8 @@ class ConversationManager:
                 spec, arguments, f"/{name} {arguments}".strip(), record=False
             ),
             extra_skill=spec,
+            trigger="skill",
+            scope=isolated_scope(spec.command_name),
         ):
             pass
         return self._last_fork_conclusion or "本次 Skill 未产出结果。"
@@ -1132,6 +1214,13 @@ class ConversationManager:
                 parts.append(active)
             if pending:
                 parts.append(pending)
+            # c12 注入通道：Hook 的 `prompt` 动作产物排在最后一段。
+            # **必须在这个每轮求值的闭包里取**，不能在闭包外取一次——模型可能在
+            # 第 N 轮触发一条注入型 Hook，它要从第 N+1 轮起可见（与 Skill 正文同理）。
+            # 「一次性」由 `consume_injections` 的取走即清保证。
+            injected = self._hooks.consume_injections()
+            if injected:
+                parts.append(injected)
             return "\n\n".join(parts)
         # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
         debug_log_path = (
@@ -1188,15 +1277,26 @@ class ConversationManager:
             self._grant_for_skill(spec)
 
     def _wrap_events(
-        self, events: Iterator[AgentEvent], extra_skill: "Optional[SkillSpec]" = None
+        self,
+        events: Iterator[AgentEvent],
+        extra_skill: "Optional[SkillSpec]" = None,
+        trigger: str = "user",
+        scope: Optional[str] = None,
     ) -> Iterator[AgentEvent]:
         """
-        Agent 事件流的包装生成器：**预授权的成对授予/撤销** + 自然停止钩子。
+        Agent 事件流的包装生成器：**预授权的成对授予/撤销** + 自然停止钩子
+        + **回合级 Hook 两事件**（c12）。
 
         :param events: Agent 产出的原始事件流
         :param extra_skill: 本次额外触发的 Skill（`context: fork` 走子对话时它不进
                             激活列表，但它的 `allowed-tools` 同样该生效）
-        :returns: 语义完全相同的事件流（仅多了两处副作用）
+        :param trigger: 本次回合由谁触发，进 `turn_start` 负载：
+                        `"user"`（用户消息 / 斜杠命令）或 `"skill"`（Skill 子对话）
+        :param scope: 本次回合的作用域，进两个事件的负载。**fork 子对话必须显式传**——
+                      子对话的 trace 作用域是在**内层生成器**里进入的，而本方法的
+                      `turn_start` 发生在那之前，现取只会拿到 `main`。
+                      为 None 时取记录器当前作用域（主对话即 `main`）。
+        :returns: 语义完全相同的事件流（仅多了几处副作用）
 
         ## 为什么授予与撤销放在这里
 
@@ -1227,15 +1327,68 @@ class ConversationManager:
         token = len(self._engine.turn_rules)
         if extra_skill is not None:
             self._grant_for_skill(extra_skill)
+
+        # ── 回合级 Hook（c12）──
+        #
+        # 搭本方法的车是刻意的：它已经是「每一次 Agent 执行的唯一包装点」，
+        # 主对话 / 用户触发的子对话 / 模型自行发起的子对话三条路径都经过。
+        # 于是一处接线就覆盖全部，且生成器 `finally` 的语义顺带保证
+        # **取消、出错、迭代上限三种非正常终止下 `turn_end` 照样产出**。
+        turn_scope = scope or self._current_scope()
+        self._dispatch_turn(HookEventType.TURN_START, scope=turn_scope, trigger=trigger)
+        # 只有真的有人监听 `turn_end` 才累积正文（spec N7）——否则一整回合的
+        # AI 正文会白攒一遍内存。
+        track_text = self._hooks.has_listeners(HookEventType.TURN_END)
+        text_buffer: list[str] = []
+        stop_reason = ""
+
         try:
             for event in events:
-                if (
-                    event.type == AgentEventType.FINISHED
-                    and event.stop_reason == StopReason.COMPLETED
-                ):
-                    self.memory_manager.on_natural_stop(self.history)
+                if track_text:
+                    # PROGRESS 表示进入新一轮迭代，正文段落随之翻篇；
+                    # 因此缓冲区里留下的始终是**最后一段**正文。
+                    if event.type == AgentEventType.PROGRESS:
+                        text_buffer.clear()
+                    elif event.type == AgentEventType.TEXT:
+                        text_buffer.append(event.text)
+                if event.type == AgentEventType.FINISHED:
+                    stop_reason = (
+                        event.stop_reason.value if event.stop_reason is not None else ""
+                    )
+                    if event.stop_reason == StopReason.COMPLETED:
+                        self.memory_manager.on_natural_stop(self.history)
                 yield event
         finally:
             # 回滚而非清空：模型在主对话里自行发起子对话时，这里是内层，
             # 清空会连外层那次执行的授权一并抹掉（见 grant_turn_rules 的说明）。
+            #
+            # **撤销必须排在 Hook 分发之前**：`turn_end` 的动作可能跑上几十秒，
+            # 把回滚压在它后面等于让预授权多活那么久。
             self._engine.restore_turn_rules(token)
+            self._dispatch_turn(
+                HookEventType.TURN_END,
+                scope=turn_scope,
+                stop_reason=stop_reason,
+                last_text="".join(text_buffer),
+            )
+
+    def _current_scope(self) -> str:
+        """读记录器当前作用域，失败时退回主作用域（观测不该把主流程带下水）。"""
+        try:
+            return self._recorder.current_scope()
+        except Exception:
+            return SCOPE_MAIN
+
+    def _dispatch_turn(self, event: "HookEventType", **fields) -> None:
+        """
+        分发一个回合级事件（c12 spec F2）。
+
+        副作用：可能起子进程 / 发 HTTP 请求；异常一律吞掉——本方法在 `finally`
+        里也会被调用，抛出会覆盖掉正在传播的真实异常。
+        """
+        if not self._hooks.has_listeners(event):
+            return
+        try:
+            self._hooks.dispatch(event, lambda: dict(fields))
+        except Exception:
+            pass

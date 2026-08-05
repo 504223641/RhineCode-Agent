@@ -24,7 +24,7 @@ RUN_HEAD = 30
 RUN_TAIL = 10
 
 
-def _decode(raw: bytes) -> str:
+def decode_subprocess_output(raw: bytes) -> str:
     """
     把子进程的原始字节输出解码成文本。
 
@@ -43,6 +43,10 @@ def _decode(raw: bytes) -> str:
     因此这里固定按 UTF-8 优先解码，失败再退回本地编码（照顾 `dir`、`chcp`
     这类仍按 ANSI 输出的旧 Windows 命令），最后一道 errors="replace" 保证
     任何字节序列都能出结果——乱码远好过静默丢失。
+
+    **本函数是公开的，因为 c12 的 Hook 命令动作复用它**（`hooks/actions.py`）。
+    那里同样要起子进程读输出，同样会撞上这个坑。各写一份是典型的
+    「改一处漏一处」——而漏改的表现正是上面描述的「输出凭空消失且不报错」。
     """
     if not raw:
         return ""
@@ -119,7 +123,7 @@ class RunCommandTool(Tool):
             timeout = args.get("timeout") or DEFAULT_TIMEOUT
 
             # 显式固定 cwd，避免调用方未来改变进程目录后命令跑到工作区外。
-            # 刻意不传 text=True：由 _decode 自己按 UTF-8 优先解码，
+            # 刻意不传 text=True：由 decode_subprocess_output 自己按 UTF-8 优先解码，
             # 否则中文输出会在 subprocess 的读取线程里解码失败并被静默吞成空串。
             proc = subprocess.run(
                 command,
@@ -129,8 +133,8 @@ class RunCommandTool(Tool):
                 timeout=timeout,
             )
 
-            stdout = _decode(proc.stdout)
-            stderr = _decode(proc.stderr)
+            stdout = decode_subprocess_output(proc.stdout)
+            stderr = decode_subprocess_output(proc.stderr)
             out_lines = len(stdout.splitlines())
             err_lines = len(stderr.splitlines())
 

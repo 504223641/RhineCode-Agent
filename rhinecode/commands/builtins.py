@@ -56,6 +56,11 @@ def _handle_mcp(invocation: CommandInvocation, controller: CommandController) ->
     controller.show_message(controller.query_report(ReportTarget.MCP))
 
 
+def _handle_hooks(invocation: CommandInvocation, controller: CommandController) -> None:
+    """/hooks：查看已加载的 Hook 规则、加载警告与本次运行的触发统计（纯只读，c12）。"""
+    controller.show_message(controller.query_report(ReportTarget.HOOKS))
+
+
 def _handle_context(invocation: CommandInvocation, controller: CommandController) -> None:
     """/context：查询上下文用量报告并展示（纯只读）。"""
     controller.show_message(controller.query_report(ReportTarget.CONTEXT))
@@ -264,6 +269,14 @@ def build_builtin_registry() -> CommandRegistry:
                 usage="/mcp",
                 command_type=CommandType.LOCAL,
                 handler=_handle_mcp,
+            ),
+            CommandSpec(
+                name="/hooks",
+                aliases=(),
+                description="查看已加载的 Hook 规则、加载警告与本次触发统计",
+                usage="/hooks",
+                command_type=CommandType.LOCAL,
+                handler=_handle_hooks,
             ),
             CommandSpec(
                 name="/context",

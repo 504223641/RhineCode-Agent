@@ -546,6 +546,27 @@ class HistoryView(ScrollableContainer):
         """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
         self._add_widget(f"[bold red]● 错误：{escape(text)}[/bold red]")
 
+    def append_warning(self, text: str) -> None:
+        """
+        追加一条**醒目**的警告消息（橙色粗体，与确认面板同色系，c12）。
+
+        与 `append_system` 的差别只有一个：那条是 `[dim]`（比正文更暗），这条是
+        `[bold #FFA500]`。
+
+        ## 为什么需要它
+
+        今天唯一的用户是**项目级 Hook 的启动提示**——那是本项目里唯一一段
+        「可能来自别人的仓库、且会被直接执行」的内容，它的可读性就是那道防线的强度。
+        用 `append_system` 渲染的话，这条警告会比普通提示**更不显眼**（dim），
+        方向正好反了（人眼评审时发现）。
+
+        **不加前缀符号**：调用方传进来的文本自带 `⚠`，widget 再加一个会重复。
+
+        ⚠ 与本类其它方法同理，文本必须经 `escape` —— 那是 `tui/widgets.py` 自己的
+        版本，绝不能换成 `rich.markup.escape`（落单的 `[` 会被它放过并在布局阶段崩）。
+        """
+        self._add_widget(f"[bold #FFA500]{escape(text)}[/bold #FFA500]")
+
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
         self.query_one("#history-messages", Vertical).remove_children()
@@ -973,6 +994,7 @@ class ConfirmPanel(OptionList):
     # 但**两处刻意不合一**：让 trace（只依赖标准库的叶子包）反向依赖 permission
     # 会破坏它的架构不变量。一致性由 tests 里遍历 Layer 的断言钉住。
     _LAYER_LABELS = {
+        "hook": "⓪Hook 规则",
         "blacklist": "①危险命令黑名单",
         "sandbox": "②路径沙箱",
         "network": "②′网络边界",

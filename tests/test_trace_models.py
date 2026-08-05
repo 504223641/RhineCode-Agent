@@ -23,9 +23,11 @@ from rhinecode.trace.models import (
 
 
 class EventTypeTest(unittest.TestCase):
-    def test_fifteen_members_with_snake_case_values(self) -> None:
+    def test_seventeen_members_with_snake_case_values(self) -> None:
+        # 显式写死条数是刻意的：新增事件类型时这条会红，提醒去同步
+        # `reader.SUMMARIZERS`、CLAUDE.md 与 docs/internals（漏了不报错）。
         members = list(TraceEventType)
-        self.assertEqual(len(members), 15)
+        self.assertEqual(len(members), 17)
         for m in members:
             # 取值必须是成员名的小写形式：落盘的 type 字段与阅读器的 --type 参数直接比对
             self.assertEqual(m.value, m.name.lower())

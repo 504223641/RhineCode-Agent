@@ -6,6 +6,28 @@
 > 逐条描述各章能力的**实际行为与边界**（阈值、降级路径、哪些 Provider 生效）。
 > 主文件的能力表只回答「有什么」，这里回答「具体怎么表现」。
 
+- **Hook 系统**（c12）：独立 `hooks/` 层。一条规则 = `event`（必填）+ `if`（可省，省略即无条件）+ `action`（必填），另有可选的 `name` 与三个执行控制字段。从**两层 YAML** 加载（用户级 `~/.rhinecode/hooks.yaml` + 项目级 `<项目根>/.rhinecode/hooks.yaml`，**没有本地级**），两层规则全部生效不按层级覆盖，执行顺序固定为「用户级 → 项目级 → 层内声明序」，**不提供优先级字段**。
+
+  **十二个事件**：会话级 `session_start` / `session_end`；回合级 `turn_start` / `turn_end`（主对话与子对话都触发，由 `scope` 区分）；消息级 `user_message`（含斜杠命令）/ `assistant_message`；工具级 `pre_tool_use` / `post_tool_use` / `post_tool_use_failure`；系统级 `pre_compact` / `post_compact`（**只对第二层 LLM 摘要触发**，第一层存盘不触发）/ `notification`（四种 `kind`）。
+
+  **`user_message` 与 `turn_start` 不是重复事件而是来源不同**：`/help` 触发前者不触发后者（命令不进 AI），模型自行发起的 fork 子对话则相反。
+
+  **后置事件只挂在「真的执行了」之后**：未知工具、参数非法、`out_of_scope`、`plan_blocked`、权限 DENY、用户拒绝、Hook 自己拦下——七种情形一个后置事件都不产。其中前四种连 `pre_tool_use` 都不触发（它们在进入执行判定之前就被挡下），后三种会触发前置。
+
+  **条件**：`if` 下写 `all`（全部满足）或 `any`（任一满足），**二选一、不混用、不嵌套**。每项是「字段: 模式」，四种匹配形态——精确（`tool: run_command`）、glob（`command: "git *"`，命令类带词边界、路径类是 gitignore 风格、其余是确定性的 `fnmatchcase`）、正则（`/^git (push|reset)/`，**非锚定**）、反向（值前缀 `!`，可与前三种叠加）。工具级事件的 `tool_input` 逐字展开成顶层字段名，故可直接写 `command:` / `file_path:`；与公共字段（`event`/`session_id`/`cwd`）或事件字段（`tool`/`tool_call_id`/`is_read_only`/`scope`）重名时**后者优先**。
+
+  **四种动作**：`command`（事件负载以 JSON 从 **stdin** 喂入，配置里不做任何插值；退出码 0 通过 / 2 拦截 / 其它失败；stdout 可给决策 JSON）、`prompt`（注入 `<system-reminder>`，**一次性**，下一次请求可见后即清）、`http`（响应不参与任何决策）、`agent`（**本版本仅占位，不会真的运行**）。
+
+  **执行控制**：`once`（本次进程内只跑一次，**不持久化**）、`async`（后台不等结果，`pre_tool_use` 上**禁止**）、`timeout`（command 缺省 60 秒、http 缺省 10 秒）。
+
+  **拦截语义**：只有 `pre_tool_use` 能拦截，结论三选一——deny / ask / 不表态，**没有 allow**。多条命中时按最严合并（deny > ask > 不表态）。`ask` 只把权限管线的 ALLOW 升级为 ASK，**绝不降级 DENY**。
+
+  **失败语义**：`pre_tool_use` 上 Hook 自身失败（超时 / 崩溃 / 退出码非 0 非 2 / stdout 非法 JSON）一律**按拦截处理**（fail-closed），文案含「Hook 自身执行失败」以便与「工具执行异常」区分；其余全部事件只记 trace 与一行提示，不影响任何流程。
+
+  **缺省零行为**：两层配置都不存在时装配出的是 `NullHookManager`——不读文件、不构造负载、不产任何 trace 事件，运行时行为与 C11 逐字一致。
+
+  **可观测**：`/hooks` 报告已加载规则（来源层 / 事件 / 条件 / 动作 / 触发次数 / 最近结论）+ 加载警告 + 配置位置；trace 新增 `hook_dispatch`（**零命中也记**——那是排查「我的 hook 为什么没跑」的第一现场）与 `hook_execute` 两类事件。**本章不做 `/hooks reload`**，改了规则要重启。
+
 - **Skill 系统**（c11，已对齐 **Agent Skills 开放标准**）：独立 `skills/` 层（对标 permission/context/memory/commands：纯逻辑 + 单点接入，不依赖 Textual）。单个 Skill = 可选的 YAML frontmatter（`name`/`description`/`when_to_use`/`allowed-tools`/`context`/`disable-model-invocation`/`user-invocable`/`model`，**全部可选**）+ Markdown SOP 正文；一份只有正文的 `.md` 也是合法 Skill，说明从正文第一段提取。连字符与下划线两种键名写法等价。支持单文件型（`x.md`）与目录型（含 `SKILL.md` 入口 + 随附资源）。
 
   **命令名来自文件系统路径**（目录名 / 去扩展名的文件名），`name` 只是显示标签——这是「外部 Skill 原样可用」的地基：从 Claude Code 或 Codex 拉一个目录丢进 `.rhinecode/skills/` 就能用，不必检查也不必修改 frontmatter。**三级存放**：项目 > 用户 > 内置，同名整份覆盖。

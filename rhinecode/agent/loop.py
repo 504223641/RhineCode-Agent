@@ -43,6 +43,13 @@ from rhinecode.agent.events import (
 from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
+from rhinecode.hooks import (
+    HookDecision,
+    HookEventType,
+    HookVerdict,
+    NO_VERDICT,
+    NullHookManager,
+)
 from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
 from rhinecode.trace import (
     SCOPE_MAIN,
@@ -62,6 +69,7 @@ OUTCOME_INVALID_ARGUMENTS = "invalid_arguments"  # 模型生成的参数 JSON �
 OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
 OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
 OUTCOME_PLAN_BLOCKED = "plan_blocked"            # Plan Mode 规划阶段夹带的副作用工具
+OUTCOME_BLOCKED_BY_HOOK = "blocked_by_hook"      # c12：被 Hook 前置层拦下（含 Hook 自身失败的 fail-closed）
 
 # ── 用户在人在回路面板里选「拒绝」时回灌给模型的文本 ──
 #
@@ -193,16 +201,21 @@ class Agent:
         provider: BaseProvider,
         registry: Optional[ToolRegistry],
         recorder: "Optional[TraceRecorderProtocol]" = None,
+        hooks=None,
     ):
         """
         :param provider: 已实例化的 Provider，负责实际 API 调用
         :param registry: 工具注册中心；为 None 时不向模型暴露任何工具（退化为纯对话循环）
         :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
                          **不传等于零回归**——本类的全部埋点都变成空调用
+        :param hooks: Hook 编排者（c12）。缺省用 `NullHookManager()`，
+                      **不传同样等于零回归**——三个工具级事件的分发全部变成空调用，
+                      且负载构造器一次都不会被执行
         """
         self._provider = provider
         self._registry = registry
         self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
+        self._hooks = hooks if hooks is not None else NullHookManager()
 
     # ------------------------------------------------------------------ #
     # 行为记录埋点（trace）
@@ -247,6 +260,133 @@ class Agent:
                 "is_concurrent": is_concurrent,
                 "outcome": outcome,
             },
+        )
+
+    # ------------------------------------------------------------------ #
+    # Hook 前置层（c12）
+    # ------------------------------------------------------------------ #
+    def _tool_fields(self, tc: ToolCall, tool: Tool, **extra) -> dict:
+        """
+        构造工具级事件的负载字段（spec F2 工具级三事件）。
+
+        :param tc: 工具调用
+        :param tool: 对应工具实例
+        :param extra: 事件专有的补充字段（如 `tool_output` / `duration_ms` / `error`）
+        :returns: 字段字典
+
+        ## `tool_input` 逐字展开
+
+        模型生成的工具参数**每个键都升成顶层字段名**（spec F3.2），因此用户可以直接写
+        `command:` / `file_path:` 而不必写 `tool_input.command`。
+
+        ## ⚠ 事件字段覆盖同名的参数
+
+        `tool` / `tool_call_id` / `is_read_only` / `scope` 在参数之后写入，因此**覆盖**
+        同名的工具参数。理由与公共字段相同：一个恰好叫 `scope` 的工具参数若能盖掉
+        分发作用域，一条「只在主对话生效」的规则会在某些工具上突然错位。
+        代价是这四个名字无法用于匹配工具参数——已知且可接受。
+
+        副作用：无。
+        """
+        fields: dict = {}
+        if isinstance(tc.arguments, dict):
+            fields.update(tc.arguments)
+        fields.update(
+            {
+                "tool": tc.name,
+                "tool_call_id": tc.id,
+                "is_read_only": tool.read_only,
+                "scope": self._safe_scope(),
+            }
+        )
+        fields.update(extra)
+        return fields
+
+    def _dispatch_pre_tool(self, tc: ToolCall, tool: Tool) -> "HookVerdict":
+        """
+        分发 `pre_tool_use` 并取回结论（spec F6）。
+
+        :returns: Hook 的结论；无人监听或分发出错时为 `NO_VERDICT`（不表态）
+
+        先问 `has_listeners` 是 spec N7 的硬要求：为假时**不构造负载**——
+        一次 `write_file` 的 `tool_input` 就是整份文件内容，白构造一遍不可接受。
+
+        兜底 `try` 是纵深防御：`dispatch` 自己已保证不抛，这里再兜一层，
+        因为本方法所在的位置是「异常会变成工具结果回灌模型」的高危区
+        （与 `_safe_emit` 系列同一理由）。
+
+        副作用：可能起子进程 / 发 HTTP 请求（由命中的规则决定）。
+        """
+        if not self._hooks.has_listeners(HookEventType.PRE_TOOL_USE):
+            return NO_VERDICT
+        try:
+            return self._hooks.dispatch(
+                HookEventType.PRE_TOOL_USE, lambda: self._tool_fields(tc, tool)
+            ).verdict
+        except Exception:
+            return NO_VERDICT
+
+    def _dispatch_post_tool(
+        self, tc: ToolCall, tool: Tool, res: ToolResult, duration_ms: float
+    ) -> None:
+        """
+        分发 `post_tool_use` 或 `post_tool_use_failure`（spec F2）。
+
+        :param res: 执行结果，按 `res.ok` 决定分发哪个事件
+
+        ## ⚠ 只在「真的执行了」之后调用
+
+        本方法的两个调用点都紧挨着 `outcome == OUTCOME_EXECUTED` 的 `_trace_tool`。
+        六种「压根没执行」的分支（未知工具 / 参数错误 / out_of_scope / plan_blocked /
+        权限 DENY / 用户拒绝 / Hook 拦截）**一个都不能挂**——`post_tool_use_failure`
+        的语义是「跑了但失败了」，把「没跑」混进来会让「统计工具失败率」
+        这类用途直接失真，而且不报错（spec AC3）。
+
+        副作用：可能起子进程 / 发 HTTP 请求。异常一律吞掉。
+        """
+        event = (
+            HookEventType.POST_TOOL_USE if res.ok else HookEventType.POST_TOOL_USE_FAILURE
+        )
+        if not self._hooks.has_listeners(event):
+            return
+        extra: dict = {"tool_output": res.output, "duration_ms": duration_ms}
+        if not res.ok:
+            extra["error"] = res.summary or "工具执行失败"
+        try:
+            self._hooks.dispatch(event, lambda: self._tool_fields(tc, tool, **extra))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _apply_hook_ask(
+        decision: DecisionResult, verdict: "HookVerdict"
+    ) -> DecisionResult:
+        """
+        Hook 判 ASK 时，把权限管线的 ALLOW **升级**为 ASK（spec F6.1）。
+
+        :param decision: 权限管线的结论
+        :param verdict: Hook 的结论
+        :returns: 生效后的结论
+
+        ## ⚠ 只升级 ALLOW，绝不降级 DENY
+
+        写成「命中 ASK 就置为 ASK」会让一条 Hook 把①黑名单的 DENY 变成一次
+        **可以点「同意」的确认面板**——Hook 于是获得了放宽权限的能力，
+        而「Hook 只能收紧」正是本章全部安全论证的依据（spec AC15）。
+
+        副作用：无。
+        """
+        if verdict.decision != HookDecision.ASK:
+            return decision
+        if decision.decision != Decision.ALLOW:
+            # DENY 原样保留；已经是 ASK 的也不必重复包装。
+            return decision
+        return DecisionResult(
+            Decision.ASK,
+            Layer.HOOK,
+            verdict.reason,
+            kind=decision.kind,
+            host=decision.host,
         )
 
     # 本层的四个「受保护漏斗」。
@@ -654,6 +794,9 @@ class Agent:
         # **与 out_of_scope 分开是刻意的**：两处过滤职责不同，回灌给模型的
         # 下一步指引也完全不同——那边是「换个工具」，这边是「先提交计划」。
         plan_blocked: list[ToolCall] = []
+        # 被 Hook 前置层拦下的调用（c12）。与上面两个分开，同样是因为回灌指引不同——
+        # 那两处是「换个工具」「先提交计划」，这里是「这是用户预先写下的规则，别绕」。
+        hook_blocked: list[tuple[ToolCall, "HookVerdict"]] = []
         # 串行桶元素：(调用, 工具或None, 决策或None)。
         # tool=None → 未知工具；decision=None → 参数解析失败（两者都不进引擎）。
         serial: list[tuple[ToolCall, Optional[Tool], Optional[DecisionResult]]] = []
@@ -668,23 +811,6 @@ class Agent:
             if tool is None:
                 serial.append((tc, None, None))
                 ctx.unknown_count += 1
-                continue
-            # 系统级串行工具**强制走串行、不进只读并发桶**（对齐改造 F8）。
-            #
-            # 理由是它现在可能开一整条子对话（`context: fork` 的 Skill 由模型自行
-            # 发起时）。在只读并发桶里跑子对话意味着：子对话自己的确认面板会从
-            # 线程池的工作线程里弹出来，而那正是 C11 加锁不变量那一课的同型场景，
-            # 只是后果更重——那次是状态栏刷新，这次是整条交互链。
-            #
-            # 给一个 ALLOW 决策直接放行：它与改造前的实际效果相同（`read_only=True`
-            # 会在权限引擎的只读简化分支被直接放行），只是不再经过引擎。
-            if tool.system_serial and self._visible(tc.name, excluded):
-                ctx.known_count += 1
-                serial.append((
-                    tc,
-                    tool,
-                    DecisionResult(Decision.ALLOW, Layer.RULE, "系统级工具，免确认"),
-                ))
                 continue
             # 工具存在，但**本轮没发给模型**（被 Skill 白名单收窄掉了）。
             # 模型仍可能凭训练先验硬造出这样一次调用——实测 DeepSeek 就在
@@ -708,15 +834,72 @@ class Agent:
             # 五层权限管线仍会照常拦截（会弹确认面板），但那是「最后一道」而非
             # 「本该有的一道」——Plan Mode 的承诺是「批准前不动手」，
             # 不该退化成「批准前每次都问你要不要动手」。
-            if planning and not tool.read_only:
+            #
+            # `and not tool.system_serial` 把一条**原本隐式**的豁免写成了显式条件：
+            # 改造前系统级串行工具在这一步之前就已经 `continue` 掉了，因此从不受
+            # 规划阶段过滤约束。现在 Hook 分发要收在单一点上（见下），系统级工具的
+            # 分流必须挪到这一步之后，那条豁免就得自己写出来，否则今天唯一的系统级
+            # 工具（`load_skill`）的行为会悄悄改变。
+            if planning and not tool.read_only and not tool.system_serial:
                 plan_blocked.append(tc)
                 ctx.unknown_count += 1
                 continue
+
             ctx.known_count += 1
             if not isinstance(tc.arguments, dict):
-                # 参数解析失败或非对象 JSON：不进引擎，留待串行路径产出结构化错误。
+                # 参数解析失败或非对象 JSON：不进引擎，也**不触发 Hook**——
+                # 这次调用在任何判定之前就已经废了。留待串行路径产出结构化错误。
+                #
+                # 这一步从「系统级工具分流之后」提到了「之前」，因此系统级工具的
+                # 非法参数现在也走结构化错误，而不是带着一个字符串进 `tool.execute`
+                # 去撞 AttributeError。两者都是 ok=False 且都不执行，新形态的
+                # 报错更可读。
                 serial.append((tc, tool, None))
                 continue
+
+            # ── Hook 前置层（c12）：**唯一分发点** ──
+            #
+            # 位置卡在这里的理由，两头都不能挪：
+            # - 往前挪会让四个「压根没执行」的分支（未知工具 / out_of_scope /
+            #   plan_blocked / 参数非法）也触发 `pre_tool_use`。
+            # - 往后挪就跨过了系统级工具的分流，那条路径将拿不到 Hook 结论。
+            #
+            # 它排在**五层权限管线之前**：Hook 说拦就直接拦，连 `engine.decide`
+            # 都不调（这一点有专门的反证测试钉着——防「先跑引擎再看 hook」
+            # 这种顺序写反但结果碰巧正确的实现）。
+            #
+            # ⚠ **「权限 DENY」与「用户在面板拒绝」两种情形下 `pre_tool_use`
+            # 照常触发**，这与 spec F2 边界第 2 条的字面表述不同。那条边界写的是
+            # 「一个都不触发任何工具级事件」，但它给出的理由只讲 post 事件的语义
+            # （「跑了但失败了」）；而 `pre_tool_use` 按决策 1A 排在五层**之前**，
+            # 在跑权限判定之前根本无从知道它会不会 DENY——结构上做不到。
+            # 因此那条边界按「管后置事件」理解，前置事件对每一次进入判定的调用都触发。
+            hook_verdict = self._dispatch_pre_tool(tc, tool)
+            if hook_verdict.decision == HookDecision.DENY:
+                hook_blocked.append((tc, hook_verdict))
+                continue
+
+            # 系统级串行工具**强制走串行、不进只读并发桶**（对齐改造 F8）。
+            #
+            # 理由是它现在可能开一整条子对话（`context: fork` 的 Skill 由模型自行
+            # 发起时）。在只读并发桶里跑子对话意味着：子对话自己的确认面板会从
+            # 线程池的工作线程里弹出来，而那正是 C11 加锁不变量那一课的同型场景，
+            # 只是后果更重——那次是状态栏刷新，这次是整条交互链。
+            #
+            # 给一个 ALLOW 决策直接放行：它与改造前的实际效果相同（`read_only=True`
+            # 会在权限引擎的只读简化分支被直接放行），只是不再经过引擎。
+            # Hook 若判 ASK，这条放行同样会被升级为「问用户」。
+            if tool.system_serial:
+                serial.append((
+                    tc,
+                    tool,
+                    self._apply_hook_ask(
+                        DecisionResult(Decision.ALLOW, Layer.RULE, "系统级工具，免确认"),
+                        hook_verdict,
+                    ),
+                ))
+                continue
+
             # 权限决策：规范化 → engine.decide。
             request = to_request(tool, tc.arguments, engine.mode)
             decision = engine.decide(request)
@@ -731,6 +914,14 @@ class Agent:
             # 无副作用」的既有性质（`decide` 的 docstring 明写「副作用：无」）。
             # 把埋点塞进引擎会让那句话变成假话，而权限层是安全边界，它的可预测性
             # 比少写一行埋点重要。
+            #
+            # ⚠️ **埋点必须排在下面的 Hook 升级之后**，记的是**生效的**那个结论。
+            #
+            # 埋在升级之前的话，一次「权限判 ALLOW、Hook 把它升级为 ASK」的调用
+            # 会在记录里留下 `decision=allow`，而用户实际看到的是一个确认面板——
+            # 观测设施撒谎且不报错，排查的人会据此断定「Hook 没生效」。
+            # 端到端场景 2 就是靠这条判定层为 `hook` 的记录来验升级的（实测踩过）。
+            decision = self._apply_hook_ask(decision, hook_verdict)
             self._safe_emit(
                 TraceEventType.PERMISSION_DECISION,
                 tool=tc.name,
@@ -750,6 +941,8 @@ class Agent:
                 layer=decision.layer.value,
                 reason=decision.reason,
             )
+            # 升级已在埋点之前完成（见上方说明）。这里只做分桶：
+            # 升级后的调用必须走串行桶弹面板，不能留在只读并发桶里。
             if decision.decision == Decision.ALLOW and tool.read_only:
                 readonly.append((tc, tool))
             else:
@@ -799,6 +992,22 @@ class Agent:
             )
             results[tc.id] = res
             self._trace_tool(tc, res, OUTCOME_PLAN_BLOCKED)
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
+
+        # 被 Hook 前置层拦下的：不执行，回灌规则给出的原因（c12 spec F6.3）。
+        #
+        # 文案整体由 `HookManager` 产出（`BLOCKED_FEEDBACK`），这里只负责搬运——
+        # 拦截原因是「用户预先声明的规则」这个语义要靠文案掰正，把它散到两个模块
+        # 各写一半，改一处就会漂移。
+        #
+        # **刻意不置 `ctx.user_denied`**：那个标志的含义是「人刚刚在面板上说了不」，
+        # 会让下一轮硬性不发任何工具。Hook 拦截是一条预设规则命中，不是人的即时决定，
+        # 借用它会让模型在一条无关的规则触发后突然失去全部工具。
+        for tc, verdict in hook_blocked:
+            yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+            res = ToolResult(ok=False, output=verdict.reason, summary="Hook 拦截")
+            results[tc.id] = res
+            self._trace_tool(tc, res, OUTCOME_BLOCKED_BY_HOOK)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 只读且放行：并发
@@ -935,6 +1144,10 @@ class Agent:
         if not valid:
             return
 
+        # 结果循环里只拿得到 tc，而 Hook 的后置事件负载要用 tool.read_only，
+        # 因此先建一张 id → 工具 的表。
+        tools_by_id = {tc.id: tool for tc, tool in valid}
+
         # 提交任务**之前**捕获父作用域（trace T32）。
         #
         # 准确的理由（别写成「否则 tool_execute 会被记成 main」——那是错的）：
@@ -973,13 +1186,17 @@ class Agent:
                 except Exception as e:
                     res = ToolResult(ok=False, output=f"工具执行异常: {e}")
                 results[tc.id] = res
+                duration = durations.get(tc.id, 0)
                 self._trace_tool(
                     tc,
                     res,
                     OUTCOME_EXECUTED,
-                    duration_ms=durations.get(tc.id, 0),
+                    duration_ms=duration,
                     is_concurrent=True,
                 )
+                # 工具级后置事件（c12）：只挂在「真的执行了」之后（spec AC3）。
+                # 这里跑在生成器所在的 Worker 线程上，不在池线程里。
+                self._dispatch_post_tool(tc, tools_by_id[tc.id], res, duration)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
     def _run_one_serial(
@@ -1054,8 +1271,9 @@ class Agent:
         except Exception as e:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res
-        self._trace_tool(
-            tc, res, OUTCOME_EXECUTED,
-            duration_ms=round((time.monotonic() - t0) * 1000, 3),
-        )
+        duration = round((time.monotonic() - t0) * 1000, 3)
+        self._trace_tool(tc, res, OUTCOME_EXECUTED, duration_ms=duration)
+        # 工具级后置事件（c12）：只挂在「真的执行了」之后。上面每一条提前 return
+        # 的分支（未知工具 / 参数错误 / 权限拒绝 / 用户拒绝）都不挂——它们压根没跑。
+        self._dispatch_post_tool(tc, tool, res, duration)
         yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)

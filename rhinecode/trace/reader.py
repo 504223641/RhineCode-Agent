@@ -108,6 +108,7 @@ def _s_api_response(r: dict) -> str:
 # 破坏「trace 是只依赖标准库的叶子包」这条架构不变量。
 # 两处一致由 tests/test_trace_reader.py 里一条遍历 Layer 的断言钉住，漏改当场红。
 _LAYER_NAMES = {
+    "hook": "⓪Hook",
     "blacklist": "①黑名单",
     "sandbox": "②沙箱",
     "network": "②′网络边界",
@@ -187,6 +188,32 @@ def _s_history_restored(r: dict) -> str:
     return f"{r.get('origin')} · {r.get('message_count')} 条 · session {r.get('session_id')}"
 
 
+def _s_hook_dispatch(r: dict) -> str:
+    """
+    一次生命周期事件的分发（c12）。
+
+    **零命中也会产出这条事件**，而那恰恰是排查「我的 hook 为什么没跑」的第一现场：
+    看到「命中 0 条」就说明事件确实触发了、是条件没匹配上；一条都看不到则说明
+    分发点压根没接上。两种情况的排查方向完全不同。
+    """
+    verdict = r.get("verdict") or "none"
+    return (
+        f"{r.get('event')} → 命中 {r.get('matched', 0)} 条"
+        f"，执行 {r.get('executed', 0)} 条 · 结论 {verdict}"
+    )
+
+
+def _s_hook_execute(r: dict) -> str:
+    """单条 Hook 规则的执行结果（c12）。"""
+    status = "ok" if r.get("ok") else "失败"
+    verdict = r.get("verdict") or "none"
+    tail = f" · {_text_of(r.get('detail'), 50)}" if r.get("detail") else ""
+    return (
+        f"[{r.get('source')}] {r.get('rule')} · {r.get('action_type')}"
+        f" → {status}/{verdict}（{r.get('duration_ms', 0)}ms）{tail}"
+    )
+
+
 SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.SESSION_START.value: _s_session_start,
     TraceEventType.SESSION_END.value: _s_session_end,
@@ -203,6 +230,8 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.CONTEXT_COMPACTION.value: _s_context_compaction,
     TraceEventType.SKILL_STATE.value: _s_skill_state,
     TraceEventType.HISTORY_RESTORED.value: _s_history_restored,
+    TraceEventType.HOOK_DISPATCH.value: _s_hook_dispatch,
+    TraceEventType.HOOK_EXECUTE.value: _s_hook_execute,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」
