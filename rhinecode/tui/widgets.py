@@ -973,6 +973,7 @@ class ConfirmPanel(OptionList):
     # 但**两处刻意不合一**：让 trace（只依赖标准库的叶子包）反向依赖 permission
     # 会破坏它的架构不变量。一致性由 tests 里遍历 Layer 的断言钉住。
     _LAYER_LABELS = {
+        "hook": "⓪Hook 规则",
         "blacklist": "①危险命令黑名单",
         "sandbox": "②路径沙箱",
         "network": "②′网络边界",
