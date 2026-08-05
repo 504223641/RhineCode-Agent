@@ -469,12 +469,65 @@ class ReportTest(unittest.TestCase):
         self.assertIsNone(m.project_notice())
 
 
+class CommonFieldsTest(unittest.TestCase):
+    """三个公共字段由 manager 统一填充，且**覆盖**同名的展开字段（spec F3.2）。"""
+
+    def test_common_fields_are_injected(self):
+        seen = {}
+
+        def fake(action, payload, client_factory=None):
+            seen.update(payload.fields)
+            return ActionOutcome(ok=True)
+
+        patcher = mock.patch.object(hook_manager, "run_action", side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        m = HookManager([_rule("r", event=TURN)])
+        m.bind_context(session_id="sess-42", cwd="/proj")
+        m.dispatch(TURN, lambda: {"scope": "main"})
+
+        self.assertEqual(seen["event"], TURN.value)
+        self.assertEqual(seen["session_id"], "sess-42")
+        self.assertEqual(seen["cwd"], "/proj")
+        self.assertEqual(seen["scope"], "main")
+
+    def test_common_fields_win_over_expanded_ones(self):
+        """
+        工具参数里恰好也叫 `cwd` 的情况真实存在。让它盖掉「项目根」会让一条
+        按项目筛选的条件在某些工具上突然错位——所以公共字段后写入、优先。
+        """
+        seen = {}
+
+        def fake(action, payload, client_factory=None):
+            seen.update(payload.fields)
+            return ActionOutcome(ok=True)
+
+        patcher = mock.patch.object(hook_manager, "run_action", side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        m = HookManager([_rule("r", event=TURN)])
+        m.bind_context(session_id="s", cwd="/proj")
+        m.dispatch(TURN, lambda: {"cwd": "/tool/param", "event": "伪造"})
+
+        self.assertEqual(seen["cwd"], "/proj")
+        self.assertEqual(seen["event"], TURN.value)
+
+    def test_bind_context_keeps_unset_fields(self):
+        m = HookManager([])
+        m.bind_context(session_id="a", cwd="/x")
+        m.bind_context(session_id="b")
+        self.assertEqual(m._common_fields(TURN)["cwd"], "/x")
+        self.assertEqual(m._common_fields(TURN)["session_id"], "b")
+
+
 class NullManagerTest(unittest.TestCase):
     """空实现的接口与 `HookManager` 对齐（AC24）。"""
 
     def test_interface_parity(self):
         null, real = NullHookManager(), HookManager([])
-        for name in ("enabled", "rules", "warnings", "has_listeners",
+        for name in ("enabled", "rules", "warnings", "has_listeners", "bind_context",
                      "dispatch", "consume_injections", "report", "project_notice"):
             self.assertTrue(hasattr(null, name), f"NullHookManager 缺少 {name}")
             self.assertTrue(hasattr(real, name), f"HookManager 缺少 {name}")

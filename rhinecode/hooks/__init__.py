@@ -93,6 +93,9 @@ class NullHookManager:
     rules: list = []
     warnings: list = []
 
+    def bind_context(self, session_id: str = "", cwd: str = "") -> None:
+        """什么都不做（没有负载要填）。"""
+
     def has_listeners(self, event: HookEventType) -> bool:
         """恒为 False——调用方据此跳过负载构造。"""
         return False

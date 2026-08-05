@@ -150,6 +150,40 @@ class HookManager:
         self._stats: dict[str, dict[str, Any]] = {}
         self._injections: list[str] = []
 
+        # 三个公共字段由本类统一填充（见 `_common_fields`）。
+        self._session_id: str = ""
+        self._cwd: str = ""
+
+    # ------------------------------------------------------------------ #
+    # 公共字段
+    # ------------------------------------------------------------------ #
+    def bind_context(self, session_id: str = "", cwd: str = "") -> None:
+        """
+        绑定公共字段的取值（会话 ID 与项目根）。
+
+        :param session_id: 当前会话 ID；`/clear`、`/resume` 切换会话后要重新绑定
+        :param cwd: 项目根绝对路径
+
+        由装配层调用一次、协调层在会话切换时再调用。**不传的字段保持原值**，
+        因此调用方可以只更新 `session_id`。
+
+        副作用：改写内部字段（仅供负载构造使用，不参与任何判定）。
+        """
+        if session_id:
+            self._session_id = session_id
+        if cwd:
+            self._cwd = cwd
+
+    def _common_fields(self, event: HookEventType) -> dict[str, Any]:
+        """
+        构造三个公共字段（spec F2 开头）。
+
+        **由本类统一填充，而不是让五个分发点各拼一次**——那是典型的漏改点：
+        少填一个 `session_id` 不报错，只是某个事件的负载里悄悄少一个字段，
+        而用户写的 `session_id: xxx` 条件从此永不命中。
+        """
+        return {"event": event.value, "session_id": self._session_id, "cwd": self._cwd}
+
     # ------------------------------------------------------------------ #
     # 受保护的埋点漏斗
     # ------------------------------------------------------------------ #
@@ -276,9 +310,12 @@ class HookManager:
     ) -> DispatchResult:
         """`dispatch` 的主体，四段式加锁。异常由调用方兜底。"""
         listeners = self._by_event.get(event, [])
-        fields = payload_factory() if payload_factory is not None else {}
-        if not isinstance(fields, dict):
-            fields = {}
+        raw = payload_factory() if payload_factory is not None else {}
+        fields: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+        # 公共字段**后写入，因此覆盖同名的展开字段**（spec F3.2：公共字段优先）。
+        # 工具参数里恰好也叫 `cwd` 的情况真实存在，让它盖掉「项目根」会让
+        # 一条按项目筛选的条件在某些工具上突然错位。
+        fields.update(self._common_fields(event))
         payload = HookPayload(event, fields)
 
         # 条件求值在锁外：规则不可变、`evaluate` 是纯函数，没有任何共享状态。
