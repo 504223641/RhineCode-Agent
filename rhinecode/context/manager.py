@@ -18,6 +18,7 @@ ContextManager 是 Context 层唯一持有 provider 引用、唯一有副作用�
 from pathlib import Path
 from typing import Optional
 
+from rhinecode.hooks import HookEventType, NullHookManager
 from rhinecode.provider.base import BaseProvider, Message
 from rhinecode.context.estimate import estimate_tokens
 from rhinecode.context.offload import Offloader
@@ -100,6 +101,7 @@ class ContextManager:
         store_dir: Path,
         auto_margin: Optional[int] = None,
         recorder: "Optional[TraceRecorderProtocol]" = None,
+        hook_manager=None,
     ) -> None:
         """
         :param provider: Provider，用于第二层摘要的 LLM 调用（复用 stream_chat）
@@ -110,8 +112,12 @@ class ContextManager:
                             见 `_derive_margin`；显式传值则原样采用（测试用）。
                             手动 /compact 不设余量阈值（用户主动触发即尽力压缩），故无对应参数。
         :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
+        :param hook_manager: Hook 编排者（c12）。缺省 `NullHookManager()`，同样不传等于零回归。
+                             **只有第二层（LLM 摘要）产出事件**，第一层存盘不产——
+                             那一层每轮都可能发生若干次，挂 Hook 上去只会产生噪音。
         """
         self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
+        self._hooks = hook_manager if hook_manager is not None else NullHookManager()
         self._provider = provider
         self._model = model
         self.window = window
@@ -220,12 +226,53 @@ class ContextManager:
 
         副作用：可能发起摘要 LLM 调用并原地重构 history。
         """
-        return self._do_summary(history)
+        return self._do_summary(history, trigger="manual")
 
     # ------------------------------------------------------------------ #
     # 第二层摘要核心
     # ------------------------------------------------------------------ #
-    def _do_summary(self, history: list[Message]) -> CompactionNotice:
+    def _do_summary(
+        self, history: list[Message], trigger: str = "auto"
+    ) -> CompactionNotice:
+        """
+        第二层摘要的**分发外壳**（c12）：在真正的摘要前后各产出一个 Hook 事件。
+
+        :param history: 当前对话历史
+        :param trigger: `"auto"`（余量不足自动触发）或 `"manual"`（用户敲 /compact）
+        :returns: 与内层逐字相同的通知
+
+        ## 为什么要有这层外壳
+
+        内层 `_summarize` 有**四条 return 路径**（无早段 / 请求异常 / 解析失败 / 成功），
+        逐条手写 `post_compact` 必漏一条，而漏了不报错——只是某种结局下事件凭空消失。
+        用外壳把「每条 return 都要过它」变成结构上的必然，手法与
+        `permission/engine.decide` 里那个唯一出口闭包 `_verdict` 相同。
+
+        副作用：见 `_summarize`，另加两次 Hook 分发。
+        """
+        before_count = len(history)
+        self._dispatch_compact(
+            HookEventType.PRE_COMPACT, trigger=trigger, message_count=before_count
+        )
+        notice = self._summarize(history)
+        self._dispatch_compact(
+            HookEventType.POST_COMPACT,
+            trigger=trigger,
+            message_count=before_count,
+            ok=(notice.kind == "summary"),
+        )
+        return notice
+
+    def _dispatch_compact(self, event: "HookEventType", **fields) -> None:
+        """分发一个压缩事件；无人监听时不构造负载，异常一律吞掉。"""
+        if not self._hooks.has_listeners(event):
+            return
+        try:
+            self._hooks.dispatch(event, lambda: dict(fields))
+        except Exception:
+            pass
+
+    def _summarize(self, history: list[Message]) -> CompactionNotice:
         """
         执行一次 LLM 摘要并原地重构历史；封装失败与熔断处理（F11/F12/F15/N2）。
 
