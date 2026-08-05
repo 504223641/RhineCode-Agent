@@ -147,7 +147,8 @@ def render_report(
 
     :param rules: 已加载的全部规则（顺序即执行顺序）
     :param warnings: 加载期警告
-    :param stats: 规则名 → 统计字典
+    :param stats: **规则唯一键**（`HookRule.key`）→ 统计字典。
+                  用 key 而不是 name——name 可能重复，用它做键会让两条同名规则的统计互相覆盖
     :param user_path: 用户级配置路径（展示用）
     :param project_path: 项目级配置路径（展示用）
     :returns: 多行文本
@@ -172,7 +173,7 @@ def render_report(
         lines.append(f"已加载 Hook 规则（共 {len(rules)} 条，按执行顺序）")
         lines.append("")
         for ordinal, rule in enumerate(rules, 1):
-            lines.extend(_render_rule(rule, stats.get(rule.name), ordinal))
+            lines.extend(_render_rule(rule, stats.get(rule.key), ordinal))
             lines.append("")
 
     if warnings:
