@@ -35,6 +35,22 @@ from rhinecode.commands import (
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.conversation import ConversationManager, SessionListRequest
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
+from rhinecode.commands.parser import InputKind, parse_input
+from rhinecode.hooks import HookEventType
+
+# `_interact` 的交互种类 → Hook `notification` 事件的 `kind` 取值（c12 spec F2）。
+#
+# 两套词汇刻意不合一：`_interact` 的 kind 是**内部结算标识**（还要映射面板选项、
+# 进 trace 的 interaction 事件），而 Hook 的 kind 是**写进用户配置里的稳定契约**。
+# 合并会让「改一个内部标识」变成「破坏用户的 hooks.yaml」。
+#
+# ⚠ 新增交互种类时要在这里加一行；漏改不报错，只是那种面板弹出时
+# `kind` 会退回内部标识，用户按文档写的条件匹配不上。
+_NOTIFY_KINDS = {
+    "confirm": "awaiting_confirm",
+    "clarify": "awaiting_clarify",
+    "approve": "awaiting_plan",
+}
 from rhinecode.trace import (
     NullRecorder,
     SCOPE_MAIN,
@@ -376,6 +392,8 @@ class RhineApp(App):
             return self._manager.skills_report()
         if target == ReportTarget.SKILLS_PROMPT:
             return self._manager.skills_prompt_report()
+        if target == ReportTarget.HOOKS:
+            return self._manager.hooks_report()
         raise ValueError(f"未知的报告目标：{target!r}")
 
     def refresh_status(self) -> None:
@@ -625,7 +643,39 @@ class RhineApp(App):
             text = event.text
 
         panel.hide()
+        # c12 `user_message`：在**命令分发之前**分发。
+        #
+        # 它与 `turn_start` 不是重复事件而是来源不同：`/help` 这类命令触发
+        # 前者而不触发后者（命令不进 AI），模型自行发起的 fork 子对话则相反。
+        # 空输入不算（与 trace 的 `user_input` 同口径：空提交是零副作用的）。
+        parsed = parse_input(text)
+        if parsed.kind != InputKind.EMPTY:
+            self._dispatch_hook(
+                HookEventType.USER_MESSAGE,
+                text=parsed.raw_text.strip(),
+                is_command=(parsed.kind == InputKind.SLASH),
+            )
         self._dispatcher.dispatch(text, self)
+
+    def _dispatch_hook(self, event: "HookEventType", **fields) -> None:
+        """
+        分发一个界面侧的 Hook 事件（c12）。
+
+        :param event: 事件类型
+        :param fields: 事件专有字段
+
+        无人监听时不构造负载（spec N7）；异常一律吞掉——本方法有一个调用点在
+        `_do_stream` 的收尾路径上，抛出会把一次正常结束变成崩溃。
+
+        副作用：可能起子进程 / 发 HTTP 请求。
+        """
+        hooks = getattr(self._manager, "_hooks", None)
+        if hooks is None or not hooks.has_listeners(event):
+            return
+        try:
+            hooks.dispatch(event, lambda: dict(fields))
+        except Exception:
+            pass
 
     def _start_stream_worker(self, gen) -> None:
         """
@@ -764,12 +814,18 @@ class RhineApp(App):
             # 把已累积的内容记一条。记的是**已在界面上呈现的完整一段**，
             # 而不是逐块增量（那会产出几百条碎片事件）。
             if response_chunks:
+                text = "".join(response_chunks)
                 self._recorder.emit_lazy(
                     TraceEventType.UI_MESSAGE,
-                    lambda text="".join(response_chunks): {
-                        "source": "assistant",
-                        "text": clip(text),
-                    },
+                    lambda text=text: {"source": "assistant", "text": clip(text)},
+                )
+                # c12 `assistant_message`：与 `ui_message` 埋点**同位置、同产出条件**。
+                # 搭它的车是刻意的——「一段 AI 正文产出完毕」这件事在本文件里只有
+                # 这一个判定点，另立一处判定必然与它漂移。
+                self._dispatch_hook(
+                    HookEventType.ASSISTANT_MESSAGE,
+                    scope=self._recorder.current_scope(),
+                    text=text,
                 )
             thinking_widget = None
             thinking_chunks = []
@@ -935,6 +991,16 @@ class RhineApp(App):
             #
             # 本调用只做内存写与一次 `emit`，不碰界面，故在 finally 里是安全的。
             reset_text_widgets()
+            # c12 `notification`：一次 Agent 运行结束。
+            #
+            # 位置与上面那次 `reset_text_widgets()` 同理——必须在两个
+            # `call_from_thread` **之前**：它们在应用退出竞态下会抛 RuntimeError，
+            # 放后面等于「出错时不通知」，而「跑完了叫我一声」正是出错时也想要的。
+            self._dispatch_hook(
+                HookEventType.NOTIFICATION,
+                kind="agent_finished",
+                message="本次运行已结束。",
+            )
             self.call_from_thread(self._set_streaming, False)
             # **没等到结果的工具行必须在这里收尾**，否则留在界面上一直橘着、
             # 计时器每秒还在跳，看起来程序卡在某个工具上了。
@@ -1041,6 +1107,17 @@ class RhineApp(App):
         # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
         self._busy_hint_shown = False
         self.call_from_thread(show_fn)
+        # c12 `notification`：面板**已经弹出之后**才分发。
+        #
+        # 放在 `show_fn` 之后而不是之前，是因为 Hook 动作可能跑上几十秒；
+        # 放前面会让「面板迟迟不出现」，而这个事件的用途恰恰是「我切走了，
+        # 有事叫我」——面板出得越早越好。放在 `wait()` 之前也无害：
+        # 用户在此期间的选择会被存进盒子并 set()，稍后 wait() 立即返回。
+        self._dispatch_hook(
+            HookEventType.NOTIFICATION,
+            kind=_NOTIFY_KINDS.get(kind, kind),
+            message=display or f"等待用户{kind}",
+        )
         box["event"].wait()
         result = box["result"]
         # 交互埋点（trace F14）：埋在**阻塞等待返回之后**（即结算时刻），

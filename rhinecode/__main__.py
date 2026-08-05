@@ -27,6 +27,7 @@ from pathlib import Path
 from rhinecode.bootstrap import BootstrapError, build_app
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
 from rhinecode.permission import config as perm_config
+from rhinecode.hooks import config as hook_config
 from rhinecode.mcp import config as mcp_config
 from rhinecode.tools.path_guard import workspace_root
 from rhinecode.trace import NullRecorder, default_trace_path
@@ -91,23 +92,25 @@ def main() -> None:
     explicit = args.config is not None
     config_path = Path(args.config) if explicit else user_config_path()
 
-    # 首次运行引导：仅在缺省流程（未显式 --config）里为用户级 ~/.rhinecode 生成三类模板。
-    # 三类语义不同：
+    # 首次运行引导：仅在缺省流程（未显式 --config）里为用户级 ~/.rhinecode 生成四类模板。
+    # 两类语义不同：
     # - config.yaml 必需（含 api_key）→ 本次才生成时，引导填 key 后退出。
-    # - permissions.yaml / mcp.yaml 可选（fail-safe，缺省即空）→ 模板全注释、等价于空，
-    #   静默生成、不因它们退出；已有 config.yaml 的老用户下次运行会顺带补上这两份。
+    # - permissions.yaml / mcp.yaml / hooks.yaml 可选（fail-safe，缺省即空）→
+    #   模板全注释、等价于空，静默生成、不因它们退出；已有 config.yaml 的老用户
+    #   下次运行会顺带补上这几份。
     if not explicit:
         try:
             config_created = scaffold_user_config(config_path)
             perm_config.scaffold_user_config(perm_config.user_config_path())
             mcp_config.scaffold_user_config(mcp_config.user_config_path())
+            hook_config.scaffold_user_config(hook_config.user_config_path())
         except OSError as e:
             print(f"无法生成配置模板：{e}", file=sys.stderr)
             sys.exit(1)
         if config_created:
             print(
                 f"已在 {config_path.parent} 生成配置模板"
-                "（config.yaml / permissions.yaml / mcp.yaml），"
+                "（config.yaml / permissions.yaml / mcp.yaml / hooks.yaml），"
                 "请在 config.yaml 填入真实 api_key 后重新运行 rhine。"
             )
             sys.exit(0)

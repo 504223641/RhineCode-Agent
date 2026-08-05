@@ -357,23 +357,44 @@ class ConversationManager:
 
     def _compose_startup_notice(self, memory_notice: Optional[str]) -> Optional[str]:
         """
-        把记忆系统的启动提示与权限规则的加载警告拼成一条启动提示。
+        把记忆系统的启动提示、权限规则的加载警告与 **Hook 的两段提示**
+        拼成一条启动提示。
 
         :param memory_notice: `MemoryManager.startup()` 的返回（可能为 None）
-        :returns: 拼接后的提示；两者都为空时返回 None
+        :returns: 拼接后的提示；全部为空时返回 None
 
-        由 `tui/app.py` 在界面挂载时写进聊天区。两者都可能为空，
+        由 `tui/app.py` 在界面挂载时写进聊天区。各段都可能为空，
         拼接时不产生多余空行——空提示与「有提示但只有一行空白」在界面上
         是两种观感，后者会让人以为出了什么事。
+
+        ## ⚠ 为什么 Hook 的提示必须走这条通道，不能用 print
+
+        启动阶段的 `print` 发生在 Textual 接管屏幕**之前**，会被 alternate screen
+        整个盖住——用户要等到退出程序才在终端里看见，那时早已失去意义
+        （C11 踩过，`bootstrap.py` 里有记载）。而项目级 Hook 的逐条展示
+        是 spec F9.1 的**全部安全价值**：被盖住等于那道防线没了。
+
+        项目级提示排在最前面：它是唯一一段「可能来自别人仓库、且会直接执行」
+        的内容，用户第一眼该看到它。
 
         副作用：无。
         """
         parts: list[str] = []
+        # 项目级 Hook 逐条展示（c12 F9.1）。**每次启动都出现**，不做「只提示一次」
+        # 的持久化——有状态的话，`git pull` 新拉进来的规则会在状态未失效时被静默吞掉。
+        project_hooks = self._hooks.project_notice()
+        if project_hooks:
+            parts.append(project_hooks)
         if memory_notice:
             parts.append(memory_notice)
         errors = getattr(self._engine, "load_errors", None) or []
         if errors:
             parts.append("权限规则加载提示：\n" + "\n".join(f"- {e}" for e in errors))
+        hook_warnings = self._hooks.warnings
+        if hook_warnings:
+            parts.append(
+                "Hook 规则加载提示：\n" + "\n".join(f"- {w}" for w in hook_warnings)
+            )
         if not parts:
             return None
         return "\n\n".join(parts)

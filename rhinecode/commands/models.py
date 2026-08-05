@@ -77,6 +77,7 @@ class ReportTarget(Enum):
     MEMORY = "memory"
     SKILLS = "skills"
     SKILLS_PROMPT = "skills_prompt"
+    HOOKS = "hooks"
 
 
 @dataclass(frozen=True)
