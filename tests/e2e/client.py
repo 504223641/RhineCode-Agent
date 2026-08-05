@@ -21,16 +21,27 @@
 ——如果客户端也依赖产品代码，那么「产品代码本身有语法错误」这种情形下，
 连报错都报不出来。
 
-## 三种失败必须翻译成人话
+## 四种失败必须翻译成人话
 
 | 现象 | 翻译 |
 | --- | --- |
 | 连不上 | 「宿主已不在（名片 X，pid N）」+ 清理指引 |
 | 响应 pid 与名片不符 | 「端口已被其它进程占用，名片疑似陈旧」 |
 | **读到 EOF（空响应）** | 「宿主在处理本指令期间退出了」 |
+| **连接被对端 RST**（宿主被强杀） | 同上，另注明「连接被强制关闭」 |
 
 第三条最容易被写成 `JSONDecodeError`：`wait` 期间宿主自行退出（空闲超时、
 或别人发了 `quit`）正是这个形态，而那个异常名字对使用者毫无信息量。
+
+**第四条是全阶段复测（`docs/e2e-sweep/testing-p1a-driver.md` 缺陷 D1）补上的，
+它和第三条是同一件事的两种 TCP 形态**，漏掉一种就等于这条翻译只做了一半：
+
+| 宿主怎么没的 | TCP 层 | 不处理时的表现 |
+| --- | --- | --- |
+| `quit` / 空闲超时 / 正常崩溃 | FIN → `recv` 返回 `b""` | 走下面那条可读提示 |
+| **强杀**（`Stop-Process -Force` / `SIGKILL`） | **RST → `recv` 直接抛异常** | 裸 `ConnectionResetError` traceback |
+
+也就是说：**最需要可读信息的那一刻（宿主意外死了），给出的却是最没有信息量的输出。**
 """
 
 from __future__ import annotations
@@ -66,19 +77,56 @@ def force_utf8_output() -> None:
                 pass  # 被重定向到不支持 reconfigure 的对象上，忽略即可
 
 
+def _host_gone(info: HostInfo, request: dict, detail: str = "") -> RuntimeError:
+    """
+    造一条「宿主没了」的可读提示。
+
+    :param info: 名片，用于把 pid 报给使用者
+    :param request: 本次指令，用于说明是在做什么的时候断的
+    :param detail: 形态补充说明（EOF 与 RST 两种路径各自不同），空串表示不补充
+    :returns: 待抛出的 RuntimeError（**只造不抛**，由调用方 raise，保留 `from e`）
+
+    EOF 与 RST 是同一件事的两种 TCP 形态，所以文案收在这里**只写一份**——
+    分开写的话，将来改措辞必然只改到一处，而另一处要等下一次宿主意外死掉才被发现。
+    """
+    detail_line = f"{detail}\n" if detail else ""
+    return RuntimeError(
+        f"宿主在处理本指令期间退出了（pid={info.pid}，指令 {request.get('cmd')!r}）。\n"
+        f"{detail_line}"
+        f"常见原因：空闲超时到了、别的客户端发了 quit、或宿主崩溃。\n"
+        f"用 `python -m tests.e2e.client hosts` 确认它是否还在。"
+    )
+
+
 def send_command(info: HostInfo, request: dict, *, timeout: float) -> dict:
     """
     发一条指令并读回一条响应。
 
     :raises StaleHostError: 连不上（第一级陈旧判定）
-    :raises RuntimeError: 读到 EOF——宿主在处理本指令期间退出了
+    :raises RuntimeError: 宿主在处理本指令期间没了——EOF（正常退出）
+        与 RST（被强杀）两种形态翻译成同一条可读提示
     """
     sock = discovery.connect(info, timeout=timeout)
     try:
         sock.sendall(protocol.encode(request))
         buffer = b""
         while b"\n" not in buffer:
-            chunk = sock.recv(65536)
+            try:
+                chunk = sock.recv(65536)
+            except (ConnectionResetError, ConnectionAbortedError) as exc:
+                # 宿主被强杀 → 对端发 RST → recv 直接抛，走不到下面的 EOF 分支。
+                #
+                # **这里无条件抛、不像 EOF 那样「能解多少算多少」**，理由是结构性的：
+                # while 的条件是「buffer 里还没有 \n」，所以能执行到这次 recv，
+                # 就说明**完整的一行响应必然还没到齐**。此时保留半截 buffer 交给
+                # decode，只会把一个明确的「宿主没了」换成一个 JSONDecodeError
+                # ——正是本模块 docstring 点名要消灭的那种没信息量的报错。
+                raise _host_gone(
+                    info,
+                    request,
+                    f"连接被对端强制关闭（{type(exc).__name__}），常见于宿主被强杀；"
+                    f"这种情况通常还会残留临时工作区，需一并手工清理。",
+                ) from exc
             if chunk:
                 # ⚠️ 这一行漏掉过一次：不累积的话 buffer 永远为空，
                 # 下一次 recv 读到 EOF 就会误报「宿主退出了」——
@@ -86,11 +134,7 @@ def send_command(info: HostInfo, request: dict, *, timeout: float) -> dict:
                 buffer += chunk
                 continue
             if not buffer:
-                raise RuntimeError(
-                    f"宿主在处理本指令期间退出了（pid={info.pid}，指令 {request.get('cmd')!r}）。\n"
-                    f"常见原因：空闲超时到了、别的客户端发了 quit、或宿主崩溃。\n"
-                    f"用 `python -m tests.e2e.client hosts` 确认它是否还在。"
-                )
+                raise _host_gone(info, request)
             break  # 收到过数据但连接先断了：能解多少算多少，交给下面的 decode 判定
         line, _, _ = buffer.partition(b"\n")
         return protocol.decode(line)
