@@ -914,6 +914,14 @@ class Agent:
             # 无副作用」的既有性质（`decide` 的 docstring 明写「副作用：无」）。
             # 把埋点塞进引擎会让那句话变成假话，而权限层是安全边界，它的可预测性
             # 比少写一行埋点重要。
+            #
+            # ⚠️ **埋点必须排在下面的 Hook 升级之后**，记的是**生效的**那个结论。
+            #
+            # 埋在升级之前的话，一次「权限判 ALLOW、Hook 把它升级为 ASK」的调用
+            # 会在记录里留下 `decision=allow`，而用户实际看到的是一个确认面板——
+            # 观测设施撒谎且不报错，排查的人会据此断定「Hook 没生效」。
+            # 端到端场景 2 就是靠这条判定层为 `hook` 的记录来验升级的（实测踩过）。
+            decision = self._apply_hook_ask(decision, hook_verdict)
             self._safe_emit(
                 TraceEventType.PERMISSION_DECISION,
                 tool=tc.name,
@@ -933,9 +941,8 @@ class Agent:
                 layer=decision.layer.value,
                 reason=decision.reason,
             )
-            # Hook 判 ASK 时把 ALLOW 升级为 ASK（**只升级，绝不降级 DENY**）。
-            # 必须在分桶之前——升级后的调用要走串行桶弹面板，不能留在并发桶里。
-            decision = self._apply_hook_ask(decision, hook_verdict)
+            # 升级已在埋点之前完成（见上方说明）。这里只做分桶：
+            # 升级后的调用必须走串行桶弹面板，不能留在只读并发桶里。
             if decision.decision == Decision.ALLOW and tool.read_only:
                 readonly.append((tc, tool))
             else:

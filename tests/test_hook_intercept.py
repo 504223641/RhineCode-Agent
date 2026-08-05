@@ -299,6 +299,77 @@ class AskUpgradeTest(unittest.TestCase):
         self.assertIn("[权限拒绝", _results(events)[0].tool_result.output)
 
 
+class TraceFidelityTest(unittest.TestCase):
+    """
+    `permission_decision` 记的必须是**生效的**那个结论（端到端场景 2 实测踩过）。
+
+    埋点若排在 Hook 升级之前，一次「权限判 ALLOW、Hook 升级为 ASK」的调用会在
+    记录里留下 `decision=allow`，而用户实际看到的是一个确认面板——
+    **观测设施撒谎且不报错**，排查的人会据此断定「Hook 没生效」。
+    """
+
+    class _Rec:
+        enabled = True
+
+        def __init__(self):
+            self.events: list[tuple] = []
+
+        def emit(self, event_type, **payload):
+            self.events.append((getattr(event_type, "value", event_type), payload))
+
+        def emit_lazy(self, event_type, factory):
+            self.emit(event_type, **factory())
+
+        def current_scope(self):
+            return "main"
+
+        def bind_scope(self, name):
+            pass
+
+    def test_records_the_effective_decision_after_upgrade(self):
+        _install_outcomes(
+            self, {"x": ActionOutcome(ok=True, verdict=HookDecision.ASK, reason="要确认")}
+        )
+        rec = self._Rec()
+        registry = ToolRegistry()
+        registry.register(FakeReadTool())
+        agent = Agent(
+            ScriptedProvider([ToolCall("c1", "read_file", {"path": "a.py"})]),
+            registry,
+            recorder=rec,
+            hooks=HookManager([_rule()]),
+        )
+        list(agent.run(
+            [Message(role="user", content="go")], "off", False, "", lambda: "", "m", None,
+            PermissionEngine(RuleSet([]), mode=PermissionMode.PERMISSIVE),
+            lambda *a: True, None, None, threading.Event(),
+        ))
+
+        decisions = [p for name, p in rec.events if name == "permission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["decision"], "ask", "记的必须是升级后的结论")
+        self.assertEqual(decisions[0]["layer"], "hook")
+
+    def test_records_allow_when_hook_says_nothing(self):
+        _install_outcomes(self, {"x": ActionOutcome(ok=True)})
+        rec = self._Rec()
+        registry = ToolRegistry()
+        registry.register(FakeReadTool())
+        agent = Agent(
+            ScriptedProvider([ToolCall("c1", "read_file", {"path": "a.py"})]),
+            registry,
+            recorder=rec,
+            hooks=HookManager([_rule()]),
+        )
+        list(agent.run(
+            [Message(role="user", content="go")], "off", False, "", lambda: "", "m", None,
+            PermissionEngine(RuleSet([]), mode=PermissionMode.PERMISSIVE),
+            lambda *a: True, None, None, threading.Event(),
+        ))
+        decisions = [p for name, p in rec.events if name == "permission_decision"]
+        self.assertEqual(decisions[0]["decision"], "allow", "不表态时不该被改写")
+
+
 class FailClosedTest(unittest.TestCase):
     """Hook 自身失败在 pre_tool_use 上即拦截（AC17）。"""
 

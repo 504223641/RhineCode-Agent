@@ -229,7 +229,17 @@ class RhineApp(App):
         if self._manager.history:
             self.query_one(HistoryView).render_history(self._manager.history)
         if self._manager.startup_notice:
-            self.query_one(HistoryView).append_system(self._manager.startup_notice)
+            # ⚠️ 必须走 `show_message` 而不是直接 `append_system`。
+            #
+            # 两者在**界面上**一模一样，差别只在前者会顺带产出一条 `ui_message`
+            # 埋点。直接调 `append_system` 的话，这段提示在界面上显示得好好的，
+            # 却**一个字都没被记下来**——与 P1a 实测到的「最后一段 AI 正文不进
+            # 记录」是同型缺口，同样在界面上完全看不出来。
+            #
+            # c12 起这条不再只是「记录完整性」问题：项目级 Hook 的逐条展示是
+            # spec F9.1 的**全部安全价值**，而「它到底有没有出现在首屏」只能靠
+            # 这条埋点来判定（护栏见 `tests/test_e2e_hooks.py` 场景 7）。
+            self.show_message(self._manager.startup_notice)
         self._manager.memory_manager.notify = self._notify_memory
         self.set_interval(120, self._manager.memory_manager.touch_session_lock)
 
