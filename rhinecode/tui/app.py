@@ -228,6 +228,15 @@ class RhineApp(App):
         # 先把整段历史回放到聊天区，再显示启动提示——与 /resume 面板载入后的体验一致。
         if self._manager.history:
             self.query_one(HistoryView).render_history(self._manager.history)
+        # 项目级 Hook 的逐条展示（c12 F9.1）**单独走醒目通道、排在最前**。
+        #
+        # 它与下面那条 `startup_notice` 分开，是因为两者的性质完全不同：
+        # 后者是记忆系统提示、权限/Hook 加载警告这类**信息**，dim 正合适；
+        # 而这一段是「这些命令会在你机器上直接执行」的**警告**，用同一条 dim 通道
+        # 渲染会让它比普通提示还不显眼——方向正好反了（人眼评审时发现）。
+        hook_notice = self._manager.hooks_project_notice()
+        if hook_notice:
+            self.show_warning(hook_notice)
         if self._manager.startup_notice:
             # ⚠️ 必须走 `show_message` 而不是直接 `append_system`。
             #
@@ -369,6 +378,20 @@ class RhineApp(App):
         """显示本地命令结果或错误（系统行）。"""
         self._trace_ui_message("system", text)
         self.query_one(HistoryView).append_system(text)
+
+    def show_warning(self, text: str) -> None:
+        """
+        显示一条**醒目**的警告（橙色粗体，c12）。
+
+        与 `show_message` 的唯一差别是渲染样式：那条走 `[dim]`（比正文更暗），
+        这条走 `[bold #FFA500]`。埋点仍记 `source="system"`——**刻意不新增一种
+        source 取值**：trace 那边的 source 词汇是断言与阅读器共用的契约，
+        为一个样式差异扩充它不划算，而「界面上出现过这段文本」才是这条埋点的价值。
+
+        今天唯一的用户是项目级 Hook 的启动提示（spec F9.1）。
+        """
+        self._trace_ui_message("system", text)
+        self.query_one(HistoryView).append_warning(text)
 
     def send_user_message(self, content: str, display_content: Optional[str] = None) -> None:
         """

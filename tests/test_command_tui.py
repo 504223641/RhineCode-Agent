@@ -135,6 +135,9 @@ class FakeManager:
     def __init__(self) -> None:
         self.history: list = []
         self.startup_notice = None
+        # c12：App 在 on_mount 里单独取项目级 Hook 提示，走醒目通道展示
+        # （与 startup_notice 分开——那条是 dim 的信息，这条是警告）。
+        self.hooks_project_notice_value = None
         self.memory_manager = FakeMemoryManager()
         self.thinking_effort = "off"
         self.plan_mode = False
@@ -203,6 +206,13 @@ class FakeManager:
 
     def skills_prompt_report(self) -> str:
         return "Skill 注入报告"
+
+    def hooks_report(self) -> str:
+        return "Hook 报告"
+
+    def hooks_project_notice(self):
+        """项目级 Hook 提示；缺省 None（多数用例没有项目级规则）。"""
+        return self.hooks_project_notice_value
 
     def reload_skills(self) -> str:
         return "Skill 已重新加载"

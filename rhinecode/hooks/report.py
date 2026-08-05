@@ -198,6 +198,10 @@ def render_project_notice(project_rules: list[HookRule]) -> Optional[str]:
     1. **逐条列出**，不折叠、不省略、不只给计数。
     2. **命令串与 URL 完整展示**，不截断——被截断的命令看不出它到底干什么，
        而「看得出它干什么」正是这条提示存在的全部理由。
+    2a. **正文里不要用 Markdown 语法**（`**粗体**`）。这段文本会经 `escape` 进
+       Textual 的 markup 通道，而 Textual 只认 `[bold]…[/bold]`，不认 `**`——
+       写了只会在界面上显示成两个字面星号（人眼评审时实测发现）。
+       需要强调就用【方括号】这类纯文本记号，或由调用方整段套样式。
     3. 调用方**每次启动都要展示**，不做「只提示一次」的持久化。有状态的话，
        新增的规则会在状态未失效时被静默吞掉（与项目级 Skill 同一课）。
 
@@ -213,7 +217,7 @@ def render_project_notice(project_rules: list[HookRule]) -> Optional[str]:
     lines = [
         f"⚠ 发现 {len(project_rules)} 条项目级 Hook 规则"
         f"（来自 .rhinecode/hooks.yaml，随仓库分发）。",
-        "它们会在对应时刻**直接执行**，不经模型、也不经确认面板。请当作代码来评审：",
+        "它们会在对应时刻【直接执行】，不经模型、也不经确认面板。请当作代码来评审：",
         "",
     ]
     for ordinal, rule in enumerate(project_rules, 1):

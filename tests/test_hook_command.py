@@ -165,5 +165,52 @@ class MarkupSafetyTest(unittest.TestCase):
         self._render(notice)
 
 
+class ProminenceTest(unittest.TestCase):
+    """
+    项目级提示必须**醒目**，不能走 dim 通道（人眼评审后补的护栏）。
+
+    ## 这条防的是什么
+
+    `append_system` 把系统消息统一包成 `[dim]◆ …[/dim]`——比正文更暗。
+    项目级 Hook 的逐条展示曾经走的就是它，于是本项目里唯一一段
+    「这些命令会在你机器上直接执行」的警告，渲染出来比普通提示还不显眼，
+    方向正好反了。
+
+    另一半是 Markdown 星号：`**直接执行**` 在 Textual 里**不会变粗**
+    （它只认 `[bold]…[/bold]`），只会显示成两个字面星号。
+    """
+
+    def _spans(self, markup: str):
+        from textual.content import Content
+
+        return [s.style for s in Content.from_markup(markup).spans]
+
+    def test_append_warning_is_not_dim(self):
+        from rhinecode.tui.widgets import escape
+
+        styles = self._spans(f"[bold #FFA500]{escape('⚠ 危险')}[/bold #FFA500]")
+        self.assertTrue(styles, "应当有样式跨度")
+        self.assertNotIn("dim", " ".join(styles), "警告不能比正文更暗")
+        self.assertIn("bold", " ".join(styles))
+
+    def test_append_system_is_dim_for_contrast(self):
+        """对照组：普通系统消息确实是 dim 的——两者必须不同，否则这条护栏没意义。"""
+        from rhinecode.tui.widgets import escape
+
+        styles = self._spans(f"[dim]◆ {escape('普通提示')}[/dim]")
+        self.assertIn("dim", " ".join(styles))
+
+    def test_project_notice_has_no_markdown_asterisks(self):
+        """上屏文本里不能有 `**`——Textual 不认，只会显示成字面星号。"""
+        m = HookManager([_rule("上报", source="project")])
+        notice = m.project_notice() or ""
+        self.assertNotIn("**", notice)
+        self.assertIn("直接执行", notice, "强调没了但话还得在")
+
+    def test_report_has_no_markdown_asterisks(self):
+        text = HookManager([_rule("r")], warnings=["某条写坏了"]).report()
+        self.assertNotIn("**", text)
+
+
 if __name__ == "__main__":
     unittest.main()

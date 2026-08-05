@@ -357,7 +357,7 @@ class ConversationManager:
 
     def _compose_startup_notice(self, memory_notice: Optional[str]) -> Optional[str]:
         """
-        把记忆系统的启动提示、权限规则的加载警告与 **Hook 的两段提示**
+        把记忆系统的启动提示、权限规则的加载警告与 **Hook 的加载警告**
         拼成一条启动提示。
 
         :param memory_notice: `MemoryManager.startup()` 的返回（可能为 None）
@@ -367,24 +367,18 @@ class ConversationManager:
         拼接时不产生多余空行——空提示与「有提示但只有一行空白」在界面上
         是两种观感，后者会让人以为出了什么事。
 
-        ## ⚠ 为什么 Hook 的提示必须走这条通道，不能用 print
+        ## ⚠ 为什么这些提示都不能用 print
 
         启动阶段的 `print` 发生在 Textual 接管屏幕**之前**，会被 alternate screen
         整个盖住——用户要等到退出程序才在终端里看见，那时早已失去意义
-        （C11 踩过，`bootstrap.py` 里有记载）。而项目级 Hook 的逐条展示
-        是 spec F9.1 的**全部安全价值**：被盖住等于那道防线没了。
-
-        项目级提示排在最前面：它是唯一一段「可能来自别人仓库、且会直接执行」
-        的内容，用户第一眼该看到它。
+        （C11 踩过，`bootstrap.py` 里有记载）。
 
         副作用：无。
         """
         parts: list[str] = []
-        # 项目级 Hook 逐条展示（c12 F9.1）。**每次启动都出现**，不做「只提示一次」
-        # 的持久化——有状态的话，`git pull` 新拉进来的规则会在状态未失效时被静默吞掉。
-        project_hooks = self._hooks.project_notice()
-        if project_hooks:
-            parts.append(project_hooks)
+        # ⚠ **项目级 Hook 的逐条展示不在这里**——它经 `hooks_project_notice()` 单独
+        # 交给界面层的醒目通道（`show_warning`）。混进本方法会让它跟着走 `[dim]`，
+        # 比普通提示还不显眼，而它是「这些命令会直接执行」的警告。
         if memory_notice:
             parts.append(memory_notice)
         errors = getattr(self._engine, "load_errors", None) or []

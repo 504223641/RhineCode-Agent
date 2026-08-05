@@ -336,12 +336,13 @@ class BootstrapSessionTest(WorkspaceFixture):
         result.cleanup()
         self.assertIn("触发：1 次", result.manager.hooks_report())
 
-    def test_project_notice_is_in_the_startup_notice(self):
+    def test_project_notice_lists_each_rule_in_full(self):
         """
         spec F9.1：项目级规则逐条列出，**命令串完整**。
 
-        走 `startup_notice` 而不是 print——启动期 print 会被 Textual 的
-        alternate screen 整个盖住，用户要退出程序才看得见。
+        ⚠ 它**不在** `startup_notice` 里，而是经 `hooks_project_notice()` 单独交给
+        界面层的醒目通道（`show_warning` → 橙色粗体）。混进 `startup_notice` 会让它
+        跟着走 `[dim]`，比普通提示还不显眼——而它是「这些命令会直接执行」的警告。
         """
         long_cmd = "curl -X POST https://example.com/hook --data @report.json"
         self._write_project_hooks(
@@ -353,10 +354,14 @@ class BootstrapSessionTest(WorkspaceFixture):
             f"      command: '{long_cmd}'\n"
         )
         result = self._build()
-        notice = result.manager.startup_notice or ""
+        notice = result.manager.hooks_project_notice() or ""
         self.assertIn("项目级 Hook 规则", notice)
         self.assertIn("直接执行", notice)
         self.assertIn(long_cmd, notice, "命令串必须完整展示，不能截断")
+        self.assertNotIn(
+            "**", notice,
+            "上屏文本里不能有 Markdown 星号——Textual 只认 [bold]，`**` 会显示成字面星号",
+        )
 
     def test_project_notice_appears_on_every_startup(self):
         """刻意不做「只提示一次」的持久化——新拉进来的规则不能被静默吞掉。"""
@@ -366,8 +371,8 @@ class BootstrapSessionTest(WorkspaceFixture):
             "    event: turn_start\n"
             "    action: {type: prompt, text: hi}\n"
         )
-        first = self._build().manager.startup_notice or ""
-        second = self._build().manager.startup_notice or ""
+        first = self._build().manager.hooks_project_notice() or ""
+        second = self._build().manager.hooks_project_notice() or ""
         self.assertIn("项目级 Hook 规则", first)
         self.assertIn("项目级 Hook 规则", second)
 
@@ -381,7 +386,7 @@ class BootstrapSessionTest(WorkspaceFixture):
         )
         result = self._build()
         self.assertTrue(result.manager._hooks.enabled)
-        self.assertNotIn("项目级 Hook 规则", result.manager.startup_notice or "")
+        self.assertIsNone(result.manager.hooks_project_notice())
 
     def test_load_warning_reaches_the_startup_notice(self):
         """坏配置不阻断启动，但必须**可见**（spec F8 的补偿手段）。"""

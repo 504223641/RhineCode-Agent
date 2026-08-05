@@ -411,8 +411,27 @@ class SubprocessTest(unittest.TestCase):
         traces_dir = work / ".rhinecode" / "traces"
 
         def probe():
+            """
+            等到记录里**真的出现 `session_start`** 才算就绪。
+
+            ⚠ 不能只等「文件非空」——`session_start` **不是文件里的第一条事件**
+            （`bind_tools` 的 `skill_state` 排在它前面，`bootstrap.py` 的第 ⑦ 步
+            注释写着这条）。只等非空的话，会读到「只有 skill_state」的那一瞬间，
+            下面的断言随即失败。
+
+            这个竞态一直都在，但窗口很窄，只在**全量测试的并发负载**下才偶尔命中
+            （单跑必绿）——与 CLAUDE.md 里记着的 `force_rmtree` 那条是同一类坑。
+            c12 在 `skill_state` 与 `session_start` 之间插入了 Hook 配置加载，
+            把窗口拉宽了，于是它稳定复现了出来。
+            """
             files = sorted(traces_dir.glob("*.jsonl")) if traces_dir.exists() else []
-            return files[0] if files and files[0].stat().st_size > 0 else None
+            if not files or files[0].stat().st_size == 0:
+                return None
+            try:
+                records = _read(files[0])
+            except Exception:  # noqa: BLE001 —— 可能正读到写了一半的行
+                return None
+            return files[0] if any(r.get("type") == "session_start" for r in records) else None
 
         path = self._launch_until_trace(
             "--config", str(self._good_config()), "--trace", cwd=work, probe=probe
