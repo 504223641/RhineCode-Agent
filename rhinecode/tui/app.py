@@ -248,9 +248,28 @@ class RhineApp(App):
         """
         笔记更新的低打扰通知（c9 F20）。运行在笔记 daemon 线程，
         用 call_from_thread 把渲染调度回主线程（Textual 线程安全要求）。
+
+        **埋点位置刻意排在 call_from_thread 之后**（全阶段复测观察 O5）。
+
+        原先这里直接调 `append_system`、绕过了 `_trace_ui_message`，后果是
+        c9 的 AC19「笔记变更时界面出现低打扰提示」在**任何**基于 trace 的验收里
+        都是盲区——记录里没有这条 `ui_message`，而「显示了没记」与「压根没显示」
+        （notify 为 None，或下面这个 except 把异常吞了）在 trace 上完全无法区分。
+
+        补埋点时把它放在成功调用之后，是为了让「记录里有 ⟺ 界面上真的出现过」
+        成立：`call_from_thread` 是**阻塞式**的，它正常返回就意味着主线程确实
+        执行完了 `append_system`。反过来若照 `show_message` 那样先记后显示，
+        退出竞态下 `call_from_thread` 抛出、异常被下面吞掉，就会留下一条
+        **界面上从未出现过的记录**——观测设施撒谎，而且不报错。
+
+        这与 CLAUDE.md 记的 `_do_stream` 那条「埋点放在 call_from_thread 之前」
+        **不矛盾**：那里记的是**已经流式显示过**的正文，埋点只是补记录，
+        放后面等于「出错时不记录」；这里的提示则是**还没显示**，先记就是撒谎。
+        判据是同一条——记录必须与用户真实看到的一致。
         """
         try:
             self.call_from_thread(self.query_one(HistoryView).append_system, text)
+            self._trace_ui_message("system", text)
         except Exception:
             # 应用正在退出等边缘情况：通知丢弃即可，不影响任何状态。
             pass
