@@ -845,20 +845,38 @@ class Agent:
                 ctx.unknown_count += 1
                 continue
 
+            ctx.known_count += 1
+            if not isinstance(tc.arguments, dict):
+                # 参数解析失败或非对象 JSON：不进引擎，也**不触发 Hook**——
+                # 这次调用在任何判定之前就已经废了。留待串行路径产出结构化错误。
+                #
+                # 这一步从「系统级工具分流之后」提到了「之前」，因此系统级工具的
+                # 非法参数现在也走结构化错误，而不是带着一个字符串进 `tool.execute`
+                # 去撞 AttributeError。两者都是 ok=False 且都不执行，新形态的
+                # 报错更可读。
+                serial.append((tc, tool, None))
+                continue
+
             # ── Hook 前置层（c12）：**唯一分发点** ──
             #
             # 位置卡在这里的理由，两头都不能挪：
-            # - 往前挪会让「压根没执行」的三个分支（未知工具 / out_of_scope /
-            #   plan_blocked）也触发 `pre_tool_use`，违反 spec F2 边界第 2 条。
+            # - 往前挪会让四个「压根没执行」的分支（未知工具 / out_of_scope /
+            #   plan_blocked / 参数非法）也触发 `pre_tool_use`。
             # - 往后挪就跨过了系统级工具的分流，那条路径将拿不到 Hook 结论。
             #
             # 它排在**五层权限管线之前**：Hook 说拦就直接拦，连 `engine.decide`
             # 都不调（这一点有专门的反证测试钉着——防「先跑引擎再看 hook」
             # 这种顺序写反但结果碰巧正确的实现）。
+            #
+            # ⚠ **「权限 DENY」与「用户在面板拒绝」两种情形下 `pre_tool_use`
+            # 照常触发**，这与 spec F2 边界第 2 条的字面表述不同。那条边界写的是
+            # 「一个都不触发任何工具级事件」，但它给出的理由只讲 post 事件的语义
+            # （「跑了但失败了」）；而 `pre_tool_use` 按决策 1A 排在五层**之前**，
+            # 在跑权限判定之前根本无从知道它会不会 DENY——结构上做不到。
+            # 因此那条边界按「管后置事件」理解，前置事件对每一次进入判定的调用都触发。
             hook_verdict = self._dispatch_pre_tool(tc, tool)
             if hook_verdict.decision == HookDecision.DENY:
                 hook_blocked.append((tc, hook_verdict))
-                ctx.known_count += 1
                 continue
 
             # 系统级串行工具**强制走串行、不进只读并发桶**（对齐改造 F8）。
@@ -872,7 +890,6 @@ class Agent:
             # 会在权限引擎的只读简化分支被直接放行），只是不再经过引擎。
             # Hook 若判 ASK，这条放行同样会被升级为「问用户」。
             if tool.system_serial:
-                ctx.known_count += 1
                 serial.append((
                     tc,
                     tool,
@@ -883,11 +900,6 @@ class Agent:
                 ))
                 continue
 
-            ctx.known_count += 1
-            if not isinstance(tc.arguments, dict):
-                # 参数解析失败或非对象 JSON：不进引擎，留待串行路径产出结构化错误。
-                serial.append((tc, tool, None))
-                continue
             # 权限决策：规范化 → engine.decide。
             request = to_request(tool, tc.arguments, engine.mode)
             decision = engine.decide(request)
