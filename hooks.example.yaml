@@ -1,0 +1,128 @@
+# RhineCode Hook 规则示例（c12）
+#
+# 把本文件复制到下列任一位置即可生效（两层，**没有本地级**）：
+#   ~/.rhinecode/hooks.yaml                 用户级（跨项目的个人自动化）
+#   <项目根>/.rhinecode/hooks.yaml          项目级（随仓库走、可提交、团队共享）
+#
+# 两层规则**全部生效**、不按层级覆盖；执行顺序固定为「用户级 → 项目级 → 层内声明序」，
+# 不提供优先级字段。首次运行 `rhine` 会在用户级自动生成一份全注释模板，
+# 所以多数情况下不必从本文件复制。
+#
+# ── 一条规则 = 三要素 ──
+#   event   何时触发（必填）
+#   if      条件（可省，省略即无条件）
+#   action  做什么（必填）
+# 另有可选的 name（展示用）与 once / async / timeout 三个执行控制。
+#
+# ── 十二个事件 ──
+#   会话级：session_start / session_end
+#   回合级：turn_start / turn_end            （scope 为 main 或 isolated:<skill名>）
+#   消息级：user_message / assistant_message  （user_message 含斜杠命令）
+#   工具级：pre_tool_use / post_tool_use / post_tool_use_failure
+#   系统级：pre_compact / post_compact / notification
+#
+#   工具级事件的负载会把模型生成的工具参数**逐字展开成顶层字段**，
+#   所以能直接写 command: / file_path:，不必写 tool_input.command。
+#
+#   后置事件只在「真的执行了」之后触发——未知工具、参数非法、被规划阶段挡下、
+#   权限拒绝、用户拒绝、被 Hook 自己拦下，这些都不产生 post_tool_use*。
+#
+# ── 条件的四种匹配形态 ──
+#   精确  tool: run_command
+#   通配  command: "git *"                 命令类带词边界（不命中 github-cli）
+#                                          路径类是 gitignore 风格（**/*.py 跨层）
+#   正则  command: "/^git (push|reset)/"   一对 / 包裹，非锚定
+#   反向  tool: "!run_command"             值前缀 !，可与上面三种叠加
+#
+#   if 下写 all（全部满足）或 any（任一满足），**二选一，不混用不嵌套**。
+#   命令类字段会「整条 + 逐段」双重检查：`git push *` 同样命中
+#   `git add x && git commit -m y && git push origin main`。
+#   字段不存在时该条件判为不成立——**反向匹配也不成立**。
+#
+# ── 四种动作 ──
+#   command  跑一条 shell 命令。事件负载以 JSON 从**标准输入**喂给它；
+#            配置里不做任何字符串插值（避免模型生成的参数被拼进命令行）。
+#            退出码 0 通过 / 2 拦截 / 其它算失败。
+#            stdout 可输出 {"decision": "deny"|"ask", "reason": "..."}。
+#   prompt   往 <system-reminder> 注入一段文本，模型下一次请求可见，**只出现一次**。
+#   http     发一个 HTTP 请求。响应**不参与任何决策**。
+#   agent    启动子 Agent —— **本版本仅占位，不会真的运行**。
+#
+# ── 执行控制 ──
+#   once: true     本次进程运行内只触发一次（不持久化，重启重置）
+#   async: true    后台执行不等结果（**pre_tool_use 上禁止**）
+#   timeout: 30    超时秒数（command 缺省 60，http 缺省 10）
+#
+# ⚠ 两条性质，写规则前必须知道
+#   1. Hook **只能收紧不能放宽**：pre_tool_use 的结论只有「拦截 / 升级为人工确认 /
+#      不表态」三种，**没有放行**；升级也只把 ALLOW 变成 ASK，绝不把 DENY 降级。
+#      照 Claude Code 文档写出的 {"decision":"allow"} 会被明确忽略。
+#      要放行什么，请用 permissions.yaml 的 allow 规则。
+#   2. 拦截类 Hook **自身失败即拦截**（fail-closed）：脚本崩了、超时了、退出码不对，
+#      都按拦下处理。这样一条写坏的安全 Hook 会立刻可见，而不是静默失效。
+#      其余事件的 Hook 失败只记录一行，不影响任何流程。
+#
+# ⚠ 项目级 <项目根>/.rhinecode/hooks.yaml 随仓库分发，里面的命令会在对应时刻
+#   **直接执行**（不经模型、不经确认面板）。启动时会用醒目样式逐条列出它们的
+#   事件与完整命令串——请当作代码来评审。
+#
+# 用 /hooks 查看已加载规则、加载警告与本次运行的触发次数。
+
+hooks:
+  # ① 改完 Python 文件自动格式化
+  - name: 格式化改动的 Python 文件
+    event: post_tool_use
+    if:
+      all:
+        - tool: edit_file
+        - file_path: "**/*.py"
+    action:
+      type: command
+      command: "python -m black ."
+      timeout: 30
+
+  # ② 拦住直接 push 到 main（退出码 2 = 拦截，stderr 作为回灌给模型的原因）
+  #    脚本内容示例（另存为 .rhinecode/block_push.py）：
+  #        import sys
+  #        sys.stderr.write("本仓库禁止直接 push 到 main，请改走 Pull Request 流程")
+  #        sys.exit(2)
+  - name: 禁止直接 push 到 main
+    event: pre_tool_use
+    if:
+      all:
+        - tool: run_command
+        - command: "git push * main*"
+    action:
+      type: command
+      command: "python .rhinecode/block_push.py"
+
+  # ③ 每个回合开始时给模型注入一句提醒（只作用于主对话，不打扰 Skill 子对话）
+  - name: 提醒当前分支
+    event: turn_start
+    if:
+      all:
+        - scope: main
+    action:
+      type: prompt
+      text: "改动代码前先确认当前分支不是 main。"
+
+  # ④ 干完活叫我一声（后台异步，不拖慢收尾）
+  - name: 完成时通知
+    event: notification
+    if:
+      all:
+        - kind: agent_finished
+    action:
+      type: http
+      url: "https://example.com/your-webhook"
+      method: POST
+    async: true
+
+  # ⑤ 每次会话开始装一次依赖（once 使它在本次进程内只跑一次）
+  - name: 开局装依赖
+    event: session_start
+    action:
+      type: command
+      command: "npm ci"
+      timeout: 300
+    once: true

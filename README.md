@@ -17,11 +17,12 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 Skill 系统已**对齐 [Agent Skills 开放标准](https://agentskills.io)**（Claude Code 与 Codex 共同遵循的那套），所以从 Claude Code 拿一个 Skill 目录复制进来就能直接用，不需要改任何东西。
 
-> 工具调用、Plan Mode、权限系统与 Skill 仅在 `protocol: deepseek` 且启用默认工具注册中心时可用；记忆系统的 RHINE.md 注入与会话存档/恢复对所有 Provider 生效。Anthropic / OpenAI Provider 目前保持纯对话能力。
+> 工具调用、Plan Mode、权限系统、Skill 与 Hook 的工具级事件仅在 `protocol: deepseek` 且启用默认工具注册中心时可用；记忆系统的 RHINE.md 注入与会话存档/恢复对所有 Provider 生效。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 功能
 
 - **Skill 系统**（已对齐 Agent Skills 开放标准）：把可复用的 AI 操作封装成 Markdown 文件，三级存放同名覆盖；启动只注入名字与说明、用时由 `load_skill` 按需加载完整 SOP；`context: fork` 可开子对话只回流结论；`allowed-tools` 是**预授权**（列出的操作免确认，不限制模型能调什么）；自动注册 `/<name>` 短命令并进 Tab 补全，`/skills reload` 热更新；内置 commit / review / test 三个样板。详见 [Skill 系统](#skill-系统)。
+- **Hook 系统**：在生命周期的固定节点上挂**你自己声明**的自动化动作。一条规则 = 事件 + 条件（可省）+ 动作，写在 `hooks.yaml` 里。十二个事件覆盖会话 / 回合 / 消息 / 工具四层加三个系统级；四种动作（跑 shell 命令 / 注入提示词 / 发 HTTP / 子 Agent 占位）；`once` / `async` / `timeout` 三种执行控制。`pre_tool_use` 可以**拦截**工具调用——但它**只能收紧不能放宽**（没有 allow）。`/hooks` 查看规则与触发情况。详见 [Hook 系统](#hook-系统)。
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
@@ -52,17 +53,17 @@ pip install -e .
 
 ## 配置
 
-安装后**首次运行 `rhine`**会在 `~/.rhinecode/` 下自动生成三份配置模板，并提示你填入真实 `api_key`：
+安装后**首次运行 `rhine`**会在 `~/.rhinecode/` 下自动生成四份配置模板，并提示你填入真实 `api_key`：
 
 ```bash
 rhine
-# → 已在 ~/.rhinecode 生成配置模板（config.yaml / permissions.yaml / mcp.yaml），请在 config.yaml 填入真实 api_key 后重新运行 rhine。
+# → 已在 ~/.rhinecode 生成配置模板（config.yaml / permissions.yaml / mcp.yaml / hooks.yaml），请在 config.yaml 填入真实 api_key 后重新运行 rhine。
 ```
 
 - `config.yaml`：主配置（**必需**），含 `api_key`。填好后即可在**任意目录**运行 `rhine`，不必再 `cd` 回源码目录、也不必每次带 `--config`（若仍是占位符 `YOUR_API_KEY`，会被拦下并提示）。
-- `permissions.yaml` / `mcp.yaml`：可选增强，生成的模板**内容全是注释、默认不生效**（等价于无文件，行为不变）；想用时取消注释即可，无需从示例文件复制。
+- `permissions.yaml` / `mcp.yaml` / `hooks.yaml`：可选增强，生成的模板**内容全是注释、默认不生效**（等价于无文件，行为不变）；想用时取消注释即可，无需从示例文件复制。
 
-这三份是**用户级全局配置**，在任意目录运行 `rhine` 都会读到。
+这四份是**用户级全局配置**，在任意目录运行 `rhine` 都会读到。
 
 你也可以手动从示例文件复制一份到项目内使用，并用 `--config` 显式指定：
 
@@ -161,6 +162,7 @@ C10 起所有斜杠命令由**单一命令注册中心**统一管理：执行、
 | `/init` | — | 提示词 | 让 Agent 探索项目并生成项目根 `RHINE.md`；已存在时不覆盖、只输出改进建议，写盘走完整权限管线（DeepSeek 工具模式生效）。界面与恢复回放只显示 `/init`，模型收到完整内置提示词 |
 | `/skills` | — | 本地 | 管理 Skill：无参列出全部、`prompt` 查看实际注入内容、`reload` 热更新（连同斜杠短命令一并重新注册）、`off [名字]` 卸载、`run <名字> [参数]` 执行 |
 | `/<skill名>` | — | 提示词 | 每个 Skill 自动注册的短命令（如 `/commit`、`/review`）；与内置命令重名时跳过注册，改用 `/skills run <名字>` |
+| `/hooks` | — | 本地 | 查看已加载的 Hook 规则（来源层、事件、条件、动作、本次运行的触发次数与最近结论）、加载警告与配置位置，只读。**本版本不做 `reload`**，改了规则要重启 |
 | `/clear` | `/reset`、`/new` | 界面 | 清空当前对话历史（并复位上下文压缩状态；会话存档开新档、旧档保留；一并卸载已激活 Skill） |
 | `/exit` | `/quit` | 界面 | 退出程序 |
 
@@ -278,6 +280,122 @@ allowed-tools: [Bash(git *), Read]
 `/skills` 会**逐条告知本版本的实际行为**——比如 `background: true` 会明说
 「将同步等待子对话跑完」，而不只是「不支持」。
 
+
+## Hook 系统
+
+把「触发条件明确、动作固定、每次都一样」的重复劳动交给机器：AI 改完 `.py` 就自动跑格式化、
+拦住某种参数组合的命令、每个回合开始时给模型注入当前分支、干完活响一声。
+
+### 写一条规则
+
+在 `~/.rhinecode/hooks.yaml`（或项目级 `<项目根>/.rhinecode/hooks.yaml`）里写：
+
+```yaml
+hooks:
+  # ① 改完 Python 文件自动格式化
+  - name: 格式化改动的 Python 文件
+    event: post_tool_use
+    if:
+      all:
+        - tool: edit_file
+        - file_path: "**/*.py"
+    action:
+      type: command
+      command: "python -m black ."
+      timeout: 30
+
+  # ② 拦住直接 push 到 main（退出码 2 = 拦截）
+  - name: 禁止直接 push 到 main
+    event: pre_tool_use
+    if:
+      all:
+        - tool: run_command
+        - command: "git push * main*"
+    action:
+      type: command
+      command: "python .rhinecode/block_push.py"
+```
+
+三要素：**event**（何时，必填）+ **if**（条件，可省，省略即无条件）+ **action**（做什么，必填）。
+
+### 十二个事件
+
+| 层 | 事件 |
+|------|------|
+| 会话级 | `session_start` / `session_end` |
+| 回合级 | `turn_start` / `turn_end`（主对话与子对话都触发，用 `scope` 区分） |
+| 消息级 | `user_message`（含斜杠命令） / `assistant_message` |
+| 工具级 | `pre_tool_use`（**唯一可拦截**） / `post_tool_use` / `post_tool_use_failure` |
+| 系统级 | `pre_compact` / `post_compact`（只对第二层 LLM 摘要） / `notification` |
+
+工具级事件的负载会把模型生成的工具参数**逐字展开成顶层字段**，所以能直接写
+`command:` / `file_path:`，不必写 `tool_input.command`。
+
+**后置事件只在「真的执行了」之后触发**——未知工具、参数非法、被规划阶段挡下、
+权限拒绝、用户拒绝、被 Hook 自己拦下，这些都不产生 `post_tool_use*`。
+
+### 条件
+
+`if` 下写 `all`（全部满足）或 `any`（任一满足），**二选一，不混用不嵌套**。
+每项是「字段: 模式」，四种形态：
+
+| 形态 | 写法 | 说明 |
+|------|------|------|
+| 精确 | `tool: run_command` | 完全相等 |
+| 通配 | `command: "git *"` | 命令类带**词边界**（`git *` 不命中 `github-cli`），路径类是 gitignore 风格 |
+| 正则 | `command: "/^git (push\|reset)/"` | 一对 `/` 包裹，**非锚定** |
+| 反向 | `tool: "!run_command"` | 值前缀 `!`，可与上面三种叠加 |
+
+**命令类字段会整条 + 逐段双重检查**：`command: "git push *"` 同样能命中
+`git add x && git commit -m y && git push origin main`。这一条不能省——
+真实模型在一次普通的「改完提交推上去」请求里，自己就会写出那种复合命令。
+
+字段不存在时该条件**判为不成立，反向匹配也不成立**（「字段不存在」不等于「不匹配」）。
+
+### 四种动作
+
+| 类型 | 说明 |
+|------|------|
+| `command` | 跑一条 shell 命令。**事件负载以 JSON 从标准输入喂给它**，配置里不做任何字符串插值。退出码 0 通过 / 2 拦截 / 其它算失败；stdout 可以输出 `{"decision": "deny"\|"ask", "reason": "..."}` |
+| `prompt` | 往 `<system-reminder>` 注入一段文本，模型**下一次请求**可见，**只出现一次** |
+| `http` | 发一个 HTTP 请求。响应**不参与任何决策** |
+| `agent` | 启动子 Agent —— **本版本仅占位，不会真的运行** |
+
+执行控制：`once: true`（本次进程内只跑一次，不持久化）、`async: true`（后台不等结果，
+`pre_tool_use` 上**禁止**）、`timeout`（command 缺省 60 秒、http 缺省 10 秒）。
+
+### ⚠️ 两条性质，写规则前必须知道
+
+**一、Hook 只能收紧，不能放宽。** `pre_tool_use` 的结论只有三种——拦截、升级为人工确认、
+不表态，**没有放行**。「升级」也只把权限管线的 ALLOW 变成 ASK，绝不把 DENY 降级。
+照 Claude Code 文档写出的 `{"decision":"allow"}` 会被明确忽略。
+要**放行**什么，用 `permissions.yaml` 的 allow 规则。
+
+**二、拦截类 Hook 自己跑失败 = 拦截（fail-closed）。** 脚本崩了、超时了、退出码不对，
+一律按拦下处理。这样一条上周就写坏的安全 Hook 会**立刻可见**，而不是静默失效
+让你以为防线还在。其余事件的 Hook 失败只记录一行，不影响任何流程。
+
+### 存放位置
+
+| 位置 | 用途 |
+|------|------|
+| `~/.rhinecode/hooks.yaml` | 跨项目的个人自动化 |
+| `<项目根>/.rhinecode/hooks.yaml` | 随仓库走、可提交、团队共享 |
+
+**没有本地级。** 两层规则**全部生效**、不按层级覆盖，执行顺序是「用户级 → 项目级 → 层内声明序」。
+
+⚠️ **项目级 `hooks.yaml` 里的命令会直接在你机器上执行**，不经模型、不经确认面板。
+启动时会用醒目样式**逐条列出**它们的事件与完整命令串——请当作代码来评审。
+
+### 排查
+
+`/hooks` 列出全部规则（来源层、事件、条件、动作、**本次运行的触发次数与最近结论**）+
+加载警告 + 配置位置。
+
+「触发：0 次」是排查的主力信息：工具级事件的字段集是开放的（参数名取决于是哪个工具），
+所以字段笔误在加载期发现不了，唯一的表现就是这条规则永远不命中。
+
+开 `rhine --trace` 还能看到 `hook_dispatch`（**零命中也记**）与 `hook_execute` 两类事件。
 
 ## MCP 客户端
 
@@ -468,6 +586,10 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 - Skill **拿不到任何权限豁免**：它指挥的每个工具调用照样过五层管线，正文里写「直接执行 rm -rf /」也只会在黑名单层被拦下。
 - `allowed-tools` 是**预授权，不是安全边界**：它只放宽（列出的操作在本次执行内免确认），从不收紧，而且**翻不过前两层**——声明「放行全部命令」的 Skill 照样在黑名单层被拦，声明「放行全部写入」照样在沙箱层被拦。要**限制**模型能做什么，唯一手段是 `permissions.yaml` 的 deny 规则。授权在你发出下一条消息时失效。
 - **网络访问是第一个能主动向外发数据的能力**，三条要点：① 在此之前模型读到的敏感内容都烂在本地（没有工具能发出去），`web_fetch` 把「读文件」与「访问网络」凑齐后，「网页里藏一段伪装成系统指令的文本 → 骗模型读配置 → 拼进下一次抓取的地址」这条链才成立。防御是三道叠加：不可信标注 + 域名白名单 + 只取不发。② **缺省配置下白名单并不存在**——不写任何域名规则时唯一的实际拦截是每次弹确认；想要真边界，必须在**用户级或项目级** `permissions.yaml` 里写 `allow: WebFetch(domain:...)`（写在本地级不会建立白名单）。③ 域名策略只管 `web_fetch`：`run_command` 跑起来的 `curl`/`wget`与 MCP 工具都不受它约束。另：连接期的域名解析不受超时约束，DNS rebinding 的时间窗也未封死，均为已知边界。
+- **Hook 的动作直接执行，不经模型、也不经确认面板**——这让**项目级 `hooks.yaml`** 成为本项目最大的攻击面：它随代码仓库分发，`git clone` 一个仓库再启动 `rhine`，对方写在 `session_start` 上的命令就跑在你机器上了。这比项目级 Skill 严重一个量级（Skill 正文只是发给模型的文本，它指挥的每个工具调用照样过五层管线）。对冲手段只有一个：启动时**逐条列出**每条项目级规则的「事件 → 动作原文」（命令串与 URL 完整不截断、橙色醒目、每次启动都提示）。**评审 `.rhinecode/hooks.yaml` 应与评审代码同等对待。**
+- **Hook 只能收紧，不能放宽**：`pre_tool_use` 的结论只有拦截 / 升级为人工确认 / 不表态三种，**没有放行**；「升级」也只把权限管线的 ALLOW 变成 ASK，绝不把 DENY 降级。因此 Hook 加进来之后，「能通过的调用集合」只会变小。照 Claude Code 文档写出的 `{"decision":"allow"}` 会被明确忽略。
+- Hook 命令**过①危险命令黑名单**（那一层的性质就是「不可被任何配置放开」，而 `hooks.yaml` 就是配置），但不过②③④⑤——它是你写的配置而非模型行为，过完整管线等于每次自动化都弹确认。另：配置里**不做任何字符串插值**，上下文只经**标准输入的 JSON** 抵达命令，因此模型生成的工具参数不可能被拼进 shell 命令行。
+- Hook 的 `http` 动作是本项目**第二条主动外发链路**，且比 `web_fetch` 危险（后者只取不发）。它过②′网络边界的结构性硬校验（禁 `file://`、禁内嵌凭据、禁回环与非公网地址），但不要求域名白名单。**Hook 的事件负载含完整工具参数与工具输出**，与行为记录同级敏感——模型读过的配置文件内容会原样进入 `pre_tool_use` 的负载。
 - 用户级与内置 Skill 目录经路径沙箱的**只读白名单**放行（目录型 Skill 的随附资源在工作区外，模型需按清单读取），只对读类判定生效，写入与 glob/grep 搜索面完全不动。
 
 ## 项目结构
@@ -522,6 +644,14 @@ rhinecode/
 │   ├── notes.py         # 笔记 frontmatter 解析 / 渲染 / 索引重建与截断
 │   ├── note_updater.py  # 笔记 LLM 的 Prompt 与 JSON 响应解析（文件名白名单）
 │   └── manager.py       # MemoryManager：启动 / 注入 / 存档 / 异步笔记 / resume 编排
+├── hooks/               # Hook 系统（c12）：事件 + 条件 + 动作
+│   ├── models.py        # 十二个事件枚举 / 两张字段表 / 全部数据类（零 I/O）
+│   ├── conditions.py    # 四种匹配形态 + all/any 组合（零 I/O）
+│   ├── parser.py        # YAML → HookRule + 七项集中校验（零 I/O）
+│   ├── config.py        # 两层文件定位、加载、模板生成
+│   ├── actions.py       # 四种动作执行器（命令过①黑名单，HTTP 过②′硬校验）
+│   ├── manager.py       # 分发 / once / 结论合并 / 注入队列 / 统计 / 埋点
+│   └── report.py        # /hooks 报告与项目级启动提示（零 I/O）
 ├── skills/              # Skill 系统（c11，纯逻辑 + 单点接入）
 │   ├── models.py        # 枚举 / frozen 数据类 / 常量 / builtin_skills_dir
 │   ├── parser.py        # 单份文本 → SkillSpec（纯函数，不碰文件系统）
@@ -572,7 +702,7 @@ rhinecode/
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1169 项，skipped 4
+python -m unittest discover -s tests      # 1478 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -584,14 +714,24 @@ python -m unittest discover -s tests      # 1169 项，skipped 4
 隔离与重载）、上下文（估算、两层压缩、熔断与复位）、记忆（锁原语、RHINE.md 展开、
 存档容错载入、`/resume` 回放）、Skill（解析、三层扫描、预授权翻译、加锁不变量的
 **跨线程死锁护栏**、跨轮「第 N 轮激活第 N+1 轮生效」）、命令层（注册冲突 fail-fast、
-分发、Tab 补全与高亮）、行为记录（并发序号无重号无跳号、开关双跑逐字节零回归）、
+分发、Tab 补全与高亮）、Hook（四种匹配形态、七项加载校验、四种动作、加锁不变量、
+**Hook 翻不过①黑名单与②沙箱的四条安全反证**、十二个分发点、缺省零行为）、
+行为记录（并发序号无重号无跳号、开关双跑逐字节零回归）、
 端到端驱动设施（完整交互闭环全程不重启、危险命令即使驱动者放行也在第①层被拦）。
 
 各层的详细覆盖清单见 `CLAUDE.md` 的「测试」一节。真实 LLM 下的输出质量与
-TUI 视觉效果留作手测，验收记录在 `docs/c11/acceptance/`。
+TUI 视觉效果留作手测，验收记录在 `docs/c11/acceptance/` 与 `docs/c12/acceptance.md`。
 
 
 ## 当前阶段文档
+
+**当前主线是 C12（Hook 系统），文档在 [`docs/c12/`](docs/c12/README.md)**——四份
+`spec` / `plan` / `task` / `checklist` + `README`（导航）+ `acceptance`（验收报告，
+含真实模型实跑记录）。
+
+> ⚠️ 读 `docs/c12/spec.md` 的 F2 边界第 2 条时**必须连勘误块一起读**：那条原文与
+> F6 的管线位置自相矛盾（`pre_tool_use` 排在五层权限管线之前，在跑判定之前无从知道
+> 会不会被拒绝）。实现按「本条只管后置事件」执行，`docs/c12/README.md` 有对照表。
 
 C11 的全部文档收在 `docs/c11/` 一个目录下，**进门先读 [`docs/c11/README.md`](docs/c11/README.md)**——它是导航，也写明了「同一议题两份文档说法不同时以谁为准」。分三块：
 
@@ -601,21 +741,24 @@ C11 的全部文档收在 `docs/c11/` 一个目录下，**进门先读 [`docs/c1
 
 C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
+**扩展**（不占章节号）的文档在 [`docs/extensions/`](docs/extensions/README.md)：网络访问工具 `web_fetch`、Skill 作者期。**下一步做什么**见 [`docs/todo/`](docs/todo/README.md)，按优先级编号、每份自带可一键复制的开工 Prompt。
+
 ## 后续补齐项
 
 以下问题已在工程审查中确认，但不属于当前阶段开发范围，后续章节再统一设计和实现：
 
-1. Skill 系统：市场分发与版本管理、嵌套激活、参数 schema、模板引擎、并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
-2. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
-3. Plan Mode 规划阶段的工具阶段强校验，防止模型同轮夹带副作用工具。
-4. `write_file` / `edit_file` 的文件系统级原子写入。
-5. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
-6. 权限系统后续项：网络请求限制、资源配额、审计日志。
-7. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
-8. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
-9. 上下文管理后续项：精确 tokenizer（当前仅近似估算）、摘要策略的质量/机器学习优化、存盘文件的清理与生命周期、除窗口大小外其它阈值的可配置化、跨会话摘要持久化。
-10. 行为记录后续项：TUI 驱动器（用 Pilot 无人驱动界面跑完整场景，本轮只做记录器）、记录文件的自动清理与轮转、实时流式查看、可视化时间线、跨运行对比、截断阈值可配置化、采样与按类型开关（当前只有全开与全关两态）。
-11. 记忆系统后续项：向量数据库/RAG 语义检索、团队记忆同步/跨机器共享、跨实例实时一致性、笔记自动清理与遗忘机制、各阈值可配置化、存档格式版本迁移与加密存储。
+1. **③可配置规则层对复合命令不拆段**（**已知安全缺口**，C12 验收期实测发现）：`deny: Bash(git push *)` 拦得住 `git push origin main`，却拦不住 `git status && git push origin main`——①危险命令黑名单是逐段检查的，③规则层不是。而这**不需要刻意规避**，真实模型在一次普通请求里就会写出复合命令。C12 已在 Hook 侧补齐同一口径，**权限层未动**（那会改变 C6 的规则语义，属于安全边界的行为变更，应单独评审）。详见 [`docs/todo/1-perm-compound-command.md`](docs/todo/1-perm-compound-command.md)。
+2. Hook 系统后续项：子 Agent 动作的真实运行（现为占位）、`once` 的持久化、执行顺序的显式优先级、迭代级事件、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果。
+3. Skill 系统：市场分发与版本管理、嵌套激活、参数 schema、模板引擎、并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
+4. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
+5. `write_file` / `edit_file` 的文件系统级原子写入。
+6. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
+7. 权限系统后续项：资源配额、审计日志（**网络请求限制已由 web_fetch 扩展兑现**）。
+8. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
+9. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
+10. 上下文管理后续项：精确 tokenizer（当前仅近似估算）、摘要策略的质量/机器学习优化、存盘文件的清理与生命周期、除窗口大小外其它阈值的可配置化、跨会话摘要持久化。
+11. 行为记录后续项：记录文件的自动清理与轮转、实时流式查看、可视化时间线、跨运行对比、截断阈值可配置化、采样与按类型开关（当前只有全开与全关两态）。（TUI 驱动器已实现，见 `tests/e2e/`。）
+12. 记忆系统后续项：向量数据库/RAG 语义检索、团队记忆同步/跨机器共享、跨实例实时一致性、笔记自动清理与遗忘机制、各阈值可配置化、存档格式版本迁移与加密存储。
 
 ## 扩展新 Provider
 

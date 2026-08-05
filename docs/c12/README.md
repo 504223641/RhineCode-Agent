@@ -57,6 +57,9 @@
 | `hooks/parser.py` 模块 docstring | spec F8 第 8 项**从加载期移到运行期** | 唯一「会产出决策」的动作是 `command`，而 `post_tool_use` + `command` 正是最常见的正当用法（自动格式化）。照字面实现会给每条格式化 Hook 都挂一条警告，警告区随即失去可读性 |
 | `hooks/models.py` 的 `OPEN_INPUT_EVENTS` | 三个工具级事件的**字段集是开放的** | `tool_input` 的键取决于是哪个工具，加载期不可能枚举。代价是那三个事件上的字段笔误加载期发现不了，排查靠 `/hooks` 里触发次数恒为 0 |
 | `agent/loop.py` `_execute` | 系统级工具对 Plan Mode 过滤的**隐式豁免写成显式条件** | 为把 `pre_tool_use` 收在单一分发点上，系统级工具的分流必须挪到规划阶段过滤之后；不显式写出豁免的话，今天唯一的系统级工具 `load_skill` 行为会悄悄改变 |
+| `hooks/conditions.py` `_match_command_field` | 命令类字段**整条 + 逐段**双重检查（原设计只调 `match_command`） | 真实模型实跑撞出来的：`command: "git push *"` 被 `git add x && git commit && git push origin main` 整个绕过，而那是模型自然写出的形态、不是刻意规避。①黑名单早就是拆的，Hook 侧漏了这一半 |
+| `tui/app.py` + `widgets.py` | 项目级提示从 `startup_notice` 摘出，改走**新增的醒目通道** | 人眼评审发现：原来走 `append_system` 的 `[dim]`，也就是比正文还暗；而它是本项目里唯一一段「这些命令会直接执行」的警告。顺带去掉了 Markdown 的 `**`——Textual 不认，只会显示成字面星号 |
+| `hooks/manager.py` `BLOCKED_FEEDBACK` | 删去末句「并请他决定是否调整这条规则」 | 人眼评审：它把「要不要削弱这道防线」主动摆上桌面。真实模型实跑中，模型据此给出的选项之一就是「修改 hooks.yaml」 |
 
 ## 相关代码
 
@@ -81,3 +84,7 @@
 | `tests/test_hook_dispatch_points.py` | 十二个分发点的结构护栏 + 真实 `build_app` 读真实 `hooks.yaml` |
 | `tests/test_hook_command.py` | `/hooks` 登记与报告，含 `[` 的命令串真走一次 Textual 布局 |
 | `tests/test_hook_zero_regression.py` | 缺省零行为 + 四个纯模块的**导入级** I/O 禁令 |
+| `tests/test_e2e_hooks.py` | **起真宿主子进程**的端到端六场景（拦截 / ASK 升级 / 自动化正路 / fail-closed 与 fail-open 成对 / 项目级提示上首屏） |
+
+合计 213 条。真实模型（`deepseek-v4-flash`）的两条判据见
+[`acceptance.md`](acceptance.md)「真实模型实跑」一节。
