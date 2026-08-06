@@ -61,6 +61,48 @@ def _handle_hooks(invocation: CommandInvocation, controller: CommandController) 
     controller.show_message(controller.query_report(ReportTarget.HOOKS))
 
 
+# `/agents` 的用法串，多个分支要用，抽出来避免各处写得不一致（照 `_SKILLS_USAGE` 先例）。
+_AGENTS_USAGE = "用法：/agents [cancel <任务标识|all>]"
+
+
+def _handle_agents(invocation: CommandInvocation, controller: CommandController) -> None:
+    """
+    /agents：查看子 Agent 角色与本次运行的任务，或取消任务（c13 F24）。
+
+    三种形态：
+
+    | 输入 | 行为 |
+    |---|---|
+    | `/agents` | 只读报告：全部角色（来源层、工具集、模型、轮次、权限档位声明值与生效值）、加载错误、被覆盖的定义、本次运行的任务列表 |
+    | `/agents cancel <标识>` | 取消指定任务 |
+    | `/agents cancel all` | 取消全部未完成任务 |
+
+    子命令按**首个空白**切分（沿用 C10 的 `split(maxsplit=1)` 口径）。
+
+    **本章不做 `reload`**：与 c12 同口径，改了角色定义要重启。
+    """
+    raw = invocation.arguments.strip()
+
+    if not raw:
+        controller.show_message(controller.query_report(ReportTarget.AGENTS))
+        return
+
+    parts = raw.split(maxsplit=1)
+    sub = parts[0].casefold()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "cancel":
+        # 无参与 `all` 都表示「全部」——`None` 交给下游统一处理，
+        # 这里不把 `all` 翻译成别的东西，免得两处对「全部」的表示不一致。
+        target = None if rest.casefold() in ("", "all") else rest
+        controller.show_message(controller.cancel_subagents(target))
+        # 取消会改变运行中的任务数，状态栏要跟着刷新。
+        controller.refresh_status()
+        return
+
+    controller.show_message(f"未知子命令：{parts[0]}\n{_AGENTS_USAGE}")
+
+
 def _handle_context(invocation: CommandInvocation, controller: CommandController) -> None:
     """/context：查询上下文用量报告并展示（纯只读）。"""
     controller.show_message(controller.query_report(ReportTarget.CONTEXT))
@@ -277,6 +319,14 @@ def build_builtin_registry() -> CommandRegistry:
                 usage="/hooks",
                 command_type=CommandType.LOCAL,
                 handler=_handle_hooks,
+            ),
+            CommandSpec(
+                name="/agents",
+                aliases=(),
+                description="查看子 Agent 角色与本次运行的任务，或取消任务",
+                usage="/agents [cancel <任务标识|all>]",
+                command_type=CommandType.LOCAL,
+                handler=_handle_agents,
             ),
             CommandSpec(
                 name="/context",
