@@ -40,6 +40,7 @@
 由协调层打包成 `SubAgentRuntime` 注入（见 `runner.py`）。
 """
 
+from rhinecode.subagents.discovery import discover_agents
 from rhinecode.subagents.models import (
     DEFAULT_MAX_TURNS,
     ENTRY_SUFFIX,
@@ -55,19 +56,52 @@ from rhinecode.subagents.models import (
     ShadowedAgent,
     builtin_agents_dir,
 )
+from rhinecode.subagents.render import render_agent_index
+from rhinecode.subagents.report import render_report
+from rhinecode.subagents.runner import ParentSnapshot, SubAgentRuntime
+from rhinecode.subagents.service import DelegateOutcome, SubAgentService
+from rhinecode.subagents.tasks import (
+    BRANCH_AGENT_NAME,
+    KIND_BRANCH,
+    KIND_ROLE,
+    STATUS_LABELS,
+    TaskManager,
+    TaskRecord,
+    TaskStatus,
+)
+from rhinecode.subagents.toolset import GLOBAL_DENIED_TOOLS, resolve_toolset
 
 __all__ = [
+    # 数据结构
     "AgentSpec",
     "AgentCatalog",
     "AgentSource",
     "AgentLoadError",
     "ShadowedAgent",
+    "TaskRecord",
+    "TaskStatus",
+    "TaskManager",
+    "DelegateOutcome",
+    "ParentSnapshot",
+    "SubAgentRuntime",
+    "SubAgentService",
+    # 入口函数
+    "discover_agents",
+    "resolve_toolset",
+    "render_agent_index",
+    "render_report",
+    "builtin_agents_dir",
+    # 常量
     "SOURCE_LABELS",
+    "STATUS_LABELS",
     "UNSUPPORTED_FIELDS",
+    "GLOBAL_DENIED_TOOLS",
     "ENTRY_SUFFIX",
     "DEFAULT_MAX_TURNS",
     "HARD_MAX_TURNS",
     "MAX_CONCURRENT",
     "FOREGROUND_TIMEOUT",
-    "builtin_agents_dir",
+    "KIND_ROLE",
+    "KIND_BRANCH",
+    "BRANCH_AGENT_NAME",
 ]
