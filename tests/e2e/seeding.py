@@ -141,6 +141,33 @@ def seed_user_skill(
     return target
 
 
+def seed_project_agent(
+    root: PathLike, name: str, frontmatter: Mapping[str, object], body: str
+) -> Path:
+    """
+    预置一个**项目级**子 Agent 角色：`<root>/.rhinecode/agents/<name>.md`（c13）。
+
+    :returns: 写入的文件路径
+
+    与 `seed_project_skill` 的路径规则相同（都在 `.rhinecode/` 下），
+    只是目录名不同。角色 frontmatter 唯一必填的是 `description`。
+    """
+    target = Path(root) / ".rhinecode" / "agents" / f"{name}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_render_skill(name, frontmatter, body), encoding="utf-8")
+    return target
+
+
+def seed_user_agent(
+    user_dir: PathLike, name: str, frontmatter: Mapping[str, object], body: str
+) -> Path:
+    """预置一个**用户级**子 Agent 角色：`<user_dir>/agents/<name>.md`（c13）。"""
+    target = Path(user_dir) / "agents" / f"{name}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_render_skill(name, frontmatter, body), encoding="utf-8")
+    return target
+
+
 def seed_permissions(
     target_dir: PathLike, allow: Iterable[str] = (), deny: Iterable[str] = ()
 ) -> Path:

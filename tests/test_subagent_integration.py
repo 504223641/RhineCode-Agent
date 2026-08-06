@@ -424,6 +424,77 @@ class ParentSnapshotTest(IntegrationBase):
         self.assertTrue(snapshot.stable)
         self.assertIn("read_file", snapshot.tool_names)
 
+    def test_drops_trailing_unpaired_tool_calls(self) -> None:
+        """
+        **真实模型验收实测到的缺陷的回归护栏（C13 场景 4 首跑）。**
+
+        `parent_snapshot()` 是从 `RunAgentTool.execute()` 调进来的，而那运行在
+        Agent Loop 的**串行段内**——此刻循环已经把 `assistant(tool_calls)`
+        追加进 `history`，对应的 `tool` 结果要等本轮全部工具跑完才追加。
+
+        不清理的话，子 Agent 的首次请求必然被 API 拒绝：
+
+            400 - An assistant message with 'tool_calls' must be followed by
+                  tool messages responding to each 'tool_call_id'
+
+        本用例**刻意重现那个「跑到一半」的形态**（历史以无配对的
+        assistant(tool_calls) 结尾）——只用干净历史构造的测试压根碰不到它，
+        这正是它当初逃过 20 项单元测试的原因。
+        """
+        from rhinecode.provider.base import Message, ToolCall
+
+        manager = self._manager()
+        manager.history.append(Message(role="user", content="帮我查一下"))
+        # ↓ 循环在分流执行之前就追加了这一条，而 tool 结果还没来
+        manager.history.append(
+            Message(
+                role="assistant",
+                content="我用 branch 开一个子 Agent……",
+                tool_calls=[ToolCall(id="c1", name="run_agent", arguments={})],
+            )
+        )
+
+        snapshot = manager.parent_snapshot()
+
+        self.assertTrue(
+            all(not (m.role == "assistant" and m.tool_calls) for m in snapshot.history),
+            "快照里不得留下无配对的 assistant(tool_calls)",
+        )
+        # 用户那条要留着——子 Agent 需要它才知道上下文
+        self.assertTrue(any(m.role == "user" for m in snapshot.history))
+
+    def test_keeps_paired_tool_calls(self) -> None:
+        """
+        **反证**：配对完整时不该误删。
+
+        没有这一条，一个「把所有 assistant(tool_calls) 都丢掉」的实现
+        也能让上一条通过，而那会让分支式子 Agent 完全看不到父对话做过什么。
+        """
+        from rhinecode.provider.base import Message, ToolCall
+
+        manager = self._manager()
+        manager.history.extend(
+            [
+                Message(role="user", content="读一下 a.py"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(id="c1", name="read_file", arguments={})],
+                ),
+                Message(role="tool", tool_call_id="c1", content="文件内容"),
+                Message(role="assistant", content="读完了。"),
+            ]
+        )
+
+        snapshot = manager.parent_snapshot()
+        roles = [m.role for m in snapshot.history]
+
+        self.assertIn("tool", roles, "配对完整的 tool 结果必须保留")
+        self.assertTrue(
+            any(m.role == "assistant" and m.tool_calls for m in snapshot.history),
+            "配对完整的 assistant(tool_calls) 必须保留",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

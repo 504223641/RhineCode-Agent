@@ -130,6 +130,67 @@ def seed_with_git(workspace: Path, user_dir: Path) -> None:
     )
 
 
+def seed_subagents(workspace: Path, user_dir: Path) -> None:
+    """
+    C13 真实模型验收的预置（子 Agent 系统）。
+
+    放了三样东西，各对应一条待验判据：
+
+    1. **一个够真实的代码库**——同一个符号 `RETRY_LIMIT` 散落在三个文件里。
+       这是「该委派而不该自己硬翻」的典型任务：要看清全貌得读好几个文件，
+       而那些内容对主对话毫无价值。用于验 AC6b / 场景 7（模型会不会**主动**委派）
+       与场景 8（结论是否自包含、可直接用）。
+    2. **一个项目级角色 `auditor`**——用于验 AC4（项目级角色每次启动都提示）。
+       它刻意**只读**，好让缺省档下也能真的跑起来。
+    3. **不预置任何 allow 规则**——于是场景 3（权限边界）成立：
+       委派一个要写文件的任务时，写入会在非交互环境下被自动拒绝，
+       观察子 Agent 是就此收敛并在结论里说明，还是反复重试。
+    """
+    seeding.seed_files(
+        workspace,
+        {
+            "src/config.py": "# 全局配置\nRETRY_LIMIT = 3\nTIMEOUT_SECONDS = 30\n",
+            "src/client.py": (
+                "from src.config import RETRY_LIMIT\n"
+                "\n"
+                "def fetch(url):\n"
+                "    for attempt in range(RETRY_LIMIT):\n"
+                "        pass\n"
+            ),
+            "src/worker.py": (
+                "from src.config import RETRY_LIMIT\n"
+                "\n"
+                "def run_job(job):\n"
+                "    remaining = RETRY_LIMIT\n"
+                "    while remaining > 0:\n"
+                "        remaining -= 1\n"
+            ),
+            "tests/test_client.py": (
+                "def test_retry():\n"
+                "    # RETRY_LIMIT 改成 5 之后这条要跟着改\n"
+                "    assert True\n"
+            ),
+            "README.md": "# 演示项目\n\n一个用来验证子 Agent 委派的小项目。\n",
+        },
+    )
+    seeding.seed_rhine_md(workspace, "# 本项目\n\n用中文回答。\n")
+    seeding.seed_project_agent(
+        workspace,
+        "auditor",
+        {
+            "description": (
+                "需要检查代码里是否存在硬编码常量、重复定义、缺少测试覆盖这类问题时用它。"
+                "只读，不会修改任何东西。"
+            ),
+            "tools": "read_file, glob_files, grep_content",
+            "permission_mode": "strict",
+            "max_turns": 10,
+        },
+        "你是代码审查员。只读地检查问题，最后一段给出自包含的结论，"
+        "写清每个问题的文件路径与具体位置。不要尝试修改任何文件。",
+    )
+
+
 def seed_isolated_skill(workspace: Path, user_dir: Path) -> None:
     """
     预置一个**独立模式**且**指定了模型**的 Skill（AC30）。

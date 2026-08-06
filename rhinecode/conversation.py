@@ -42,6 +42,7 @@ from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.skills.manager import SkillManager
 from rhinecode.hooks import HookEventType, NullHookManager
+from rhinecode.memory.session import drop_unpaired
 from rhinecode.permission.engine import narrower_mode
 from rhinecode.subagents.render import render_agent_index
 from rhinecode.subagents.report import render_report
@@ -996,6 +997,25 @@ class ConversationManager:
         共享同一个列表会让它的历史在跑到一半时被改动——既破坏消息协议顺序，
         也让「它到底看到了什么」无法复现。
 
+        ## ⚠ 必须做不成对清理，否则子 Agent 的首次请求必然 400
+
+        本方法是从 `RunAgentTool.execute()` 调进来的，而那**运行在 Agent Loop
+        的串行段内**——此刻循环已经把 `assistant(tool_calls)` 追加进 `history`
+        （`loop.run` 在分流执行之前就追加了），而对应的 `tool` 结果消息要等
+        本轮全部工具跑完才追加。于是裸快照以一条**无配对的
+        `assistant(tool_calls)` 结尾**，DeepSeek 直接拒绝：
+
+            400 - An assistant message with 'tool_calls' must be followed by
+                  tool messages responding to each 'tool_call_id'
+
+        这是真实模型验收实测到的缺陷（C13 场景 4 首跑）。**单元测试抓不到它**：
+        那些测试都是从一段干净的历史建快照，压根构造不出「跑到一半」的形态。
+        护栏见 `tests/test_subagent_integration.py::ParentSnapshotTest`。
+
+        被丢掉的那条 `assistant` 里可能带着本轮的前言正文（「我用 branch 开一个
+        子 Agent……」），一并丢弃是对的——那句话描述的正是这次尚未完成的委派本身，
+        对子 Agent 没有价值。
+
         副作用：无（只读当前状态并复制）。
         """
         assembled = build_default_prompt(
@@ -1008,8 +1028,10 @@ class ConversationManager:
             untrusted_enabled=self._config.web_fetch_enabled,
         )
         names = tuple(self._registry.names()) if self._registry is not None else ()
+        # 复用会话存档那套配对清理（同一份实现，不另写一遍）。
+        paired, _dropped = drop_unpaired(list(self.history))
         return ParentSnapshot(
-            history=tuple(self.history),
+            history=tuple(paired),
             stable=assembled.stable,
             tool_names=names,
         )
