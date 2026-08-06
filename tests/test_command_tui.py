@@ -222,9 +222,6 @@ class FakeManager:
     def drain_subagent_notifications(self) -> tuple:
         return ()
 
-    def request_subagent_background(self):
-        return None
-
     def agents_report(self) -> str:
         return "子 Agent 报告"
 

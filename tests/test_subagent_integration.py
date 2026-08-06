@@ -394,7 +394,6 @@ class ZeroRegressionTest(IntegrationBase):
         self.assertIsNone(manager.agents_project_notice())
         self.assertEqual(manager.running_subagent_count(), 0)
         self.assertEqual(manager.drain_subagent_notifications(), ())
-        self.assertIsNone(manager.request_subagent_background())
         self.assertIn("未启用", manager.agents_report())
         self.assertIn("未启用", manager.cancel_subagents(None))
         # 交付是空操作，历史不变

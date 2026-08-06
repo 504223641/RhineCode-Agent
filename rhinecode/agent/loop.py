@@ -50,6 +50,7 @@ from rhinecode.hooks import (
     NO_VERDICT,
     NullHookManager,
 )
+from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
 from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
 from rhinecode.trace import (
     SCOPE_MAIN,
@@ -198,6 +199,7 @@ class RunOptions:
     allow_summary: bool = True
     excluded_tools: frozenset = frozenset()
     interactive: bool = True
+    subagent_gate: object = None
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
@@ -609,6 +611,10 @@ class Agent:
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
+        # c13：子 Agent 闸门。缺省 NullGate → 两处调用退化为零成本空操作，
+        # **不传等于零回归**。
+        gate = options.subagent_gate if options.subagent_gate is not None else NullGate()
+        wait_rounds = 0               # 已为子 Agent 停留过几次（防无限接力）
         deny_cooldown = False         # 上一轮有工具被用户拒绝 → 本轮不发工具（见 DENIED_BY_USER_FEEDBACK）
 
         def _record(msg: Message) -> None:
@@ -627,6 +633,19 @@ class Agent:
                 return
 
             yield AgentEvent(type=AgentEventType.PROGRESS, iteration=iteration)
+
+            # 子 Agent 结论的交付点（c13 修订）。**必须在本轮组装请求之前**。
+            #
+            # 位置合法性：协议只禁止在 `assistant(tool_calls)` 与它对应的
+            # `tool` 结果**之间**插消息，而此刻上一轮的 tool 结果早已写完。
+            # 初版把这件事挂在协调层的 `_run()` 上（每条用户消息才一次），
+            # 后果是主 Agent 在同一次运行里跑了六轮、结论一轮都没进去——
+            # 用户必须插一句话才能让任务继续，等于把连贯的任务硬生生截断。
+            #
+            # 放在压缩**之前**：新追加的消息也要参与 token 估算。
+            for extra in gate.take_pending():
+                history.append(extra)
+                _record(extra)
 
             # 上下文压缩（c8 F3）：每次 API 请求前先跑两层压缩（先第一层存盘、再按需第二层摘要），
             # 把可能过长的历史压回 token 预算内。压缩可能原地修改 history（改写工具结果 / 重构列表）。
@@ -714,6 +733,43 @@ class Agent:
                     final_msg = Message(role="assistant", content=text)
                     history.append(final_msg)
                     _record(final_msg)
+
+                # ── 子 Agent 等待闸门（c13 修订）──
+                #
+                # 模型准备收工了，但它自己委派出去的、**声明过要等结果**的子 Agent
+                # 还在跑。这时候结束循环等于让它拿着不完整的信息回答，而用户
+                # 必须再插一句话才能让任务继续——那正是初版被诟病的「变相中断」。
+                #
+                # 所以：停下来等，把结论注入后**再跑一轮**，让模型自己决定
+                # 是继续干还是收工。
+                #
+                # **等待不是卡顿，是进度**：跑子 Agent 就是在执行任务，与主 Agent
+                # 自己跑一遍测试套件性质相同。因此这里**不设体验意义上的超时**，
+                # 唯一的逃生口是 `Esc`（`cancel_event` 会让 `wait_any` 立刻返回）。
+                # 「我不需要等这个结果」由模型在委派时用 `background=true` 表达。
+                #
+                # `wait_rounds` 是兜底：防「等到一个 → 模型又委派一个 → 再等」
+                # 无限接力。撞上它就正常收工，未完成的结论仍会在下一条用户消息时送达。
+                if wait_rounds < MAX_WAIT_ROUNDS and gate.has_awaited():
+                    wait_rounds += 1
+                    waiting = gate.describe_awaited()
+                    # 这条提示不可省：没有它，界面上就是「AI 突然不说话了」，
+                    # 用户分不清是在等还是卡死了。
+                    yield AgentEvent(
+                        type=AgentEventType.NOTICE,
+                        message=f"等待子 Agent 完成：{waiting}（按 Esc 可取消）",
+                    )
+                    if gate.wait_any(cancel_event):
+                        # 等到了结论 → 下一轮迭代开头的 take_pending 会把它注入
+                        continue
+                    if cancel_event.is_set():
+                        yield AgentEvent(
+                            type=AgentEventType.FINISHED,
+                            stop_reason=StopReason.USER_CANCELLED,
+                        )
+                        return
+                    # 没等到（撞上兜底上限，或那些任务已经全部交付过了）→ 照常收工
+
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
                 return
 

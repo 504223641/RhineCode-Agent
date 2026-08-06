@@ -202,39 +202,28 @@ class CancelTest(unittest.TestCase):
         self.assertEqual(TaskManager().cancel_all(), 0)
 
 
-class BackgroundHandoffTest(unittest.TestCase):
-    """转后台：唤醒前台等待方，但任务照跑。"""
+class AwaitedFlagTest(unittest.TestCase):
+    """
+    `awaited` 标记：模型是否声明「这次我要这个结果」（c13 修订）。
+
+    它替代了初版的 `backgrounded`。语义变了：那个是「等待方不等了」的**结果**，
+    这个是模型在委派时的**声明**——决定 Agent Loop 收工前要不要停下来等它。
+    """
 
     def setUp(self) -> None:
         self.tm = TaskManager()
-        self.record = self.tm.create(KIND_ROLE, "explorer", "t")
 
-    def test_mark_backgrounded_wakes_waiter(self) -> None:
-        self.assertTrue(self.tm.mark_backgrounded(self.record.task_id))
-        self.assertTrue(self.record.backgrounded)
-        self.assertTrue(self.record.done_event.is_set())
-        # 任务仍在跑——转后台不是取消
-        self.assertIs(self.record.status, TaskStatus.RUNNING)
-        self.assertFalse(self.record.cancel_event.is_set())
-
-    def test_backgrounded_flag_distinguishes_from_real_completion(self) -> None:
+    def test_defaults_to_awaited(self) -> None:
         """
-        `done_event` 两种情形都会置位，靠 `backgrounded` 才分得出来。
-
-        只看 `done_event` 的话，等待方会把「我不等了」误当成「它做完了」，
-        然后把一个空结论当成工具结果回灌给模型。
+        缺省为真。理由：模型不写 `background` 就是「我要这个结果」——
+        缺省不等的话，一次普通委派的结论会石沉大海到下一条用户消息。
         """
-        self.tm.mark_backgrounded(self.record.task_id)
-        self.assertTrue(self.record.backgrounded)
+        self.assertTrue(self.tm.create(KIND_ROLE, "a", "t").awaited)
 
-        other = self.tm.create(KIND_ROLE, "x", "t")
-        self.tm.finish(other.task_id, TaskStatus.COMPLETED, "结论")
-        self.assertTrue(other.done_event.is_set())
-        self.assertFalse(other.backgrounded)
-
-    def test_mark_backgrounded_on_finished_returns_false(self) -> None:
-        self.tm.finish(self.record.task_id, TaskStatus.COMPLETED, "x")
-        self.assertFalse(self.tm.mark_backgrounded(self.record.task_id))
+    def test_can_be_cleared(self) -> None:
+        record = self.tm.create(KIND_ROLE, "a", "t")
+        record.awaited = False
+        self.assertFalse(record.awaited)
 
 
 class ConcurrencyTest(unittest.TestCase):

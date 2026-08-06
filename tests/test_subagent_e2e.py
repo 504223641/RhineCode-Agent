@@ -212,13 +212,19 @@ class BackgroundE2ETest(E2EBase):
         self.manager = self.result.manager
 
     def test_background_does_not_block_main(self) -> None:
-        """AC17a：主对话不等那 0.15 秒。"""
+        """
+        `background=true` 时主对话不等那 0.15 秒，且**循环也不为它停留**。
+
+        c13 修订注记：这条原本断言回灌文本含「后台」。新语义下委派**永远**
+        立即返回（所以「转入后台」这个说法本身没了），`background` 表达的
+        是「这次我不要这个结果」——文案随之改成「本轮不会为它停留」。
+        """
         started = time.monotonic()
         list(self.manager.submit_user_message("找一下"))
         elapsed = time.monotonic() - started
 
-        self.assertLess(elapsed, 0.12, "显式后台不该阻塞主对话")
-        self.assertIn("后台", self.provider.main_bodies[-1])
+        self.assertLess(elapsed, 0.12, "委派不该阻塞主对话")
+        self.assertIn("不会为它停留", self.provider.main_bodies[-1])
         self._settle(self.manager)
 
     def test_two_consumption_lines_are_independent(self) -> None:

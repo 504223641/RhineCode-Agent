@@ -44,6 +44,7 @@ from rhinecode.skills.manager import SkillManager
 from rhinecode.hooks import HookEventType, NullHookManager
 from rhinecode.memory.session import drop_unpaired
 from rhinecode.permission.engine import narrower_mode
+from rhinecode.subagents.gate import SubAgentGate, render_subagent_message
 from rhinecode.subagents.render import render_agent_index
 from rhinecode.subagents.report import render_report
 from rhinecode.subagents.runner import ParentSnapshot
@@ -975,6 +976,19 @@ class ConversationManager:
             "评审 .rhinecode/agents/ 应与评审代码同等对待——用 /agents 查看详情。"
         )
 
+    def subagent_gate(self):
+        """
+        构造本次运行用的子 Agent 闸门（c13 修订）。
+
+        :returns: `SubAgentGate`；服务未启用时 `None`（循环会用 `NullGate` 兜底）
+
+        每次 `run()` 现造一个：它本身无状态（数据全在任务表里），
+        造一个的成本可以忽略，而现造能保证它永远指向当下的任务表。
+        """
+        if self.subagent_service is None:
+            return None
+        return SubAgentGate(self.subagent_service.tasks, render_subagent_message)
+
     def _agent_index_text(self) -> str:
         """
         角色清单文本，填进系统提示的 135 槽位（spec F9）。
@@ -1040,13 +1054,18 @@ class ConversationManager:
         """
         把已完成的子 Agent 结论追加进主历史（spec F21 第 3 步）。
 
-        由 `_run` 在**组装请求之前**调用。时机卡在这里是必须的：
-        不能在一次正在运行的循环中途改动 `history`，那会破坏
-        「assistant(tool_calls) 后面紧跟对应的 tool 结果」这条消息协议顺序。
+        **c13 修订后本方法退居兜底**：主路径是 Agent Loop 的迭代级交付
+        （见 `agent/gate.py`），那才是「同一次运行内就能拿到结论」的实现。
+        这里保留的是**跨用户消息**的场景——比如一个 `background=true` 的
+        子 Agent 在主对话早已收工之后才跑完，它的结论要在下一条用户消息时补上。
+
+        由 `_run` 在**组装请求之前**调用。
 
         **为什么追加进历史而不是走一次性的系统提醒**：提醒不进历史，
         下一轮就消失了，模型在第三轮就会忘记子 Agent 说过什么——
         而子 Agent 的结论恰恰是**有长期价值**的信息。
+
+        与闸门共用同一份渲染（`render_subagent_message`）。
 
         消息用 `role="user"` 并包一层标记块：让模型知道这不是人在说话。
         `display_content` 置空串，使界面与 `/resume` 回放**不**把它显示成
@@ -1057,13 +1076,9 @@ class ConversationManager:
         if self.subagent_service is None:
             return
         for record in self.subagent_service.tasks.take_deliverables():
-            content = (
-                f"<subagent-result agent=\"{record.agent_name}\" "
-                f"task_id=\"{record.task_id}\" status=\"{record.status.value}\">\n"
-                f"{record.conclusion}\n"
-                f"</subagent-result>"
-            )
-            message = Message(role="user", content=content, display_content="")
+            # 与闸门共用**同一份**渲染，不另写一遍——两处各拼一次标记块，
+            # 改了其中一处就会出现「同一条结论在历史里长得不一样」。
+            message = render_subagent_message(record)
             self.history.append(message)
             self.memory_manager.record_message(message)
 
@@ -1134,12 +1149,6 @@ class ConversationManager:
         if self.subagent_service is None:
             return ()
         return self.subagent_service.tasks.drain_notifications()
-
-    def request_subagent_background(self) -> Optional[str]:
-        """把当前前台等待中的子 Agent 切到后台（`Ctrl+B`，spec F19 第三种方式）。"""
-        if self.subagent_service is None:
-            return None
-        return self.subagent_service.request_background()
 
     def _run_forked_skill(
         self, spec: SkillSpec, arguments: str, display: str, record: bool = True
@@ -1535,7 +1544,10 @@ class ConversationManager:
             self._cancel_event,
             self._context_manager,
             self.memory_manager.record_message,
-            options=RunOptions(),   # 主对话不排除任何工具
+            options=RunOptions(
+                # c13：子 Agent 闸门。为 None 时循环用 NullGate 兜底、零回归。
+                subagent_gate=self.subagent_gate(),
+            ),
         )
         return self._wrap_events(events, extra_skill=grant_skill)
 

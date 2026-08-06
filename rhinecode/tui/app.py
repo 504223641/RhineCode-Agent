@@ -704,14 +704,21 @@ class RhineApp(App):
         if self._pending_interaction is not None or self._session_panel_active:
             return
 
-        # 2. 运行中按 Esc 取消循环；Ctrl+B 把前台等待中的子 Agent 切到后台（c13 F19）
+        # 2. 运行中按 Esc 取消循环
+        #
+        # c13 注记：这里曾有一个 `Ctrl+B`「把前台等待中的子 Agent 切到后台」。
+        # 随「发起与等待分离」的改造一并删除——前台阻塞等待已经不存在了，
+        # 而且那个语义空间本来就被占满了：「这次要不要这个结果」由**模型**用
+        # `background` 参数表达，「不干了」用 Esc，「掐掉某个子 Agent」用
+        # `/agents cancel <标识>`。用户中途推翻模型的声明、逼它拿不完整的信息
+        # 回答，既罕用产出又差。
+        #
+        # 更根本的一条：**等待不是卡顿，是进度**——跑子 Agent 就是在执行任务，
+        # 与主 Agent 自己跑一遍测试套件性质相同，没人会为后者设计「别等了」的键。
         if self._stream_active:
             if event.key == "escape":
                 event.stop()
                 self._manager.request_cancel()
-            elif event.key == "ctrl+b":
-                event.stop()
-                self._switch_subagent_to_background()
             return
 
         # 3. 命令面板导航
@@ -727,27 +734,6 @@ class RhineApp(App):
         elif event.key == "escape":
             event.stop()
             panel.hide()
-
-    def _switch_subagent_to_background(self) -> None:
-        """
-        把当前**前台等待中**的子 Agent 切到后台（`Ctrl+B`，c13 F19 第三种方式）。
-
-        本方法运行在**主线程**（按键处理），而等待方阻塞在 Worker 线程的
-        `done_event.wait()` 上。置位那个事件让它立刻醒来——不涉及任何
-        跨线程 widget 写入，因此没有 `call_from_thread` 的死锁风险。
-
-        没有前台任务时给一句提示而不是静默：用户按了键什么都不发生，
-        分不清是「没生效」还是「按错了」。
-
-        副作用：改任务的 backgrounded 标志；向聊天区追加一行提示。
-        """
-        task_id = self._manager.request_subagent_background()
-        if task_id:
-            self.show_message(
-                f"子 Agent [{task_id}] 已转入后台，跑完后结论会自动送达。"
-            )
-        else:
-            self.show_message("当前没有正在前台等待的子 Agent。")
 
     def on_input_bar_input_submitted(self, event: InputBar.InputSubmitted) -> None:
         """

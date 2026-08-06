@@ -21,7 +21,8 @@
 **刻意不合成一条**：
 
 - 通知在任务完成的**那一刻**发生（用户当时在做什么都不影响）；
-- 交付要等到主对话**下一次发请求**之前（不能在一次正在运行的循环中途改历史）。
+- 交付要等到**下一轮迭代**组装请求之前（c13 修订：交付点已从「每条用户消息一次」
+  下移到迭代级，见 `agent/gate.py`）。
 
 合成一条会导致「用户还没看到通知，模型已经引用了结论」或反之。
 """
@@ -86,11 +87,10 @@ class TaskRecord:
     :param stop_reason: 结束原因（Agent Loop 的 `StopReason` 值，或异常摘要）
     :param delivered: 结论是否已追加进主历史
     :param notified: 完成通知是否已出现在界面上
-    :param backgrounded: 是否已转后台。**前台等待方置位**，
-        用于区分「运行器真的做完了」与「等待方不等了」——两者都会让
-        `done_event` 置位，只看那个事件分不出来
+    :param awaited: 模型是否声明「这次我要这个结果」。见字段处的注释
     :param cancel_event: 取消信号，运行器在安全点轮询
-    :param done_event: 完成信号，前台等待方 `wait` 它
+    :param done_event: 完成信号。**c13 修订后已无前台等待方**，保留它是因为
+        运行器的收尾仍靠它表达「这条真的结束了」，且测试用它做同步点
     """
 
     task_id: str
@@ -106,7 +106,10 @@ class TaskRecord:
     stop_reason: str = ""
     delivered: bool = False
     notified: bool = False
-    backgrounded: bool = False
+    # 模型委派时是否声明「这次我要这个结果」（`background=false`，缺省）。
+    # 为真时 Agent Loop 在准备自然结束前会停下来等它（见 agent/gate.py）；
+    # `background=true` 置假——那是模型明说过不等的，循环不该为它停留。
+    awaited: bool = True
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
 
@@ -221,7 +224,7 @@ class TaskManager:
         `done_event.set()` 放在**锁外**：它会唤醒等待线程，属于跨线程调度，
         持锁时做这件事违反本模块的加锁不变量。
 
-        副作用：改记录字段；置 `done_event`（唤醒前台等待方）。
+        副作用：改记录字段；置 `done_event`。
         """
         with self._lock:
             record = self._tasks.get(task_id)
@@ -366,28 +369,6 @@ class TaskManager:
         for record in records:
             record.cancel_event.set()
         return len(records)
-
-    def mark_backgrounded(self, task_id: str) -> bool:
-        """
-        标记任务已转入后台，并唤醒前台等待方（spec F19 第二、三种方式）。
-
-        :param task_id: 任务标识
-        :returns: 是否成功标记（未知标识或已结束时为假）
-
-        置 `done_event` 是为了让阻塞中的 `wait()` **立刻**返回，而不是干等到超时。
-        等待方靠 `backgrounded` 而非 `done_event` 判断「是真做完了还是我不等了」。
-        """
-        with self._lock:
-            record = self._tasks.get(task_id)
-            if record is None or record.status.is_terminal:
-                record = None
-            else:
-                record.backgrounded = True
-
-        if record is None:
-            return False
-        record.done_event.set()
-        return True
 
 
 __all__ = [

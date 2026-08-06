@@ -188,96 +188,101 @@ class ConcurrencyLimitTest(ServiceBase):
         self.assertTrue(outcome.ok)
 
 
-class ForegroundTest(ServiceBase):
-    """AC17b：前台等待与超时转后台。"""
+class NonBlockingTest(ServiceBase):
+    """
+    **c13 修订的核心判据：`delegate` 永不阻塞。**
 
-    def test_fast_task_returns_conclusion(self) -> None:
+    初版在这里同步等 60 秒，造成两个真实缺陷（多个委派串行、结论要等到
+    下一条用户消息）。等待已经移交给 Agent Loop，本层只管起线程。
+    """
+
+    def test_returns_immediately_even_for_slow_subagent(self) -> None:
+        slow = _CountingProvider(delay=0.5)
+        service = self._service(provider=slow)
+
+        started = time.monotonic()
+        outcome = service.delegate(KIND_ROLE, "explorer", "t")
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(outcome.ok)
+        self.assertLess(elapsed, 0.2, "delegate 不得阻塞等待子 Agent")
+        self.assertIsNotNone(outcome.task_id)
+        self._settle(service)
+
+    def test_multiple_delegations_run_in_parallel(self) -> None:
+        """
+        **用户报的第二个问题的回归护栏。**
+
+        一轮里发三个各花 0.4 秒的委派：修复前它们要跑 1.2 秒以上（串行），
+        修复后应当在 0.4 秒多一点就全部结束。
+
+        判据取「总耗时」而不是「起止时间重叠」——后者在慢机器上更脆，
+        而两种形态的总耗时差了三倍，怎么抖都分得开。
+        """
+        slow = _CountingProvider(delay=0.4)
+        service = self._service(provider=slow, max_concurrent=5)
+
+        started = time.monotonic()
+        for i in range(3):
+            self.assertTrue(service.delegate(KIND_ROLE, "explorer", f"任务{i}").ok)
+        self._settle(service, timeout=10)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed, 0.9,
+            f"三个子 Agent 应当并行（各 0.4s），实际 {elapsed:.2f}s——串行会是 1.2s 以上",
+        )
+
+    def test_awaited_by_default(self) -> None:
+        """
+        缺省 `awaited=True`：模型不写 `background` 就是「我要这个结果」，
+        Agent Loop 收工前会停下来等它。
+        """
+        service = self._service()
+        outcome = service.delegate(KIND_ROLE, "explorer", "t")
+        self.assertTrue(service.tasks.get(outcome.task_id).awaited)
+        self._settle(service)
+
+    def test_background_true_clears_awaited(self) -> None:
+        service = self._service()
+        outcome = service.delegate(KIND_ROLE, "explorer", "t", background=True)
+        self.assertFalse(service.tasks.get(outcome.task_id).awaited)
+        self._settle(service)
+
+
+class StartedTextTest(ServiceBase):
+    """回灌文案要让模型建立正确的预期。"""
+
+    def test_awaited_text_says_result_comes_back_automatically(self) -> None:
+        """
+        缺省路径必须说清「结论会在你收工前自动回来」——否则模型拿到一个
+        任务标识，最自然的下一步就是去查它，而本章刻意不提供查询工具。
+        """
         service = self._service()
         outcome = service.delegate(KIND_ROLE, "explorer", "t")
 
-        self.assertTrue(outcome.ok)
-        self.assertFalse(outcome.backgrounded)
-        self.assertEqual(outcome.text, "结论")
-
-    def test_timeout_hands_off_to_background(self) -> None:
-        """超时后工具立即返回，而任务**仍在跑**（不是被取消）。"""
-        slow = _CountingProvider(delay=0.5)
-        service = self._service(provider=slow, foreground_timeout=0.05)
-
-        outcome = service.delegate(KIND_ROLE, "explorer", "t")
-
-        self.assertTrue(outcome.ok, "转后台算成功发起")
-        self.assertTrue(outcome.backgrounded)
-        self.assertIn(outcome.task_id, outcome.text)
-        record = service.tasks.get(outcome.task_id)
-        self.assertIs(record.status, TaskStatus.RUNNING)
-        self.assertFalse(record.cancel_event.is_set(), "转后台不是取消")
-
-        self._settle(service)
-        self.assertIs(record.status, TaskStatus.COMPLETED)
-
-    def test_backgrounded_text_forbids_polling(self) -> None:
-        """
-        转后台的文案必须明确「结论会自动送达、别反复问进度」。
-
-        没有这句的话，模型拿到一个任务标识，很自然的下一步就是去查它——
-        而本章刻意不提供查询工具（结论是推过去的，spec F21）。
-        """
-        service = self._service(foreground_timeout=0.01)
-        outcome = service.delegate(KIND_ROLE, "explorer", "t", background=True)
-
-        self.assertIn("自动送达", outcome.text)
+        self.assertIn("自动回到你手里", outcome.text)
         self.assertIn("不要反复询问进度", outcome.text)
         self._settle(service)
 
-    def test_explicit_background_does_not_block(self) -> None:
-        """AC17a：显式后台时立即返回，不等那 0.3 秒。"""
-        slow = _CountingProvider(delay=0.3)
-        service = self._service(provider=slow, foreground_timeout=30.0)
-
-        started = time.monotonic()
+    def test_background_text_says_it_will_not_wait(self) -> None:
+        """
+        `background=true` 的文案要**明确不同**：本轮不会为它停留。
+        两条措辞一样的话，模型无从建立正确预期。
+        """
+        service = self._service()
         outcome = service.delegate(KIND_ROLE, "explorer", "t", background=True)
-        elapsed = time.monotonic() - started
 
-        self.assertTrue(outcome.backgrounded)
-        self.assertLess(elapsed, 0.2, "显式后台不该阻塞")
+        self.assertIn("不会为它停留", outcome.text)
+        self.assertIn("下一条用户消息", outcome.text)
         self._settle(service)
 
-
-class ManualBackgroundTest(ServiceBase):
-    """AC17c 的可自动化部分：`request_background` 让等待方提前返回。"""
-
-    def test_request_background_releases_the_waiter(self) -> None:
-        slow = _CountingProvider(delay=1.0)
-        service = self._service(provider=slow, foreground_timeout=30.0)
-        result: list = []
-
-        def worker() -> None:
-            result.append(service.delegate(KIND_ROLE, "explorer", "t"))
-
-        thread = threading.Thread(target=worker)
-        thread.start()
-
-        # 等它进入前台等待
-        deadline = time.monotonic() + 3
-        while service.foreground_task_id() is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertIsNotNone(service.foreground_task_id(), "应当已进入前台等待")
-
-        switched = service.request_background()
-        thread.join(timeout=5)
-
-        self.assertIsNotNone(switched)
-        self.assertTrue(result and result[0].backgrounded)
-        self._settle(service, timeout=5)
-
-    def test_request_background_without_foreground_task(self) -> None:
-        self.assertIsNone(self._service().request_background())
-
-    def test_foreground_id_cleared_after_return(self) -> None:
+    def test_two_texts_differ(self) -> None:
         service = self._service()
-        service.delegate(KIND_ROLE, "explorer", "t")
-        self.assertIsNone(service.foreground_task_id())
+        a = service.delegate(KIND_ROLE, "explorer", "t")
+        b = service.delegate(KIND_ROLE, "explorer", "t", background=True)
+        self.assertNotEqual(a.text, b.text)
+        self._settle(service)
 
 
 class BranchDelegationTest(ServiceBase):
