@@ -67,7 +67,7 @@
 
 常量：`DEFAULT_MAX_TURNS = 15`（与 `SKILL_MAX_ITERATIONS` 同值，同一个理由：
 子任务该聚焦）、`HARD_MAX_TURNS = 25`（不得超过主对话的 `MAX_ITERATIONS`）、
-`MAX_CONCURRENT = 3`、`FOREGROUND_TIMEOUT = 60.0`。
+`MAX_CONCURRENT = 3`。
 
 `UNSUPPORTED_FIELDS`：`skills` / `memory` / `isolation` / `color` / `hooks` /
 `mcp_servers` / `background` / `effort` —— 登记表，遇到就产生一条**具名**警告
@@ -102,8 +102,8 @@ TaskStatus = RUNNING | COMPLETED | FAILED | CANCELLED
 | `stop_reason` | 结束原因 |
 | `delivered` | 结论是否已交付主历史（F21 用） |
 | `cancel_event` | `threading.Event`，取消信号 |
-| `done_event` | `threading.Event`，前台等待用 |
-| `backgrounded` | 是否已转后台（前台等待方置位，用于「转后台后不要再回填工具结果」） |
+| `done_event` | `threading.Event`，运行器收尾时置位（测试用它做同步点） |
+| `awaited` | 模型是否声明「这次我要这个结果」（`background=false`，缺省）。为真时 Agent Loop 收工前会停下来等它 |
 
 ### SubAgentRuntime（`subagents/runner.py`）
 
@@ -248,7 +248,7 @@ Plan Mode 的两个特殊工具（提问 / 提交计划）不在注册中心里�
 10. 埋 `subagent_end`，`tasks.finish(...)`，置 `done_event`。
 
 整段包 `try/except BaseException`：**后台线程的异常无人接管**，逃逸出去会让任务永远停在
-RUNNING、前台等待方永远等不到 `done_event`。异常一律转成 FAILED + 可读结论。
+RUNNING、循环末尾的等待闸门永远等不到它。异常一律转成 FAILED + 可读结论。
 
 ### `subagents/service.py` —— 组合层（F6/F19/F20）
 
@@ -263,16 +263,36 @@ RUNNING、前台等待方永远等不到 `done_event`。异常一律转成 FAILE
 | `index_text() -> str` | 角色清单注入文本（F9） |
 | `tasks` | 任务管理器 |
 | `report(...) -> str` | `/agents` 报告 |
-| `request_background(task_id)` | 手动切后台（Ctrl+B 用） |
+| `gate()` | 构造供 Agent Loop 用的等待闸门（见下） |
 
 `delegate` 流程：校验 → 查角色 → `resolve_toolset` → 空集则失败（F14）→
-并发上限（F20）→ 建任务 → 起 `threading.Thread(daemon=True)` → 分流：
+并发上限（F20）→ 建任务（置 `awaited = not background`）→
+起 `threading.Thread(daemon=True)` → **立即返回**任务标识。
 
-- 后台（显式 / 分支式）→ 立即返回「已转入后台，标识 X」；
-- 前台 → `record.done_event.wait(FOREGROUND_TIMEOUT)`；
-  - 返回 True → 结论作为工具结果；
-  - 返回 False（或期间被 `request_background` 置位）→ 置 `backgrounded`，
-    返回「已转入后台」。
+**本方法永不阻塞**，因此同一轮里的多个委派天然并行。
+
+### `agent/gate.py` + `subagents/gate.py` —— 等待闸门（F19/F21）
+
+**职责**：Agent Loop 与子 Agent 系统之间的窄接口，只有四个方法。
+
+**协议定义在消费方**（`agent/gate.py`），实现留在提供方（`subagents/gate.py`）。
+⚠ 这不是风格问题：`agent` 层依赖 `subagents` 会**直接撞循环导入**
+（`agent.loop` → `subagents/__init__` → `runner` → `agent.loop`），
+报错是 `cannot import name 'Agent' from partially initialized module`。
+
+| 方法 | 循环在什么时候调 |
+| --- | --- |
+| `take_pending() -> list[Message]` | **每轮迭代组装请求之前**。取走已完成未交付的结论，幂等 |
+| `has_awaited() -> bool` | 模型不再调工具、准备自然结束时 |
+| `wait_any(cancel_event) -> bool` | 上一条为真时。阻塞到有结论可交付，**被取消信号立刻打断** |
+| `describe_awaited() -> str` | 产出「等待子 Agent：xxx」那条提示 |
+
+`NullGate` 让「不启用子 Agent」时全部退化为零成本空调用——**不传等于零回归**。
+
+**没有超时旋钮**：跑子 Agent 就是在执行任务，与主 Agent 自己跑一遍测试套件
+性质相同。给等待设体验意义上的上限会把正常工作腰斩（一个 `max_turns: 20`
+的子 Agent 真跑起来可能要五分钟）。唯一的逃生口是 `Esc`；另有
+`WAIT_HARD_LIMIT`（防线程挂死）与 `MAX_WAIT_ROUNDS`（防无限接力）两个安全网。
 
 ### `subagents/render.py` / `report.py` —— 文本产出（F9/F24）
 
@@ -329,36 +349,45 @@ system_serial = True
   主线程读 `drain_notifications()` → 写通知行；读 `running_count()` → 刷状态栏。
   **全程主线程，零跨线程 widget 写入**——从结构上避开与 Textual 阻塞式
   `call_from_thread` 组成死锁的那一类问题（C11 已踩过）。
-- `on_key` 增加 `Ctrl+B`：有前台等待中的子 Agent 时调 `request_background`。
 - 状态栏新增「子Agent: N」字段。
 
 ---
 
 ## 模块交互
 
-**一次前台委派（超时转后台）的完整链路**：
+**一次委派的完整链路**（缺省 `background=false`，即「我要这个结果」）：
 
 ```
 模型 → run_agent(type=role, agent=explorer, task=...)
   └─ Agent Loop 串行段（system_serial，跳过权限管线）
       └─ SubAgentService.delegate()
           ├─ resolve_toolset() → 非空
-          ├─ TaskManager.create() → task_id=a3f1c9
+          ├─ TaskManager.create() → task_id=a3f1c9，awaited=True
           ├─ Thread(run_subagent) ──────────────┐
-          └─ done_event.wait(60) ── 超时 ───┐   │（独立线程）
-                                            │   ├ bind_scope("subagent:explorer")
-   工具结果「已转入后台，标识 a3f1c9」 ◀────┘   ├ engine.derive(min 档)
-   主对话继续                                    ├ Agent.run(...)  ← 每次工具调用
+          └─ **立即返回**                        │（独立线程）
+                                                 ├ bind_scope("subagent:explorer")
+   工具结果「已启动，标识 a3f1c9」                ├ engine.derive(min 档)
+   主对话**当轮继续**（多个委派在此并行）         ├ Agent.run(...)  ← 每次工具调用
                                                  │   仍过 五层管线 + Hook
-                                                 ├ tasks.finish(COMPLETED, 结论)
-                                                 └ done_event.set()
+                                                 └ tasks.finish(COMPLETED, 结论)
+                                                       │
+   ┌───────────────────────────────────────────────────┤
+   │                                                   │
+   │ 每轮迭代组装请求前：gate.take_pending()            │
+   │   → 结论作为一条消息追加进历史 → **模型当轮就看到** │
+   │                                                   │
+   │ 模型准备自然结束时：gate.has_awaited()             │
+   │   → 还有要等的 → NOTICE「等待子 Agent…」            │
+   │   → gate.wait_any(cancel_event)  ← Esc 可立刻打断  │
+   │   → 等到了就 continue，再跑一轮                     │
+   └───────────────────────────────────────────────────┤
                                                        │
    TUI 定时器（0.5s，主线程）◀──────────────────────────┘
      └ drain_notifications() → 聊天区出通知行
-                                                       │
-   主对话下一次请求组装前 ◀─────────────────────────────┘
-     └ take_deliverables() → 结论作为一条消息追加进主历史 → 模型看到
 ```
+
+**`background=true` 时**只少一件事：`awaited` 为假，循环不为它停留；
+它的结论走协调层的 `_deliver_subagent_results()`，在下一条用户消息时补上。
 
 ## 文件组织
 
@@ -370,6 +399,7 @@ rhinecode/
 │   ├── parser.py                 — 单文件解析与字段归一
 │   ├── discovery.py              — 三层扫描与覆盖
 │   ├── toolset.py                — 分层工具过滤（纯函数）
+│   ├── gate.py                   — 等待闸门的**实现**（协议在 agent/gate.py）
 │   ├── tasks.py                  — TaskManager（线程安全）
 │   ├── runner.py                 — SubAgentRuntime、run_subagent
 │   ├── service.py                — SubAgentService 门面
@@ -378,7 +408,9 @@ rhinecode/
 │   └── builtin/
 │       └── explorer.md           — 内置只读调研角色
 ├── tools/run_agent.py            ← 新增：委派工具
-├── agent/loop.py                 ← 改：RunOptions.interactive、非交互拒绝分支与文案
+├── agent/gate.py                 ← 新增：等待闸门的**协议**与 NullGate
+├── agent/loop.py                 ← 改：RunOptions.interactive / subagent_gate、
+│                                    非交互拒绝分支、迭代级交付点、收工前的等待闸门
 ├── permission/engine.py          ← 改：derive()
 ├── trace/models.py               ← 改：subagent_start / subagent_end
 ├── trace/reader.py               ← 改：两个摘要函数登记进 SUMMARIZERS
@@ -386,7 +418,7 @@ rhinecode/
 ├── commands/builtins.py          ← 改：/agents 的 CommandSpec 与处理函数
 ├── commands/models.py            ← 改：ReportTarget 新增取值
 ├── conversation.py               ← 改：服务构造、清单注入、结论交付、清空时取消
-├── tui/app.py                    ← 改：轮询定时器、Ctrl+B、状态栏字段
+├── tui/app.py                    ← 改：轮询定时器、状态栏字段
 ├── tui/widgets.py                ← 改：状态栏渲染新增字段
 ├── commands/controller.py        ← 改：协议新增取消方法
 └── bootstrap.py                  ← 改：装配 SubAgentService、注册工具、项目级角色提示
@@ -401,7 +433,7 @@ tests/
 ├── test_subagent_toolset.py      — 三层过滤顺序、空集、未解析名字
 ├── test_subagent_tasks.py        — 并发安全、两条消费线、取消
 ├── test_subagent_runner.py       — 权限派生、非交互拒绝、结论提取、异常兜底
-├── test_subagent_service.py      — 并发上限、前台超时转后台、空工具集失败
+├── test_subagent_service.py      — 并发上限、永不阻塞、多委派并行、空工具集失败
 ├── test_subagent_tool.py         — 参数校验、system_serial、错误回灌文案
 ├── test_subagent_report.py       — /agents 三形态
 ├── test_subagent_integration.py  — 结论交付主历史、Hook 生效、清空时取消
@@ -413,7 +445,7 @@ tests/
 | 决策点 | 选择 | 理由 |
 | --- | --- | --- |
 | 包名 | `subagents/`（复数） | 与既有 `agent/`（Agent Loop）只差一字母会长期误读 |
-| 线程模型 | 子 Agent 一律独立线程，前台=主 Worker 阻塞等待 | 「转后台」退化为「停止等待」，不需要在运行途中移交执行状态——这是三种进后台方式能统一实现的关键 |
+| 线程模型 | 子 Agent 一律独立线程，**委派永不阻塞** | 发起与等待分离：`delegate` 只起线程，等待交给 Agent Loop 在收工前统一处理。于是多个委派天然并行，结论也能在同一次运行内回流 |
 | TUI 更新 | 定时轮询（`set_interval`），不做跨线程推送 | 后台线程 `call_from_thread` 是阻塞式的，与持锁组件配合会构成确定性死锁（C11 已踩过）。轮询把全部 widget 写入留在主线程 |
 | 权限隔离 | `PermissionEngine.derive()` 派生实例 | 引擎的 `mode` / `turn_rules` 是**可变字段**。子 Agent 若直接改主引擎的 mode，主对话的权限档会被后台线程改掉，且界面上看不出来 |
 | `session_rules` 共享 | 按引用共享（只读使用） | 用户在主对话确认面板上选的「本会话放行」应当对子 Agent 生效——那是明确授予。而 `turn_rules` 不共享（spec F17） |
@@ -424,4 +456,7 @@ tests/
 | 角色身份 | `name` 优先，缺省回落文件名 | spec F2 已定：保证从官方生态复制来的定义原样可用 |
 | 委派工具进不进权限管线 | 不进（`system_serial=True`） | 委派本身无副作用；副作用全部来自子 Agent 的工具调用，那些逐个过完整管线。与 `load_skill` 同先例 |
 | 后台附加过滤层 | 保留结构位、当前为空集 | 见 spec F13 的说明块：本章全程非交互，前后台约束相同，造人为差异会让同一角色在两种场景下行为不同而配置上看不出来 |
+| 发起与等待分离 | `delegate` 永不阻塞；等待在 Agent Loop 收工前统一处理 | 初版在工具调用里同步等，一个设计错误造成两个缺陷：等待独占串行桶 → 多个委派串行；配套的异步交付点挂在「每条用户消息一次」→ 结论在同一次运行内拿不到、任务被变相中断 |
+| 闸门协议放哪 | 协议在 `agent/gate.py`（消费方），实现在 `subagents/gate.py` | 反过来会撞循环导入，实测报错 `cannot import name 'Agent' from partially initialized module` |
+| 等待超时 | **不设**体验意义上的超时，逃生口是 `Esc` | 等待不是卡顿，是进度。初版设过 180 秒，会把一个 `max_turns: 20` 的子 Agent 腰斩 |
 | Plan Mode | 子 Agent 一律 `plan_mode=False` | 它非交互，没有人能审批计划；顺带使两个特殊工具天然不出现 |

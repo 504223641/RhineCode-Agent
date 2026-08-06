@@ -14,15 +14,18 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | C9 | **记忆系统** —— RHINE.md 项目指令、会话存档与恢复、自动笔记 |
 | C10 | **斜杠命令系统** —— 单一注册中心统一驱动执行 / 帮助 / 补全 / 高亮 |
 | C11 | **Skill 系统** —— 把重复输入的提示词封装成可复用的 Markdown 文件（[详见下文](#skill-系统)） |
+| C12 | **Hook 系统** —— 在生命周期的固定节点上挂你自己声明的自动化动作（[详见下文](#hook-系统)） |
+| C13 | **子 Agent 系统** —— 把子任务委派给独立上下文的 Agent，只拿回结论（[详见下文](#子-agent-系统)） |
 
 Skill 系统已**对齐 [Agent Skills 开放标准](https://agentskills.io)**（Claude Code 与 Codex 共同遵循的那套），所以从 Claude Code 拿一个 Skill 目录复制进来就能直接用，不需要改任何东西。
 
-> 工具调用、Plan Mode、权限系统、Skill 与 Hook 的工具级事件仅在 `protocol: deepseek` 且启用默认工具注册中心时可用；记忆系统的 RHINE.md 注入与会话存档/恢复对所有 Provider 生效。Anthropic / OpenAI Provider 目前保持纯对话能力。
+> 工具调用、Plan Mode、权限系统、Skill、子 Agent 与 Hook 的工具级事件仅在 `protocol: deepseek` 且启用默认工具注册中心时可用；记忆系统的 RHINE.md 注入与会话存档/恢复对所有 Provider 生效。Anthropic / OpenAI Provider 目前保持纯对话能力。
 
 ## 功能
 
 - **Skill 系统**（已对齐 Agent Skills 开放标准）：把可复用的 AI 操作封装成 Markdown 文件，三级存放同名覆盖；启动只注入名字与说明、用时由 `load_skill` 按需加载完整 SOP；`context: fork` 可开子对话只回流结论；`allowed-tools` 是**预授权**（列出的操作免确认，不限制模型能调什么）；自动注册 `/<name>` 短命令并进 Tab 补全，`/skills reload` 热更新；内置 commit / review / test 三个样板。详见 [Skill 系统](#skill-系统)。
 - **Hook 系统**：在生命周期的固定节点上挂**你自己声明**的自动化动作。一条规则 = 事件 + 条件（可省）+ 动作，写在 `hooks.yaml` 里。十二个事件覆盖会话 / 回合 / 消息 / 工具四层加三个系统级；四种动作（跑 shell 命令 / 注入提示词 / 发 HTTP / 子 Agent 占位）；`once` / `async` / `timeout` 三种执行控制。`pre_tool_use` 可以**拦截**工具调用——但它**只能收紧不能放宽**（没有 allow）。`/hooks` 查看规则与触发情况。详见 [Hook 系统](#hook-系统)。
+- **子 Agent 系统**：主 Agent 可以把子任务**委派**给独立上下文的子 Agent，只拿回一段结论——一次「找出项目里所有用到 X 的地方」不再把二十个文件的内容堆进你的对话。角色用 Markdown + frontmatter 定义（工具白黑名单、模型、轮次上限、权限档位），三级存放同名覆盖。委派**永不阻塞**，多个子 Agent 天然并行；结论跑完后自动回到主 Agent 手里，不需要你插话。子 Agent 的能力**只会比主对话小**（工具集三层过滤、权限只能收紧、判 ASK 一律自动拒绝）。`/agents` 查看角色与任务。详见 [子 Agent 系统](#子-agent-系统)。
 - **ReAct Agent Loop**：自动执行“调用模型 → 执行工具 → 回灌结果 → 再调用模型”的多轮循环。
 - **流式输出**：正文与思考内容逐块渲染，后台 Worker 不阻塞 TUI 主线程。
 - **DeepSeek 工具系统**：支持读文件、glob 找文件、grep 搜内容、写文件、精确编辑文件、运行命令；大文件读取需要显式行范围，文件发现类工具会逐文件尊重 `Read(...)` deny 规则。
@@ -163,7 +166,8 @@ C10 起所有斜杠命令由**单一命令注册中心**统一管理：执行、
 | `/skills` | — | 本地 | 管理 Skill：无参列出全部、`prompt` 查看实际注入内容、`reload` 热更新（连同斜杠短命令一并重新注册）、`off [名字]` 卸载、`run <名字> [参数]` 执行 |
 | `/<skill名>` | — | 提示词 | 每个 Skill 自动注册的短命令（如 `/commit`、`/review`）；与内置命令重名时跳过注册，改用 `/skills run <名字>` |
 | `/hooks` | — | 本地 | 查看已加载的 Hook 规则（来源层、事件、条件、动作、本次运行的触发次数与最近结论）、加载警告与配置位置，只读。**本版本不做 `reload`**，改了规则要重启 |
-| `/clear` | `/reset`、`/new` | 界面 | 清空当前对话历史（并复位上下文压缩状态；会话存档开新档、旧档保留；一并卸载已激活 Skill） |
+| `/agents` | — | 本地 | 查看子 Agent 角色（来源层、说明、最终工具集、模型、轮次上限、权限档位的声明值与生效值）、加载错误与本次运行的任务；`cancel <标识\|all>` 取消任务。**本版本不做 `reload`**，改了角色定义要重启 |
+| `/clear` | `/reset`、`/new` | 界面 | 清空当前对话历史（并复位上下文压缩状态；会话存档开新档、旧档保留；一并卸载已激活 Skill、取消未完成的子 Agent） |
 | `/exit` | `/quit` | 界面 | 退出程序 |
 
 三种类型的含义：**本地**命令直接执行固定逻辑、不进入 Agent Loop（`/compact` 的专用摘要调用是明确例外）；**界面**命令改变会话或界面状态、同样不进入 Agent；**提示词**命令把内置预设提示词作为用户请求交给 AI。本地与界面命令不消耗对话 Token、不写入模型历史。无参数命令会忽略多余参数（`/clear now` 仍执行清空）。
@@ -397,6 +401,136 @@ hooks:
 
 开 `rhine --trace` 还能看到 `hook_dispatch`（**零命中也记**）与 `hook_execute` 两类事件。
 
+## 子 Agent 系统
+
+把子任务**委派**给一个独立上下文的 Agent，只拿回它的结论。
+
+一次「找出项目里所有用到 `RETRY_LIMIT` 的地方」可能要读二十个文件——这些内容
+对你后面的对话毫无价值，却会一直占着上下文、每一轮都重发一遍。交给子 Agent 去做，
+你的对话里只多出一段结论。
+
+### 两种委派
+
+| 类型 | 从哪开始 | 什么时候用 |
+| --- | --- | --- |
+| `role` | **空白对话** + 一个预定义角色 | 「去查清楚某件事」这类自包含的活 |
+| `branch` | **继承当前对话的历史快照** | 「接着刚才的分析继续挖」这类需要上下文的活 |
+
+主 Agent 自己判断该不该委派，你不需要点名。
+
+### 写一个角色
+
+角色是一个 Markdown 文件，`frontmatter` 里**只有 `description` 必填**：
+
+```markdown
+---
+name: auditor
+description: 需要检查代码里是否存在硬编码常量、重复定义、缺少测试覆盖这类问题时用它。只读，不会修改任何东西。
+tools: read_file, glob_files, grep_content
+permission_mode: strict
+max_turns: 10
+---
+
+你是代码审查员。只读地检查问题，最后一段给出自包含的结论，
+写清每个问题的文件路径与具体位置。不要尝试修改任何文件。
+```
+
+| 字段 | 作用 |
+| --- | --- |
+| `name` | 角色标识。**不写就取文件名** |
+| `description` | **必填**。什么时候该委派给它——主 Agent 就靠这一句选角色 |
+| `tools` | 工具白名单。**不写 = 继承你当前能用的全部工具**；写成 `[]` = 一个都不给（委派会直接失败） |
+| `disallowed_tools` | 黑名单，在白名单结果上再减 |
+| `model` | `inherit`（缺省）或具体模型名——可以让调研类角色跑在便宜的小模型上 |
+| `max_turns` | 轮次上限，缺省 15，硬顶 25 |
+| `permission_mode` | `strict` / `default` / `permissive`。**写放行档不会提权**，见下 |
+
+连字符与下划线两种写法都认（`disallowed-tools` 与 `disallowed_tools` 等价）。
+正文是这个角色的系统提示，**可以为空**——只靠工具白名单收窄行为的角色也是合法的。
+
+**正文里最值得写的一句**：告诉它「最后一段必须是自包含的结论」。
+只有那一段会回到你的对话里，写成「如上所述」就等于什么都没说。
+
+### 存放位置
+
+| 层级 | 位置 | 优先级 |
+| --- | --- | --- |
+| 项目级 | `<项目根>/.rhinecode/agents/` | 最高，随代码仓库分发 |
+| 用户级 | `~/.rhinecode/agents/` | 中，跨项目复用 |
+| 内置 | 随程序分发 | 最低，目前只有 `explorer` |
+
+同名角色高优先层覆盖低优先层；被覆盖的那份在 `/agents` 里仍然可见，
+免得你改了一个文件却发现没生效、又找不到原因。
+
+坏文件不影响别的：一个 YAML 写错的角色只让它自己加载失败，其余照常可用，
+错误在 `/agents` 里列出来。
+
+### 委派是异步的，但结论不会漏掉
+
+调用委派工具**立即返回**，所以同一轮里发起的多个子 Agent 是**真并行**的。
+
+结论怎么回来：
+
+- 子 Agent 跑完的那一刻，聊天区出一行完成通知；
+- 主 Agent 在**下一轮**就能看到结论——**不需要你插话**；
+- 如果主 Agent 想收尾了而子 Agent 还没跑完，它会**停下来等**，
+  聊天区显示 `等待子 Agent 完成：...（按 Esc 可取消）`，拿到结论再继续。
+
+模型可以在委派时传 `background: true` 表示「这次我不要这个结果」，
+那样就不会为它停留（结论仍会在之后送达）。
+
+**等待期间按 `Esc`** 会取消整轮；子 Agent 本身不受影响、照样跑完。
+想掐掉某个具体的子 Agent 用 `/agents cancel <标识>`。
+
+同时最多跑 3 个，超了会明确告诉模型「当前在跑的是哪几个」，让它等一个再开。
+
+### ⚠️ 缺省配置下子 Agent 只能做只读的事
+
+子 Agent 是**非交互**执行的——它不会弹确认面板给你。于是权限管线判定为
+「需要人工确认」的操作（写文件、跑命令）会被**自动拒绝**。
+
+想让它能写，两条路：
+
+1. 在 `permissions.yaml` 里写下对应的 `allow` 规则；
+2. 用 `/perm` 把主对话切到放行档之后再委派。
+
+这是刻意选的偏严方向。实际用起来，模型往往会自己把写入留在主对话里做
+（那里有你在回路上），只把只读调研交给子 Agent。
+
+### ⚠️ 角色**无法自行提权**
+
+角色写 `permission_mode: permissive` 不会让它比你更宽——实际生效的是
+**你当前档位与它声明档位里更严的那个**。`/agents` 会同时显示
+「声明值 → 实际生效值」，让你看得出差别从哪来。
+
+这条很重要，因为 `.rhinecode/agents/` **随代码仓库分发**：`git clone`
+一个别人的仓库再启动，就可能多出几个主 Agent 可以委派的角色。它们无法提权，
+但**评审 `.rhinecode/agents/` 应该和评审代码一样认真**——角色正文是发给模型的指令。
+
+另外三条边界：
+
+- 子 Agent 的工具集里**永远没有**委派工具与 Skill 加载工具（防无限嵌套）；
+- 它**不继承** Skill `allowed-tools` 授予的临时预授权；
+- 你写在 `hooks.yaml` 里的 `pre_tool_use` 拦截规则**对子 Agent 同样生效**
+  ——主 Agent 没法靠「委派出去」绕过它。
+
+### 管理
+
+```
+/agents                    # 角色清单 + 本次运行的任务（状态 / 轮次 / 用量 / 结论首行）
+/agents cancel <标识>       # 取消某个任务
+/agents cancel all         # 取消全部未完成的
+```
+
+改了角色定义要**重启**才生效（本版本不做热更新）。
+
+### 从 Claude Code 搬过来
+
+角色文件格式对齐 Claude Code 的 subagent：把 `.claude/agents/*.md` 复制进
+`.rhinecode/agents/` 通常就能直接用。本项目不支持的字段
+（`skills` / `memory` / `isolation` / `color` / `hooks` / `mcpServers` /
+`background` / `effort`）只会被**忽略并具名提示**，不影响角色可用。
+
 ## MCP 客户端
 
 RhineCode 可作为 [MCP](https://modelcontextprotocol.io) 客户端接入外部 MCP Server，把它们提供的工具接进工具中心，无需改动源码。启动时自动完成「连接 → `initialize` 握手 → `tools/list` 发现 → 注册」；之后远端工具与内置工具走同一套 Agent Loop 与权限管线。
@@ -591,6 +725,9 @@ Plan Mode 开关会保持开启；下一条用户消息会重新从规划阶段�
 - Hook 命令**过①危险命令黑名单**（那一层的性质就是「不可被任何配置放开」，而 `hooks.yaml` 就是配置），但不过②③④⑤——它是你写的配置而非模型行为，过完整管线等于每次自动化都弹确认。另：配置里**不做任何字符串插值**，上下文只经**标准输入的 JSON** 抵达命令，因此模型生成的工具参数不可能被拼进 shell 命令行。
 - Hook 的 `http` 动作是本项目**第二条主动外发链路**，且比 `web_fetch` 危险（后者只取不发）。它过②′网络边界的结构性硬校验（禁 `file://`、禁内嵌凭据、禁回环与非公网地址），但不要求域名白名单。**Hook 的事件负载含完整工具参数与工具输出**，与行为记录同级敏感——模型读过的配置文件内容会原样进入 `pre_tool_use` 的负载。
 - 用户级与内置 Skill 目录经路径沙箱的**只读白名单**放行（目录型 Skill 的随附资源在工作区外，模型需按清单读取），只对读类判定生效，写入与 glob/grep 搜索面完全不动。
+- **子 Agent 的能力只会比主对话小，永远不会更大**，这条能逐层论证：工具集里永远没有委派工具与 Skill 加载工具（防无限嵌套）；权限档位取「你当前档位与角色声明档位里更严的那个」，**角色写放行档不产生任何提权效果**；判定为「需人工确认」的操作一律自动拒绝；**不继承** Skill `allowed-tools` 授予的临时预授权。因此不需要为「模型能不能委派」单独设一道闸——它委派出去也做不了自己直接做不了的事。
+- **项目级 `.rhinecode/agents/` 随代码仓库分发**：`git clone` 一个仓库再启动就可能多出几个可委派的角色。它们无法提权（上一条），但角色正文是**发给模型的指令**，**评审 `.rhinecode/agents/` 应与评审代码同等对待**——用 `/agents` 查看当前加载了哪些、各自来自哪一层。
+- **Hook 对子 Agent 全量生效**：你写在 `hooks.yaml` 里的 `pre_tool_use` 拦截规则，对子 Agent 内发起的同类调用同样拦得住——主 Agent 没法靠「委派出去」绕过它。另：**子 Agent 的结论会进入主对话历史**，它读到的内容若被写进结论就会一并回来（与上下文摘要同理，deny 只挡新读取、挡不住已在历史里的内容）。
 
 ## 项目结构
 
@@ -605,6 +742,7 @@ rhinecode/
 │   ├── collector.py     # StreamCollector 双路收集
 │   ├── loop.py          # Agent Loop 核心（含权限决策预扫接入点）
 │   ├── plan_tools.py    # ask_user / present_plan 特殊工具 schema
+│   ├── gate.py          # 子 Agent 等待闸门的**协议**与 NullGate（c13）
 │   ├── cache_log.py     # 缓存命中调试日志
 │   └── prompt/          # 结构化系统提示模块、环境信息与 system-reminder 注入
 ├── trace/               # 行为记录（跨阶段测试设施，叶子包、只依赖标准库）
@@ -652,6 +790,18 @@ rhinecode/
 │   ├── actions.py       # 四种动作执行器（命令过①黑名单，HTTP 过②′硬校验）
 │   ├── manager.py       # 分发 / once / 结论合并 / 注入队列 / 统计 / 埋点
 │   └── report.py        # /hooks 报告与项目级启动提示（零 I/O）
+├── subagents/           # 子 Agent 系统（c13）：角色 + 任务表 + 运行器
+│   ├── models.py        # AgentSpec / AgentCatalog / 常量表 / builtin_agents_dir
+│   ├── parser.py        # frontmatter → AgentSpec（纯函数，不碰文件系统）
+│   ├── discovery.py     # 三层扫描与同名覆盖，全程 fail-safe
+│   ├── toolset.py       # 分层工具过滤（安全边界排在用户配置之前）
+│   ├── tasks.py         # TaskManager（线程安全；刻意不持有任何回调）
+│   ├── runner.py        # 在独立线程里跑完一个子 Agent
+│   ├── service.py       # 委派门面（永不阻塞 → 多个委派天然并行）
+│   ├── gate.py          # 等待闸门的实现（协议在 agent/gate.py）
+│   ├── render.py        # 角色清单注入文本
+│   ├── report.py        # /agents 报告
+│   └── builtin/         # 内置角色（explorer）
 ├── skills/              # Skill 系统（c11，纯逻辑 + 单点接入）
 │   ├── models.py        # 枚举 / frozen 数据类 / 常量 / builtin_skills_dir
 │   ├── parser.py        # 单份文本 → SkillSpec（纯函数，不碰文件系统）
@@ -702,7 +852,7 @@ rhinecode/
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1478 项，skipped 4
+python -m unittest discover -s tests      # 1763 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -725,9 +875,16 @@ TUI 视觉效果留作手测，验收记录在 `docs/c11/acceptance/` 与 `docs/
 
 ## 当前阶段文档
 
-**当前主线是 C12（Hook 系统），文档在 [`docs/c12/`](docs/c12/README.md)**——四份
+**当前主线是 C13（子 Agent 系统），文档在 [`docs/c13/`](docs/c13/README.md)**——四份
 `spec` / `plan` / `task` / `checklist` + `README`（导航）+ `acceptance`（验收报告，
 含真实模型实跑记录）。
+
+> ⚠️ 进门先读 [`docs/c13/README.md`](docs/c13/README.md) 的「开发期的两次设计修订」：
+> 委派的执行模型（发起与等待分离）与项目级角色的启动提示，都在开发期改过一次。
+> 四份文档里带「修订记录」的地方都是它们留下的，`task.md` 整篇是当初的执行计划、
+> 刻意未逐条改写。
+
+C12（Hook 系统）文档在 [`docs/c12/`](docs/c12/README.md)。
 
 > ⚠️ 读 `docs/c12/spec.md` 的 F2 边界第 2 条时**必须连勘误块一起读**：那条原文与
 > F6 的管线位置自相矛盾（`pre_tool_use` 排在五层权限管线之前，在跑判定之前无从知道

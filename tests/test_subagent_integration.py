@@ -360,29 +360,6 @@ class PromptInjectionTest(IntegrationBase):
     def test_index_empty_without_service(self) -> None:
         self.assertEqual(self._manager(with_service=False)._agent_index_text(), "")
 
-    def test_project_notice_only_for_project_layer(self) -> None:
-        """内置角色不触发项目级提示——它随程序分发，不是别人塞进仓库的。"""
-        self.assertIsNone(self._manager().agents_project_notice())
-
-    def test_project_notice_lists_names(self) -> None:
-        manager = self._manager()
-        manager.subagent_service.catalog = AgentCatalog(
-            specs={
-                "deploy": AgentSpec(
-                    name="deploy",
-                    description="x",
-                    body="",
-                    source=AgentSource.PROJECT,
-                    path=Path("deploy.md"),
-                )
-            }
-        )
-        notice = manager.agents_project_notice()
-
-        self.assertIsNotNone(notice)
-        self.assertIn("deploy", notice)
-        self.assertIn("评审", notice)
-
 
 class ZeroRegressionTest(IntegrationBase):
     """AC24：服务为 None 时全部接入点安全降级。"""
@@ -391,7 +368,6 @@ class ZeroRegressionTest(IntegrationBase):
         manager = self._manager(with_service=False)
 
         self.assertEqual(manager._agent_index_text(), "")
-        self.assertIsNone(manager.agents_project_notice())
         self.assertEqual(manager.running_subagent_count(), 0)
         self.assertEqual(manager.drain_subagent_notifications(), ())
         self.assertIn("未启用", manager.agents_report())

@@ -242,13 +242,6 @@ class RhineApp(App):
         hook_notice = self._manager.hooks_project_notice()
         if hook_notice:
             self.show_warning(hook_notice)
-        # 项目级角色的提示（c13 F4）。走普通通道而非 `show_warning`——
-        # 角色正文只是「发给模型的文本」，它指挥的每个工具调用照样过五层权限
-        # 管线，危险程度比 Hook 低一个量级（Hook 的动作直接执行）。
-        # 用同一条醒目通道会稀释掉 Hook 那条警告的分量。
-        agent_notice = self._manager.agents_project_notice()
-        if agent_notice:
-            self.show_message(agent_notice)
         if self._manager.startup_notice:
             # ⚠️ 必须走 `show_message` 而不是直接 `append_system`。
             #

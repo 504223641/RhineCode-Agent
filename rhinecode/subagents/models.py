@@ -72,14 +72,10 @@ DEFAULT_MAX_TURNS = 15
 # 「HARD_MAX_TURNS 不大于 MAX_ITERATIONS」，改大了当场红。
 HARD_MAX_TURNS = 25
 
-# 同时运行的子 Agent 上限（含前台正在等待的那个）。
+# 同时运行的子 Agent 上限。
 # 超限时委派**立即失败**而不排队——排队会让模型拿到一个「成功了但不知道
 # 什么时候开始」的结果，比明确失败更难处理（spec F20）。
 MAX_CONCURRENT = 3
-
-# 前台等待的超时秒数。超过即自动转后台，委派工具立即返回（spec F19 第二种方式）。
-FOREGROUND_TIMEOUT = 60.0
-
 
 # 本章不支持、但 Claude Code 的角色定义里存在的字段。
 #
@@ -97,7 +93,7 @@ UNSUPPORTED_FIELDS = {
     "color": "界面显示颜色（本章的任务行不着色）",
     "hooks": "角色专属 Hook（Hook 规则统一从 hooks.yaml 加载）",
     "mcp_servers": "角色专属 MCP Server（MCP 连接在装配期统一建立）",
-    "background": "强制后台（改用委派时的 background 参数，见 spec F19）",
+    "background": "角色级强制不等（改用委派时的 background 参数，见 spec F19）",
     "effort": "思考强度（子 Agent 继承主对话的设置）",
 }
 
@@ -204,21 +200,6 @@ class AgentCatalog:
     errors: tuple[AgentLoadError, ...] = ()
     shadowed: tuple[ShadowedAgent, ...] = ()
 
-    def project_names(self) -> tuple[str, ...]:
-        """
-        取全部**项目级**角色名（spec F4 的启动提示用）。
-
-        :returns: 按目录顺序的角色名元组
-
-        项目级角色随代码仓库分发——`git clone` 一个仓库再启动，就会多出几个
-        主 Agent 可以委派的角色。每次启动都要提示，让用户有机会去看一眼。
-        """
-        return tuple(
-            name
-            for name, spec in self.specs.items()
-            if spec.source is AgentSource.PROJECT
-        )
-
 
 def builtin_agents_dir() -> Path:
     """
@@ -244,7 +225,6 @@ __all__ = [
     "DEFAULT_MAX_TURNS",
     "HARD_MAX_TURNS",
     "MAX_CONCURRENT",
-    "FOREGROUND_TIMEOUT",
     "UNSUPPORTED_FIELDS",
     "AgentSpec",
     "AgentLoadError",

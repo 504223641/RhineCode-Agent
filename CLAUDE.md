@@ -37,7 +37,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | C9 | 记忆系统 | 三层 RHINE.md 项目指令（含 `@include` 展开）+ 每条消息即时 JSONL 存档与容错恢复 + Agent 自然停止后异步沉淀四类笔记；多实例由锁文件防护 |
 | C10 | 斜杠命令系统 | 单一 `CommandSpec` 注册表同时驱动执行 / `/help` / 补全 / 高亮；本地与界面命令绕过 Agent，未知命令不进 AI |
 | C11 | Skill 系统 | 把重复输入的提示词封装成独立 Markdown 文件（三级存放、两阶段加载、`context: fork` 子对话、`allowed-tools` 预授权、自动注册短命令）。**已对齐 Agent Skills 开放标准**，外部 Skill 目录复制进来即可用。字段与行为细节见下一节 |
-| C13 | **子 Agent 系统** | 主 Agent 把子任务委派给独立上下文的子 Agent，只拿回结论。两条路径：**定义式**（Markdown+frontmatter 定义的角色，从空白对话起步）与**分支式**（继承父历史快照、强制后台）。子 Agent 一律独立线程运行、**全程非交互**（判 ASK 自动拒绝）、能力**只会比主对话小**（工具集三层过滤 / 权限只能收紧 / 不继承回合级预授权）。结论完成即追加进主历史 |
+| C13 | **子 Agent 系统** | 主 Agent 把子任务委派给独立上下文的子 Agent，只拿回结论。两条路径：**定义式**（Markdown+frontmatter 定义的角色，从空白对话起步）与**分支式**（继承父历史快照、强制后台）。子 Agent 一律独立线程运行、**全程非交互**（判 ASK 自动拒绝）、能力**只会比主对话小**（工具集三层过滤 / 权限只能收紧 / 不继承回合级预授权）。**委派永不阻塞**（多个委派天然并行），结论在 Agent Loop 的**每轮迭代**注入主历史，且模型准备收工时循环会停下来等它 |
 | C12 | **Hook 系统** | 在生命周期的固定节点上挂用户声明的自动化动作。一条规则 = **事件 + 条件（可省）+ 动作**，从两层 YAML 加载。十二个事件覆盖会话 / 回合 / 消息 / 工具四层加三个系统级；四种动作（shell 命令 / 注入提示词 / HTTP / 子 Agent 占位）；三种执行控制（只跑一次 / 后台异步 / 超时）。**`pre_tool_use` 可拦截，且只能收紧不能放宽**——详见下一节与「安全边界」 |
 
 ### C13 的角色定义格式（不请自来才有用，故留在主文件）
@@ -139,6 +139,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
+- **改动子 Agent 闸门的协议（c13）** → `agent/gate.py`（协议 + `NullGate`）+ `subagents/gate.py`（实现）+ `agent/loop.py` 的两处调用点（迭代级 `take_pending` / 收工前的 `has_awaited`+`wait_any`）。⚠️ **协议必须留在 `agent/` 这一侧**：`agent` 依赖 `subagents` 会直接撞循环导入（`agent.loop` → `subagents/__init__` → `runner` → `agent.loop`），实测报错 `cannot import name 'Agent' from partially initialized module`
+- **子 Agent 结论的渲染只有一份** → `subagents/gate.py` 的 `render_subagent_message`。闸门（迭代级交付）与协调层的 `_deliver_subagent_results`（跨用户消息的兜底）**共用它**，各拼一次标记块的话会出现「同一条结论在历史里长得不一样」
 - **新增角色 frontmatter 字段（c13）** → `subagents/models.py` 的 `AgentSpec` 字段 +（若本项目仍不支持）`UNSUPPORTED_FIELDS` + `subagents/parser.py` 的读取与归一 + `subagents/report.py` 的展示。**漏删 `UNSUPPORTED_FIELDS` 里那一项的后果最迷惑**：功能已经做了，用户却被告知「本项目不支持该字段，已忽略」。护栏见 `test_subagent_parser.py::UnsupportedFieldsTest`（遍历常量表逐个断言）
 - **新增「任何子 Agent 都不该看到」的工具（c13）** → `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`。**漏改不报错**，只是子 Agent 多出一个能力，而配置和界面上都看不出异常。那一层排在角色白名单**之前**是刻意的——反过来的话，一条 `tools: run_agent` 就能让子 Agent 拿到委派能力、无限嵌套下去。护栏见 `test_subagent_toolset.py`（遍历该集合逐个断言，新增项自动被覆盖）
 - **改动角色清单表头或委派工具的描述（c13）** → `subagents/render.py` 的 `_INDEX_HEADER` + `tools/run_agent.py` 的 `description`。**两处必须同口径**（命中就委派 / 替代自己动手 / 用户不必点名 / 拿不准就委派 / 说明上下文成本）——它们是模型决定「要不要委派」时读的**唯一两处文本**，一处强一处弱等于白改。这与 C11 的 `_INDEX_HEADER` ↔ `load_skill.description` 是**同一个坑的第二次**。护栏见 `test_subagent_tool.py::SameVoiceTest`
@@ -249,7 +251,6 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 - **Skill 短命令**：每个 Skill 自动注册 `/<name>`（如 `/commit`、`/review`），进 Tab 补全与 `/help`；与内置命令或其别名重名时跳过注册并在启动时提示改用 `/skills run <name>`。
 - `/hooks`：查看已加载的 Hook 规则（来源层、事件、条件、动作、本次运行的触发次数与最近结论）、加载警告与配置位置。纯只读，**本章不做 `reload`**，改了规则要重启（c12）。
 - `/agents`：查看子 Agent 角色（来源层、说明、最终工具集、模型、轮次上限、**权限档位的声明值与实际生效值**）、加载错误、未生效的定义、本次运行的任务（状态/轮次/用量/结论首行）；`/agents cancel <标识|all>` 取消任务。**本章不做 `reload`**，改了角色定义要重启（c13）。
-- **`Ctrl+B`**：把当前**前台等待中**的子 Agent 切到后台，主对话立刻继续（c13）。
 - `/clear`（别名 `/reset`、`/new`）：清空当前对话历史（并复位上下文压缩的锚点/熔断/已存盘状态；会话存档开新档、旧档保留，c9；一并卸载全部已激活 Skill，c11）。
 - `/exit`（别名 `/quit`）：退出程序。
 
@@ -354,6 +355,10 @@ python -m unittest discover -s tests      # 1728 项，skipped 4
   ⑥ **Hook 对子 Agent 全量生效**（工具级三事件）。不生效的话主 Agent 只要把
   「跑 git push」委派出去就能绕过用户写的拦截规则。护栏见
   `tests/test_subagent_integration.py::HookIntegrationTest`。
+  ⑦ **等待期间唯一的逃生口是 `Esc`**。委派缺省是「我要这个结果」，模型准备收工时
+  循环会停下来等子 Agent——**刻意不设体验意义上的超时**（跑子 Agent 就是在执行任务，
+  与主 Agent 自己跑一遍测试套件性质相同）。因此 `gate.wait_any` 必须检查取消信号，
+  不检查就等于按了 `Esc` 没用。
 - 行为记录（trace，测试设施）：**产物比会话存档更敏感**——里面既有完整的模型请求与响应，也有每次工具执行的参数与**输出原文**（被读过的文件内容、命令输出）。如果模型在对话中读过配置文件，那份内容会原样进入 `tool_execute` 事件，**其中可能含明文 API Key**。三条纪律：① 忽略规则要加在**启动 `rhine` 的那个项目**里——trace 产物落在该项目根的 `.rhinecode/traces/` 下，而本仓库 `.gitignore` 的那行只在开发 RhineCode 时生效；去别的项目跑 trace 前，先给那个项目的 `.gitignore` 补上 `.rhinecode/traces/`（**实测过：不补就会被 `git status` 列出来**）。勿提交、勿外传、勿贴进 issue；② `session_start` 的配置快照里 `api_key` 已被固定掩码替换（`redact_config` 是白名单式逐字段取值，新增含密字段默认不记录），但这**只保证配置快照**——工具输出里的泄漏不在它的职责范围内，由 `.gitignore` 兜底；③ 记录器**不改变任何权限判定**，它只观测；`--trace` 不是权限开关，开启它不会让模型多做任何一件事。另：记录失败一律静默（写盘失败、路径不可写、负载序列化异常全被吞掉），这是**有意的**——观测设施绝不能反过来阻断被观测的系统。
 - 端到端驱动设施（P1a，测试设施）四条：① **控制通道不鉴权**——它只绑 `127.0.0.1`、只在宿主活着的这段时间存在，任何能在本机跑程序的人都能连上去驱动它。这是刻意接受的取舍（加鉴权会让一个测试设施凭空多出密钥管理），代价是**驱动期间应把本机视为可信环境**；真实模式尤其要注意，那时宿主进程持有你的真实凭据。② **驱动器不扩大权限面**——它替人应答只是换了第⑤层人在回路的执行者，前四层一字不动：驱动者选「放行」的危险命令照样在第①层黑名单被拦下（`test_e2e_host.py` 有专门护栏钉着这条）。③ **`exclude_tools` 摘掉的两个工具是隔离边界的一部分**：`mcp_add_server` 会写**真实**用户主目录且不吃 `user_dir`，`mcp_resolve_server` 虽是 `read_only=True` 却要访问外部包索引——而只读且被放行的工具**根本不弹面板**，应答者拦不住它。改动这个集合前先想清楚隔离还成不成立。④ **宿主的记录产物与 trace 同等敏感**（它就是 trace），落在临时工作区里、随宿主退出一并删除；用 `--keep-workspace` 保留时请自行按上一条的三条纪律处理。
 - **网络访问（web_fetch 扩展）**：这是 RhineCode 第一个**能主动向外发送数据**的工具，三条要点——

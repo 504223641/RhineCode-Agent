@@ -225,9 +225,6 @@ class FakeManager:
     def agents_report(self) -> str:
         return "子 Agent 报告"
 
-    def agents_project_notice(self):
-        return None
-
     def cancel_subagents(self, target) -> str:
         return "已取消"
 

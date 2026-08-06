@@ -199,27 +199,5 @@ class OrderingTest(DiscoveryBase):
         self.assertEqual(list(self.discover().specs), ["a", "b", "c"])
 
 
-class ProjectNamesTest(DiscoveryBase):
-    """`project_names()` 供 spec F4 的启动提示使用。"""
-
-    def test_only_project_layer_counted(self) -> None:
-        _write(self.project, "p1.md", "description: x")
-        _write(self.project, "p2.md", "description: x")
-        _write(self.user, "u1.md", "description: x")
-        _write(self.builtin, "b1.md", "description: x")
-
-        self.assertEqual(self.discover().project_names(), ("p1", "p2"))
-
-    def test_overridden_user_agent_not_counted_as_project(self) -> None:
-        """
-        项目级覆盖了用户级同名角色时，它算**一个**项目级角色。
-
-        （这条是防「按 shadowed 条数重复计数」的那类实现错误。）
-        """
-        _write(self.project, "rev.md", "description: x")
-        _write(self.user, "rev.md", "description: x")
-        self.assertEqual(self.discover().project_names(), ("rev",))
-
-
 if __name__ == "__main__":
     unittest.main()

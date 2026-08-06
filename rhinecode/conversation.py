@@ -947,35 +947,6 @@ class ConversationManager:
             hook_manager=self._hooks,
         )
 
-    def agents_project_notice(self) -> Optional[str]:
-        """
-        项目级角色的启动提示（spec F4）。
-
-        :returns: 提示文本；没有项目级角色时 `None`
-
-        **每次启动都提示，刻意不做「只提示一次」的持久化**：有状态的话，
-        `git pull` 新拉进来的角色会被静默吞掉——而那正是最需要看一眼的时刻。
-        理由与 C11 的项目级 Skill、C12 的项目级 Hook 完全相同。
-
-        与 C12 的**逐条列出动作原文**不同，这里只列名字。两者的危险程度差一个
-        量级：Hook 的动作**直接执行**、不经模型也不经人在回路；而角色正文只是
-        「发给模型的文本」，它指挥的每个工具调用照样过五层权限管线 + Hook 拦截，
-        且子 Agent 的能力只会比主对话更小（工具集三层过滤、权限只能收紧、
-        判 ASK 一律自动拒绝）。
-
-        副作用：无。
-        """
-        if self.subagent_service is None:
-            return None
-        names = self.subagent_service.catalog.project_names()
-        if not names:
-            return None
-        return (
-            f"发现 {len(names)} 个项目级子 Agent 角色：{'、'.join(names)}。\n"
-            "它们随代码仓库分发，主 Agent 可以把任务委派给它们执行。"
-            "评审 .rhinecode/agents/ 应与评审代码同等对待——用 /agents 查看详情。"
-        )
-
     def subagent_gate(self):
         """
         构造本次运行用的子 Agent 闸门（c13 修订）。

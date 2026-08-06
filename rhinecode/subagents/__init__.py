@@ -44,7 +44,6 @@ from rhinecode.subagents.discovery import discover_agents
 from rhinecode.subagents.models import (
     DEFAULT_MAX_TURNS,
     ENTRY_SUFFIX,
-    FOREGROUND_TIMEOUT,
     HARD_MAX_TURNS,
     MAX_CONCURRENT,
     SOURCE_LABELS,
@@ -100,7 +99,6 @@ __all__ = [
     "DEFAULT_MAX_TURNS",
     "HARD_MAX_TURNS",
     "MAX_CONCURRENT",
-    "FOREGROUND_TIMEOUT",
     "KIND_ROLE",
     "KIND_BRANCH",
     "BRANCH_AGENT_NAME",
