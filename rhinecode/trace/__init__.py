@@ -27,6 +27,7 @@ from rhinecode.trace.models import (
     default_trace_path,
     isolated_scope,
     redact_config,
+    subagent_scope,
 )
 from rhinecode.trace.recorder import (
     NullRecorder,
@@ -42,6 +43,7 @@ __all__ = [
     "SCOPE_NOTES",
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
+    "subagent_scope",
     "MAX_FIELD_CHARS",
     "MAX_MESSAGE_ITEMS",
     "REDACTED",

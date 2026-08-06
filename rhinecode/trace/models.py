@@ -24,7 +24,7 @@ from typing import Any, Union
 
 class TraceEventType(str, Enum):
     """
-    行为记录的事件种类，共十七类（spec F11–F16 十五类 + c12 Hook 两类）。
+    行为记录的事件种类，共十九类（spec F11–F16 十五类 + c12 Hook 两类 + c13 子 Agent 两类）。
 
     继承 `str` 是为了让枚举成员可以直接当字符串用（`json.dumps` 能原样序列化、
     与阅读器的 `--type` 过滤参数可直接比较），与项目里 `AgentEventType`、
@@ -50,6 +50,8 @@ class TraceEventType(str, Enum):
     HISTORY_RESTORED = "history_restored"        # F16：会话历史被恢复
     HOOK_DISPATCH = "hook_dispatch"              # c12：生命周期事件的分发（**零命中也记**）
     HOOK_EXECUTE = "hook_execute"                # c12：单条 Hook 规则的执行结果
+    SUBAGENT_START = "subagent_start"            # c13：一次委派的发起（角色、任务、工具集）
+    SUBAGENT_END = "subagent_end"                # c13：子 Agent 的结束（原因、轮次、用量）
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +91,24 @@ def isolated_scope(name: str) -> str:
     跑多个不同的独立模式 Skill，各自的轮次计数需要分开。
     """
     return f"isolated:{name}"
+
+
+def subagent_scope(name: str) -> str:
+    """
+    构造 c13 子 Agent 的作用域名。
+
+    :param name: 角色名；分支式子 Agent 传 `"branch"`
+    :returns: 形如 `subagent:explorer` 的作用域字符串
+
+    **为什么不复用 `isolated_scope`**：两者都是「一条独立的子对话」，但读 trace 的人
+    需要把它们分开——Skill 子对话由一个写好的 Skill 承载、同步阻塞主对话；
+    子 Agent 由模型临时委派、可能在后台跑、有独立的角色与工具集。
+    排查「这轮请求是谁发的」时，混成一个前缀等于把两类问题揉在一起。
+
+    多个子 Agent 可以**并发**，各自的作用域靠角色名区分；作用域本身存在
+    `threading.local` 里，因此并发的多个后台线程天然互不干扰。
+    """
+    return f"subagent:{name}"
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +271,7 @@ __all__ = [
     "SCOPE_NOTES",
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
+    "subagent_scope",
     "MAX_FIELD_CHARS",
     "MAX_MESSAGE_ITEMS",
     "REDACTED",

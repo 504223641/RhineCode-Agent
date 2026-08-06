@@ -89,10 +89,54 @@ class TimelineTest(ReaderTestBase):
         _, out, _ = self.run_reader()
         self.assertIn(reader.UNREGISTERED, out)
 
-    def test_all_fifteen_types_registered(self) -> None:
-        """成对维护点的正向守卫：十五类事件在摘要表里一个都不少。"""
+    def test_all_types_registered(self) -> None:
+        """
+        成对维护点的正向守卫：**全部**事件类型在摘要表里一个都不少。
+
+        （原名写死了「十五类」，c12 加两类、c13 再加两类之后名字就过期了。
+        判据本身一直是遍历枚举，与数量无关，故只改名不改逻辑。）
+        """
         missing = [t.value for t in TraceEventType if t.value not in reader.SUMMARIZERS]
         self.assertEqual(missing, [], f"这些类型缺摘要函数：{missing}")
+
+    def test_subagent_summaries(self) -> None:
+        """
+        c13 两类事件的摘要要点：起始摘出角色与任务，结束摘出轮次与用量。
+
+        断言的是**关键字段出现在摘要里**而不是逐字固化整行——措辞可以调，
+        但「读一眼就知道是谁、跑了多少轮」这件事不能丢。
+
+        顺带钉住摘要必须是**单行**：`_text_of` 把换行渲染成 `⏎`，
+        这是全项目统一口径。真换行会把时间线的「一事件一行」结构冲散。
+        """
+        start = reader.summarize(
+            {
+                "type": "subagent_start",
+                "kind": "role",
+                "agent": "explorer",
+                "task_id": "a3f1c9",
+                "tool_count": 3,
+                "task": "找出所有实现了 Tool 抽象的文件\n第二行",
+            }
+        )
+        self.assertIn("explorer", start)
+        self.assertIn("a3f1c9", start)
+        self.assertIn("找出所有实现了", start)
+        self.assertNotIn("\n", start)
+
+        end = reader.summarize(
+            {
+                "type": "subagent_end",
+                "task_id": "a3f1c9",
+                "status": "completed",
+                "turns": 4,
+                "usage_tokens": 1234,
+                "stop_reason": "completed",
+            }
+        )
+        self.assertIn("a3f1c9", end)
+        self.assertIn("4 轮", end)
+        self.assertIn("1234", end)
 
     def test_malformed_record_does_not_crash_summary(self) -> None:
         """一条畸形记录只影响它自己那行摘要，不让整个阅读器失败。"""
