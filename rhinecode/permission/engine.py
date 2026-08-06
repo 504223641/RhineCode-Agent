@@ -31,6 +31,41 @@ from rhinecode.permission.models import (
 from rhinecode.permission.rules import RuleSet
 from rhinecode.tools.path_guard import is_readable_path, is_within_workspace
 
+# ── 权限模式的「严格程度」排序（c13）──
+#
+# 数字越小越严。存在的理由是 c13 的 F16：子 Agent 的实际生效档位取
+# min(主对话档位, 角色声明档位)——角色可以把自己限得更严，但**声明放行档不产生
+# 任何提权效果**。
+#
+# 为什么不给 `PermissionMode` 加序号或让它继承 `IntEnum`：那会让「档位可比较」
+# 变成枚举本身的性质，而它在别处（配置解析、界面展示、trace 负载）只是个标识串。
+# 单独放一张表，比较语义就只在需要它的这一处成立。
+_MODE_ORDER = {
+    PermissionMode.STRICT: 0,
+    PermissionMode.DEFAULT: 1,
+    PermissionMode.PERMISSIVE: 2,
+}
+
+
+def narrower_mode(a: PermissionMode, b: PermissionMode) -> PermissionMode:
+    """
+    取两个权限模式中**更严**的那一档（c13 spec F16）。
+
+    :param a: 其一（通常是主对话当前档位）
+    :param b: 其二（通常是角色 frontmatter 声明的档位）
+    :returns: 更严的那一档；两者相同则返回该档
+
+    严格程度：STRICT < DEFAULT < PERMISSIVE。
+
+    这是「子 Agent 只能收紧不能放宽」这条安全承诺的**全部实现**——
+    与 C12「Hook 只能收紧不能放宽」是同一条原则。有了它，
+    `.rhinecode/agents/` 里一个随代码仓库分发的角色文件**无法自行提权**：
+    它写 `permission_mode: permissive`，在默认档的主对话下实际拿到的仍是默认档。
+
+    副作用：无（纯函数）。
+    """
+    return a if _MODE_ORDER[a] <= _MODE_ORDER[b] else b
+
 
 class PermissionEngine:
     """
@@ -79,6 +114,54 @@ class PermissionEngine:
         self.turn_rules: list[Rule] = []
         self.mode = mode
         self.load_errors: list[str] = load_errors or []
+
+    def derive(self, mode: PermissionMode) -> "PermissionEngine":
+        """
+        派生一个供**子 Agent** 使用的引擎视图（c13 spec F16/F17）。
+
+        :param mode: 派生实例的权限模式，调用方应当已用 `narrower_mode` 与主档取过更严的一档
+        :returns: 新的 `PermissionEngine` 实例
+
+        共享与独立的分界（这是本方法的全部内容，逐条都有理由）：
+
+        | 成员 | 处理 | 理由 |
+        | --- | --- | --- |
+        | `file_ruleset` / `policy_ruleset` | **共享同一对象** | 配置在本会话内不变，复制没有意义 |
+        | `session_rules` | **共享同一个列表对象** | 用户在主对话确认面板上选的「本会话放行」是**明确授予**，理应对子 Agent 生效 |
+        | `turn_rules` | **全新空列表** | 回合级预授权（Skill 的 `allowed-tools`）绑在某一次执行上，不该跟着委派跑出去（spec F17） |
+        | `mode` | 取参数 | 见下 |
+        | `load_errors` | 共享 | 只读，供报告展示 |
+
+        ## 为什么必须派生，而不是直接改 `self.mode`
+
+        引擎是**单实例共享**的：协调层构造一个，主对话与全部子 Agent 都拿它做判定。
+        而 `mode` 与 `turn_rules` 都是**可变字段**。子 Agent 若为了落实自己的档位
+        去写 `engine.mode`，改掉的是**主对话的档位**——而子 Agent 跑在后台线程里，
+        这意味着用户正在对话的主循环的权限档位被一个后台线程静默改掉了，
+        **界面上完全看不出来**，等到下一次弹（或不弹）确认面板时才显形。
+
+        ## 调用方约定
+
+        派生实例是**只读视图**：不得在它上面调 `grant_turn_rules` /
+        `register_session_rule` 之类的登记方法。子 Agent 不弹确认面板（spec F15），
+        因此本来也没有登记的入口——这条约定是给将来改动的人看的。
+
+        副作用：无（只构造新对象，不修改 self）。
+        """
+        derived = PermissionEngine(
+            self.file_ruleset,
+            mode,
+            self.load_errors,
+            self.policy_ruleset,
+        )
+        # 构造函数会给 session_rules / turn_rules 各建一个新空列表，这里按上表覆写：
+        # session_rules 换成同一个对象（共享），turn_rules 保持构造函数给的新空列表。
+        derived.session_rules = self.session_rules
+        # load_errors 也必须显式赋值：构造函数写的是 `load_errors or []`，
+        # 传进去的若是**空列表**（最常见的情况——没有加载错误），`or` 会取右边
+        # 新建一个，共享就静默地不成立了。显式赋值让行为不依赖这个偶然性。
+        derived.load_errors = self.load_errors
+        return derived
 
     @classmethod
     def load(
