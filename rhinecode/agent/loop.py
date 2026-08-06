@@ -70,6 +70,7 @@ OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
 OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
 OUTCOME_PLAN_BLOCKED = "plan_blocked"            # Plan Mode 规划阶段夹带的副作用工具
 OUTCOME_BLOCKED_BY_HOOK = "blocked_by_hook"      # c12：被 Hook 前置层拦下（含 Hook 自身失败的 fail-closed）
+OUTCOME_DENIED_NON_INTERACTIVE = "denied_non_interactive"  # c13：非交互执行（子 Agent）里判 ASK，无人可确认
 
 # ── 用户在人在回路面板里选「拒绝」时回灌给模型的文本 ──
 #
@@ -103,6 +104,37 @@ DENIED_BY_USER_FEEDBACK = (
     "\n"
     "请立即停止本次任务的推进，向用户说明你原本打算做什么、为什么需要这一步，"
     "并询问他拒绝的原因、以及希望你怎么继续。等他答复后再行动。"
+)
+
+# ── 非交互执行下判 ASK 时回灌给模型的文本（c13 spec F15）──
+#
+# ## 它与 DENIED_BY_USER_FEEDBACK 的语义差别
+#
+# 上面那条说的是「**人做了决定**」——所以它要求模型停下来、去问用户为什么，
+# 并且配套一条硬约束（下一轮不发任何工具），让它物理上只能说话。
+#
+# 这一条说的是「**没有人能做决定**」。子 Agent 跑在非交互环境里（可能在后台，
+# 用户正在跟主对话说话），确认面板压根弹不出来。这不是谁拒绝了它，
+# 是这条路在当前环境下走不通。
+#
+# 因此两处指引恰好相反：那条要求「停止推进」，这条要求「换条路继续」——
+# 子 Agent 的价值就在于把活干完并回流一段结论，让它一遇到确认就瘫掉，
+# 等于缺省配置下它什么都做不成（spec F15 已明示这个代价：缺省档下只能做只读的事）。
+#
+# ## 也因此**不置 `user_denied`**
+#
+# 那个标志会让下一轮 `tools=None`。对子 Agent 用它是错的：它应该带着工具继续，
+# 改用只读方式达成目标。护栏见 `tests/test_agent_non_interactive.py`（含反证）。
+DENIED_NON_INTERACTIVE_FEEDBACK = (
+    "这次 {name} 调用需要人工确认，而当前是**非交互执行环境**（子 Agent），"
+    "没有人能应答确认面板，因此它被自动拒绝。\n"
+    "\n"
+    "**这不是有人拒绝了你，也不是工具坏了**——是这条路在当前环境下走不通。"
+    "原样重试同一个调用不会有不同结果。\n"
+    "\n"
+    "请改用不需要确认的方式推进：优先用只读工具达成目标。"
+    "如果这一步确实非做不可，就把它写进你最终的结论里，"
+    "说明「这一步需要用户授权，建议的做法是……」，由主对话去和用户确认。"
 )
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
@@ -149,12 +181,23 @@ class RunOptions:
         每轮回调求值（子对话的排除集在整条子对话里恒定不变）。
 
         缺省空集 = 不排除任何工具。
+    :param interactive: 本次执行能否与人交互。**缺省 True 即既有行为，不传等于零回归**。
+
+        为 False 时（c13 的子 Agent）只改一件事：权限管线判 ASK 的调用
+        **不再调 `ask` 回调**，直接按 `OUTCOME_DENIED_NON_INTERACTIVE` 拒绝并回灌
+        `DENIED_NON_INTERACTIVE_FEEDBACK`，且**不置 `user_denied`**。
+
+        为什么必须是开关而不是「让 ask 回调返回 False」：那条路会走进
+        `DENIED_BY_USER_FEEDBACK`（文案写的是「这是用户的决定，不要绕」）
+        并硬性禁掉下一轮的全部工具。对子 Agent 这两条都是错的——
+        没有任何用户做过决定，而它应当改用只读方式继续干活。
     """
 
     max_iterations: int = MAX_ITERATIONS
     record_usage: bool = True
     allow_summary: bool = True
     excluded_tools: frozenset = frozenset()
+    interactive: bool = True
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
@@ -689,6 +732,7 @@ class Agent:
                 # 与 `_schema_for` 的 `planning` **同口径**：两者必须一致，
                 # 否则会出现「发了工具却拒绝执行」或「没发工具也照常执行」。
                 planning=plan_mode and not execution_phase,
+                interactive=options.interactive,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -758,6 +802,7 @@ class Agent:
         cancel_event: threading.Event,
         excluded: frozenset = frozenset(),
         planning: bool = False,
+        interactive: bool = True,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -767,7 +812,8 @@ class Agent:
         - ALLOW + 只读 → 进并发桶（无需确认）。
         - ALLOW + 副作用 → 进串行桶，直接执行（命中 allow 规则即免确认，spec AC4）。
         - DENY → 进串行桶，产出结构化拒绝结果、不执行（不终止循环，spec F8）。
-        - ASK → 进串行桶，执行前调 ask 回调弹 HITL 面板。
+        - ASK → 进串行桶，执行前调 ask 回调弹 HITL 面板；
+          **`interactive` 为假时（c13 子 Agent）直接判拒，`ask` 不会被调用**。
 
         分流后：
         - 特殊工具（ask_user / present_plan）：串行，路由到 clarify / approve_plan。
@@ -783,6 +829,8 @@ class Agent:
         :param ask: 人工确认回调（仅 ASK 时调用）
         :param clarify/approve_plan: 特殊工具的交互回调
         :param cancel_event: 取消信号，串行执行前检查
+        :param interactive: 能否与人交互（c13）。缺省 True 即既有行为；为假时
+            ASK 走非交互拒绝分支，见 `DENIED_NON_INTERACTIVE_FEEDBACK`
 
         副作用：实际执行工具（可能读写文件、跑命令）；通过回调与用户交互。
         """
@@ -1035,7 +1083,9 @@ class Agent:
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_one_serial(tc, tool, decision, results, ctx, ask)
+            yield from self._run_one_serial(
+                tc, tool, decision, results, ctx, ask, interactive
+            )
 
     def _run_special(
         self,
@@ -1207,6 +1257,7 @@ class Agent:
         results: dict[str, ToolResult],
         ctx: _RoundContext,
         ask: AskFn,
+        interactive: bool = True,
     ) -> Iterator[AgentEvent]:
         """
         串行处理单个工具调用：未知 / 参数错误 / 权限拒绝 / 待确认 / 放行（c6）。
@@ -1219,7 +1270,10 @@ class Agent:
         :param tool: 对应工具实例；None 表示未知工具
         :param decision: 权限决策结果；None 表示参数解析失败（未进引擎）
         :param results: 输出参数，写入 id → ToolResult
-        :param ask: 人工确认回调（仅 decision 为 ASK 时调用）
+        :param ask: 人工确认回调（仅 decision 为 ASK **且 interactive 为真**时调用）
+        :param interactive: 能否与人交互（c13）。为假时 ASK 直接判拒并回灌
+            `DENIED_NON_INTERACTIVE_FEEDBACK`，`ask` 一次都不会被调用。
+            **缺省 True 即既有行为。**
         """
         # 未知工具：结构化错误（沿用既有行为，含 TOOL_START）
         if tool is None:
@@ -1248,6 +1302,24 @@ class Agent:
             )
             results[tc.id] = res
             self._trace_tool(tc, res, OUTCOME_DENIED_BY_PERMISSION)
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
+            return
+
+        # 待确认（非交互执行）：没有人能应答面板，直接拒绝（c13 spec F15）。
+        #
+        # **刻意排在调 `ask` 之前**：`ask` 回调在子 Agent 场景下会跨线程弹面板，
+        # 一旦真的走进去就是「后台线程往主界面弹了一个没人预期的面板」。
+        # 这里拦住，那条路径压根不会被触达。
+        if decision.decision == Decision.ASK and not interactive:
+            res = ToolResult(
+                ok=False,
+                output=DENIED_NON_INTERACTIVE_FEEDBACK.format(name=tc.name),
+                summary="非交互环境自动拒绝",
+            )
+            results[tc.id] = res
+            # **不置 `ctx.user_denied`**：那个标志会让下一轮 `tools=None`。
+            # 子 Agent 应当带着工具继续、改用只读方式达成，见常量注释。
+            self._trace_tool(tc, res, OUTCOME_DENIED_NON_INTERACTIVE)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
