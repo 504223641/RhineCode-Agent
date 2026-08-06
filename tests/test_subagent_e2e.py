@@ -57,6 +57,13 @@ class _ScriptedProvider(BaseProvider):
         self.turns = 0
         self.systems: list[str] = []
         self.bodies: list[str] = []
+        # 主对话那些轮次的请求体，**与 `bodies` 分开收**。
+        #
+        # ⚠ `bodies` 由主线程与子 Agent 线程**共同追加**，因此 `bodies[-1]`
+        # 不一定是主对话最后那一轮——子 Agent 可能刚好在它之后发了请求。
+        # 用 `bodies[-1]` 断言会得到一个**间歇性失败**的测试（实测约 1/8 概率），
+        # 而失败信息看起来像产品出了问题（「结论怎么不在请求里」），极易误判。
+        self.main_bodies: list[str] = []
         self.tool_names: list[list[str]] = []
         self._background = background
         self._sub_delay = sub_delay
@@ -64,9 +71,10 @@ class _ScriptedProvider(BaseProvider):
     def stream_chat(self, messages, thinking_effort="off", tools=None, system=None):
         self.turns += 1
         self.systems.append(system or "")
-        self.bodies.append(
-            "\n".join(str(getattr(m, "content", "") or "") for m in messages)
-        )
+        body = "\n".join(str(getattr(m, "content", "") or "") for m in messages)
+        self.bodies.append(body)
+        if not (system or "").startswith(_ROLE_BODY_HEAD):
+            self.main_bodies.append(body)
         self.tool_names.append(
             sorted(t["function"]["name"] for t in (tools or []))
         )
@@ -180,7 +188,7 @@ class ForegroundE2ETest(E2EBase):
         self.assertEqual(tasks[0].status.value, "completed")
         self.assertIn("a.py", tasks[0].conclusion)
         # 工具结果回灌进了第 2 轮的请求体
-        self.assertIn("a.py", self.provider.bodies[-1])
+        self.assertIn("a.py", self.provider.main_bodies[-1])
 
     def test_main_engine_mode_unchanged(self) -> None:
         """AC14b 的端到端侧判据：角色声明 strict，主引擎仍是 default。"""
@@ -210,7 +218,7 @@ class BackgroundE2ETest(E2EBase):
         elapsed = time.monotonic() - started
 
         self.assertLess(elapsed, 0.12, "显式后台不该阻塞主对话")
-        self.assertIn("后台", self.provider.bodies[-1])
+        self.assertIn("后台", self.provider.main_bodies[-1])
         self._settle(self.manager)
 
     def test_two_consumption_lines_are_independent(self) -> None:
@@ -221,7 +229,7 @@ class BackgroundE2ETest(E2EBase):
         self.assertEqual(self.manager.drain_subagent_notifications(), ())
         # 通知取走了，交付线照样能拿到
         list(self.manager.submit_user_message("继续"))
-        self.assertIn("在 a.py 与 b.py", self.provider.bodies[-1])
+        self.assertIn("在 a.py 与 b.py", self.provider.main_bodies[-1])
 
     def test_conclusion_survives_to_the_round_after_next(self) -> None:
         """
@@ -234,10 +242,10 @@ class BackgroundE2ETest(E2EBase):
         self._settle(self.manager)
 
         list(self.manager.submit_user_message("继续"))
-        self.assertIn("在 a.py 与 b.py", self.provider.bodies[-1], "第二轮应含结论")
+        self.assertIn("在 a.py 与 b.py", self.provider.main_bodies[-1], "第二轮应含结论")
 
         list(self.manager.submit_user_message("再继续"))
-        self.assertIn("在 a.py 与 b.py", self.provider.bodies[-1], "第三轮仍应含结论")
+        self.assertIn("在 a.py 与 b.py", self.provider.main_bodies[-1], "第三轮仍应含结论")
 
     def test_conclusion_delivered_exactly_once(self) -> None:
         list(self.manager.submit_user_message("找一下"))
@@ -246,7 +254,7 @@ class BackgroundE2ETest(E2EBase):
         list(self.manager.submit_user_message("再继续"))
 
         self.assertEqual(
-            self.provider.bodies[-1].count("<subagent-result"),
+            self.provider.main_bodies[-1].count("<subagent-result"),
             1,
             "结论只该被交付一次，重复会让同一段内容在历史里出现多遍",
         )
