@@ -26,6 +26,7 @@ from textual.events import Key
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
+from rhinecode.subagents.tasks import STATUS_LABELS
 from rhinecode.commands import (
     CommandDispatcher,
     CommandRegistry,
@@ -194,6 +195,10 @@ class RhineApp(App):
         # /resume 会话选择面板是否正在展示（c9 交互化）：
         # 展示期间输入框被禁用，此标志作为各输入路径的一致性兜底守卫。
         self._session_panel_active = False
+        # 上一次轮询看到的运行中子 Agent 数（c13）。
+        # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
+        # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
+        self._last_subagent_count = 0
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
@@ -237,6 +242,13 @@ class RhineApp(App):
         hook_notice = self._manager.hooks_project_notice()
         if hook_notice:
             self.show_warning(hook_notice)
+        # 项目级角色的提示（c13 F4）。走普通通道而非 `show_warning`——
+        # 角色正文只是「发给模型的文本」，它指挥的每个工具调用照样过五层权限
+        # 管线，危险程度比 Hook 低一个量级（Hook 的动作直接执行）。
+        # 用同一条醒目通道会稀释掉 Hook 那条警告的分量。
+        agent_notice = self._manager.agents_project_notice()
+        if agent_notice:
+            self.show_message(agent_notice)
         if self._manager.startup_notice:
             # ⚠️ 必须走 `show_message` 而不是直接 `append_system`。
             #
@@ -251,6 +263,12 @@ class RhineApp(App):
             self.show_message(self._manager.startup_notice)
         self._manager.memory_manager.notify = self._notify_memory
         self.set_interval(120, self._manager.memory_manager.touch_session_lock)
+
+        # 子 Agent 完成轮询（c13）。0.5 秒是「人眼感觉是即时的」与「不白跑」的折中：
+        # 更快没有可感收益，更慢会让「跑完了却半天不出通知」变得明显。
+        # 只在服务启用时注册——没启用时每 0.5 秒调一次空方法纯属浪费。
+        if self._manager.subagent_service is not None:
+            self.set_interval(0.5, self._poll_subagents)
 
         # Skill 激活通知（c11）：模型调 load_skill 成功后立刻刷新状态栏的
         # Skill 段，让用户当下就看到激活数变化，而不用等本轮流式结束。
@@ -333,6 +351,9 @@ class RhineApp(App):
             context_warn=bool(ctx and ctx[1]),
             # 已激活 Skill 数（c11）：无激活时为 None，状态栏隐藏该段。
             skill_status=self._manager.skill_status_segment(),
+            # 运行中的子 Agent 数（c13）：为 0 时给 None，状态栏隐藏该段——
+            # 没用委派的用户看到的状态栏与 c12 逐字一致。
+            subagent_status=self._subagent_status_segment(),
         )
         self.query_one(StatusBar).update_status(**status_args)
         # 为什么记「组装后的文本」而不是九个散字段（trace F15）：用户真正看到的
@@ -427,7 +448,71 @@ class RhineApp(App):
             return self._manager.skills_prompt_report()
         if target == ReportTarget.HOOKS:
             return self._manager.hooks_report()
+        if target == ReportTarget.AGENTS:
+            return self._manager.agents_report()
         raise ValueError(f"未知的报告目标：{target!r}")
+
+    def cancel_subagents(self, target: "Optional[str]") -> str:
+        """取消子 Agent 任务（`/agents cancel`，c13 F22/F24）。"""
+        return self._manager.cancel_subagents(target)
+
+    # ------------------------------------------------------------------ #
+    # 子 Agent（c13）
+    # ------------------------------------------------------------------ #
+
+    def _subagent_status_segment(self) -> "Optional[str]":
+        """
+        状态栏的子 Agent 段。
+
+        :returns: 形如 `子Agent:2`；**没有任务在跑时返回 None**（该段隐藏）
+
+        隐藏而不是显示 `子Agent:0`，与 MCP / Skill 两段同构：
+        没用委派的用户看到的状态栏与 c12 逐字一致，不平白多一段噪音。
+
+        文本刻意不含方括号（与 `SkillManager.status_segment` 同口径）——
+        状态栏走 Content markup，字面 `[` 要转义，能不引入就不引入。
+        """
+        count = self._manager.running_subagent_count()
+        return f"子Agent:{count}" if count else None
+
+    def _poll_subagents(self) -> None:
+        """
+        定时轮询子 Agent 的完成情况（c13 F21 第 1 步 / F23）。
+
+        由 `on_mount` 注册的 `set_interval` 在**主线程**每 0.5 秒调一次。
+
+        ## 为什么用轮询而不是让后台线程推送
+
+        后台线程要更新界面只能走 `call_from_thread`，而它是**阻塞式**的：
+        调用线程会一直等到主线程处理完。子 Agent 线程在持有任务表锁、
+        或恰好在 Hook 分发的临界区里调它，就与主线程组成确定性死锁——
+        C11 的 `SkillManager` 已经踩过一次，整个 TUI 冻结、调用栈上没有线索。
+
+        轮询把**全部 widget 写入留在主线程**，从结构上消掉这一整类问题。
+        代价是完成通知最多晚 0.5 秒出现，对人眼完全无感。
+
+        整段包 try/except：**观测与通知设施绝不能反过来打断界面**。
+        一条通知渲染失败最多是少看见一行，而异常逃逸出定时器会让整个
+        轮询停摆，后续所有任务的通知一并消失。
+
+        副作用：向聊天区追加通知行；可能刷新状态栏。
+        """
+        try:
+            finished = self._manager.drain_subagent_notifications()
+            for record in finished:
+                self.show_message(
+                    f"子 Agent {record.agent_name}[{record.task_id}] "
+                    f"{STATUS_LABELS.get(record.status, record.status.value)}"
+                    f"（{record.turns} 轮 · {record.duration_seconds:.1f}s）"
+                    f"——结论将在下一轮对话中自动交给 AI。"
+                )
+            running = self._manager.running_subagent_count()
+            if finished or running != self._last_subagent_count:
+                self._last_subagent_count = running
+                self._refresh_status()
+        except Exception:
+            # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断定时器。
+            pass
 
     def refresh_status(self) -> None:
         """刷新状态栏（命令处理函数显式调用，取代旧的命令字符串白名单）。"""
@@ -619,11 +704,14 @@ class RhineApp(App):
         if self._pending_interaction is not None or self._session_panel_active:
             return
 
-        # 2. 运行中按 Esc 取消循环
+        # 2. 运行中按 Esc 取消循环；Ctrl+B 把前台等待中的子 Agent 切到后台（c13 F19）
         if self._stream_active:
             if event.key == "escape":
                 event.stop()
                 self._manager.request_cancel()
+            elif event.key == "ctrl+b":
+                event.stop()
+                self._switch_subagent_to_background()
             return
 
         # 3. 命令面板导航
@@ -639,6 +727,27 @@ class RhineApp(App):
         elif event.key == "escape":
             event.stop()
             panel.hide()
+
+    def _switch_subagent_to_background(self) -> None:
+        """
+        把当前**前台等待中**的子 Agent 切到后台（`Ctrl+B`，c13 F19 第三种方式）。
+
+        本方法运行在**主线程**（按键处理），而等待方阻塞在 Worker 线程的
+        `done_event.wait()` 上。置位那个事件让它立刻醒来——不涉及任何
+        跨线程 widget 写入，因此没有 `call_from_thread` 的死锁风险。
+
+        没有前台任务时给一句提示而不是静默：用户按了键什么都不发生，
+        分不清是「没生效」还是「按错了」。
+
+        副作用：改任务的 backgrounded 标志；向聊天区追加一行提示。
+        """
+        task_id = self._manager.request_subagent_background()
+        if task_id:
+            self.show_message(
+                f"子 Agent [{task_id}] 已转入后台，跑完后结论会自动送达。"
+            )
+        else:
+            self.show_message("当前没有正在前台等待的子 Agent。")
 
     def on_input_bar_input_submitted(self, event: InputBar.InputSubmitted) -> None:
         """

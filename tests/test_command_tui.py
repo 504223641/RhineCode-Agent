@@ -210,6 +210,30 @@ class FakeManager:
     def hooks_report(self) -> str:
         return "Hook 报告"
 
+    # ---- c13 子 Agent 相关 ----
+    # `subagent_service = None` 让 App 走「未启用」分支：不注册轮询定时器，
+    # 状态栏不显示子 Agent 段——与真实的非工具模式一致。
+
+    subagent_service = None
+
+    def running_subagent_count(self) -> int:
+        return 0
+
+    def drain_subagent_notifications(self) -> tuple:
+        return ()
+
+    def request_subagent_background(self):
+        return None
+
+    def agents_report(self) -> str:
+        return "子 Agent 报告"
+
+    def agents_project_notice(self):
+        return None
+
+    def cancel_subagents(self, target) -> str:
+        return "已取消"
+
     def hooks_project_notice(self):
         """项目级 Hook 提示；缺省 None（多数用例没有项目级规则）。"""
         return self.hooks_project_notice_value

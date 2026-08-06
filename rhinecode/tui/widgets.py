@@ -853,6 +853,7 @@ def compose_status_text(
     context_status: "str | None" = None,
     context_warn: bool = False,
     skill_status: "str | None" = None,
+    subagent_status: "str | None" = None,
 ) -> str:
     """
     组装状态栏的 Content markup 文本（纯函数，c10 抽出便于单测）。
@@ -897,6 +898,10 @@ def compose_status_text(
     # 这里仍走 escape 兜底，与其它段口径一致。
     if skill_status is not None:
         text += f" | {escape(str(skill_status))}"
+    # 子 Agent 段（c13）：仅在有运行中的任务时展示（形如 `子Agent:2`），
+    # 与 MCP / Skill 两段「None 即隐藏」同构——没用委派的用户状态栏与 c12 一致。
+    if subagent_status is not None:
+        text += f" | {escape(str(subagent_status))}"
     return text + " "
 
 
@@ -920,6 +925,7 @@ class StatusBar(Static):
         context_status: "str | None" = None,
         context_warn: bool = False,
         skill_status: "str | None" = None,
+        subagent_status: "str | None" = None,
     ) -> None:
         """
         刷新状态栏显示内容（文本组装见 compose_status_text 纯函数）。
@@ -934,6 +940,8 @@ class StatusBar(Static):
         :param context_status: 上下文用量摘要；为 None（无 ContextManager）时不展示该段。
         :param context_warn: 上下文是否接近上限或已熔断；为真时该段橘色高亮预警。
         :param skill_status: 已激活 Skill 摘要（如 "Skill:2"）；为 None 时不展示该段（c11）。
+        :param subagent_status: 运行中的子 Agent 摘要（如 "子Agent:2"）；
+                                为 None（无任务在跑）时不展示该段（c13）。
         """
         self.update(
             compose_status_text(
@@ -946,6 +954,7 @@ class StatusBar(Static):
                 context_status,
                 context_warn,
                 skill_status,
+                subagent_status,
             )
         )
 

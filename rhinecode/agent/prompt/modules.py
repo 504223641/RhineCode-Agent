@@ -95,11 +95,18 @@ def optional_slots() -> list[PromptModule]:
     不产生任何文本与多余空行（F3），因此未启用的能力对输出零影响。
     实现对应能力时只需在拼装入口填入 content，无需改动拼装逻辑（F4）。
 
-    当前四个槽位：
+    当前五个槽位：
     - 110「自定义指令」（c9 填充：三层 RHINE.md）
     - 120「已激活 Skill」（c11 填充：已激活 Skill 的完整 SOP 正文）
     - 130「长期记忆」（c9 填充：两级记忆索引）
+    - 135「可用子 Agent 角色」（c13 填充：角色清单）
     - 140「可用 Skill 清单」（c11 填充：第一阶段清单）
+
+    **为什么子 Agent 角色清单是 135、排在 Skill 清单之前**（c13）：
+    两者都进稳定通道，而前缀缓存「从第一处变化起、其后全部失效」，
+    因此**越稳定的内容越该排在前面**。角色目录在会话内**恒定不变**
+    （本章不提供 reload，改了要重启），Skill 清单则会随 `/skills reload` 变。
+    排在它前面，一次 Skill 热更新就不会连带把角色清单的缓存也打掉。
 
     **为什么「可用 Skill 清单」是 140 而不是插在 115**（c11 T33）：
     它进的是**稳定通道**（cacheable=True），而稳定段是前缀缓存的作用对象。
@@ -115,5 +122,6 @@ def optional_slots() -> list[PromptModule]:
         PromptModule(name="自定义指令", priority=110, cacheable=False, content=""),
         PromptModule(name="已激活 Skill", priority=120, cacheable=False, content=""),
         PromptModule(name="长期记忆", priority=130, cacheable=False, content=""),
+        PromptModule(name="可用子 Agent 角色", priority=135, cacheable=True, content=""),
         PromptModule(name="可用 Skill 清单", priority=140, cacheable=True, content=""),
     ]
