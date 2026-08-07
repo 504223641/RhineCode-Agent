@@ -34,19 +34,34 @@ from rhinecode.worktree.models import ProvisionEntry, ProvisionResult
 
 def _safe_target(target_root: Path, relative: str) -> Path:
     """
-    算出条目在隔离工作区内的落点，并确认它没有跳出去。
+    算出条目在隔离工作区内的落点，并确认它没有跳出去、也不是工作区根本身。
 
     :param target_root: 隔离工作区根目录
     :param relative: 相对路径（来自清单条目的 `source`）
     :returns: 解析后的绝对路径
-    :raises PathGuardError: 解析后越过了 `target_root`
+    :raises PathGuardError: 解析后越过了 `target_root`，**或等于 `target_root`**
 
     为什么来源已经校验过了、这里还要再校验一次目标：`source` 通过了
     「在主项目根内」的校验，只说明它作为**来源**是安全的；把同一个字符串
     当作**相对 target_root 的路径**再拼一次，是另一次独立的拼接，
     必须独立校验。两次校验的根不同，缺一不可。
+
+    ⚠ **「不等于根本身」这一条是验收期审计出来的漏洞，不可省。**
+
+    `worktree.copy: ["."]` 是一条完全合法的路径写法：`resolve_in_workspace(".", root)`
+    返回的正是 `root` 自己，越界检查照样通过。于是 `_copy_one` 会先
+    `shutil.rmtree(工作区根)` 把刚建好的工作区整个删掉，再把**整个主项目**
+    （含 `.rhinecode/worktrees/` 下的其它工作区）递归复制进去。
+
+    它不是攻击构造——用户想「把项目里的东西都带过去」时很自然就会这么写，
+    而报错信息会是一句莫名其妙的复制失败。
     """
-    return resolve_in_workspace(relative, target_root)
+    resolved = resolve_in_workspace(relative, target_root)
+    if resolved == Path(target_root).resolve():
+        raise PathGuardError(
+            f"落点不能是隔离工作区根目录本身：{relative!r}"
+        )
+    return resolved
 
 
 def _copy_one(source: Path, target: Path) -> None:
@@ -112,9 +127,15 @@ def provision(
             )
             continue
 
-        # ① 来源必须在主项目根内。
+        # ① 来源必须在主项目根内，**且不能是主项目根本身**。
+        #
+        # 后半条与 `_safe_target` 那条同源：`"."` 解析出来就是主项目根，
+        # 越界检查照样过，然后 `copytree(主项目根, ...)` 会把整个项目
+        # （含其它隔离工作区）递归拷进去。验收期审计出来的。
         try:
             source = resolve_in_workspace(raw, main_root)
+            if source == Path(main_root).resolve():
+                raise PathGuardError(f"来源不能是项目根目录本身：{raw!r}")
         except PathGuardError as exc:
             warnings.append(f"环境初始化：条目 {raw!r} 超出项目目录，已跳过（{exc}）")
             continue

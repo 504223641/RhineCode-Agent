@@ -98,6 +98,20 @@ def _task_line(record: TaskRecord) -> str:
         f" · {record.turns} 轮 · {record.usage_tokens} token"
         f" · {record.duration_seconds:.1f}s"
     )
+    # c14 F23：隔离任务多一行工作区信息。
+    #
+    # 非隔离任务这两个字段是空串，整行不出现——`/agents` 里绝大多数任务都不隔离，
+    # 无条件加一行「隔离工作区：无」纯属噪音。
+    #
+    # 分支名排在路径**前面**：用户要拿它做 `git merge`，路径只是排查时才看。
+    if record.worktree_path or record.worktree_branch:
+        parts = []
+        if record.worktree_branch:
+            parts.append(f"分支 {record.worktree_branch}")
+        if record.worktree_path:
+            parts.append(f"路径 {record.worktree_path}")
+        head += "\n    隔离工作区：" + " · ".join(parts)
+
     body = record.conclusion or record.task_text
     if body:
         preview = body.strip().splitlines()[0][:_CONCLUSION_PREVIEW]

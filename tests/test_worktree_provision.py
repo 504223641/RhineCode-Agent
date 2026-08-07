@@ -125,6 +125,45 @@ class SkipAndWarnTest(ProvisionTestBase):
         self.assertEqual(len(result.warnings), 1)
         self.assertFalse((self.target / "id_rsa").exists())
 
+    def test_dot_entry_does_not_wipe_the_worktree(self):
+        """
+        ⚠ **验收期审计出来的漏洞的反证。**
+
+        `"."` 是一条完全合法的路径写法：越界检查照样通过，而它解析出来
+        就是根目录自己。若不单独挡掉，`_copy_one` 会先 `rmtree(工作区根)`
+        把刚建好的工作区整个删掉，再把**整个主项目**（含其它隔离工作区）
+        递归复制进去。
+
+        它不是攻击构造——用户想「把项目里的东西都带过去」时很自然就会这么写。
+        """
+        (self.main / "keep.txt").write_text("main\n", encoding="utf-8")
+        (self.target / "existing.txt").write_text("worktree\n", encoding="utf-8")
+
+        result = provision(self.main, self.target, [ProvisionEntry(".", "copy")])
+
+        self.assertEqual(result.applied, ())
+        self.assertEqual(len(result.warnings), 1)
+        self.assertTrue(
+            (self.target / "existing.txt").is_file(), "工作区不能被清空"
+        )
+        self.assertFalse((self.target / "keep.txt").exists(), "不该把主项目拷进来")
+
+    def test_dot_variants_are_rejected(self):
+        """`./`、`.\\`、以及绝对形式的项目根都是同一件事。"""
+        for raw in (".", "./", ".\\"):
+            with self.subTest(raw=raw):
+                result = provision(
+                    self.main, self.target, [ProvisionEntry(raw, "copy")]
+                )
+                self.assertEqual(result.applied, (), f"{raw!r} 不该生效")
+
+    def test_absolute_project_root_is_rejected(self):
+        result = provision(
+            self.main, self.target, [ProvisionEntry(str(self.main), "link")]
+        )
+        self.assertEqual(result.applied, ())
+        self.assertEqual(len(result.warnings), 1)
+
     def test_missing_source_is_skipped(self):
         result = provision(
             self.main, self.target, [ProvisionEntry("nope.yaml", "copy")]
