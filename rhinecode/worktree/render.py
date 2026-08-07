@@ -1,0 +1,117 @@
+"""
+交付信息段的文本渲染（c14 T10，spec F17）。
+
+**为什么这段信息由系统给、不靠模型自述。**
+
+C13 的结论回流机制是「取最后一条 assistant 消息的全文」。真实模型实测过一个
+现象：告诉它「只有最后一段会被带回去」，它就会在结论前面写一堆过程叙述。
+同一类可靠性问题在本章换了个形式——分支名如果靠模型自己写，它可能：
+
+- 写成任务名而不是分支名
+- 漏写
+- 写成 `agent/xxx`，而实际分支是 `agent/xxx-2`（创建时撞名，系统改的）
+
+而主 Agent 拿着这个名字去 `git merge`，错了会报「分支不存在」，
+排查时谁也想不到根因在这。
+
+代价近乎为零：运行器**本来就要**跑一遍 git 来决定「保留还是删除」
+（spec F16），那份信息现成的，顺手渲染出来不多花一次 git 调用。
+
+⚠ **本模块只产出这一段文本，不负责拼接。** 拼接在 `subagents/gate.py` 的
+`render_subagent_message` 里——CLAUDE.md 有一条成对维护点要求「子 Agent 结论的
+渲染只有一份」（闸门的迭代级交付与协调层的兜底交付共用它），本模块不能绕过它
+自己往历史里塞东西。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+from rhinecode.worktree.models import ChangeStatus, WorktreeHandle
+
+# 变更文件清单最多列几项。超出部分折叠成「等 N 个文件」。
+#
+# 取 10 的理由：这段信息会**整段进入主对话的上下文**并占用它的预算
+# （与 C13 对结论长度的约束同一考量）。主 Agent 需要的是「大致改了哪一块」，
+# 真要看全部就去 `git diff`——交付信息段里已经给了分支名。
+_MAX_FILES = 10
+
+
+def _display_path(main_root: Optional[Path], path: Path) -> str:
+    """
+    把工作区路径转成便于阅读的形式。
+
+    :returns: 能算出相对主项目根的路径时用相对形式，否则用绝对路径
+
+    用相对形式是因为绝对路径又长又含用户名，塞进模型上下文纯属浪费；
+    而相对形式（`.rhinecode/worktrees/fix-toolset`）本身就说明了它是什么。
+    """
+    if main_root is None:
+        return str(path)
+    try:
+        return str(Path(path).resolve().relative_to(Path(main_root).resolve())).replace(
+            "\\", "/"
+        )
+    except (ValueError, OSError):
+        return str(path)
+
+
+def render_delivery(
+    handle: WorktreeHandle,
+    status: ChangeStatus,
+    main_root: Optional[Path] = None,
+    removed: bool = False,
+) -> str:
+    """
+    渲染一个隔离子 Agent 的交付信息段（spec F17）。
+
+    :param handle: 工作区句柄。`branch` / `base_commit` 取的是**实际值**
+    :param status: 变更状态，来自 `lifecycle.inspect`
+    :param main_root: 主项目根，用于把路径显示成相对形式
+    :param removed: 该工作区是否已被自动删除（无变更时会删，spec F16）
+    :returns: 一段可直接追加到结论末尾的文本
+
+    副作用：无（纯函数）。
+
+    两种形态：
+
+    - **已删除**（子 Agent 什么都没改）：只说明一句，不给分支名与路径——
+      它们已经不存在了，给出来只会让主 Agent 去 merge 一个已删的分支。
+    - **已保留**：给出分支名、基点、路径、提交数、改动文件、是否有未提交改动。
+      主 Agent 后续的 `git merge` / `git diff` 全靠这几行。
+    """
+    if removed:
+        return (
+            "── 隔离工作区 ─────────────────────\n"
+            "该子 Agent 未产生任何文件变更，其隔离工作区与分支已自动清理。"
+        )
+
+    lines = ["── 隔离工作区 ─────────────────────"]
+
+    if handle.branch:
+        base = f"（基于 {handle.base_commit}）" if handle.base_commit else ""
+        lines.append(f"分支：{handle.branch}{base}")
+    lines.append(f"路径：{_display_path(main_root, Path(handle.path))}")
+    lines.append(f"提交：{status.commits} 个")
+
+    if status.files:
+        shown = list(status.files[:_MAX_FILES])
+        rest = len(status.files) - len(shown)
+        text = "、".join(shown)
+        if rest > 0:
+            text += f" 等 {len(status.files)} 个文件"
+        lines.append(f"改动：{text}")
+    else:
+        lines.append("改动：无")
+
+    lines.append(
+        "未提交改动：有（这些改动只存在于该目录中，不会随分支合并带走）"
+        if status.dirty
+        else "未提交改动：无"
+    )
+
+    return "\n".join(lines)
+
+
+__all__ = ["render_delivery"]
