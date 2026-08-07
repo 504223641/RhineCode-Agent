@@ -66,7 +66,7 @@ class ModeTarget(Enum):
 class ReportTarget(Enum):
     """
     query_report 的目标报告：MCP 连接状态 / 上下文用量 / 记忆系统状态 /
-    Skill 状态 / Skill 实际注入内容。
+    Skill 状态 / Skill 实际注入内容 / Hook 规则 / 子 Agent 角色与任务。
 
     **成对维护点**：新增枚举值须同步三处——本枚举、`tui/app.py` 的
     `query_report` 分支（未知值明确抛错）、`conversation.py` 的对应领域方法。
@@ -78,6 +78,7 @@ class ReportTarget(Enum):
     SKILLS = "skills"
     SKILLS_PROMPT = "skills_prompt"
     HOOKS = "hooks"
+    AGENTS = "agents"
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,19 @@ class CommandController(Protocol):
 
     def exit_application(self) -> None:
         """退出应用。"""
+        ...
+
+    def cancel_subagents(self, target: Optional[str]) -> str:
+        """
+        取消子 Agent 任务（c13 F22/F24）。
+
+        :param target: 任务标识；`None` 或 `"all"` 表示取消**全部**未完成任务
+        :returns: 给用户看的结果文本（取消了几个 / 标识不存在 / 无任务可取消）
+
+        **为什么 `/agents` 不是纯只读命令**（与 `/mcp` / `/hooks` 不同）：
+        一个跑偏的后台子 Agent 若没有取消入口，用户只能退出整个程序。
+        取消是本章唯一必须的写操作，其余形态仍是只读。
+        """
         ...
 
     def run_skill(self, name: str, arguments: str, display: str) -> None:

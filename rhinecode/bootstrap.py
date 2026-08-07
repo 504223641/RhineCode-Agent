@@ -25,6 +25,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from rhinecode.agent.prompt.builder import build_default_prompt
+from rhinecode.agent.prompt.environment import collect_environment
+from rhinecode.agent.prompt.texts import UNTRUSTED_CONTENT
 from rhinecode.commands import CommandRegistrationError, build_builtin_registry
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.config import Config
@@ -36,6 +39,11 @@ from rhinecode.mcp.manager import MCPManager
 from rhinecode.provider.factory import create_provider
 from rhinecode.skills.manager import SkillManager
 from rhinecode.skills.models import builtin_skills_dir
+from rhinecode.subagents.discovery import discover_agents
+from rhinecode.subagents.models import builtin_agents_dir
+from rhinecode.subagents.runner import SubAgentRuntime
+from rhinecode.subagents.service import SubAgentService
+from rhinecode.tools.run_agent import RunAgentTool
 from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.web_fetch import WebFetchTool
@@ -319,6 +327,56 @@ def build_app(
     # 与 `memory_manager.notify` / `skill_manager.notify_activation` 是同一形态。
     load_skill_tool.run_fork = manager.run_forked_for_model
     load_skill_tool.on_activated = manager.on_skill_activated
+
+    # ⑤' 子 Agent 系统（c13）。
+    #
+    # **位置卡在协调层之后、`session_start` 快照之前**，两头都不能挪：
+    # - 不能提前：`SubAgentRuntime` 要拿协调层的 `_provider_for`（角色可指定
+    #   `model:`）、`_engine`、以及「造一个新 ContextManager」的工厂，
+    #   这些都要到第 ⑤ 步才存在；
+    # - 不能推后：`run_agent` 必须在 `session_start` **之前**注册进工具中心，
+    #   否则快照里的 `tool_names` 与实际工具集不符——观测设施撒谎，且不报错。
+    #   （与上面 `exclude_tools` 摘除是同一条理由。）
+    #
+    # 与 `load_skill` 同样采用属性注入解耦构造顺序：服务在协调层之后建好，
+    # 再回填给协调层。
+    if tool_registry is not None:
+        agent_catalog = discover_agents(
+            workspace_root() / ".rhinecode" / "agents",
+            user_dir / "agents",
+            builtin_agents_dir(),
+        )
+        subagent_runtime = SubAgentRuntime(
+            # `_provider_for` 只接受非空模型名；角色未指定时用主 Provider。
+            provider_for=lambda model: (
+                manager._provider_for(model) if model else provider
+            ),
+            registry=tool_registry,
+            engine=manager.permission_engine,
+            main_mode=lambda: manager.permission_engine.mode,
+            environment_text=lambda: build_default_prompt(
+                collect_environment(cfg, str(workspace_root()))
+            ).dynamic,
+            default_model=cfg.model,
+            hooks=hook_manager,
+            recorder=recorder,
+            new_context_manager=manager.new_subagent_context_manager,
+            # 「外部不可信内容」段原文。运行器只在子 Agent 的**最终工具集**
+            # 含网络访问工具时才注入它（spec F7 的例外），这里只负责把文本递过去。
+            untrusted_section=UNTRUSTED_CONTENT if cfg.web_fetch_enabled else "",
+            thinking_effort=manager.thinking_effort,
+        )
+        subagent_service = SubAgentService(
+            agent_catalog,
+            subagent_runtime,
+            # **必须是回调**：MCP 工具在上面的 `connect_all` 里才注册进来，
+            # 取值型会拿到一份不含它们的陈旧快照。
+            tool_names_provider=tool_registry.names,
+        )
+        manager.subagent_service = subagent_service
+        tool_registry.register(
+            RunAgentTool(subagent_service, parent_snapshot=manager.parent_snapshot)
+        )
 
     # ⑥ 界面层。
     app = RhineApp(manager, cfg, command_registry, recorder=recorder)

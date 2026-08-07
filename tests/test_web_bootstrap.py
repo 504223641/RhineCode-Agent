@@ -269,13 +269,23 @@ class SwitchChainTests(BootstrapFixture):
     两条链都必须穿过协调层。
     """
 
-    def test_both_prompt_call_sites_receive_the_switch(self) -> None:
+    def test_all_prompt_call_sites_receive_the_switch(self) -> None:
         """
-        链路②有**两个**调用点：主对话（`_run`）与 fork 子对话（`_run_forked_skill`）。
+        链路②的调用点（c13 起**三个**）：
 
-        漏传其中一处的表现是「主对话有不可信约束、fork 子对话没有」——
-        **界面上完全看不出来**，只有被注入的页面恰好走进 fork 子对话时才显形。
+        1. 主对话（`_run`）；
+        2. fork 子对话（`_run_forked_skill`）；
+        3. **分支式子 Agent 的父快照**（`parent_snapshot`，c13 F8）——
+           它继承父对话的稳定提示，漏传会让分支式子 Agent 失去不可信约束。
+
+        漏传任一处的表现都是「主对话有不可信约束、某条子对话没有」——
+        **界面上完全看不出来**，只有被注入的页面恰好走进那条子对话时才显形。
         所以这里直接查源码里的调用点，而不是只跑一条主对话。
+
+        **定义式子 Agent 不在此列**：它按 spec F7 只拿角色正文 + 环境信息，
+        不走 `build_default_prompt` 的八模块；那道约束由 `runner._build_prompts`
+        在「最终工具集含网络访问工具」时单独追加，护栏见
+        `tests/test_subagent_runner.py::SystemPromptTest`。
         """
         import inspect
 
@@ -284,9 +294,9 @@ class SwitchChainTests(BootstrapFixture):
         source = inspect.getsource(conv)
         occurrences = source.count("untrusted_enabled=self._config.web_fetch_enabled")
         self.assertEqual(
-            occurrences, 2,
-            "build_default_prompt 的两个调用点都要传开关；"
-            "漏一处会让 fork 子对话失去不可信约束，且界面上看不出来",
+            occurrences, 3,
+            "build_default_prompt 的三个调用点都要传开关；"
+            "漏一处会让对应的子对话失去不可信约束，且界面上看不出来",
         )
 
     def test_disabled_skips_domain_validation(self) -> None:

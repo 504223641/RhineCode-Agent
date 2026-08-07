@@ -50,6 +50,7 @@ from rhinecode.hooks import (
     NO_VERDICT,
     NullHookManager,
 )
+from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
 from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
 from rhinecode.trace import (
     SCOPE_MAIN,
@@ -70,6 +71,7 @@ OUTCOME_DENIED_BY_PERMISSION = "denied_by_permission"  # 权限管线判 DENY
 OUTCOME_DENIED_BY_USER = "denied_by_user"        # 人在回路面板里选了拒绝
 OUTCOME_PLAN_BLOCKED = "plan_blocked"            # Plan Mode 规划阶段夹带的副作用工具
 OUTCOME_BLOCKED_BY_HOOK = "blocked_by_hook"      # c12：被 Hook 前置层拦下（含 Hook 自身失败的 fail-closed）
+OUTCOME_DENIED_NON_INTERACTIVE = "denied_non_interactive"  # c13：非交互执行（子 Agent）里判 ASK，无人可确认
 
 # ── 用户在人在回路面板里选「拒绝」时回灌给模型的文本 ──
 #
@@ -103,6 +105,40 @@ DENIED_BY_USER_FEEDBACK = (
     "\n"
     "请立即停止本次任务的推进，向用户说明你原本打算做什么、为什么需要这一步，"
     "并询问他拒绝的原因、以及希望你怎么继续。等他答复后再行动。"
+)
+
+# ── 非交互执行下判 ASK 时回灌给模型的文本（c13 spec F15）──
+#
+# ## 它与 DENIED_BY_USER_FEEDBACK 的语义差别
+#
+# 上面那条说的是「**人做了决定**」——所以它要求模型停下来、去问用户为什么，
+# 并且配套一条硬约束（下一轮不发任何工具），让它物理上只能说话。
+#
+# 这一条说的是「**没有人能做决定**」。子 Agent 跑在非交互环境里（可能在后台，
+# 用户正在跟主对话说话），确认面板压根弹不出来。这不是谁拒绝了它，
+# 是这条路在当前环境下走不通。
+#
+# 因此两处指引恰好相反：那条要求「停止推进」，这条要求「换条路继续」——
+# 子 Agent 的价值就在于把活干完并回流一段结论，让它一遇到确认就瘫掉，
+# 等于缺省配置下它什么都做不成（spec F15 已明示这个代价：缺省档下只能做只读的事）。
+#
+# ## 也因此**不置 `user_denied`**
+#
+# 那个标志会让下一轮 `tools=None`。对子 Agent 用它是错的：它应该带着工具继续，
+# 改用只读方式达成目标。护栏见 `tests/test_agent_non_interactive.py`（含反证）。
+DENIED_NON_INTERACTIVE_FEEDBACK = (
+    "这次 {name} 调用需要人工确认，而当前是**非交互执行环境**（子 Agent），"
+    "没有人能应答确认面板，因此它被自动拒绝。\n"
+    "\n"
+    "**这不是有人拒绝了你，也不是工具坏了**——是这条路在当前环境下走不通。"
+    "原样重试同一个调用不会有不同结果。\n"
+    "\n"
+    "**换一个工具也没用**：写文件、改文件、执行命令这一类操作在这个环境下"
+    "会被同样拒绝，不必逐个试过去——那只会白烧轮次。\n"
+    "\n"
+    "请改用不需要确认的方式推进：优先用只读工具达成目标。"
+    "如果这一步确实非做不可，就把它写进你最终的结论里，"
+    "说明「这一步需要用户授权，建议的做法是……」，由主对话去和用户确认。"
 )
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
@@ -149,12 +185,24 @@ class RunOptions:
         每轮回调求值（子对话的排除集在整条子对话里恒定不变）。
 
         缺省空集 = 不排除任何工具。
+    :param interactive: 本次执行能否与人交互。**缺省 True 即既有行为，不传等于零回归**。
+
+        为 False 时（c13 的子 Agent）只改一件事：权限管线判 ASK 的调用
+        **不再调 `ask` 回调**，直接按 `OUTCOME_DENIED_NON_INTERACTIVE` 拒绝并回灌
+        `DENIED_NON_INTERACTIVE_FEEDBACK`，且**不置 `user_denied`**。
+
+        为什么必须是开关而不是「让 ask 回调返回 False」：那条路会走进
+        `DENIED_BY_USER_FEEDBACK`（文案写的是「这是用户的决定，不要绕」）
+        并硬性禁掉下一轮的全部工具。对子 Agent 这两条都是错的——
+        没有任何用户做过决定，而它应当改用只读方式继续干活。
     """
 
     max_iterations: int = MAX_ITERATIONS
     record_usage: bool = True
     allow_summary: bool = True
     excluded_tools: frozenset = frozenset()
+    interactive: bool = True
+    subagent_gate: object = None
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
@@ -494,7 +542,12 @@ class Agent:
 
         planning = plan_mode and not execution_phase
         base = (
-            self._registry.readonly_schemas() if planning else self._registry.schemas()
+            # c13：规划阶段 = 只读工具 + 声明了 `plan_safe` 的工具。
+            # 后者目前只有委派工具——Plan Mode 恰恰最需要把调研赶出主上下文
+            # （规划要读很多东西，而那些内容要一路背到执行阶段）。
+            # 它在那一阶段的自我约束（只许委派全只读角色）由它自己执行，
+            # 循环只负责把阶段告诉它，见下面 `_run_one_serial` 的 `plan_stage`。
+            self._registry.planning_schemas() if planning else self._registry.schemas()
         )
 
         if excluded:
@@ -566,6 +619,10 @@ class Agent:
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
+        # c13：子 Agent 闸门。缺省 NullGate → 两处调用退化为零成本空操作，
+        # **不传等于零回归**。
+        gate = options.subagent_gate if options.subagent_gate is not None else NullGate()
+        wait_rounds = 0               # 已为子 Agent 停留过几次（防无限接力）
         deny_cooldown = False         # 上一轮有工具被用户拒绝 → 本轮不发工具（见 DENIED_BY_USER_FEEDBACK）
 
         def _record(msg: Message) -> None:
@@ -584,6 +641,19 @@ class Agent:
                 return
 
             yield AgentEvent(type=AgentEventType.PROGRESS, iteration=iteration)
+
+            # 子 Agent 结论的交付点（c13 修订）。**必须在本轮组装请求之前**。
+            #
+            # 位置合法性：协议只禁止在 `assistant(tool_calls)` 与它对应的
+            # `tool` 结果**之间**插消息，而此刻上一轮的 tool 结果早已写完。
+            # 初版把这件事挂在协调层的 `_run()` 上（每条用户消息才一次），
+            # 后果是主 Agent 在同一次运行里跑了六轮、结论一轮都没进去——
+            # 用户必须插一句话才能让任务继续，等于把连贯的任务硬生生截断。
+            #
+            # 放在压缩**之前**：新追加的消息也要参与 token 估算。
+            for extra in gate.take_pending():
+                history.append(extra)
+                _record(extra)
 
             # 上下文压缩（c8 F3）：每次 API 请求前先跑两层压缩（先第一层存盘、再按需第二层摘要），
             # 把可能过长的历史压回 token 预算内。压缩可能原地修改 history（改写工具结果 / 重构列表）。
@@ -671,6 +741,43 @@ class Agent:
                     final_msg = Message(role="assistant", content=text)
                     history.append(final_msg)
                     _record(final_msg)
+
+                # ── 子 Agent 等待闸门（c13 修订）──
+                #
+                # 模型准备收工了，但它自己委派出去的、**声明过要等结果**的子 Agent
+                # 还在跑。这时候结束循环等于让它拿着不完整的信息回答，而用户
+                # 必须再插一句话才能让任务继续——那正是初版被诟病的「变相中断」。
+                #
+                # 所以：停下来等，把结论注入后**再跑一轮**，让模型自己决定
+                # 是继续干还是收工。
+                #
+                # **等待不是卡顿，是进度**：跑子 Agent 就是在执行任务，与主 Agent
+                # 自己跑一遍测试套件性质相同。因此这里**不设体验意义上的超时**，
+                # 唯一的逃生口是 `Esc`（`cancel_event` 会让 `wait_any` 立刻返回）。
+                # 「我不需要等这个结果」由模型在委派时用 `background=true` 表达。
+                #
+                # `wait_rounds` 是兜底：防「等到一个 → 模型又委派一个 → 再等」
+                # 无限接力。撞上它就正常收工，未完成的结论仍会在下一条用户消息时送达。
+                if wait_rounds < MAX_WAIT_ROUNDS and gate.has_awaited():
+                    wait_rounds += 1
+                    waiting = gate.describe_awaited()
+                    # 这条提示不可省：没有它，界面上就是「AI 突然不说话了」，
+                    # 用户分不清是在等还是卡死了。
+                    yield AgentEvent(
+                        type=AgentEventType.NOTICE,
+                        message=f"等待子 Agent 完成：{waiting}（按 Esc 可取消）",
+                    )
+                    if gate.wait_any(cancel_event):
+                        # 等到了结论 → 下一轮迭代开头的 take_pending 会把它注入
+                        continue
+                    if cancel_event.is_set():
+                        yield AgentEvent(
+                            type=AgentEventType.FINISHED,
+                            stop_reason=StopReason.USER_CANCELLED,
+                        )
+                        return
+                    # 没等到（撞上兜底上限，或那些任务已经全部交付过了）→ 照常收工
+
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
                 return
 
@@ -689,6 +796,7 @@ class Agent:
                 # 与 `_schema_for` 的 `planning` **同口径**：两者必须一致，
                 # 否则会出现「发了工具却拒绝执行」或「没发工具也照常执行」。
                 planning=plan_mode and not execution_phase,
+                interactive=options.interactive,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -758,6 +866,7 @@ class Agent:
         cancel_event: threading.Event,
         excluded: frozenset = frozenset(),
         planning: bool = False,
+        interactive: bool = True,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -767,7 +876,8 @@ class Agent:
         - ALLOW + 只读 → 进并发桶（无需确认）。
         - ALLOW + 副作用 → 进串行桶，直接执行（命中 allow 规则即免确认，spec AC4）。
         - DENY → 进串行桶，产出结构化拒绝结果、不执行（不终止循环，spec F8）。
-        - ASK → 进串行桶，执行前调 ask 回调弹 HITL 面板。
+        - ASK → 进串行桶，执行前调 ask 回调弹 HITL 面板；
+          **`interactive` 为假时（c13 子 Agent）直接判拒，`ask` 不会被调用**。
 
         分流后：
         - 特殊工具（ask_user / present_plan）：串行，路由到 clarify / approve_plan。
@@ -783,6 +893,8 @@ class Agent:
         :param ask: 人工确认回调（仅 ASK 时调用）
         :param clarify/approve_plan: 特殊工具的交互回调
         :param cancel_event: 取消信号，串行执行前检查
+        :param interactive: 能否与人交互（c13）。缺省 True 即既有行为；为假时
+            ASK 走非交互拒绝分支，见 `DENIED_NON_INTERACTIVE_FEEDBACK`
 
         副作用：实际执行工具（可能读写文件、跑命令）；通过回调与用户交互。
         """
@@ -835,12 +947,22 @@ class Agent:
             # 「本该有的一道」——Plan Mode 的承诺是「批准前不动手」，
             # 不该退化成「批准前每次都问你要不要动手」。
             #
-            # `and not tool.system_serial` 把一条**原本隐式**的豁免写成了显式条件：
-            # 改造前系统级串行工具在这一步之前就已经 `continue` 掉了，因此从不受
-            # 规划阶段过滤约束。现在 Hook 分发要收在单一点上（见下），系统级工具的
-            # 分流必须挪到这一步之后，那条豁免就得自己写出来，否则今天唯一的系统级
-            # 工具（`load_skill`）的行为会悄悄改变。
-            if planning and not tool.read_only and not tool.system_serial:
+            # ⚠ **豁免条件是 `plan_safe`，不是 `system_serial`**（c13 修订）。
+            #
+            # 这里原本写的是 `and not tool.system_serial`——那是为 `load_skill`
+            # 写的，而 `load_skill` 是 `read_only=True`，本来就被前一个条件挡在外面，
+            # 于是那条豁免长期是**空转**的。
+            #
+            # C13 的委派工具 `run_agent` 恰好把它激活了：`system_serial=True`
+            # **且** `read_only=False`。后果实测过——规划阶段模型凭训练先验硬造出
+            # 一个 `run_agent` 调用，它**既没被这里挡下、又因为 system_serial
+            # 不进权限管线**，直接执行了；而它委派出去的子 Agent 可以写文件。
+            # Plan Mode「批准前不动手」的承诺就此被绕过。
+            #
+            # 改成 `plan_safe` 之后：`load_skill` 仍靠 `read_only=True` 通过
+            # （行为一字不变），而任何**没有明确声明过自己规划期安全**的副作用工具
+            # 一律被挡——豁免从「凡是系统级工具」收窄成「明确承诺过的工具」。
+            if planning and not tool.read_only and not tool.plan_safe:
                 plan_blocked.append(tc)
                 ctx.unknown_count += 1
                 continue
@@ -1035,7 +1157,9 @@ class Agent:
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_one_serial(tc, tool, decision, results, ctx, ask)
+            yield from self._run_one_serial(
+                tc, tool, decision, results, ctx, ask, interactive, planning
+            )
 
     def _run_special(
         self,
@@ -1207,6 +1331,8 @@ class Agent:
         results: dict[str, ToolResult],
         ctx: _RoundContext,
         ask: AskFn,
+        interactive: bool = True,
+        planning: bool = False,
     ) -> Iterator[AgentEvent]:
         """
         串行处理单个工具调用：未知 / 参数错误 / 权限拒绝 / 待确认 / 放行（c6）。
@@ -1219,7 +1345,13 @@ class Agent:
         :param tool: 对应工具实例；None 表示未知工具
         :param decision: 权限决策结果；None 表示参数解析失败（未进引擎）
         :param results: 输出参数，写入 id → ToolResult
-        :param ask: 人工确认回调（仅 decision 为 ASK 时调用）
+        :param ask: 人工确认回调（仅 decision 为 ASK **且 interactive 为真**时调用）
+        :param interactive: 能否与人交互（c13）。为假时 ASK 直接判拒并回灌
+            `DENIED_NON_INTERACTIVE_FEEDBACK`，`ask` 一次都不会被调用。
+            **缺省 True 即既有行为。**
+        :param planning: 是否处于 Plan Mode 的规划阶段（c13）。只用于把阶段
+            告知 `plan_safe` 工具——它们据此自我约束（见 `Tool.plan_safe`）。
+            **缺省 False 即既有行为。**
         """
         # 未知工具：结构化错误（沿用既有行为，含 TOOL_START）
         if tool is None:
@@ -1251,6 +1383,24 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
+        # 待确认（非交互执行）：没有人能应答面板，直接拒绝（c13 spec F15）。
+        #
+        # **刻意排在调 `ask` 之前**：`ask` 回调在子 Agent 场景下会跨线程弹面板，
+        # 一旦真的走进去就是「后台线程往主界面弹了一个没人预期的面板」。
+        # 这里拦住，那条路径压根不会被触达。
+        if decision.decision == Decision.ASK and not interactive:
+            res = ToolResult(
+                ok=False,
+                output=DENIED_NON_INTERACTIVE_FEEDBACK.format(name=tc.name),
+                summary="非交互环境自动拒绝",
+            )
+            results[tc.id] = res
+            # **不置 `ctx.user_denied`**：那个标志会让下一轮 `tools=None`。
+            # 子 Agent 应当带着工具继续、改用只读方式达成，见常量注释。
+            self._trace_tool(tc, res, OUTCOME_DENIED_NON_INTERACTIVE)
+            yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
+            return
+
         # 待确认：弹 HITL 面板，用户拒绝则不执行
         if decision.decision == Decision.ASK:
             approved = ask(tc, tool, decision)
@@ -1267,7 +1417,14 @@ class Agent:
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
         t0 = time.monotonic()
         try:
-            res = tool.execute(tc.arguments)
+            if tool.plan_safe:
+                # 声明了 `plan_safe` 的工具**必须**接受这个关键字参数
+                # （契约写在 `Tool.plan_safe` 的说明里）。多传它是为了让工具
+                # 能在规划阶段自我约束——循环不该也不能替它做那个判断，
+                # 那需要认识具体工具的语义。
+                res = tool.execute(tc.arguments, plan_stage=planning)
+            else:
+                res = tool.execute(tc.arguments)
         except Exception as e:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res

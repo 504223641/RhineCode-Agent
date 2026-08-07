@@ -61,6 +61,10 @@ class FakeController:
 
     # ---- c11 新增的三个控制器方法 ----
 
+    def cancel_subagents(self, target) -> str:
+        self.calls.append(("cancel_subagents", target))
+        return f"cancel:{target}"
+
     def run_skill(self, name: str, arguments: str, display: str) -> None:
         self.calls.append(("run_skill", name, arguments, display))
 

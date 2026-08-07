@@ -18,8 +18,12 @@
     tools.load_skill   → skills.manager       （tools 依赖 skills）
     tools.base         ← mcp.tool_adapter     （mcp 依赖 tools）
     tools.mcp_config   → mcp.auto_config      （tools 依赖 mcp）
+    tools.web_fetch    → web.fetcher          （tools 依赖 web）
+    tools.run_agent    → subagents.service    （tools 依赖 subagents，c13）
+    tools.registry     ← subagents.runner     （subagents 依赖 tools）
 
-`tools ↔ mcp` 这一组是货真价实的互依，之所以不成环，唯一依靠的就是本文件是空的
+`tools ↔ mcp` 与 `tools ↔ subagents` 都是货真价实的互依，
+之所以不成环，唯一依靠的就是本文件是空的
 （只有 docstring）：Python 导入 `rhinecode.tools.mcp_config` 时会先执行
 `rhinecode/tools/__init__.py`，若它是空的，`tools` 包立刻初始化完成，
 随后加载子模块即可，整条链路上不会回头去碰 `mcp`。

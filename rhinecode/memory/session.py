@@ -294,7 +294,7 @@ class SessionStore:
         except OSError:
             return SessionLoadResult([], 0, 0, None)
 
-        messages, dropped = _drop_unpaired(raw_messages)
+        messages, dropped = drop_unpaired(raw_messages)
         return SessionLoadResult(messages, skipped, dropped, _parse_ts(last_ts))
 
     def attach(self, session_id: str) -> bool:
@@ -436,9 +436,20 @@ def _deserialize_line(line: str) -> "tuple[Optional[Message], Optional[str]]":
     )
 
 
-def _drop_unpaired(messages: list[Message]) -> "tuple[list[Message], int]":
+def drop_unpaired(messages: list[Message]) -> "tuple[list[Message], int]":
     """
-    不成对清理（F11②/F12）：保证载入历史里 assistant(tool_calls) ↔ tool 严格配对。
+    不成对清理（F11②/F12）：保证一段历史里 assistant(tool_calls) ↔ tool 严格配对。
+
+    **两个调用方**（c13 起）：
+
+    1. 会话存档载入（本模块 `load`）——存档可能在写到一半时被中断；
+    2. **c13 分支式子 Agent 的父快照**（`conversation.parent_snapshot`）——
+       快照是在 Agent Loop 的**串行段内**取的，此刻循环已经把
+       `assistant(tool_calls)` 追加进历史、而对应的 `tool` 结果要等本轮
+       全部工具跑完才追加。不清理的话，子 Agent 的首次请求必然 400：
+       *"An assistant message with 'tool_calls' must be followed by tool messages"*。
+       这是真实模型验收实测到的缺陷——**单元测试抓不到**，因为它们都是从
+       一段干净的历史建快照。
 
     两趟扫描：
     1. 收集全部 role=tool 行的 tool_call_id 集合；

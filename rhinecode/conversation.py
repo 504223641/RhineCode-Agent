@@ -42,6 +42,13 @@ from rhinecode.memory import MemoryManager
 from rhinecode.memory.session import SessionInfo
 from rhinecode.skills.manager import SkillManager
 from rhinecode.hooks import HookEventType, NullHookManager
+from rhinecode.memory.session import drop_unpaired
+from rhinecode.permission.engine import narrower_mode
+from rhinecode.subagents.gate import SubAgentGate, render_subagent_message
+from rhinecode.subagents.render import render_agent_index
+from rhinecode.subagents.report import render_report
+from rhinecode.subagents.runner import ParentSnapshot
+from rhinecode.subagents.toolset import resolve_toolset
 from rhinecode.trace import (
     SCOPE_MAIN,
     NullRecorder,
@@ -172,6 +179,7 @@ class ConversationManager:
         recorder: "Optional[TraceRecorderProtocol]" = None,
         provider_factory: Optional[Callable[[Config], BaseProvider]] = None,
         hook_manager=None,
+        subagent_service=None,
     ):
         """
         初始化对话管理器。
@@ -309,7 +317,17 @@ class ConversationManager:
         register_read_root(builtin_skills_dir())
 
         # 按模型名缓存的临时 Provider（c11 F22：独立模式 Skill 可指定模型）。
+        #
+        # ⚠ c13 起它会被**多个后台子 Agent 线程并发访问**（角色可指定 model），
+        # 因此加一把锁。不加的话两个线程可能同时判空、各造一个 Provider，
+        # 后写入的覆盖先写入的——多出来那个客户端连同它的连接池就此泄漏，
+        # 而功能上完全看不出异常。
         self._provider_cache: dict[str, BaseProvider] = {}
+        self._provider_cache_lock = threading.Lock()
+
+        # c13：子 Agent 服务门面。为 None 时整章能力不启用（非 DeepSeek 工具模式），
+        # 全部接入点都判空跳过，行为与 c12 逐字一致（spec N1）。
+        self.subagent_service = subagent_service
 
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
@@ -454,6 +472,10 @@ class ConversationManager:
         # SESSION_START。顺序不可颠倒——颠倒会让两条事件都带着新档 ID，
         # 「哪次会话结束了」这个信息就丢了。
         self._dispatch_session(HookEventType.SESSION_END, reason="clear")
+        # c13 F22：会话切换前先取消全部未完成的子 Agent。
+        # **必须在清空之前**——它们跑完之后会把结论交付进 `history`，
+        # 而那时用户已经清空了对话，凭空多出一段来路不明的内容。
+        cancelled = self._cancel_subagents_for_switch()
         self.history = []
         if self._context_manager is not None:
             self._context_manager.reset()
@@ -461,6 +483,8 @@ class ConversationManager:
         self.skill_manager.clear_active()
         self._hooks.bind_context(session_id=self.memory_manager.session_id)
         self._dispatch_session(HookEventType.SESSION_START, source="clear")
+        if cancelled:
+            return f"对话历史已清空（同时取消了 {cancelled} 个正在运行的子 Agent）"
         return "对话历史已清空"
 
     def request_cancel(self) -> None:
@@ -645,6 +669,14 @@ class ConversationManager:
             #
             # 载入**失败**时不清空：此时仍停留在原会话，激活态应当原样保持。
             self.skill_manager.clear_active()
+            # c13 F22：子 Agent 同理——它们是为会话 A 发起的，跑完之后会把结论
+            # 交付进 `history`，而那时用户已经在会话 B 里了。同样只在载入成功时取消。
+            cancelled = self._cancel_subagents_for_switch()
+            if cancelled:
+                yield AgentEvent(
+                    type=AgentEventType.NOTICE,
+                    message=f"已取消 {cancelled} 个为上一个会话发起的子 Agent。",
+                )
             # 历史恢复埋点（trace F16）。`origin` 区分两条来源：
             # 这里是运行中的 `/resume`；另一条是启动时的 `--continue`
             # （它在 ConversationManager 构造期间原地改写 history、一条事件都不产，
@@ -842,6 +874,15 @@ class ConversationManager:
 
         副作用：首次调用某模型时构造一个新 Provider（可能建立 HTTP 连接池）。
         """
+        # ⚠ 整段包在锁里（c13）：多个后台子 Agent 线程可能同时走到这里。
+        # 「判空 → 构造 → 写回」若不是原子的，两个线程会各造一个 Provider，
+        # 后写入的覆盖先写入的，多出来那个连同它的连接池就此泄漏。
+        # 构造 Provider 不发网络请求（只建客户端对象），持锁期间做它是安全的。
+        with self._provider_cache_lock:
+            return self._provider_for_locked(model)
+
+    def _provider_for_locked(self, model: str) -> BaseProvider:
+        """`_provider_for` 的锁内实现，单独抽出只是为了不让那个方法过长。"""
         cached = self._provider_cache.get(model)
         if cached is not None:
             return cached
@@ -860,6 +901,225 @@ class ConversationManager:
             provider = TracingProvider(provider, self._recorder, model)
         self._provider_cache[model] = provider
         return provider
+
+    # ------------------------------------------------------------------ #
+    # 子 Agent（c13）
+    # ------------------------------------------------------------------ #
+
+    @property
+    def permission_engine(self) -> PermissionEngine:
+        """
+        权限引擎（只读访问，c13）。
+
+        装配层要拿它构造 `SubAgentRuntime`——子 Agent 据它 `derive` 出自己的
+        引擎视图。暴露成属性而不是让装配层去读 `_engine`：那是私有字段，
+        而这条访问是**长期契约**的一部分，该有个正式名字。
+
+        ⚠ 调用方**只读**：不得在这个引擎上改 `mode` 或登记规则。
+        子 Agent 要改档位一律走 `derive()`（见 `PermissionEngine.derive` 的说明）。
+        """
+        return self._engine
+
+    def new_subagent_context_manager(self) -> "Optional[ContextManager]":
+        """
+        为一个子 Agent 造一个**全新的**上下文管理器（spec N5）。
+
+        :returns: 新实例；工具能力未启用时 `None`（子 Agent 不跑任何压缩）
+
+        **每个子 Agent 一个新实例，绝不共享 `self._context_manager`**：
+        它持有 `_anchor_tokens` / `_anchor_len` / `_summary_failures` /
+        `_circuit_broken` 这些可变状态且**没有锁**，而子 Agent 是并发的。
+        共享的话，两个子 Agent 会互相污染对方的估算锚点，主历史的锚点
+        也会被它们改掉——表现是主对话的用量估算突然失准，而没有任何报错。
+
+        新建实例很轻（只是几个字段加一个 Offloader），存盘目录仍共享。
+
+        副作用：无（构造不做 IO）。
+        """
+        if not self._tools_enabled:
+            return None
+        return ContextManager(
+            self._provider,
+            self._config.model,
+            self._config.context_window,
+            workspace_root() / ".rhinecode" / "context",
+            recorder=self._recorder,
+            hook_manager=self._hooks,
+        )
+
+    def subagent_gate(self):
+        """
+        构造本次运行用的子 Agent 闸门（c13 修订）。
+
+        :returns: `SubAgentGate`；服务未启用时 `None`（循环会用 `NullGate` 兜底）
+
+        每次 `run()` 现造一个：它本身无状态（数据全在任务表里），
+        造一个的成本可以忽略，而现造能保证它永远指向当下的任务表。
+        """
+        if self.subagent_service is None:
+            return None
+        return SubAgentGate(self.subagent_service.tasks, render_subagent_message)
+
+    def _agent_index_text(self) -> str:
+        """
+        角色清单文本，填进系统提示的 135 槽位（spec F9）。
+
+        :returns: 清单文本；服务未启用或一个角色都没有时为空串（槽位整体跳过）
+
+        副作用：无。
+        """
+        if self.subagent_service is None:
+            return ""
+        return render_agent_index(self.subagent_service.catalog)
+
+    def parent_snapshot(self) -> "ParentSnapshot":
+        """
+        取当前主对话的快照，供分支式委派使用（spec F8）。
+
+        :returns: 含**历史副本**、当前稳定系统提示与可见工具名的快照
+
+        **历史必须是副本**：子 Agent 跑起来之后主对话还会继续追加消息，
+        共享同一个列表会让它的历史在跑到一半时被改动——既破坏消息协议顺序，
+        也让「它到底看到了什么」无法复现。
+
+        ## ⚠ 必须做不成对清理，否则子 Agent 的首次请求必然 400
+
+        本方法是从 `RunAgentTool.execute()` 调进来的，而那**运行在 Agent Loop
+        的串行段内**——此刻循环已经把 `assistant(tool_calls)` 追加进 `history`
+        （`loop.run` 在分流执行之前就追加了），而对应的 `tool` 结果消息要等
+        本轮全部工具跑完才追加。于是裸快照以一条**无配对的
+        `assistant(tool_calls)` 结尾**，DeepSeek 直接拒绝：
+
+            400 - An assistant message with 'tool_calls' must be followed by
+                  tool messages responding to each 'tool_call_id'
+
+        这是真实模型验收实测到的缺陷（C13 场景 4 首跑）。**单元测试抓不到它**：
+        那些测试都是从一段干净的历史建快照，压根构造不出「跑到一半」的形态。
+        护栏见 `tests/test_subagent_integration.py::ParentSnapshotTest`。
+
+        被丢掉的那条 `assistant` 里可能带着本轮的前言正文（「我用 branch 开一个
+        子 Agent……」），一并丢弃是对的——那句话描述的正是这次尚未完成的委派本身，
+        对子 Agent 没有价值。
+
+        副作用：无（只读当前状态并复制）。
+        """
+        assembled = build_default_prompt(
+            collect_environment(self._config, str(workspace_root())),
+            custom_instructions=self.memory_manager.custom_instructions(),
+            memory_index=self.memory_manager.memory_index(),
+            skill_index=self.skill_manager.index_text(),
+            active_skills="",
+            agent_index=self._agent_index_text(),
+            untrusted_enabled=self._config.web_fetch_enabled,
+        )
+        names = tuple(self._registry.names()) if self._registry is not None else ()
+        # 复用会话存档那套配对清理（同一份实现，不另写一遍）。
+        paired, _dropped = drop_unpaired(list(self.history))
+        return ParentSnapshot(
+            history=tuple(paired),
+            stable=assembled.stable,
+            tool_names=names,
+        )
+
+    def _deliver_subagent_results(self) -> None:
+        """
+        把已完成的子 Agent 结论追加进主历史（spec F21 第 3 步）。
+
+        **c13 修订后本方法退居兜底**：主路径是 Agent Loop 的迭代级交付
+        （见 `agent/gate.py`），那才是「同一次运行内就能拿到结论」的实现。
+        这里保留的是**跨用户消息**的场景——比如一个 `background=true` 的
+        子 Agent 在主对话早已收工之后才跑完，它的结论要在下一条用户消息时补上。
+
+        由 `_run` 在**组装请求之前**调用。
+
+        **为什么追加进历史而不是走一次性的系统提醒**：提醒不进历史，
+        下一轮就消失了，模型在第三轮就会忘记子 Agent 说过什么——
+        而子 Agent 的结论恰恰是**有长期价值**的信息。
+
+        与闸门共用同一份渲染（`render_subagent_message`）。
+
+        消息用 `role="user"` 并包一层标记块：让模型知道这不是人在说话。
+        `display_content` 置空串，使界面与 `/resume` 回放**不**把它显示成
+        一条用户输入（完成通知已经由 TUI 的轮询单独出过一行了）。
+
+        副作用：向 `history` 追加消息并写会话存档。
+        """
+        if self.subagent_service is None:
+            return
+        for record in self.subagent_service.tasks.take_deliverables():
+            # 与闸门共用**同一份**渲染，不另写一遍——两处各拼一次标记块，
+            # 改了其中一处就会出现「同一条结论在历史里长得不一样」。
+            message = render_subagent_message(record)
+            self.history.append(message)
+            self.memory_manager.record_message(message)
+
+    def _cancel_subagents_for_switch(self) -> int:
+        """会话切换（`/clear` / `/resume`）时取消全部子 Agent，返回取消数量。"""
+        if self.subagent_service is None:
+            return 0
+        return self.subagent_service.cancel_all_for_session_switch()
+
+    def agents_report(self) -> str:
+        """
+        `/agents` 的只读报告（spec F24）。
+
+        :returns: 多行文本。服务未启用时给出说明而不是空报告——
+                  用户敲了命令却什么都没有会以为程序坏了。
+
+        副作用：无。
+        """
+        if self.subagent_service is None:
+            return "子 Agent 未启用（需要 protocol: deepseek 且启用工具注册中心）。"
+
+        service = self.subagent_service
+
+        def tools_for(spec) -> str:
+            names = self._registry.names() if self._registry is not None else []
+            result = resolve_toolset(names, spec)
+            return "、".join(sorted(result.allowed)) or "（空，该角色无法启动）"
+
+        def effective_mode_for(spec):
+            if spec.permission_mode is None:
+                return self._engine.mode
+            return narrower_mode(self._engine.mode, spec.permission_mode)
+
+        return render_report(
+            service.catalog,
+            service.tasks.snapshot(),
+            tools_for=tools_for,
+            effective_mode_for=effective_mode_for,
+            project_dir=str(workspace_root() / ".rhinecode" / "agents"),
+            user_dir=str(self._user_dir / "agents"),
+        )
+
+    def cancel_subagents(self, target: Optional[str]) -> str:
+        """
+        取消子 Agent 任务（`/agents cancel`，spec F22/F24）。
+
+        :param target: 任务标识；`None` 或 `"all"` 表示全部
+        :returns: 给用户看的结果文本
+        """
+        if self.subagent_service is None:
+            return "子 Agent 未启用。"
+        return self.subagent_service.cancel(target)
+
+    def running_subagent_count(self) -> int:
+        """当前运行中的子 Agent 数量（状态栏用）。"""
+        if self.subagent_service is None:
+            return 0
+        return self.subagent_service.tasks.running_count()
+
+    def drain_subagent_notifications(self) -> tuple:
+        """
+        取走待通知的已完成任务（TUI 轮询用，spec F21 第 1 步）。
+
+        :returns: 记录元组；服务未启用时为空元组
+
+        由 TUI 在**主线程**每 0.5 秒调一次。取走即置位，因此不会重复通知。
+        """
+        if self.subagent_service is None:
+            return ()
+        return self.subagent_service.tasks.drain_notifications()
 
     def _run_forked_skill(
         self, spec: SkillSpec, arguments: str, display: str, record: bool = True
@@ -1167,6 +1427,14 @@ class ConversationManager:
         """
         self._cancel_event = threading.Event()
 
+        # c13 F21 第 3 步：把已完成的子 Agent 结论追加进主历史。
+        #
+        # **位置卡死在这里**：必须在下面组装请求**之前**、且在一次运行的**最外层**。
+        # 往后挪到循环内部会在「assistant(tool_calls) 与对应的 tool 结果」之间
+        # 插进一条 user 消息，破坏消息协议顺序；往前挪到 TUI 的轮询里则会
+        # 在主循环运行途中改 history，是同一个问题。
+        self._deliver_subagent_results()
+
         # 结构化系统提示（c5）：以项目根为工作目录采集环境信息，拼装出稳定/动态两段。
         # stable 逐轮不变 → 走 system 参数命中缓存；dynamic（环境信息）由循环注入 <system-reminder>。
         # Plan Mode 的引导不再在此构造，改由循环按轮节奏注入（见 loop.run / reminders）。
@@ -1183,6 +1451,9 @@ class ConversationManager:
             memory_index=self.memory_manager.memory_index(),
             skill_index=self.skill_manager.index_text(),
             active_skills="",
+            # c13：角色清单进 135 稳定槽位（排在 Skill 清单之前，见 builder 注释）。
+            # 服务未启用时是空串，槽位整体跳过、输出与 c12 逐字一致。
+            agent_index=self._agent_index_text(),
             # web_fetch 扩展 F4 链路②的第一个调用点（另一个在 _run_forked_skill）。
             untrusted_enabled=self._config.web_fetch_enabled,
         )
@@ -1244,7 +1515,10 @@ class ConversationManager:
             self._cancel_event,
             self._context_manager,
             self.memory_manager.record_message,
-            options=RunOptions(),   # 主对话不排除任何工具
+            options=RunOptions(
+                # c13：子 Agent 闸门。为 None 时循环用 NullGate 兜底、零回归。
+                subagent_gate=self.subagent_gate(),
+            ),
         )
         return self._wrap_events(events, extra_skill=grant_skill)
 

@@ -68,6 +68,25 @@ class Tool(ABC):
     - parameters：参数的 JSON Schema（顶层 type 固定为 "object"），随工具描述发给模型
     - read_only：是否只读。True 表示无副作用（如读文件、搜索），执行前不需确认且可并发；
                  False 表示有副作用（如写文件、执行命令），执行前需用户确认且须串行执行
+    - plan_safe：**规划阶段仍可用**。缺省 False。
+
+                 Plan Mode 的规划阶段只向模型开放只读工具（承诺是「批准前不动手」）。
+                 声明本标志的工具即使 `read_only=False` 也照常出现在那一阶段，
+                 且不被规划阶段守卫拦下。
+
+                 ⚠️ **声明它等于做出一个承诺：本工具在规划阶段不产生任何副作用。**
+                 循环会在调用时多传一个 `plan_stage: bool` 关键字参数告知当前阶段，
+                 因此**声明本标志的工具必须接受它**（签名写成
+                 `execute(self, args, plan_stage=False)`），并据此自我约束。
+
+                 目前唯一的使用者是委派工具：Plan Mode 下最需要把调研赶出主上下文
+                 （规划要读很多东西，而那些内容要一路背到执行阶段），因此它在规划阶段
+                 仍然开放，但**只允许委派给最终工具集全只读的角色**——这个约束由
+                 它自己在 `plan_stage=True` 时执行。
+
+                 只对**非只读**工具有意义：只读工具本来就在规划阶段可用，
+                 而非只读工具一律走串行桶，所以 `plan_stage` 只在串行路径传递。
+
     - system_serial：**系统级串行工具**。为 True 时循环直接放行并强制串行执行，
                  既不进权限管线也不进只读并发桶。
 
@@ -84,6 +103,7 @@ class Tool(ABC):
     parameters: dict = {}
     read_only: bool = True
     system_serial: bool = False
+    plan_safe: bool = False
 
     @abstractmethod
     def execute(self, args: dict) -> ToolResult:

@@ -108,6 +108,30 @@ class ToolRegistry:
         """
         return [tool.to_schema() for tool in self._tools.values() if tool.read_only]
 
+    def planning_schemas(self) -> list[dict]:
+        """
+        导出 **Plan Mode 规划阶段**可用的工具描述（c13）。
+
+        = 只读工具 **+** 声明了 `plan_safe` 的工具。
+
+        :returns: function 描述列表
+
+        与 `readonly_schemas()` 分成两个方法而不是加参数：前者的语义是
+        「哪些工具没有副作用」，是一个关于**工具本身**的事实；本方法的语义是
+        「规划阶段能发什么」，是一条**策略**。把策略混进事实查询里，
+        将来任何一方变化都会牵动另一方。
+
+        用 `or` 而不是两次查询再拼接：一个工具可能同时是只读与 plan_safe
+        （虽然那样声明没有意义），拼接会让它在 schema 列表里出现两次。
+
+        副作用：无。
+        """
+        return [
+            tool.to_schema()
+            for tool in self._tools.values()
+            if tool.read_only or tool.plan_safe
+        ]
+
     @classmethod
     def default(cls) -> "ToolRegistry":
         """

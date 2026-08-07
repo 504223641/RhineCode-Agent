@@ -130,6 +130,168 @@ def seed_with_git(workspace: Path, user_dir: Path) -> None:
     )
 
 
+def seed_builtin_agents(workspace: Path, user_dir: Path) -> None:
+    """
+    验收三个内置角色的预置（c13）。
+
+    造一个**够分量**的小项目：光靠一次全局搜索答不上来，必须真的读几个文件、
+    把调用链串起来才行。这是三个角色能拉开差距的前提——项目太简单的话，
+    explorer 和 planner 会给出几乎一样的答案，什么也验不出来。
+
+    重试机制刻意做成「散在四处、写法各不相同、还带一处坏味道」：
+
+    - `src/config.py`   —— 常量定义（`RETRY_LIMIT` / `RETRY_DELAY`）
+    - `src/http_client.py` —— 固定间隔重试
+    - `src/job_runner.py`  —— 倒计数重试，**自己又硬编码了一个 3**（坏味道）
+    - `src/uploader.py`    —— 重试次数乘 2（另一处坏味道）
+    - `tests/test_retry.py` —— 空壳测试，注释写着「改了要跟着改」
+    - `docs/design.md`     —— 文档里写死了「最多重试三次」（改代码不改它就会不一致）
+
+    于是「把重试改成指数退避」这个问题有真实的层次：要动哪几处、顺序如何、
+    哪些是连带影响（文档、测试）、哪里有坑（两处硬编码）。
+    """
+    seeding.seed_files(
+        workspace,
+        {
+            "src/config.py": (
+                '"""全局配置。"""\n'
+                "\n"
+                "RETRY_LIMIT = 3\n"
+                "RETRY_DELAY = 1.0\n"
+                "TIMEOUT_SECONDS = 30\n"
+                "POOL_SIZE = 8\n"
+            ),
+            "src/http_client.py": (
+                "import time\n"
+                "\n"
+                "from src.config import RETRY_DELAY, RETRY_LIMIT\n"
+                "\n"
+                "\n"
+                "def fetch(url):\n"
+                '    """固定间隔重试。"""\n'
+                "    for attempt in range(RETRY_LIMIT):\n"
+                "        try:\n"
+                "            return _do_fetch(url)\n"
+                "        except OSError:\n"
+                "            time.sleep(RETRY_DELAY)\n"
+                "    raise RuntimeError('fetch failed')\n"
+                "\n"
+                "\n"
+                "def _do_fetch(url):\n"
+                "    return url\n"
+            ),
+            "src/job_runner.py": (
+                "import time\n"
+                "\n"
+                "from src.config import RETRY_DELAY\n"
+                "\n"
+                "\n"
+                "def run_job(job):\n"
+                '    """倒计数重试。注意这里没有用 RETRY_LIMIT，而是自己写死了 3。"""\n'
+                "    remaining = 3\n"
+                "    while remaining > 0:\n"
+                "        if job():\n"
+                "            return True\n"
+                "        remaining -= 1\n"
+                "        time.sleep(RETRY_DELAY)\n"
+                "    return False\n"
+            ),
+            "src/uploader.py": (
+                "from src.config import RETRY_LIMIT\n"
+                "\n"
+                "\n"
+                "def upload(blob):\n"
+                '    """上传比抓取更值得多试几次，所以这里乘了 2。"""\n'
+                "    tries = RETRY_LIMIT * 2\n"
+                "    for _ in range(tries):\n"
+                "        if _put(blob):\n"
+                "            return True\n"
+                "    return False\n"
+                "\n"
+                "\n"
+                "def _put(blob):\n"
+                "    return True\n"
+            ),
+            "tests/test_retry.py": (
+                "def test_retry_count():\n"
+                "    # RETRY_LIMIT 改成别的值之后这条要跟着改\n"
+                "    assert True\n"
+            ),
+            "docs/design.md": (
+                "# 设计说明\n"
+                "\n"
+                "## 重试策略\n"
+                "\n"
+                "网络请求失败后**最多重试三次**，每次间隔 1 秒。\n"
+                "上传任务比抓取更重要，重试次数翻倍。\n"
+            ),
+            "README.md": "# 演示项目\n\n一个带重试机制的小服务。\n",
+        },
+    )
+    seeding.seed_rhine_md(workspace, "# 本项目\n\n用中文回答。\n")
+
+
+def seed_subagents(workspace: Path, user_dir: Path) -> None:
+    """
+    C13 真实模型验收的预置（子 Agent 系统）。
+
+    放了三样东西，各对应一条待验判据：
+
+    1. **一个够真实的代码库**——同一个符号 `RETRY_LIMIT` 散落在三个文件里。
+       这是「该委派而不该自己硬翻」的典型任务：要看清全貌得读好几个文件，
+       而那些内容对主对话毫无价值。用于验 AC6b / 场景 7（模型会不会**主动**委派）
+       与场景 8（结论是否自包含、可直接用）。
+    2. **一个项目级角色 `auditor`**——用于验 AC4（项目级角色每次启动都提示）。
+       它刻意**只读**，好让缺省档下也能真的跑起来。
+    3. **不预置任何 allow 规则**——于是场景 3（权限边界）成立：
+       委派一个要写文件的任务时，写入会在非交互环境下被自动拒绝，
+       观察子 Agent 是就此收敛并在结论里说明，还是反复重试。
+    """
+    seeding.seed_files(
+        workspace,
+        {
+            "src/config.py": "# 全局配置\nRETRY_LIMIT = 3\nTIMEOUT_SECONDS = 30\n",
+            "src/client.py": (
+                "from src.config import RETRY_LIMIT\n"
+                "\n"
+                "def fetch(url):\n"
+                "    for attempt in range(RETRY_LIMIT):\n"
+                "        pass\n"
+            ),
+            "src/worker.py": (
+                "from src.config import RETRY_LIMIT\n"
+                "\n"
+                "def run_job(job):\n"
+                "    remaining = RETRY_LIMIT\n"
+                "    while remaining > 0:\n"
+                "        remaining -= 1\n"
+            ),
+            "tests/test_client.py": (
+                "def test_retry():\n"
+                "    # RETRY_LIMIT 改成 5 之后这条要跟着改\n"
+                "    assert True\n"
+            ),
+            "README.md": "# 演示项目\n\n一个用来验证子 Agent 委派的小项目。\n",
+        },
+    )
+    seeding.seed_rhine_md(workspace, "# 本项目\n\n用中文回答。\n")
+    seeding.seed_project_agent(
+        workspace,
+        "auditor",
+        {
+            "description": (
+                "需要检查代码里是否存在硬编码常量、重复定义、缺少测试覆盖这类问题时用它。"
+                "只读，不会修改任何东西。"
+            ),
+            "tools": "read_file, glob_files, grep_content",
+            "permission_mode": "strict",
+            "max_turns": 10,
+        },
+        "你是代码审查员。只读地检查问题，最后一段给出自包含的结论，"
+        "写清每个问题的文件路径与具体位置。不要尝试修改任何文件。",
+    )
+
+
 def seed_isolated_skill(workspace: Path, user_dir: Path) -> None:
     """
     预置一个**独立模式**且**指定了模型**的 Skill（AC30）。

@@ -870,6 +870,13 @@ class AllTypesTest(TraceHookBase):
             # c12 Hook 两类
             T.HOOK_DISPATCH: {"event": "pre_tool_use", "matched": 1, "executed": 1},
             T.HOOK_EXECUTE: {"rule": "禁止 push", "action_type": "command", "ok": True},
+            # c13 子 Agent 两类
+            T.SUBAGENT_START: {
+                "kind": "role", "agent": "explorer", "task_id": "a3f1c9", "tool_count": 3,
+            },
+            T.SUBAGENT_END: {
+                "task_id": "a3f1c9", "status": "completed", "turns": 4, "usage_tokens": 120,
+            },
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

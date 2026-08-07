@@ -93,6 +93,7 @@ def build_default_prompt(
     memory_index: str = "",
     skill_index: str = "",
     active_skills: str = "",
+    agent_index: str = "",
     untrusted_enabled: bool = False,
 ) -> AssembledPrompt:
     """
@@ -124,6 +125,9 @@ def build_default_prompt(
     :param custom_instructions: 「自定义指令」槽位内容（c9：RHINE.md 拼接结果），空串跳过
     :param memory_index: 「长期记忆」槽位内容（c9：记忆索引），空串跳过
     :param skill_index: 「可用 Skill 清单」槽位内容（c11：第一阶段清单），空串跳过
+    :param agent_index: 「可用子 Agent 角色」槽位内容（c13：角色清单），空串跳过。
+        进稳定通道且排在 Skill 清单**之前**——它在会话内恒定不变（本章无 reload），
+        比会随热更新变化的 Skill 清单更稳定，理由见 `optional_slots` 的注释
     :param active_skills: 「已激活 Skill」槽位内容（c11：已激活 SOP 正文），空串跳过
     :returns: AssembledPrompt(stable=固定模块+记忆槽位+Skill 清单,
               dynamic=环境信息+已激活 Skill)
@@ -153,8 +157,19 @@ def build_default_prompt(
     builder.add(
         PromptModule(name="已激活 Skill", priority=120, cacheable=False, content=active_skills)
     )
-    # 其余仍为空的预留槽：跳过上面已实际填充的四个，避免重复添加空槽。
-    _FILLED = ("自定义指令", "长期记忆", "可用 Skill 清单", "已激活 Skill")
+    # c13 填充的角色清单槽。同样进 stable，且排在 Skill 清单**之前**（135 < 140）——
+    # 它在会话内恒定不变，比会随热更新变化的清单更稳定。
+    builder.add(
+        PromptModule(name="可用子 Agent 角色", priority=135, cacheable=True, content=agent_index)
+    )
+    # 其余仍为空的预留槽：跳过上面已实际填充的五个，避免重复添加空槽。
+    _FILLED = (
+        "自定义指令",
+        "长期记忆",
+        "可用 Skill 清单",
+        "已激活 Skill",
+        "可用子 Agent 角色",
+    )
     for slot in optional_slots():
         if slot.name in _FILLED:
             continue

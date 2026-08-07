@@ -214,6 +214,30 @@ def _s_hook_execute(r: dict) -> str:
     )
 
 
+def _s_subagent_start(r: dict) -> str:
+    """
+    一次委派的发起（c13）。
+
+    任务描述只取前 60 字符（换行按 `_text_of` 的统一口径渲染成 `⏎`）：
+    它可能是一大段，时间线上一行一条的摘要装不下，也不需要——
+    全文在展开单条（`--seq`）时看得到。
+    """
+    who = r.get("agent") or "(branch)"
+    return (
+        f"{r.get('kind')}:{who} [{r.get('task_id')}]"
+        f" · 工具 {r.get('tool_count', 0)} 个 · {_text_of(r.get('task'), 60)}"
+    )
+
+
+def _s_subagent_end(r: dict) -> str:
+    """子 Agent 的结束（c13）。轮次与用量是判断「它是不是跑偏了」的第一依据。"""
+    return (
+        f"[{r.get('task_id')}] {r.get('status')}"
+        f" · {r.get('turns', 0)} 轮 · {r.get('usage_tokens', 0)} token"
+        f" · {r.get('stop_reason') or '-'}"
+    )
+
+
 SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.SESSION_START.value: _s_session_start,
     TraceEventType.SESSION_END.value: _s_session_end,
@@ -232,6 +256,8 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.HISTORY_RESTORED.value: _s_history_restored,
     TraceEventType.HOOK_DISPATCH.value: _s_hook_dispatch,
     TraceEventType.HOOK_EXECUTE.value: _s_hook_execute,
+    TraceEventType.SUBAGENT_START.value: _s_subagent_start,
+    TraceEventType.SUBAGENT_END.value: _s_subagent_end,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」
