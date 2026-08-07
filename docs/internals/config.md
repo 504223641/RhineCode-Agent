@@ -8,6 +8,10 @@
 
 `config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（anthropic/openai/deepseek）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。可选字段 `context_window`（c8）声明上下文窗口上限（token），作为「历史是否逼近溢出、何时压缩」的判断基准；缺省 / 非法 / 非正值都由 `_parse_int` fail-safe 回退默认 65536（不抛异常），故首次生成的模板**不含**此项——没写即用默认值，想调大/调小手动加一行即可。注意它只影响 RhineCode 的压缩时机，不改变模型真实上限，应贴近所用模型的实际上下文长度。 可选字段 `web_fetch_enabled`（web_fetch 扩展）是网络访问工具的总开关，缺省 `true`；设为 `false` 后工具不注册、系统提示不含「外部不可信内容」那条约束、权限规则里的 `WebFetch(domain:...)` 不做语法校验也不产生警告——**行为与该扩展之前逐字一致**。注意它走 `_parse_bool`：**非法值抛 ValueError**（与 `debug_log` 同口径），而不是像 `context_window` 那样回退默认——一个开关被写成 `maybe` 是明确的配置错误，静默回退会让用户以为自己关掉了网络访问而实际上没关。
 
+可选段 `worktree`（c14）配置子 Agent 隔离工作区的两件事：`cleanup_days`（启动时清理多少天没动过的工作区，缺省 7；**0 或负数 = 不清理**——这是它与 `context_window` 的关键差别，后者遇到 0 会回退默认，而这里 0 是合法语义，靠 `_parse_int` 的 `allow_zero=True` 表达）、`copy` 与 `link`（环境初始化清单，两段都缺省为空）。整段可缺省；**非法结构一律回退默认、不抛错**——与 `web_fetch_enabled` 刻意不同口径，理由是这三项都不是安全开关，写错了最坏是「没清理」或「没复制文件」，而 `web_fetch_enabled` 写错会让用户以为关掉了网络访问却没关。
+
+⚠ **清理与「有没有变更」的关系要说清楚**：`cleanup_days` 只决定「要不要考察某个工作区」，**不决定能不能删**。有未提交改动的工作区**永远不会**被清理（不论多老）；有提交、无未提交改动的只删目录、**保留分支**（成果仍可 `git checkout` 取回）。
+
 配置定位（`rhinecode/config.py` + `__main__.py`）：命令**不带 `--config` 时缺省读用户级全局配置 `~/.rhinecode/config.yaml`**，使 `rhine` 在任意工作目录都能读到同一份配置（工作目录本身仍作为 AI 操作的项目根，二者互不影响）。该缺省文件不存在时首次运行会自动写入模板（`scaffold_user_config`，占位 `api_key: YOUR_API_KEY`）并提示后退出；模板占位符会被 `__main__` 单独拦下引导（占位符是非空串、能过 `load()` 校验，不拦会带假 key 启动）。显式 `--config <路径>` 优先且指向不存在的文件时按错误处理（不自动造文件）。
 
 首次运行的模板生成是**四类统一**的（都在缺省流程、仅动用户级 `~/.rhinecode/`）：`__main__` 依次调 `config.scaffold_user_config` / `permission.config.scaffold_user_config` / `mcp.config.scaffold_user_config` / `hooks.config.scaffold_user_config`。语义分两类——`config.yaml` 必需，本次才生成时引导填 key 后退出；`permissions.yaml` / `mcp.yaml` / `hooks.yaml` 可选、模板**全注释**（`yaml.safe_load` 得 `None`、`_load_layer` 返回空集，与无文件等价），静默生成、**不因它们退出**，老用户下次运行会顺带补上。新增 config 模块要接入首次生成，需在其 `config.py` 加 `_CONFIG_TEMPLATE` + `scaffold_user_config` 并在 `__main__` 那段追加一次调用（**成对维护点**）。

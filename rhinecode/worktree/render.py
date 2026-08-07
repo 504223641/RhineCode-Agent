@@ -28,7 +28,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from rhinecode.worktree.models import ChangeStatus, WorktreeHandle
+from rhinecode.worktree.models import ChangeStatus, CleanupReport, WorktreeHandle
 
 # 变更文件清单最多列几项。超出部分折叠成「等 N 个文件」。
 #
@@ -114,4 +114,34 @@ def render_delivery(
     return "\n".join(lines)
 
 
-__all__ = ["render_delivery"]
+def render_cleanup_notice(report: CleanupReport) -> str:
+    """
+    渲染启动清理的结果，供首屏提示（spec F21）。
+
+    :param report: 清理结果
+    :returns: 多行文本；无内容时返回空串
+
+    ⚠ **被删除条目的分支名必须列出来。**
+
+    用户看到「目录没了」时，唯一能让他不慌的信息就是「成果还在 xxx 分支上」。
+    不列的话，一个删掉了三个工作区的启动会让人以为丢了三份工作——
+    而实际上一个提交都没少（删的只是工作目录，commit 在共享版本库里）。
+
+    未删除的条目也要列**并说明原因**：它们占着磁盘却没被回收，用户有权知道
+    为什么，否则下次还会问同样的问题。
+    """
+    if report.is_empty:
+        return ""
+
+    lines = ["隔离工作区清理："]
+    for name, branch in report.removed:
+        if branch:
+            lines.append(f"- 已回收 {name}（成果保留在分支 {branch}，可 git checkout 取回）")
+        else:
+            lines.append(f"- 已回收 {name}（无任何变更，目录与分支一并删除）")
+    for name, reason in report.kept:
+        lines.append(f"- 保留 {name}：{reason}")
+    return "\n".join(lines)
+
+
+__all__ = ["render_delivery", "render_cleanup_notice"]

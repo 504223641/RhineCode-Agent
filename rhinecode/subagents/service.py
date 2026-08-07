@@ -306,6 +306,9 @@ class SubAgentService:
         return create_worktree(
             main_project_root(),
             name=None,
+            # c14 F24：把记录器递下去。运行器与服务共用同一个（`SubAgentRuntime`
+            # 里那份），因此创建、初始化、结束三类事件落在同一条时间线上。
+            recorder=getattr(self.runtime, "recorder", None),
             agent_name=agent_name,
             # 用一次性随机短串区分并发委派。**刻意不用任务 ID**：
             # 任务记录要等工作区建成之后才创建（创建失败时不该留下记录），

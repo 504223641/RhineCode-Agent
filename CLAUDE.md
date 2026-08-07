@@ -15,7 +15,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | [`internals/capabilities.md`](docs/internals/capabilities.md) | 想知道某个能力的**实际行为与边界**：阈值多少、失败怎么降级、哪些 Provider 生效 |
 | [`internals/testing.md`](docs/internals/testing.md) | 要加/改测试，或想知道某个行为**有没有护栏钉着** |
 | [`internals/config.md`](docs/internals/config.md) | 要动配置加载、新增配置项或模板生成 |
-| [`docs/c13/README.md`](docs/c13/README.md) | **当前章节**（C13 子 Agent 系统）的 spec/plan/task/checklist |
+| [`docs/c14/README.md`](docs/c14/README.md) | **当前章节**（C14 子 Agent 工作区隔离）的 spec/plan/task/checklist |
+| [`docs/c13/README.md`](docs/c13/README.md) | C13（子 Agent 系统）的四份文档 |
 | [`docs/c12/README.md`](docs/c12/README.md) | C12（Hook 系统）的四份文档 |
 | [`docs/c11/README.md`](docs/c11/README.md) | C11 的四份文档与验收记录导航 |
 | [`docs/extensions/README.md`](docs/extensions/README.md) | **工具/能力扩展**（不占章节号）的文档在哪、以及「该开新章节还是算扩展」怎么判 |
@@ -25,7 +26,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 学习与解释要求、已知后续工程项。索引解决「我要查点东西」，解决不了
 「我不知道自己需要知道」——所以这几类不能挪进分册。
 
-当前主线到 **C13**，以 DeepSeek Provider 为主。能力自下而上分层，每一层都仍在生效：
+当前主线到 **C14**，以 DeepSeek Provider 为主。能力自下而上分层，每一层都仍在生效：
 
 | 章节 | 能力 | 一句话 |
 | --- | --- | --- |
@@ -38,6 +39,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | C10 | 斜杠命令系统 | 单一 `CommandSpec` 注册表同时驱动执行 / `/help` / 补全 / 高亮；本地与界面命令绕过 Agent，未知命令不进 AI |
 | C11 | Skill 系统 | 把重复输入的提示词封装成独立 Markdown 文件（三级存放、两阶段加载、`context: fork` 子对话、`allowed-tools` 预授权、自动注册短命令）。**已对齐 Agent Skills 开放标准**，外部 Skill 目录复制进来即可用。字段与行为细节见下一节 |
 | C13 | **子 Agent 系统** | 主 Agent 把子任务委派给独立上下文的子 Agent，只拿回结论。两条路径：**定义式**（Markdown+frontmatter 定义的角色，从空白对话起步）与**分支式**（继承父历史快照、强制后台）。子 Agent 一律独立线程运行、**全程非交互**（判 ASK 自动拒绝）、能力**只会比主对话小**（工具集三层过滤 / 权限只能收紧 / 不继承回合级预授权）。**委派永不阻塞**（多个委派天然并行），结论在 Agent Loop 的**每轮迭代**注入主历史，且模型准备收工时循环会停下来等它。内置三个角色：`explorer`（只读调研）/ `planner`（只读方案）/ `general-purpose`（全工具执行） |
+| C14 | **子 Agent 工作区隔离** | 声明了 `isolation: worktree` 的角色，每次委派在一个**独立的 Git 工作目录**里跑（`.rhinecode/worktrees/<名字>`，共享版本库、各自一个分支、基于当前 HEAD）。地基是**工作目录从进程级隐式状态改成显式参数**：路径边界判定（权限管线第②层）按**调用者的工作目录**进行，因此隔离是**物理的**而非约定的。**创建失败明确失败、绝不降级**；成果经分支交付，交付信息由**系统**追加而非模型自述；结束时无变更即回收，启动时清理过期条目（三层过滤，有未提交改动一律不删） |
 | C12 | **Hook 系统** | 在生命周期的固定节点上挂用户声明的自动化动作。一条规则 = **事件 + 条件（可省）+ 动作**，从两层 YAML 加载。十二个事件覆盖会话 / 回合 / 消息 / 工具四层加三个系统级；四种动作（shell 命令 / 注入提示词 / HTTP / 子 Agent 占位）；三种执行控制（只跑一次 / 后台异步 / 超时）。**`pre_tool_use` 可拦截，且只能收紧不能放宽**——详见下一节与「安全边界」 |
 
 ### C13 的角色定义格式（不请自来才有用，故留在主文件）
@@ -55,9 +57,10 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | `model` | `inherit`（缺省）或具体模型名 |
 | `max_turns` | 迭代上限，缺省 15，硬顶 25（越界只夹取并警告） |
 | `permission_mode` | 声明档位。**写放行档不产生提权效果**，实际生效取 `min(主对话档, 本值)` |
+| `isolation` | **c14**：写 `worktree` 表示该角色每次委派都在独立的 Git 工作目录里跑。它是**缺省值**，委派时还能在本次调用上要求隔离，合并方向**单向加严**（角色声明了，模型关不掉） |
 
-连字符与下划线两种写法都认。Claude Code 有而本项目不支持的八个字段
-（`skills` / `memory` / `isolation` / `color` / `hooks` / `mcp_servers` /
+连字符与下划线两种写法都认。Claude Code 有而本项目不支持的七个字段
+（`skills` / `memory` / `color` / `hooks` / `mcp_servers` /
 `background` / `effort`）**只产生具名警告、不阻断加载**——用户是从别处复制来的，
 他需要知道具体哪一项没生效。正文是该角色的系统提示，**可以为空**
 （只靠工具白名单收窄行为的角色是合法的）。
@@ -126,6 +129,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 | MCP | `mcp/` | 配置、JSON-RPC、两种传输、工具适配、多 Server 编排 | stdio 的 stderr 必须后台 drain，否则 Server 写日志会把子进程写阻塞 |
 | Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 | 写盘权收拢在 manager 的锁临界区内——拿锁的人就是写盘的人 |
 | Hooks | `hooks/` | Hook 规则的解析/条件求值/动作执行/分发编排 | 两条：**Hook 只能收紧不能放宽**（`HookDecision` 里没有 ALLOW，`_apply_hook_ask` 只把 ALLOW 升级为 ASK、绝不降级 DENY）——这是本章全部安全论证的依据；**加锁临界区只做纯内存读写**，动作执行、埋点、跨线程调度一律在锁外，违反会让一个 60 秒超时的命令锁死整个 manager，界面假死而调用栈上无线索 |
+| Worktree | `worktree/` | 隔离工作区的建/查/删与启动清理，**全项目唯一执行 git 的地方**（c14） | 两条：**`lifecycle.remove` 是唯一删除入口**，它先过纯判定 `judge_removal` 的三层过滤（①位置必须严格落在 `.rhinecode/worktrees/` 内且不等于它本身 ②归属必须被版本库登记 ③有未提交改动一律否决），未获许可**一步都不往下走**——绕过它等于把「空变量 rmtree 删掉整个仓库」那次事故的闸门拆了；**名字校验必须先于任何路径拼接**，先拼后验时越界路径已经产生，任何一处漏检返回值就直接落盘 |
 | SubAgents | `subagents/` | 角色解析/三层扫描/工具过滤/任务表/运行器/服务门面（c13） | 三条：**权限必须 `derive()` 派生，绝不改主引擎的 `mode`**——引擎是单实例共享、`mode` 与 `turn_rules` 都可变，后台线程改它等于静默改掉主对话的权限档位，界面上完全看不出来；**`TaskManager` 加锁临界区只做纯内存读写**，`Event.set()` 一律在锁外（它唤醒等待线程，属跨线程调度），且本类**刻意不持有任何回调**、从结构上杜绝违反；**运行器绝不调 `hooks.consume_injections()`**——那是个会被取走的队列，子 Agent 消费它会让主对话的注入型 Hook 凭空消失 |
 | Skills | `skills/` | Skill 解析/发现/渲染/预授权翻译/激活编排（叶子包） | **加锁不变量**：临界区只做纯内存读写，一切回调与跨线程调度在锁外——违反会与 Textual 阻塞式 `call_from_thread` 组成**确定性死锁，整个 TUI 冻结** |
 | Context | `context/` | 两层压缩：估算、工具结果存盘、LLM 摘要 | `allow_summary` 必须在 `and` 链最前面短路——锚点对应主历史，拿它估子对话毫无意义 |
@@ -146,6 +150,10 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
+- **`cwd` 的四个分发点（c14）** → `agent/loop.py` 的**并发只读桶** + **串行桶** + `to_request` + **hook 分发**，四处齐改。⚠ **最容易漏的是并发桶**：既有的 `plan_stage` 只在串行路径传（它只对非只读工具有意义），照抄那个写法就会漏掉并发路径——而 `read_file` / `glob_files` / `grep_content` 全是只读工具、全走那条。漏掉的后果是隔离子 Agent 的**读**落到主项目根、**写**却是对的，界面上完全看不出来。护栏见 `tests/test_loop_cwd_dispatch.py`
+- **新增路径判定函数 / 新增 `PermissionRequest` 的构造点（c14）** → **`root` 与 `cwd` 一律不给默认值**。给了默认值就等于「忘记传的地方静默按主项目根判定」，一次隔离故障会静默变成一次越权。无默认值让遗漏在开发期就变成 `TypeError`——这个代价是**故意付的**（改造时它让 141 处测试当场红，那正是它的价值）
+- **给搜索类工具加逐文件过滤器（c14）** → 过滤器签名是 `(相对路径, 本次调用的工作目录)`，**第二个参数不可省**。漏掉不会报错：构造权限请求时缺参数抛 `TypeError`，被调用点外面的 `except Exception: return False`（fail-safe）吞掉，于是**所有文件都被判拒绝**、工具照常返回 ok=True 而结果为空——用户看到的是「grep 什么都搜不到」。改造期真踩过
+- **新增 worktree 行为记录事件（c14）** → `trace/models.py` 的枚举 + `trace/reader.py` 的 `SUMMARIZERS`。与既有那条同一个坑，漏后者只显示成「（未登记类型）」
 - **改动角色正文里「结论怎么回流」的说法（c13）** → 必须与 `runner._extract_conclusion` 的实际口径一致：它取的是**最后一条 assistant 消息的全文**，不是「最后一段」。三个内置角色正文 + `SUBAGENT_CONVENTIONS` 都得同口径。**说错了不报错**，只是模型照着字面理解、在结论前面写一堆过程叙述，而那些全都会被带回主对话（真实模型实测过）。护栏见 `test_subagent_builtin.py::test_body_says_the_whole_reply_is_returned`
 - **子 Agent 的产品级约定写在运行器里，不写进角色正文** → `subagents/runner.py` 的 `SUBAGENT_CONVENTIONS`。语言约定与结论长度这两条与角色是谁无关；写进内置角色正文的话，**用户自己写的角色一个都盖不到**。⚠️ 子 Agent 的系统提示只有角色正文，`RHINE.md` 里的项目约定（比如「用中文回答」）**到不了它**
 - **新增「规划阶段仍可用」的工具（c13）** → 声明 `Tool.plan_safe = True` + **该工具的 `execute` 必须接受 `plan_stage: bool` 关键字参数**（循环会传）。⚠️ 声明它等于承诺「规划阶段不产生副作用」，工具**必须自己兑现**——循环只负责把阶段告诉它。另：规划阶段守卫的豁免条件是 `plan_safe`，**不是 `system_serial`**（那条豁免原本为 `load_skill` 写、长期空转，被 `run_agent` 激活后成了 Plan Mode 的漏洞，实测规划阶段真的执行了委派）。护栏见 `tests/test_subagent_plan_stage.py::PlanGuardTest`（两个假工具只差这一个标志、行为必须相反）
@@ -283,7 +291,7 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 
 ## Spec 驱动开发
 
-开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c13/`。
+开发新功能/章节前使用 `/spec` 技能，协作澄清需求后依次生成 `spec.md → plan.md → task.md → checklist.md`，再据此开发与验收。当前主线章节为 `docs/c14/`。
 
 **四份文档放哪，取决于这次做的是「章节」还是「扩展」**：引入新能力层级、架构表要多一层的进 `docs/<章节>/`；在既有层上加工具/加规则/扩边界的进 `docs/extensions/<扩展名>/`，**不占章节号**。判据只有一条：`CLAUDE.md` 的能力表要不要多一行——要就是章节，不要就是扩展。详见 [`docs/extensions/README.md`](docs/extensions/README.md)。
 
@@ -303,7 +311,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 1728 项，skipped 4
+python -m unittest discover -s tests      # 1969 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -373,6 +381,28 @@ python -m unittest discover -s tests      # 1728 项，skipped 4
   循环会停下来等子 Agent——**刻意不设体验意义上的超时**（跑子 Agent 就是在执行任务，
   与主 Agent 自己跑一遍测试套件性质相同）。因此 `gate.wait_any` 必须检查取消信号，
   不检查就等于按了 `Esc` 没用。
+- **子 Agent 工作区隔离（c14）六条**：
+  ① **隔离是物理的，不是约定的。** 隔离子 Agent 出不去，不是因为它守规矩，而是
+  因为它每一次路径请求都在权限管线**第②层**被以它自己的工作区为界量过。
+  相对上级引用、绝对路径、指向外面的符号链接三种写法一律在那里被拒。
+  ② **隔离只收紧、不放宽。** 隔离子 Agent 的能力是非隔离子 Agent 的**子集**：
+  沙箱根从主项目根缩小为隔离工作区，其余四层逐字不变；C13 那条「子 Agent 的能力
+  只会比主对话小」原样成立。`isolation` 的合并方向同样是**单向加严**——
+  角色声明了隔离，模型在调用时关不掉（写角色定义是人在表达约束，
+  让模型撤销它等于把开关交给被约束的一方）。
+  ③ **工作目录缺失时拒绝，绝不回退到主项目根。** 回退看似健壮，实际会造成
+  「权限引擎按隔离工作区批准了 `a.py`、工具却写到主项目根的 `a.py`」——
+  **批准的和写的不是同一个文件**，两边都不报错。
+  ④ **创建失败明确失败，不降级为无隔离运行。** 降级是本项目通篇最忌讳的形态：
+  用户配了隔离却没隔离，而界面上完全看不出来；等到子 Agent 与主 Agent
+  互相覆盖文件时，谁也想不到根因是隔离静默失效了。
+  ⑤ **自动删除绝不丢失无法从版本库取回的内容。** 未提交的改动只存在于那个目录里，
+  因此它的存在是删除的**无条件否决**（不看过期时长、不看提交数）；已提交的内容
+  删掉目录也还在共享版本库中，故「有提交」时只删目录、**保留分支**。
+  ⑥ **隔离工作区里的产物与主项目同级敏感。** 它是一份完整的源码 checkout，
+  且环境初始化可能把本地配置（含密钥）复制进去。`.rhinecode/worktrees/` 已加入
+  `.gitignore`，勿提交。另：**环境初始化只按显式清单执行、不做任何启发式**——
+  自动识别会把含明文 API Key 的 `config.yaml` 复制进多个临时目录。
 - 行为记录（trace，测试设施）：**产物比会话存档更敏感**——里面既有完整的模型请求与响应，也有每次工具执行的参数与**输出原文**（被读过的文件内容、命令输出）。如果模型在对话中读过配置文件，那份内容会原样进入 `tool_execute` 事件，**其中可能含明文 API Key**。三条纪律：① 忽略规则要加在**启动 `rhine` 的那个项目**里——trace 产物落在该项目根的 `.rhinecode/traces/` 下，而本仓库 `.gitignore` 的那行只在开发 RhineCode 时生效；去别的项目跑 trace 前，先给那个项目的 `.gitignore` 补上 `.rhinecode/traces/`（**实测过：不补就会被 `git status` 列出来**）。勿提交、勿外传、勿贴进 issue；② `session_start` 的配置快照里 `api_key` 已被固定掩码替换（`redact_config` 是白名单式逐字段取值，新增含密字段默认不记录），但这**只保证配置快照**——工具输出里的泄漏不在它的职责范围内，由 `.gitignore` 兜底；③ 记录器**不改变任何权限判定**，它只观测；`--trace` 不是权限开关，开启它不会让模型多做任何一件事。另：记录失败一律静默（写盘失败、路径不可写、负载序列化异常全被吞掉），这是**有意的**——观测设施绝不能反过来阻断被观测的系统。
 - 端到端驱动设施（P1a，测试设施）四条：① **控制通道不鉴权**——它只绑 `127.0.0.1`、只在宿主活着的这段时间存在，任何能在本机跑程序的人都能连上去驱动它。这是刻意接受的取舍（加鉴权会让一个测试设施凭空多出密钥管理），代价是**驱动期间应把本机视为可信环境**；真实模式尤其要注意，那时宿主进程持有你的真实凭据。② **驱动器不扩大权限面**——它替人应答只是换了第⑤层人在回路的执行者，前四层一字不动：驱动者选「放行」的危险命令照样在第①层黑名单被拦下（`test_e2e_host.py` 有专门护栏钉着这条）。③ **`exclude_tools` 摘掉的两个工具是隔离边界的一部分**：`mcp_add_server` 会写**真实**用户主目录且不吃 `user_dir`，`mcp_resolve_server` 虽是 `read_only=True` 却要访问外部包索引——而只读且被放行的工具**根本不弹面板**，应答者拦不住它。改动这个集合前先想清楚隔离还成不成立。④ **宿主的记录产物与 trace 同等敏感**（它就是 trace），落在临时工作区里、随宿主退出一并删除；用 `--keep-workspace` 保留时请自行按上一条的三条纪律处理。
 - **网络访问（web_fetch 扩展）**：这是 RhineCode 第一个**能主动向外发送数据**的工具，三条要点——
@@ -429,7 +459,8 @@ python -m unittest discover -s tests      # 1728 项，skipped 4
 
 13. **Hook 系统后续项（C12 spec 明确不做）**：子 Agent 动作的真实运行（现为占位，等 SubAgent 章节对接）、`once` 标记的持久化、Hook 执行顺序的显式优先级、迭代级事件（Agent Loop 内单轮迭代不开放挂载点——那是引擎内部结构，暴露成配置契约会让循环结构的任何调整都成为破坏性变更）、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、Skill/MCP 形态的 Hook 动作、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果（Claude Code 的 `updatedInput` / `updatedToolOutput`）。
 
-14. **子 Agent 系统后续项（C13 spec 明确不做）**：Worktree 文件隔离、多 Agent 团队编排
+14. **子 Agent 系统后续项（C13 spec 明确不做）**：~~Worktree 文件隔离~~ **已于
+    2026-08-08 由 C14 兑现**（`docs/c14/`）；多 Agent 团队编排
     （子 Agent 之间不通信、不互相委派）、后台任务的跨会话持久化、子 Agent 的人在回路、
     角色的持久记忆（Claude Code 的 `memory` 字段）、角色预加载 Skill（`skills` 字段）、
     插件级角色、角色定义热更新（`/agents reload`）、子 Agent 内嵌 Plan Mode、
@@ -441,6 +472,25 @@ python -m unittest discover -s tests      # 1728 项，skipped 4
     保留结构位是为了将来真需要区分时有落点，**但不为它造人为差异**——
     那会让同一个角色在两种场景下行为不同而配置上看不出来。
     护栏 `test_subagent_toolset.py::BackgroundLayerTest` 钉住「前后台结果一致」。
+
+15. **子 Agent 工作区隔离后续项（C14 spec 明确不做）**：主对话自身进出隔离工作区
+    （本章只做子 Agent 隔离，主对话的工作目录是不变量——做它意味着工作目录成为
+    运行期可变状态，C8 上下文存盘、C9 会话存档与记忆、各层配置文件的路径假设
+    全部要重新定义）、工作区之间的合并策略与代码同步、后台定时清理与手动清理入口、
+    把主项目根的未提交改动带入工作区、由系统代替子 Agent 提交、环境初始化的启发式
+    自动识别、Git 钩子的禁用与定制、按「已合并」判定删除分支、非 Git 版本控制系统
+    的隔离、工作区的跨会话持久化编目。
+
+    另有**三条已知边界**（与已知项 #4 的 OS 级沙箱同源，本章解决不了）：
+
+    - **MCP 工具不受工作目录隔离约束**。它们在权限管线里落 `kind="other"`
+      （无路径判定），且 MCP Server 是装配期以主项目根为工作目录启动的外部进程。
+      隔离子 Agent 调用 MCP 工具时，该工具的文件访问仍发生在主项目根。
+    - **`run_command` 子进程内部的路径访问不受约束**。子进程的 `cwd` 是隔离工作区，
+      但它自己用绝对路径访问主项目根仍然可行。
+    - **隔离工作区里没有 `.rhinecode/`**（它被忽略规则排除，checkout 不出来）。
+      这不影响项目级 `permissions.yaml` / `hooks.yaml` 生效——那些配置在装配期就已
+      从主项目根加载进内存，子 Agent 共享同一份引擎与 Hook 编排者。
 
 15. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
 

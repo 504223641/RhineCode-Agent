@@ -48,7 +48,7 @@ from rhinecode.worktree.models import (
     WorktreeNameError,
 )
 from rhinecode.worktree.naming import generate_name, validate_name
-from rhinecode.worktree.render import render_delivery
+from rhinecode.worktree.render import render_cleanup_notice, render_delivery
 
 __all__ = [
     # 生命周期
@@ -59,6 +59,7 @@ __all__ = [
     "scan_and_clean",
     # 渲染
     "render_delivery",
+    "render_cleanup_notice",
     # 名字
     "validate_name",
     "generate_name",

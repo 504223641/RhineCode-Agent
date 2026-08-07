@@ -375,6 +375,24 @@ class ConversationManager:
         """项目级 Hook 规则的启动提示（c12 F9.1）；无项目级规则时返回 None。"""
         return self._hooks.project_notice()
 
+    def add_startup_notice(self, text: str) -> None:
+        """
+        向启动提示追加一段（c14）。
+
+        :param text: 要追加的文本；空串忽略
+
+        存在的理由：`startup_notice` 在 `__init__` 里一次性拼好，而有些提示
+        （如隔离工作区的启动清理结果）产生在**装配层**、晚于协调层构造。
+        与其把那些依赖倒灌进构造函数，不如开一个追加口。
+
+        副作用：修改 `self.startup_notice`。
+        """
+        if not text:
+            return
+        self.startup_notice = (
+            f"{self.startup_notice}\n\n{text}" if self.startup_notice else text
+        )
+
     def _compose_startup_notice(self, memory_notice: Optional[str]) -> Optional[str]:
         """
         把记忆系统的启动提示、权限规则的加载警告与 **Hook 的加载警告**

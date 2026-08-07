@@ -487,6 +487,18 @@ def run_subagent(
                     handle, status_info, main_project_root(), removed=removed
                 )
             )
+            try:
+                recorder.emit(
+                    TraceEventType.WORKTREE_SETTLE,
+                    name=handle.name,
+                    removed=removed,
+                    dirty=status_info.dirty,
+                    commits=status_info.commits,
+                    # 保留了目录时分支必然还在；删了目录则看是否留分支。
+                    keep_branch=(not removed) or status_info.commits > 0,
+                )
+            except Exception:  # noqa: BLE001 —— 观测设施绝不能反过来影响被观测的系统
+                pass
         except Exception as exc:  # noqa: BLE001
             # 结算失败不影响结论本身——但要如实说一句，否则用户会看到一个
             # 隔离任务却完全没有工作区信息，以为是隔离没生效。

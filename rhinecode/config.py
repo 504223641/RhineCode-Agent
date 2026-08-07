@@ -51,6 +51,21 @@ api_key: YOUR_API_KEY
 # 关掉之后：工具不注册、系统提示不含「外部不可信内容」约束、
 # 权限规则里的 WebFetch(domain:...) 不做语法校验——行为与没有这个工具时一致。
 # web_fetch_enabled: false
+
+# ---- 子 Agent 工作区隔离（c14）----
+# 声明了 isolation: worktree 的角色，每次委派会在
+# <项目根>/.rhinecode/worktrees/ 下开一个独立的 Git 工作目录。
+# worktree:
+#   # 启动时清理多少天没动过的隔离工作区。0 或负数 = 不清理。
+#   # ⚠ 有未提交改动的工作区**永远不会**被清理，不受本项设置影响；
+#   #   有提交的只删目录、保留分支（成果仍可 git checkout 取回）。
+#   cleanup_days: 7
+#   # 建好工作区后要**复制**进去的文件（各自独立一份，改了不影响主目录）。
+#   # 适合本地配置——它们被 .gitignore 排除，checkout 出来的工作区里没有。
+#   copy: []
+#   # 建好工作区后要**软链**进去的目录（共享同一份，省空间省时间）。
+#   # 适合大型依赖目录，如 node_modules / .venv。
+#   link: []
 """
 
 
@@ -106,6 +121,8 @@ class Config:
                  可选字段，缺省 65536；不同模型/账号窗口不同，可按需调大调小。非法或 <=0 时
                  由 load() 回退默认值，不阻断启动（fail-safe）。
     - web_fetch_enabled：网络访问工具的总开关（web_fetch 扩展 F4）。可选字段，缺省 True。
+    - worktree.cleanup_days / worktree.copy / worktree.link：子 Agent 隔离工作区的
+      清理阈值与环境初始化清单（c14 F10/F19）。整段可缺省。
                  设为 false 后：工具不注册、不出现在模型可见的工具清单里、系统提示不含
                  「外部不可信内容」那条约束、权限规则里的 `WebFetch(domain:...)` 不做语法
                  校验也不产生警告——**行为与本扩展之前逐字一致**。
@@ -122,9 +139,16 @@ class Config:
     context_window: int = 65536
     # 网络访问工具总开关：缺省启用；非必填，老配置不写也能加载（web_fetch 扩展 F4）。
     web_fetch_enabled: bool = True
+    # c14：隔离工作区的清理阈值（天）与环境初始化清单。
+    # 三项都可缺省——不写等于「隔离工作区就是一次纯 checkout，7 天后清理」。
+    worktree_cleanup_days: int = 7
+    worktree_copy: tuple = ()
+    worktree_link: tuple = ()
 
 
-def _parse_int(value: Any, field_name: str, default: int) -> int:
+def _parse_int(
+    value: Any, field_name: str, default: int, allow_zero: bool = False
+) -> int:
     """
     把配置值解析为正整数，fail-safe：非法/缺失/非正数一律回退默认值，不抛异常。
 
@@ -134,19 +158,43 @@ def _parse_int(value: Any, field_name: str, default: int) -> int:
     :param value: 原始配置值（可能是 int、数字字符串，或任意非法值）
     :param field_name: 字段名（仅用于潜在调试，本函数不抛错故当前未用到）
     :param default: 回退默认值
-    :returns: 解析出的正整数；无法解析或 <=0 时返回 default
+    :param allow_zero: 是否接受 0 与负数（c14）。
+        `worktree.cleanup_days` 用它——0 的语义是「关掉清理」，
+        而不是「写错了」。缺省 False，既有调用点行为逐字不变
+    :returns: 解析出的整数；无法解析时返回 default
     """
     if isinstance(value, bool):
         # bool 是 int 的子类，需先排除，避免 True 被当成 1 静默接受。
         return default
     if isinstance(value, int):
-        return value if value > 0 else default
+        return value if (allow_zero or value > 0) else default
     if isinstance(value, str):
         text = value.strip()
-        if text.isdigit():
+        negative = text.startswith("-") and text[1:].isdigit()
+        if text.isdigit() or (allow_zero and negative):
             n = int(text)
-            return n if n > 0 else default
+            return n if (allow_zero or n > 0) else default
     return default
+
+
+def _parse_str_list(value: Any) -> tuple:
+    """
+    把配置值解析为字符串元组，fail-safe（c14）。
+
+    :param value: 原始配置值
+    :returns: 去空白、去空项后的字符串元组；非列表或缺失时返回空元组
+
+    **不抛错**：清单写错了最坏是「某个文件没被复制进隔离工作区」，
+    用户会在子 Agent 跑不起来时发现；而抛错会让一个可选调优项阻断启动。
+    非字符串项（数字、嵌套结构）静默跳过——它们不可能是合法的相对路径。
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    items = []
+    for raw in value:
+        if isinstance(raw, str) and raw.strip():
+            items.append(raw.strip())
+    return tuple(items)
 
 
 def _parse_bool(value: Any, field_name: str) -> bool:
@@ -205,6 +253,19 @@ def load(path: str) -> Config:
     # 注意这与上一行 context_window 的「回退默认」是两种口径，别混。
     web_fetch_enabled = _parse_bool(data.get("web_fetch_enabled", True), "web_fetch_enabled")
 
+    # c14：worktree 段整段可缺省。**非法结构一律回退默认、不抛错**——
+    # 与 context_window 同口径而非与 web_fetch_enabled 同口径，理由是这里
+    # 三项都不是安全开关：写错了最坏是「没清理」或「没复制文件」，
+    # 而 web_fetch_enabled 写错会让用户以为关掉了网络访问却没关。
+    worktree_raw = data.get("worktree")
+    if not isinstance(worktree_raw, dict):
+        worktree_raw = {}
+    worktree_cleanup_days = _parse_int(
+        worktree_raw.get("cleanup_days", 7), "worktree.cleanup_days", 7, allow_zero=True
+    )
+    worktree_copy = _parse_str_list(worktree_raw.get("copy"))
+    worktree_link = _parse_str_list(worktree_raw.get("link"))
+
     return Config(
         protocol=data["protocol"],
         model=data["model"],
@@ -213,4 +274,7 @@ def load(path: str) -> Config:
         debug_log=debug_log,
         context_window=context_window,
         web_fetch_enabled=web_fetch_enabled,
+        worktree_cleanup_days=worktree_cleanup_days,
+        worktree_copy=worktree_copy,
+        worktree_link=worktree_link,
     )

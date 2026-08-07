@@ -885,6 +885,19 @@ class AllTypesTest(TraceHookBase):
             T.SUBAGENT_END: {
                 "task_id": "a3f1c9", "status": "completed", "turns": 4, "usage_tokens": 120,
             },
+            # c14 隔离工作区四类
+            T.WORKTREE_CREATE: {
+                "name": "worker-a1b2", "branch": "agent/worker-a1b2",
+                "base_commit": "b225368", "recovered": False,
+            },
+            T.WORKTREE_PROVISION: {
+                "name": "worker-a1b2", "applied": 1, "warnings": 0, "details": [],
+            },
+            T.WORKTREE_SETTLE: {
+                "name": "worker-a1b2", "removed": False, "dirty": False,
+                "commits": 2, "keep_branch": True,
+            },
+            T.WORKTREE_CLEANUP: {"scanned": 3, "removed": 2, "kept": 1},
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

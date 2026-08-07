@@ -23,6 +23,7 @@ import os
 import time
 from pathlib import Path
 
+from rhinecode.trace import TraceEventType
 from rhinecode.worktree import gitcmd, lifecycle
 from rhinecode.worktree.models import (
     BRANCH_PREFIX,
@@ -127,13 +128,16 @@ def _relative_name(root: Path, path: Path) -> str:
         return path.name
 
 
-def scan_and_clean(main_root: Path, max_age_days: int) -> CleanupReport:
+def scan_and_clean(
+    main_root: Path, max_age_days: int, recorder=None
+) -> CleanupReport:
     """
     扫描隔离工作区目录一次，清理过期条目（spec F19/F21）。
 
     :param main_root: 主项目根
     :param max_age_days: 过期阈值（天）。小于等于 0 时**不清理任何东西**
                          （视为用户关闭了本功能）
+    :param recorder: 行为记录器（c14 F24）。`None` 时不埋点
     :returns: `CleanupReport`
 
     执行流程：
@@ -210,9 +214,23 @@ def scan_and_clean(main_root: Path, max_age_days: int) -> CleanupReport:
         except Exception as exc:  # noqa: BLE001 —— 一个坏条目不影响其余
             kept.append((name, f"处理时出错，已跳过（{exc}）"))
 
-    return CleanupReport(
+    report = CleanupReport(
         removed=tuple(removed), kept=tuple(kept), scanned=scanned
     )
+    # 埋点在函数末尾、且照例吞掉一切异常——清理本身已经 fail-safe，
+    # 观测不能反过来把它变成失败点。
+    if recorder is not None and not report.is_empty:
+        try:
+            recorder.emit(
+                TraceEventType.WORKTREE_CLEANUP,
+                scanned=report.scanned,
+                removed=len(report.removed),
+                kept=len(report.kept),
+                details=[f"{n}:{b or '-'}" for n, b in report.removed],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return report
 
 
 __all__ = ["scan_and_clean"]

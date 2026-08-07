@@ -52,6 +52,10 @@ class TraceEventType(str, Enum):
     HOOK_EXECUTE = "hook_execute"                # c12：单条 Hook 规则的执行结果
     SUBAGENT_START = "subagent_start"            # c13：一次委派的发起（角色、任务、工具集）
     SUBAGENT_END = "subagent_end"                # c13：子 Agent 的结束（原因、轮次、用量）
+    WORKTREE_CREATE = "worktree_create"          # c14：隔离工作区的创建或快速恢复
+    WORKTREE_PROVISION = "worktree_provision"    # c14：环境初始化（复制/软链的结果与警告）
+    WORKTREE_SETTLE = "worktree_settle"          # c14：结束时的保留/删除决定
+    WORKTREE_CLEANUP = "worktree_cleanup"        # c14：启动清理的结果
 
 
 # ---------------------------------------------------------------------------

@@ -38,8 +38,27 @@ from rhinecode.worktree.models import (
     WorktreeError,
     WorktreeHandle,
 )
+from rhinecode.trace import TraceEventType
 from rhinecode.worktree.naming import generate_name, validate_name
 from rhinecode.worktree.provision import provision
+
+
+def _emit(recorder, event, **fields) -> None:
+    """
+    产一条行为记录事件（c14 F24）。
+
+    :param recorder: 记录器；`None` 或不可用时**什么都不做**
+
+    ⚠ **任何异常都吞掉。** 观测设施绝不能反过来影响被观测的系统——
+    这是 trace 从 P0 起就定死的纪律。本模块尤其要守：它跑在子 Agent 的后台
+    线程上，一个埋点异常逃逸出去会让整个任务失败。
+    """
+    if recorder is None:
+        return
+    try:
+        recorder.emit(event, **fields)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def worktrees_root(main_root: Path) -> Path:
@@ -195,6 +214,7 @@ def create(
     agent_name: str = "agent",
     task_id: str = "",
     entries: Sequence[ProvisionEntry] = (),
+    recorder=None,
 ) -> tuple[WorktreeHandle, ProvisionResult]:
     """
     创建（或快速恢复）一个隔离工作区（spec F6–F10）。
@@ -204,6 +224,7 @@ def create(
     :param agent_name: 角色名，仅用于生成名字时让目录可读
     :param task_id: 任务标识，仅用于生成名字时区分并发
     :param entries: 环境初始化清单
+    :param recorder: 行为记录器（c14 F24）。`None` 时不埋点，**不传等于零成本**
     :returns: `(WorktreeHandle, ProvisionResult)`
     :raises WorktreeNameError: 名字未通过安全校验
     :raises NotARepository: 当前目录不是 Git 仓库
@@ -242,6 +263,14 @@ def create(
 
     # ③ 快速恢复（spec F9）：目录已在且确属本仓库的工作区 → 不调任何 git。
     if _is_recoverable(main_root, target):
+        _emit(
+            recorder,
+            TraceEventType.WORKTREE_CREATE,
+            name=final_name,
+            branch="",
+            base_commit="",
+            recovered=True,
+        )
         return (
             WorktreeHandle(
                 name=final_name,
@@ -280,6 +309,22 @@ def create(
 
     # ⑦ 环境初始化。它从不失败（内部把每条的异常转成警告）。
     result = provision(main_root, target, entries)
+    _emit(
+        recorder,
+        TraceEventType.WORKTREE_CREATE,
+        name=final_name,
+        branch=branch,
+        base_commit=base,
+        recovered=False,
+    )
+    _emit(
+        recorder,
+        TraceEventType.WORKTREE_PROVISION,
+        name=final_name,
+        applied=len(result.applied),
+        warnings=len(result.warnings),
+        details=list(result.warnings),
+    )
     return handle, result
 
 
