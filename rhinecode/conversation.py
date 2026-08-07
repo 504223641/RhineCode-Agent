@@ -35,7 +35,9 @@ from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
 from rhinecode.tools.registry import ToolRegistry
-from rhinecode.tools.path_guard import workspace_root, register_read_root
+# c14：协调层定位存盘/存档/角色目录与环境信息，一律是主项目根——
+# 主对话的工作目录是不变量（spec F4），隔离只发生在子 Agent 那一侧。
+from rhinecode.tools.path_guard import main_project_root, register_read_root
 from rhinecode.mcp.manager import MCPManager
 from rhinecode.context import ContextManager
 from rhinecode.memory import MemoryManager
@@ -287,7 +289,7 @@ class ConversationManager:
                 provider,
                 config.model,
                 config.context_window,
-                workspace_root() / ".rhinecode" / "context",
+                main_project_root() / ".rhinecode" / "context",
                 recorder=self._recorder,
                 hook_manager=self._hooks,
             )
@@ -299,7 +301,7 @@ class ConversationManager:
         self.memory_manager = MemoryManager(
             provider,
             config.model,
-            workspace_root(),
+            main_project_root(),
             user_dir,
             notes_enabled=self._tools_enabled,
             recorder=self._recorder,
@@ -341,7 +343,7 @@ class ConversationManager:
         # 里重新绑定——不重绑的话，`/clear` 之后所有 Hook 负载里的 session_id 仍是旧档，
         # 而那是排查「这条 hook 是哪次会话触发的」时唯一能对上的字段。
         self._hooks.bind_context(
-            session_id=self.memory_manager.session_id, cwd=str(workspace_root())
+            session_id=self.memory_manager.session_id, cwd=str(main_project_root())
         )
         self.startup_notice: Optional[str] = self._compose_startup_notice(memory_notice)
 
@@ -418,7 +420,18 @@ class ConversationManager:
         read_file 的单文件路径在执行前已由权限管线判断；grep/glob 这类目录级工具还会在
         execute 内部发现更多文件，因此需要在真正读取或返回每个文件前再次用 Read 规则判定。
         """
-        def allow_read_path(rel_path: str) -> bool:
+        def allow_read_path(rel_path: str, base) -> bool:
+            """
+            :param rel_path: 相对**本次调用工作目录**的路径
+            :param base: 本次调用的工作目录（c14）。隔离子 Agent 的 grep 必须以
+                         它自己的工作区为界，否则第②层会拿主项目根去量它的文件
+
+            ⚠ 这个 `base` 参数**不可省**。漏掉它的后果不是报错而是
+            「一个文件都不返回」：构造 `PermissionRequest` 会因缺参数抛
+            `TypeError`，而调用点外面包着 `except Exception: return False`
+            （fail-safe，宁可少返回也不错放），于是全部文件被判拒绝，
+            工具照常返回 ok=True、结果为空——用户看到的是「grep 什么都搜不到」。
+            """
             req = PermissionRequest(
                 tool_name="read_file",
                 rule_name="Read",
@@ -426,6 +439,7 @@ class ConversationManager:
                 kind="read_path",
                 is_read_only=True,
                 mode=self._engine.mode,
+                cwd=base,
             )
             return self._engine.decide(req).decision != Decision.DENY
 
@@ -942,7 +956,7 @@ class ConversationManager:
             self._provider,
             self._config.model,
             self._config.context_window,
-            workspace_root() / ".rhinecode" / "context",
+            main_project_root() / ".rhinecode" / "context",
             recorder=self._recorder,
             hook_manager=self._hooks,
         )
@@ -1004,7 +1018,7 @@ class ConversationManager:
         副作用：无（只读当前状态并复制）。
         """
         assembled = build_default_prompt(
-            collect_environment(self._config, str(workspace_root())),
+            collect_environment(self._config, str(main_project_root())),
             custom_instructions=self.memory_manager.custom_instructions(),
             memory_index=self.memory_manager.memory_index(),
             skill_index=self.skill_manager.index_text(),
@@ -1088,7 +1102,7 @@ class ConversationManager:
             service.tasks.snapshot(),
             tools_for=tools_for,
             effective_mode_for=effective_mode_for,
-            project_dir=str(workspace_root() / ".rhinecode" / "agents"),
+            project_dir=str(main_project_root() / ".rhinecode" / "agents"),
             user_dir=str(self._user_dir / "agents"),
         )
 
@@ -1171,7 +1185,7 @@ class ConversationManager:
         sub_history: list[Message] = [Message(role="user", content=invocation)]
 
         # ── 4. 子系统提示：stable 复用主对话，dynamic 只带这一个 Skill 的正文 ──
-        project_root = str(workspace_root())
+        project_root = str(main_project_root())
         env = collect_environment(self._config, project_root)
         assembled = build_default_prompt(
             env,
@@ -1380,7 +1394,11 @@ class ConversationManager:
             if choice == ConfirmDecision.ALLOW:
                 return True
             # 本会话 / 永久：构造与本次调用同口径的 allow 规则。
-            req = to_request(tool, tool_call.arguments, self._engine.mode)
+            # c14：协调层这条路径服务的是**主对话**（确认面板的重放判定），
+            # 因此固定取主项目根——主对话的工作目录是不变量（spec F4）。
+            req = to_request(
+                tool, tool_call.arguments, self._engine.mode, main_project_root()
+            )
             # ⚠ 规则的**单一来源**是 adapter.to_allow_rule（web_fetch 扩展 T23）。
             #
             # 原先这里直接 f"{rule_name}({specifier})"，对命令类与路径类是对的，
@@ -1438,7 +1456,7 @@ class ConversationManager:
         # 结构化系统提示（c5）：以项目根为工作目录采集环境信息，拼装出稳定/动态两段。
         # stable 逐轮不变 → 走 system 参数命中缓存；dynamic（环境信息）由循环注入 <system-reminder>。
         # Plan Mode 的引导不再在此构造，改由循环按轮节奏注入（见 loop.run / reminders）。
-        project_root = str(workspace_root())
+        project_root = str(main_project_root())
         env = collect_environment(self._config, project_root)
         # c9：把 RHINE.md 拼接结果与记忆索引填进 110/130 槽位（两者都可能为空串，
         # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，笔记线程会话中途
@@ -1495,7 +1513,7 @@ class ConversationManager:
             return "\n\n".join(parts)
         # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
         debug_log_path = (
-            str(workspace_root() / ".rhinecode_debug.log") if self._config.debug_log else None
+            str(main_project_root() / ".rhinecode_debug.log") if self._config.debug_log else None
         )
 
         ask = self._build_ask()

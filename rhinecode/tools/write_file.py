@@ -7,7 +7,7 @@
 
 from rhinecode.tools.base import Tool, ToolResult, human_size
 from rhinecode.tools.diff import build_diff
-from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
+from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_cwd, resolve_in_workspace
 
 
 class WriteFileTool(Tool):
@@ -33,8 +33,10 @@ class WriteFileTool(Tool):
         "required": ["path", "content"],
     }
     read_only = False
+    # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
+    workspace_aware = True
 
-    def execute(self, args: dict) -> ToolResult:
+    def execute(self, args: dict, cwd=None) -> ToolResult:
         """
         写入文件内容。
 
@@ -57,7 +59,7 @@ class WriteFileTool(Tool):
             if content is None:
                 return ToolResult(ok=False, output="缺少必填参数 content", summary="缺少参数 content")
 
-            abs_path = resolve_in_workspace(path)
+            abs_path = resolve_in_workspace(path, _require_cwd(cwd))
 
             # 写入前判断，区分新建/覆盖（写入后再判断就分不清了）
             existed = abs_path.exists()

@@ -34,6 +34,7 @@ delegate()
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -55,6 +56,13 @@ from rhinecode.subagents.tasks import (
     TaskStatus,
 )
 from rhinecode.subagents.toolset import resolve_toolset
+from rhinecode.tools.path_guard import main_project_root
+from rhinecode.worktree import ProvisionEntry, WorktreeError, create as create_worktree
+
+# 隔离声明目前唯一的合法取值。与 `parser._ISOLATION_WORKTREE` 是同一个字符串，
+# 但那边是「解析时认哪些写法」，这边是「判定时比什么」——两处职责不同，
+# 各留一份比互相 import 更清楚（本模块不该反向依赖 parser）。
+ISOLATION_WORKTREE = "worktree"
 
 VALID_KINDS = (KIND_ROLE, KIND_BRANCH)
 
@@ -76,6 +84,36 @@ class DelegateOutcome:
     backgrounded: bool = False
 
 
+def resolve_isolation(
+    spec_declared: Optional[str], call_requested: Optional[bool]
+) -> bool:
+    """
+    算出这次委派要不要隔离工作区（c14 F14）。**纯函数。**
+
+    :param spec_declared: 角色 frontmatter 里的 `isolation`（`"worktree"` 或 None）
+    :param call_requested: 本次调用的 `isolation` 参数（True / False / None=未表态）
+    :returns: 最终是否隔离
+
+    **合并方向是单向加严**：
+
+    | 角色声明 | 调用要求 | 结果 |
+    | --- | --- | --- |
+    | worktree | 任意（含 False） | **隔离** —— 调用方关不掉 |
+    | 未声明 | True | 隔离 |
+    | 未声明 | False / 未表态 | 不隔离 |
+
+    「调用方关不掉」这条不是随手加的：写角色定义是**人在表达约束**，
+    而调用方是模型。让模型能撤销用户设的隔离，等于把一道安全边界的开关
+    交给了被约束的一方。
+
+    这与 C13 已有的三处同形：Hook 只能收紧不能放宽、子 Agent 权限档取
+    `min(主对话档, 角色声明档)`、工具集三层过滤只减不增。安全论证直接沿用。
+    """
+    if spec_declared == ISOLATION_WORKTREE:
+        return True
+    return bool(call_requested)
+
+
 class SubAgentService:
     """
     子 Agent 的对外门面。
@@ -94,12 +132,16 @@ class SubAgentService:
         runtime: SubAgentRuntime,
         tool_names_provider,
         max_concurrent: int = MAX_CONCURRENT,
+        provision_entries: tuple = (),
     ) -> None:
         self.catalog = catalog
         self.runtime = runtime
         self.tasks = TaskManager()
         self._tool_names_provider = tool_names_provider
         self._max_concurrent = max_concurrent
+        # c14 F10：隔离工作区的环境初始化清单，来自 config.yaml。
+        # 缺省为空 = 隔离工作区就是一次纯 checkout。
+        self._provision_entries: tuple[ProvisionEntry, ...] = tuple(provision_entries)
 
     # ------------------------------------------------------------------ #
     # 委派
@@ -113,6 +155,7 @@ class SubAgentService:
         background: bool = False,
         parent: Optional[ParentSnapshot] = None,
         plan_stage: bool = False,
+        isolation: Optional[bool] = None,
     ) -> DelegateOutcome:
         """
         发起一次委派（spec F6/F19/F20）。
@@ -125,6 +168,8 @@ class SubAgentService:
         :param plan_stage: 是否处于 Plan Mode 的**规划阶段**（spec F19a）。
             为真时只允许委派给最终工具集**全只读**的角色——Plan Mode 的承诺是
             「批准前不动手」，一个能写文件的子 Agent 会直接绕过它
+        :param isolation: 本次调用是否要求隔离工作区（c14 F14）。
+            与角色声明**单向加严**合并，见 `resolve_isolation`
         :returns: `DelegateOutcome`
 
         失败时**不起线程、不发任何 API 请求**——这是 spec F14/F20 的全部价值。
@@ -192,16 +237,40 @@ class SubAgentService:
                 ),
             )
 
+        # ── 隔离工作区（c14 F6-F12）──
+        #
+        # 位置在并发上限**之后**：上限没过就不该在磁盘上留下任何东西。
+        # 在建任务记录**之前**：创建失败时连记录都不该产生，否则 `/agents` 里
+        # 会多出一条永远不会开始的任务。
+        want_isolation = resolve_isolation(
+            spec.isolation if spec is not None else None, isolation
+        )
+        handle = None
+        if want_isolation:
+            try:
+                handle, provision = self._create_worktree(
+                    spec.name if spec is not None else BRANCH_AGENT_NAME, task_text
+                )
+            except WorktreeError as exc:
+                # ⚠ **明确失败，绝不降级为「在主项目根里跑」**（spec F12）。
+                # 降级是本项目通篇最忌讳的形态：用户配了隔离却没隔离，
+                # 而界面上完全看不出来——子 Agent 与主 Agent 互相覆盖文件时，
+                # 谁也想不到根因是隔离静默失效了。
+                return DelegateOutcome(ok=False, text=self._isolation_failed_text(exc))
+
         record = self.tasks.create(
             kind,
             spec.name if spec is not None else BRANCH_AGENT_NAME,
             task_text,
         )
+        if handle is not None:
+            record.worktree_path = str(handle.path)
+            record.worktree_branch = handle.branch
         # `background=true` = 模型明说「这次我不要这个结果」→ 循环不为它停留。
         record.awaited = not background
         start_subagent_thread(
             self.runtime, spec, task_text, record, self.tasks,
-            toolset, all_names, parent,
+            toolset, all_names, parent, handle,
         )
 
         # ── 永远立即返回（c13 修订）──
@@ -218,6 +287,49 @@ class SubAgentService:
             text=self._started_text(record.task_id, record.agent_name, awaited=record.awaited),
             task_id=record.task_id,
             backgrounded=background,
+        )
+
+    def _create_worktree(self, agent_name: str, task_text: str):
+        """
+        为一次委派建隔离工作区（c14 F6-F10）。
+
+        :returns: `(WorktreeHandle, ProvisionResult)`
+        :raises WorktreeError: 任何创建失败（调用方转成明确的委派失败）
+
+        名字由系统生成——**刻意不让模型给名字**。spec F7 允许委派方给名字，
+        但那条通路目前没有产品需求（模型没有理由关心目录叫什么），而每多一个
+        模型可控的字符串就多一份要校验的输入。将来真需要时，
+        把名字透传进 `create` 即可，安全校验已经在 `naming` 里备好了。
+
+        副作用：在磁盘上产生一份源码 checkout，在版本库中建一个分支。
+        """
+        return create_worktree(
+            main_project_root(),
+            name=None,
+            agent_name=agent_name,
+            # 用一次性随机短串区分并发委派。**刻意不用任务 ID**：
+            # 任务记录要等工作区建成之后才创建（创建失败时不该留下记录），
+            # 此刻还没有 ID 可用。名字只需唯一可读，不需要与任务 ID 对应——
+            # 两者的关联由 `TaskRecord.worktree_path` 承担。
+            task_id=uuid.uuid4().hex[:8],
+            entries=self._provision_entries,
+        )
+
+    @staticmethod
+    def _isolation_failed_text(exc: WorktreeError) -> str:
+        """
+        创建隔离工作区失败时回灌给模型的文案（spec F12）。
+
+        要点是**说清楚为什么，并给出下一步**：模型拿到一句「失败了」只会重试，
+        而这类失败重试一百次也一样（不是 Git 仓库就永远不是）。
+        """
+        return (
+            f"委派失败：该角色要求隔离的 Git 工作目录，但创建不成功——{exc}\n\n"
+            "这次委派**没有执行**，也没有降级成不隔离运行"
+            "（那会让你和它同时改同一份文件而互相覆盖）。\n"
+            "可选做法：改派一个不要求隔离的角色、自己动手做、"
+            "或者告诉用户这个环境用不了工作区隔离。**不要重试**——"
+            "这类失败重试多少次结果都一样。"
         )
 
     def cancel(self, target: Optional[str]) -> str:

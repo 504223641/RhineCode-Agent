@@ -29,7 +29,8 @@ from typing import Optional
 
 import yaml
 
-from rhinecode.tools.path_guard import workspace_root
+# c14：项目级 mcp.yaml 同理，位置固定在主项目根。
+from rhinecode.tools.path_guard import main_project_root
 
 # 配置目录与文件名常量（与权限系统同目录 .rhinecode，但文件名不同）。
 _CONFIG_DIR_NAME = ".rhinecode"
@@ -104,7 +105,7 @@ def user_config_path(user_dir: Optional[Path] = None) -> Path:
 
 def project_config_path() -> Path:
     """项目级配置路径：<项目根>/.rhinecode/mcp.yaml（随仓库走）。"""
-    return workspace_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
+    return main_project_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
 
 
 def scaffold_user_config(path: Path) -> bool:

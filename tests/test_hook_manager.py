@@ -54,7 +54,7 @@ class _Outcomes:
     def install(self, test):
         # 假实现按「本次是哪条规则」取结果。run_action 的签名里没有规则，
         # 因此用调用序 + 动作对象反查——这里改成直接按动作的命令串区分。
-        def fake(action, payload, client_factory=None):
+        def fake(action, payload, client_factory=None, cwd=None):
             key = getattr(action, "command", None) or getattr(action, "text", "")
             self.calls.append(key)
             return self.mapping.get(key, self.default)
@@ -316,7 +316,7 @@ class AsyncTest(unittest.TestCase):
         released = threading.Event()
         finished = threading.Event()
 
-        def fake(action, payload, client_factory=None):
+        def fake(action, payload, client_factory=None, cwd=None):
             released.wait(timeout=5)
             finished.set()
             return ActionOutcome(ok=True)
@@ -337,7 +337,7 @@ class AsyncTest(unittest.TestCase):
         """异步失败不能被静默吞掉（spec F5 末段）。"""
         done = threading.Event()
 
-        def fake(action, payload, client_factory=None):
+        def fake(action, payload, client_factory=None, cwd=None):
             done.set()
             return ActionOutcome(ok=False, detail="后台失败了")
 
@@ -379,7 +379,7 @@ class LockInvariantTest(unittest.TestCase):
         other_done = threading.Event()
         trace: list = []
 
-        def fake(action, payload, client_factory=None):
+        def fake(action, payload, client_factory=None, cwd=None):
             action_started.set()
             # 若 dispatch 持锁执行动作，另一个线程会卡在 report() 里，
             # 这里等不到 other_done，5 秒后拿到 False。
@@ -475,7 +475,7 @@ class CommonFieldsTest(unittest.TestCase):
     def test_common_fields_are_injected(self):
         seen = {}
 
-        def fake(action, payload, client_factory=None):
+        def fake(action, payload, client_factory=None, cwd=None):
             seen.update(payload.fields)
             return ActionOutcome(ok=True)
 
@@ -499,7 +499,7 @@ class CommonFieldsTest(unittest.TestCase):
         """
         seen = {}
 
-        def fake(action, payload, client_factory=None):
+        def fake(action, payload, client_factory=None, cwd=None):
             seen.update(payload.fields)
             return ActionOutcome(ok=True)
 

@@ -32,6 +32,7 @@ Hook 编排（spec F5–F7、F11、F12）：本包唯一有状态的类。
 """
 
 import threading
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from rhinecode.hooks.actions import run_action
@@ -280,6 +281,7 @@ class HookManager:
         self,
         event: HookEventType,
         payload_factory: Optional[Callable[[], dict[str, Any]]] = None,
+        cwd: Optional[Path] = None,
     ) -> DispatchResult:
         """
         分发一次生命周期事件。
@@ -287,6 +289,14 @@ class HookManager:
         :param event: 事件类型
         :param payload_factory: **惰性**负载构造器，返回字段字典。
                                 该事件无人监听时**根本不会被调用**（spec N7）
+        :param cwd: 触发本次事件的 Agent 的工作目录（c14 F25）。
+
+                    **工具级三事件**由 Agent Loop 传本次运行的工作目录——
+                    隔离子 Agent 触发时就是它的隔离工作区。其余事件
+                    （会话级 / 回合级 / 消息级 / 系统级）不传，取主项目根：
+                    它们与「哪个 Agent 在跑」无关。
+
+                    不传等于 c14 之前的行为，**零回归**
         :returns: `DispatchResult`；无人监听或出错时为 `EMPTY_DISPATCH`
 
         副作用：可能起子进程、发 HTTP 请求、起后台线程；写内部统计与注入队列；产 trace 事件。
@@ -296,7 +306,7 @@ class HookManager:
         if not self.has_listeners(event):
             return EMPTY_DISPATCH
         try:
-            return self._dispatch(event, payload_factory)
+            return self._dispatch(event, payload_factory, cwd)
         except Exception as exc:  # noqa: BLE001 —— 观测/自动化设施绝不能阻断主流程
             self._safe_emit(
                 TraceEventType.HOOK_DISPATCH,
@@ -312,6 +322,7 @@ class HookManager:
         self,
         event: HookEventType,
         payload_factory: Optional[Callable[[], dict[str, Any]]],
+        cwd: Optional[Path] = None,
     ) -> DispatchResult:
         """`dispatch` 的主体，四段式加锁。异常由调用方兜底。"""
         listeners = self._by_event.get(event, [])
@@ -344,12 +355,12 @@ class HookManager:
                 # 禁止 async，所以不存在「异步却要拿结论」的情形。
                 threading.Thread(
                     target=self._execute,
-                    args=(rule, payload),
+                    args=(rule, payload, cwd),
                     daemon=True,
                     name=f"hook-{rule.key}",
                 ).start()
                 continue
-            outcomes.append((rule, self._execute(rule, payload)))
+            outcomes.append((rule, self._execute(rule, payload, cwd)))
 
         verdict = self._merge(event, outcomes)
         result = DispatchResult(verdict, len(candidates), len(to_run))
@@ -368,7 +379,12 @@ class HookManager:
         )
         return result
 
-    def _execute(self, rule: HookRule, payload: HookPayload) -> ActionOutcome:
+    def _execute(
+        self,
+        rule: HookRule,
+        payload: HookPayload,
+        cwd: Optional[Path] = None,
+    ) -> ActionOutcome:
         """
         执行单条规则的动作，写统计并埋点。
 
@@ -380,7 +396,7 @@ class HookManager:
         副作用：执行动作（可能起子进程 / 发请求）；写统计与注入队列；产 trace 事件。
         """
         try:
-            outcome = run_action(rule.action, payload, self._client_factory)
+            outcome = run_action(rule.action, payload, self._client_factory, cwd)
         except Exception as exc:  # noqa: BLE001 —— run_action 内部已兜底，这里是纵深防御
             outcome = ActionOutcome(
                 ok=False, detail=f"Hook 动作抛出异常：{type(exc).__name__}: {exc}"

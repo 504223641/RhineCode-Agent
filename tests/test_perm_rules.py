@@ -4,6 +4,11 @@ import unittest
 
 from rhinecode.permission.models import Decision, PermissionMode, PermissionRequest, Rule
 from rhinecode.permission.rules import RuleSet
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 def cmd_request(command: str) -> PermissionRequest:
@@ -14,6 +19,7 @@ def cmd_request(command: str) -> PermissionRequest:
         kind="command",
         is_read_only=False,
         mode=PermissionMode.DEFAULT,
+        cwd=_CWD,
     )
 
 
@@ -40,7 +46,7 @@ class RuleSetTests(unittest.TestCase):
 
     def test_path_rule_matches_read(self) -> None:
         rs = RuleSet([Rule("deny", "Read", "config.yaml", "user")])
-        req = PermissionRequest("read_file", "Read", "config.yaml", "read_path", True, PermissionMode.DEFAULT)
+        req = PermissionRequest("read_file", "Read", "config.yaml", "read_path", True, PermissionMode.DEFAULT, _CWD)
         result = rs.evaluate(req)
         self.assertIsNotNone(result)
         self.assertEqual(result.decision, Decision.DENY)

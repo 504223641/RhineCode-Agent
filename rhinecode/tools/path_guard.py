@@ -60,6 +60,74 @@ def main_project_root() -> Path:
     return Path.cwd().resolve()
 
 
+def require_cwd(cwd: Union[str, Path, None]) -> Path:
+    """
+    取出一次工具调用的工作目录，缺失时**抛错而不是回退**（c14，spec N2）。
+
+    :param cwd: 循环传给工具的工作目录
+    :returns: 解析后的绝对路径
+    :raises PathGuardError: 未提供或无法解析
+
+    ⚠ **为什么不缺省成主项目根。**
+
+    回退看起来更「健壮」，实际会造成一种静默的串写：权限引擎按隔离工作区
+    批准了相对路径 `a.py`（它判定的是 `<工作区>/a.py`），而工具因为没拿到 cwd
+    退回主项目根，真正写的是 `<主项目根>/a.py`——**批准的和写的不是同一个文件**，
+    主项目的内容被悄悄改掉，两边都不报错。
+
+    抛出的 `PathGuardError` 会被各工具既有的 try/except 兜成
+    `ToolResult(ok=False)`，因此不会让循环崩溃，只会明确失败。
+
+    声明了 `Tool.workspace_aware` 的工具都应当用它取 cwd。
+    """
+    return _normalize_root(cwd)
+
+
+# 隔离工作区所在目录，相对任一工作目录根（c14 F18）。
+#
+# ⚠ **这两个字面量与 `worktree/models.py` 的常量刻意重复，不要合并。**
+# 合并要让 `tools` 反向 import `worktree`，而 `worktree/provision.py` 又 import
+# 本模块——虽然 `tools/__init__.py` 是空的、当前不会真的成环，但那道保护是
+# 「碰巧成立」而不是「结构成立」，不值得为两个字符串去赌。
+# 与 CLAUDE.md 里 `Layer` 名字表「三份刻意不合一」同一条理由。
+_WORKTREES_RELATIVE = (".rhinecode", "worktrees")
+
+
+def worktrees_dir_of(root: Union[str, Path]) -> Path:
+    """
+    给定工作目录下的隔离工作区目录（c14 F18）。
+
+    :param root: 工作目录根
+    :returns: `<root>/.rhinecode/worktrees` 的绝对路径（**可能不存在**）
+
+    搜索类工具用它把隔离工作区排除在结果之外。
+    """
+    return Path(root).joinpath(*_WORKTREES_RELATIVE)
+
+
+def is_inside(path: Union[str, Path], container: Union[str, Path]) -> bool:
+    """
+    判断 `path` 是否位于 `container` 之内（含相等）。
+
+    :returns: 位于其内返回 True；任何解析失败返回 False
+
+    ⚠ 用**路径相等**判断，而不是「目录名叫 worktrees」——后者会误伤用户自己
+    叫这个名字的业务目录（比如一个真的在做 worktree 管理的项目）。
+    """
+    try:
+        target = Path(path).resolve()
+        base = Path(container).resolve()
+    except OSError:
+        return False
+    if target == base:
+        return True
+    try:
+        target.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
 def _ensure_no_parent_ref(path: Path, raw: str) -> None:
     """拒绝显式 `..`，避免先跳出再解析回来的路径绕过审计。"""
     if ".." in path.parts:
@@ -169,9 +237,18 @@ def resolve_readable(path: str, root: Union[str, Path, None]) -> Path:
        记忆索引里给模型的正是绝对目录）；resolve 后位于任一白名单根内才放行；
     3. 两条路都不通 → 重抛工作区越界错误（对模型的报错口径与原来一致）。
 
-    ⚠ 白名单分支**不看 root**：它的语义是「这些位置在任何工作目录下都可读」。
+    ⚠ 白名单分支**不看 root 的内容**：它的语义是「这些位置在任何工作目录下都可读」。
     因此隔离子 Agent 同样能读用户级记忆目录，与主对话一致（spec F5/AC5）。
+
+    ⚠ **但 root 本身仍须有效**——所以下面第一句就先归一化它、让无效 root 当场抛出。
+    不这么做的话会留下一条 N2 的旁路：`resolve_in_workspace` 因 root 无效而抛错，
+    异常被 except 接住，白名单分支不看 root 于是照常放行——**漏传 cwd 时白名单
+    读取仍然成功**。它不构成提权（白名单本来在任何 root 下都可读），但会造成
+    「同一次漏传，工作区读取失败、白名单读取成功」这种一半一半的现象，
+    排查的人会以为是白名单配错了。
     """
+    _normalize_root(root)
+
     raw = str(path)
     try:
         return resolve_in_workspace(raw, root)
@@ -258,6 +335,9 @@ def validate_glob_pattern(pattern: str) -> None:
 __all__ = [
     "PathGuardError",
     "main_project_root",
+    "require_cwd",
+    "worktrees_dir_of",
+    "is_inside",
     "resolve_in_workspace",
     "resolve_readable",
     "is_readable_path",

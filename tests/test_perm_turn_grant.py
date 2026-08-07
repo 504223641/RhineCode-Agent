@@ -31,6 +31,11 @@ from rhinecode.permission.rules import RuleSet
 from rhinecode.skills.models import SkillSource, SkillSpec
 from rhinecode.skills.validation import GRANT_SOURCE, grants_for
 from pathlib import Path
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 def _engine() -> PermissionEngine:
@@ -45,7 +50,7 @@ def _bash(command: str) -> PermissionRequest:
         specifier=command,
         kind="command",
         is_read_only=False,
-        mode=PermissionMode.DEFAULT,
+        mode=PermissionMode.DEFAULT, cwd=_CWD,
     )
 
 
@@ -56,7 +61,7 @@ def _write(path: str) -> PermissionRequest:
         specifier=path,
         kind="write_path",
         is_read_only=False,
-        mode=PermissionMode.DEFAULT,
+        mode=PermissionMode.DEFAULT, cwd=_CWD,
     )
 
 

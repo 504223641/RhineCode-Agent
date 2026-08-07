@@ -262,9 +262,22 @@ class UnsupportedFieldsTest(unittest.TestCase):
 
     def test_agent_still_usable(self) -> None:
         """带未支持字段的角色**照常可用**——它只是少一个本来就没有的能力。"""
-        spec = _parse("description: x\nmemory: user\nisolation: worktree")
+        spec = _parse("description: x\nmemory: user\ncolor: red")
         self.assertEqual(spec.description, "x")
         self.assertEqual(len(spec.warnings), 2)
+
+    def test_isolation_is_no_longer_unsupported(self) -> None:
+        """
+        c14：`isolation` 已从未支持表里移出——它现在真的生效（spec F13）。
+
+        ⚠ 这条是那条成对维护点的**正面**护栏：如果做了某个字段却忘了从
+        `UNSUPPORTED_FIELDS` 里删掉，用户会被告知「本项目不支持该字段，已忽略」，
+        而它其实生效了——这种「功能做了却说没做」的错误比漏做更难被发现。
+        """
+        self.assertNotIn("isolation", UNSUPPORTED_FIELDS)
+        spec = _parse("description: x\nisolation: worktree")
+        self.assertEqual(spec.isolation, "worktree")
+        self.assertEqual(spec.warnings, ())
 
     def test_truly_unknown_field_is_silent(self) -> None:
         """

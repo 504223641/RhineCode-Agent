@@ -48,7 +48,8 @@ from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.web_fetch import WebFetchTool
 from rhinecode.web.manager import WebFetchManager
-from rhinecode.tools.path_guard import clear_read_roots, workspace_root
+# c14：装配期定位项目级配置与目录，与「调用者站在哪个工作目录」无关，故取主项目根。
+from rhinecode.tools.path_guard import clear_read_roots, main_project_root
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.trace import (
     NullRecorder,
@@ -236,7 +237,7 @@ def build_app(
     # （这段注释随代码从 `__main__.py` 迁来。它是 C11 留下的唯一记载——
     #  迁走代码却把理由留在原地，等于把知识丢了。）
     skill_manager = SkillManager(
-        workspace_root(),
+        main_project_root(),
         user_dir,
         builtin_skills_dir(),
         has_short_command=command_registry.has_skill_command,
@@ -295,7 +296,7 @@ def build_app(
             recorder=recorder,
             client_factory=hook_client_factory,
             user_path=str(user_dir / "hooks.yaml"),
-            project_path=str(workspace_root() / ".rhinecode" / "hooks.yaml"),
+            project_path=str(main_project_root() / ".rhinecode" / "hooks.yaml"),
         )
         if (hook_rules or hook_warnings)
         # 两层配置都没有内容时用空对象：全部分发变成零成本空操作，
@@ -342,7 +343,7 @@ def build_app(
     # 再回填给协调层。
     if tool_registry is not None:
         agent_catalog = discover_agents(
-            workspace_root() / ".rhinecode" / "agents",
+            main_project_root() / ".rhinecode" / "agents",
             user_dir / "agents",
             builtin_agents_dir(),
         )
@@ -355,7 +356,7 @@ def build_app(
             engine=manager.permission_engine,
             main_mode=lambda: manager.permission_engine.mode,
             environment_text=lambda: build_default_prompt(
-                collect_environment(cfg, str(workspace_root()))
+                collect_environment(cfg, str(main_project_root()))
             ).dynamic,
             default_model=cfg.model,
             hooks=hook_manager,
@@ -391,7 +392,7 @@ def build_app(
     recorder.emit_lazy(
         TraceEventType.SESSION_START,
         lambda: {
-            "project_root": str(workspace_root()),
+            "project_root": str(main_project_root()),
             "user_dir": str(user_dir),
             "config": redact_config(cfg),
             "permission_mode": manager.permission_mode_value,

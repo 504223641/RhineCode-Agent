@@ -22,6 +22,7 @@ from rhinecode.skills.models import (
     builtin_skills_dir,
 )
 from rhinecode.skills.discovery import discover
+from rhinecode.tools.path_guard import main_project_root
 
 ALL_TOOLS = frozenset(
     {"read_file", "write_file", "run_command", "glob_files", LOAD_SKILL_TOOL}
@@ -44,6 +45,11 @@ def _skill_text(name: str, description: str = "说明", body: str = None, **extr
     lines = [f"name: {name}", f"description: {description}"]
     lines.extend(f"{k}: {v}" for k, v in extra.items())
     return "---\n" + "\n".join(lines) + "\n---\n" + (body or f"{name} 的 SOP\n")
+
+
+# c14：这些用例验的是「参数怎么被规范化」，与工作目录无关，
+# 统一传主项目根即可——与 c14 之前的判定结果逐字一致。
+_CWD = main_project_root()
 
 
 class ManagerTestBase(unittest.TestCase):
@@ -697,7 +703,7 @@ class LoadSkillToolTest(ManagerTestBase):
 
         tool = self._tool()
         engine = PermissionEngine(RuleSet([]), mode=PermissionMode.DEFAULT)
-        request = to_request(tool, {"name": "a"}, PermissionMode.DEFAULT)
+        request = to_request(tool, {"name": "a"}, PermissionMode.DEFAULT, _CWD)
         self.assertIs(engine.decide(request).decision, Decision.ALLOW)
 
     def test_activated_returns_short_confirmation_not_the_body(self) -> None:

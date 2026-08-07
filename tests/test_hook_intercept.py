@@ -128,7 +128,7 @@ def _install_outcomes(test, mapping, default=None):
     """把 `run_action` 换成按命令串给结果的假实现。"""
     default = default or ActionOutcome(ok=True)
 
-    def fake(action, payload, client_factory=None):
+    def fake(action, payload, client_factory=None, cwd=None):
         key = getattr(action, "command", "")
         return mapping.get(key, default)
 
@@ -419,7 +419,7 @@ class _Recording:
     def has_listeners(self, event):
         return event in self.listen
 
-    def dispatch(self, event, payload_factory=None):
+    def dispatch(self, event, payload_factory=None, cwd=None):
         from rhinecode.hooks.models import EMPTY_DISPATCH
 
         self.seen.append((event.value, payload_factory() if payload_factory else {}))

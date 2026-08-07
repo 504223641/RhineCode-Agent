@@ -26,15 +26,19 @@ class _FakeService:
     def __init__(self, outcome: DelegateOutcome = None, raises: bool = False) -> None:
         self.calls: list[tuple] = []
         self.plan_stages: list[bool] = []
+        # c14：记录本次调用的 isolation 参数。`None` = 未表态，与显式 False
+        # 语义不同（单向加严里两者都不能撤销角色的声明，但要能区分）。
+        self.isolations: list = []
         self._outcome = outcome or DelegateOutcome(ok=True, text="结论", task_id="a3f1c9")
         self._raises = raises
 
     def delegate(
         self, kind, agent_name, task_text, background=False, parent=None,
-        plan_stage=False,
+        plan_stage=False, isolation=None,
     ):
         self.calls.append((kind, agent_name, task_text, background, parent))
         self.plan_stages.append(plan_stage)
+        self.isolations.append(isolation)
         if self._raises:
             raise RuntimeError("服务炸了")
         return self._outcome

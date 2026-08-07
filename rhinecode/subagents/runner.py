@@ -43,7 +43,14 @@ from rhinecode.subagents.tasks import (
     TaskStatus,
 )
 from rhinecode.subagents.toolset import ToolsetResult
+from rhinecode.tools.path_guard import main_project_root
 from rhinecode.trace import NullRecorder, TraceEventType, clip, subagent_scope
+from rhinecode.worktree import (
+    WorktreeHandle,
+    inspect as worktree_inspect,
+    remove as worktree_remove,
+    render_delivery,
+)
 
 # 非正常结束时回流给主对话的说明文本。
 #
@@ -195,12 +202,40 @@ def _resolve_mode(
     return narrower_mode(main, spec.permission_mode)
 
 
+def _isolation_notice(handle: "WorktreeHandle") -> str:
+    """
+    告诉子 Agent 它在一个隔离工作区里（spec F15）。
+
+    ⚠ **这段与 `SUBAGENT_CONVENTIONS` 并列追加，不写进角色正文。**
+    与那条既有的成对维护点同一条理由：写进正文的话，用户自己写的角色一个都
+    盖不到——而隔离是**运行环境**的事实，与角色是谁无关。
+
+    内容上刻意只讲三件事：在哪、在哪个分支、成果怎么交。**不讲「你出不去」**
+    ——出不出得去是权限管线第②层的事，不靠模型自觉；写进提示反而像在暗示
+    「这里有条边界可以试探」。
+    """
+    base = f"（基于 {handle.base_commit}）" if handle.base_commit else ""
+    return (
+        "<isolated-workspace>\n"
+        "你运行在一个**独立的 Git 工作目录**中，与主对话及其它子 Agent 完全隔离。\n"
+        f"- 工作目录：{handle.path}\n"
+        f"- 所在分支：{handle.branch}{base}\n\n"
+        "你的一切文件读写与命令执行都发生在这个目录里，"
+        "不会影响主对话正在编辑的文件。\n"
+        "**改完之后请把工作提交到当前分支**（`git add` + `git commit`）——"
+        "成果是通过这个分支交回去的；没有提交的改动只留在目录里，"
+        "不会随分支被合并走。\n"
+        "</isolated-workspace>"
+    )
+
+
 def _build_prompts(
     runtime: SubAgentRuntime,
     spec: Optional[AgentSpec],
     task_text: str,
     toolset: ToolsetResult,
     parent: Optional[ParentSnapshot],
+    handle: "Optional[WorktreeHandle]" = None,
 ) -> tuple[str, Callable[[], str], list[Message]]:
     """
     组装子 Agent 的系统提示与初始历史（spec F7/F8）。
@@ -227,8 +262,13 @@ def _build_prompts(
         runtime.untrusted_section and (toolset.allowed & runtime.network_tool_names)
     )
 
+    # c14 F15：隔离说明。一次算好而不是每轮重算——句柄是不可变的。
+    isolation_notice = _isolation_notice(handle) if handle is not None else ""
+
     def dynamic() -> str:
         parts = [runtime.environment_text(), SUBAGENT_CONVENTIONS]
+        if isolation_notice:
+            parts.append(isolation_notice)
         if needs_untrusted:
             parts.append(runtime.untrusted_section)
         return "\n\n".join(p for p in parts if p)
@@ -281,6 +321,7 @@ def run_subagent(
     toolset: ToolsetResult,
     all_tool_names: frozenset,
     parent: Optional[ParentSnapshot] = None,
+    handle: "Optional[WorktreeHandle]" = None,
 ) -> None:
     """
     跑完一个子 Agent（本函数就是后台线程的 target）。
@@ -293,6 +334,8 @@ def run_subagent(
     :param toolset: 已算好的最终工具集
     :param all_tool_names: 注册中心里的全部工具名（算 `excluded_tools` 用）
     :param parent: 分支式的父快照
+    :param handle: 隔离工作区句柄（c14）。非 `None` 时本子 Agent 的一切文件读写
+        与命令执行都发生在 `handle.path` 内，结束时按变更情况保留或删除
     :returns: 无。结果看 `record`
 
     执行步骤：
@@ -337,7 +380,7 @@ def run_subagent(
         )
 
         stable, dynamic, history = _build_prompts(
-            runtime, spec, task_text, toolset, parent
+            runtime, spec, task_text, toolset, parent, handle
         )
 
         # ④ 权限派生。**绝不改 runtime.engine.mode**——那是主对话的档位。
@@ -383,6 +426,11 @@ def run_subagent(
                 # 调用了也拒绝（spec F13 的第二半）。
                 excluded_tools=frozenset(all_tool_names) - toolset.allowed,
                 interactive=False,      # 判 ASK 直接拒，见 spec F15
+                # c14 F1/F2：隔离工作区就是本次运行的工作目录。
+                # 它同时决定三件事：工具的路径解析基准、权限管线第②层的
+                # 沙箱边界、以及工具级 Hook 命令的执行目录。
+                # `None` 时循环取主项目根，行为与 c14 之前逐字一致。
+                cwd=handle.path if handle is not None else None,
             ),
         )
 
@@ -412,7 +460,45 @@ def run_subagent(
         stop_reason = StopReason.STREAM_ERROR
         conclusion = _UNEXPECTED_TEXT.format(error=exc)
 
-    # ⑧ 收尾。埋点与 finish 都在 try 之外，保证任何路径都会执行到。
+    # ⑧ 隔离工作区结算（c14 F16/F17）。
+    #
+    # ⚠ **必须排在 `tasks.finish` 之前**：`finish` 会置 `done_event`，
+    # 而那是「这条真的结束了」的信号——测试与闸门都以它为同步点。
+    # 放在它之后的话，交付信息会在结论已经交出去之后才拼好，主 Agent 拿到的
+    # 是一段没有分支名的结论。
+    #
+    # ⚠ **整段用 try 兜住，绝不向上抛**。它跑在后台线程上，异常逃逸的后果是
+    # 任务永远停在「运行中」、等待方永远阻塞。git 命令失败、目录被外部删掉、
+    # 磁盘满——任何一种都不该让一次已经跑完的委派变成永久挂起。
+    if handle is not None:
+        try:
+            status_info = worktree_inspect(handle)
+            removed = False
+            if status_info.untouched:
+                # 什么都没改 → 目录与分支一并回收（spec F16）。
+                verdict = worktree_remove(
+                    main_project_root(), handle.path, handle.branch, status_info
+                )
+                removed = verdict.allowed
+            conclusion = (
+                conclusion
+                + "\n\n"
+                + render_delivery(
+                    handle, status_info, main_project_root(), removed=removed
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 结算失败不影响结论本身——但要如实说一句，否则用户会看到一个
+            # 隔离任务却完全没有工作区信息，以为是隔离没生效。
+            conclusion = (
+                conclusion
+                + "\n\n── 隔离工作区 ─────────────────────\n"
+                + f"结算时出错，工作区已保留在 {handle.path}"
+                + (f"（分支 {handle.branch}）" if handle.branch else "")
+                + f"：{exc}"
+            )
+
+    # ⑨ 收尾。埋点与 finish 都在 try 之外，保证任何路径都会执行到。
     try:
         recorder.emit(
             TraceEventType.SUBAGENT_END,
@@ -439,6 +525,7 @@ def start_subagent_thread(
     toolset: ToolsetResult,
     all_tool_names: frozenset,
     parent: Optional[ParentSnapshot] = None,
+    handle: "Optional[WorktreeHandle]" = None,
 ) -> threading.Thread:
     """
     起一个 daemon 线程跑 `run_subagent`。
@@ -452,7 +539,10 @@ def start_subagent_thread(
     """
     thread = threading.Thread(
         target=run_subagent,
-        args=(runtime, spec, task_text, record, tasks, toolset, all_tool_names, parent),
+        args=(
+            runtime, spec, task_text, record, tasks, toolset,
+            all_tool_names, parent, handle,
+        ),
         name=f"subagent-{record.task_id}",
         daemon=True,
     )

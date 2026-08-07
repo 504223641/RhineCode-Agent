@@ -88,6 +88,14 @@ class TaskRecord:
     :param delivered: 结论是否已追加进主历史
     :param notified: 完成通知是否已出现在界面上
     :param awaited: 模型是否声明「这次我要这个结果」。见字段处的注释
+    :param worktree_path: 隔离工作区路径（c14 F23）。非隔离任务为空串。
+    :param worktree_branch: 隔离工作区的分支名。非隔离任务为空串。
+
+        ⚠ **这里只存两个字符串，不存 `WorktreeHandle` 对象。**
+        `TaskRecord` 的读写都在 `TaskManager` 的加锁临界区内，而临界区的既有
+        硬不变量是「只做纯内存读写」。放一个能调 git 的对象进去，是在给后来者
+        挖坑——他会很自然地写出 `record.worktree.inspect()`，于是一次 git
+        子进程调用跑在锁里，整个 manager 被一条卡住的命令锁死。
     :param cancel_event: 取消信号，运行器在安全点轮询
     :param done_event: 完成信号。**c13 修订后已无前台等待方**，保留它是因为
         运行器的收尾仍靠它表达「这条真的结束了」，且测试用它做同步点
@@ -106,6 +114,8 @@ class TaskRecord:
     stop_reason: str = ""
     delivered: bool = False
     notified: bool = False
+    worktree_path: str = ""
+    worktree_branch: str = ""
     # 模型委派时是否声明「这次我要这个结果」（`background=false`，缺省）。
     # 为真时 Agent Loop 在准备自然结束前会停下来等它（见 agent/gate.py）；
     # `background=true` 置假——那是模型明说过不等的，循环不该为它停留。

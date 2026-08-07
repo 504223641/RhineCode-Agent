@@ -13,6 +13,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 
 class Decision(str, Enum):
@@ -150,6 +151,20 @@ class PermissionRequest:
                  规则匹配（`rules._rule_matches` 的 url 分支）、确认面板展示（spec F9）、
                  行为记录（spec F23）。若让规则层去调 `network.py` 的解析函数，
                  而 `network.py` 又要 import `rules.py` 拿 RuleSet，就成了真的循环导入。
+    :param cwd: **本次调用的工作目录**，第②层路径沙箱据它判定边界（c14 F2）。
+
+                 主对话与非隔离子 Agent 传主项目根；隔离子 Agent 传它自己的
+                 隔离工作区——于是同一个 `write_path` 请求在两种上下文下得到
+                 不同结论，而这正是隔离的物理实现。
+
+                 ⚠ **刻意没有默认值。** 给它一个（比如缺省取主项目根）会让
+                 「忘记传的构造点」静默按主项目根判定——那正是 spec N2 要禁止的
+                 形态：一次隔离故障静默变成一次越权，隔离子 Agent 的读写落回
+                 主项目根，而界面上完全看不出来。无默认值让任何遗漏在开发期
+                 就变成 `TypeError`。
+
+                 代价是既有的全部构造点（含测试）都要改一遍——**这个代价是
+                 故意付的**，它换来的是「不可能漏」。
     """
 
     tool_name: str
@@ -158,4 +173,5 @@ class PermissionRequest:
     kind: str
     is_read_only: bool
     mode: PermissionMode
+    cwd: Path
     host: str = ""

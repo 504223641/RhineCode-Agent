@@ -11,14 +11,32 @@ from pathlib import Path
 from typing import Callable
 
 from rhinecode.tools.base import Tool, ToolResult
-from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace, workspace_root
+from rhinecode.tools.path_guard import (
+    PathGuardError,
+    is_inside,
+    require_cwd as _require_cwd,
+    resolve_in_workspace,
+    worktrees_dir_of,
+)
 
 # 返回的最大命中行数，避免超长结果。
 MAX_MATCHES = 200
 # 跳过的目录名（版本控制、虚拟环境、缓存等），减少噪声与无意义遍历。
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
 
-PathFilter = Callable[[str], bool]
+PathFilter = Callable[[str, "Path"], bool]
+"""
+逐文件权限过滤器（c6）：`(相对路径, 本次调用的工作目录) -> 是否放行`。
+
+⚠ **c14 起第二个参数不可省。** 过滤器要构造一次权限判定，而第②层沙箱按
+**调用者的工作目录**算边界——隔离子 Agent 的 grep 必须以它自己的工作区为界。
+
+这个签名变更是**刻意让旧实现当场断掉**的：调用点外面包着
+`except Exception: return False`（fail-safe，宁可少返回也不错放），
+一个漏改的过滤器会**把所有文件都判成拒绝**，而工具照常返回 ok=True、
+只是结果为空——用户看到的是「grep 什么都搜不到」，界面上没有任何异常。
+真实踩过：c14 改造期漏了协调层那一处，整套搜索静默失效。
+"""
 
 
 class GrepTool(Tool):
@@ -44,6 +62,8 @@ class GrepTool(Tool):
         "required": ["pattern"],
     }
     read_only = True
+    # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
+    workspace_aware = True
 
     def __init__(self, path_filter: PathFilter | None = None):
         self._path_filter = path_filter
@@ -52,15 +72,15 @@ class GrepTool(Tool):
         """设置实际读取文件前的权限过滤器；None 表示不过滤。"""
         self._path_filter = path_filter
 
-    def _is_allowed(self, rel_path: str) -> bool:
+    def _is_allowed(self, rel_path: str, base) -> bool:
         if self._path_filter is None:
             return True
         try:
-            return bool(self._path_filter(rel_path))
+            return bool(self._path_filter(rel_path, base))
         except Exception:
             return False
 
-    def execute(self, args: dict) -> ToolResult:
+    def execute(self, args: dict, cwd=None) -> ToolResult:
         """
         在文本文件中按正则逐行搜索。
 
@@ -86,11 +106,12 @@ class GrepTool(Tool):
             except re.error as e:
                 return ToolResult(ok=False, output=f"正则表达式非法: {e}", summary="正则非法")
 
-            target = resolve_in_workspace(args.get("path") or ".")
+            base = _require_cwd(cwd)
+            worktrees_dir = worktrees_dir_of(base)
+            target = resolve_in_workspace(args.get("path") or ".", base)
             if not target.exists():
                 return ToolResult(ok=False, output=f"路径不存在: {args.get('path')}", summary="路径不存在")
 
-            base = workspace_root()
             # 统一收集待搜索文件列表：文件直接加入，目录递归收集
             files: list[Path] = []
             if target.is_file():
@@ -103,8 +124,17 @@ class GrepTool(Tool):
                         if d in SKIP_DIRS:
                             continue
                         child = Path(root) / d
+                        # c14 F18：隔离工作区是同一份源码的副本，进搜索结果会让
+                        # 主 Agent 对每个字符串拿到 N 份重复命中。要看子 Agent
+                        # 的成果走 `git diff <分支>`。
+                        #
+                        # ⚠ 这条**不能并进上面的 SKIP_DIRS**：那张表按**目录名**
+                        # 匹配，而这里必须按**路径相等**判断，否则会误伤用户自己
+                        # 叫 worktrees 的业务目录。两者语义不同，刻意分开。
+                        if is_inside(child, worktrees_dir):
+                            continue
                         try:
-                            resolve_in_workspace(str(child))
+                            resolve_in_workspace(str(child), base)
                         except PathGuardError:
                             continue
                         safe_dirs.append(d)
@@ -112,7 +142,7 @@ class GrepTool(Tool):
                     for fn in filenames:
                         fp = Path(root) / fn
                         try:
-                            files.append(resolve_in_workspace(str(fp)))
+                            files.append(resolve_in_workspace(str(fp), base))
                         except PathGuardError:
                             continue
 
@@ -126,7 +156,7 @@ class GrepTool(Tool):
                     rel = str(fp.relative_to(base))
                 except ValueError:
                     rel = str(fp)
-                if not self._is_allowed(rel):
+                if not self._is_allowed(rel, base):
                     skipped += 1
                     continue
                 try:

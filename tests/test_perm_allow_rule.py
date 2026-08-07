@@ -16,6 +16,12 @@ import unittest
 from rhinecode.permission.adapter import to_allow_rule, to_request
 from rhinecode.permission.models import PermissionMode
 from rhinecode.tools.base import Tool
+from rhinecode.tools.path_guard import main_project_root
+
+
+# c14：这些用例验的是「参数怎么被规范化」，与工作目录无关，
+# 统一传主项目根即可——与 c14 之前的判定结果逐字一致。
+_CWD = main_project_root()
 
 
 class _FakeTool(Tool):
@@ -30,7 +36,7 @@ class _FakeTool(Tool):
 
 
 def _req(tool_name: str, args: dict, read_only: bool = False):
-    return to_request(_FakeTool(tool_name, read_only), args, PermissionMode.DEFAULT)
+    return to_request(_FakeTool(tool_name, read_only), args, PermissionMode.DEFAULT, _CWD)
 
 
 class ToRequestUrlTests(unittest.TestCase):

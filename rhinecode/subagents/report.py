@@ -77,6 +77,14 @@ def _agent_block(
         f" · 轮次上限：{spec.max_turns}"
         f" · 权限：{_mode_text(spec, effective)}",
     ]
+    # c14 F23：只在声明了隔离时显示这一行。
+    # 未声明的角色不显示「隔离：无」——绝大多数角色都不隔离，
+    # 给每个都加一行只会把真正重要的信息（说明与工具集）挤下去。
+    if spec.isolation:
+        lines.append(
+            f"    隔离：{spec.isolation}"
+            "（每次委派在独立的 Git 工作目录中运行，成果经分支交付）"
+        )
     for warning in spec.warnings:
         lines.append(f"    ⚠ {warning}")
     return lines

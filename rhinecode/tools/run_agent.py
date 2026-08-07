@@ -94,6 +94,11 @@ class RunAgentTool(Tool):
         "拿不准要不要委派时**倾向委派**——该委派而没委派会让那些文件内容常驻你的"
         "上下文、之后每一轮都要重发；多委派一次只是多一次调用。\n"
         "\n"
+        "**要改文件、而你手上也有未提交的改动时，设 `isolation: true`**——"
+        "它会在一个独立的 Git 工作目录里跑，你俩同时改文件也不会互相覆盖；"
+        "成果通过一个分支交回来，结论末尾会给出分支名。"
+        "不涉及写文件的调研类任务不需要它（建工作区要 checkout 一整份源码）。\n"
+        "\n"
         "两种类型：`role` 从空白对话起步、加载一个预定义角色（可用角色见系统提示里的清单）；"
         "`branch` 继承当前对话的历史与工具集、不需要角色，适合「接着刚才的分析继续挖」"
         "这类需要上下文的活，它**总是**在后台运行。\n"
@@ -124,6 +129,16 @@ class RunAgentTool(Tool):
                 "description": (
                     "交给子 Agent 的任务陈述。必须自包含：写清背景、要做什么、"
                     "期望产出什么形式的结论。"
+                ),
+            },
+            "isolation": {
+                "type": "boolean",
+                "description": (
+                    "是否在独立的 Git 工作目录中运行（缺省 false）。"
+                    "涉及写文件、而主对话手上可能有未提交改动时设为 true——"
+                    "它的改动不会与你互相覆盖，成果经一个新分支交回。"
+                    "注意：角色自己声明了隔离时，这里传 false **不生效**"
+                    "（隔离只能加不能减）。"
                 ),
             },
             "background": {
@@ -179,8 +194,13 @@ class RunAgentTool(Tool):
             if kind.lower() == KIND_BRANCH and self._parent_snapshot is not None:
                 parent = self._parent_snapshot()
 
+            # c14 F14：`isolation` 取原值（可能是 None）而不是 bool(...)——
+            # 「未表态」与「显式 false」在单向加严里都不能撤销角色的声明，
+            # 但区分它们能让将来加「显式 false 时给一句提示」之类的行为有落点。
             outcome = self._service.delegate(
-                kind, agent_name, task_text, background, parent, plan_stage=plan_stage
+                kind, agent_name, task_text, background, parent,
+                plan_stage=plan_stage,
+                isolation=args.get("isolation"),
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(ok=False, output=f"委派失败：{exc}", summary="委派失败")

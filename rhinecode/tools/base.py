@@ -87,6 +87,25 @@ class Tool(ABC):
                  只对**非只读**工具有意义：只读工具本来就在规划阶段可用，
                  而非只读工具一律走串行桶，所以 `plan_stage` 只在串行路径传递。
 
+    - workspace_aware：**需要知道本次调用的工作目录**。缺省 False（c14）。
+
+                 声明本标志的工具，其 `execute` **必须接受一个 `cwd` 关键字参数**
+                 （签名写成 `execute(self, args, cwd)`），循环会把本次运行的
+                 工作目录传进来：主对话与非隔离子 Agent 拿到主项目根，
+                 隔离子 Agent 拿到它自己的隔离工作区。
+
+                 一切碰路径或起子进程的工具都该声明它：文件读写编辑、
+                 模式匹配、内容检索、命令执行。声明后**必须真的用那个 cwd**
+                 去做路径解析（`path_guard` 的四个判定函数都要求显式传根），
+                 否则隔离形同虚设。
+
+                 ⚠ **与 `plan_stage` 的传递方式刻意不同：`cwd` 两条执行路径都要传。**
+                 `plan_stage` 只在串行路径传递（它只对非只读工具有意义），
+                 而只读工具（读文件、glob、grep）走的是**并发**路径，
+                 它们同样需要 cwd。照抄 `plan_stage` 的写法会漏掉并发路径，
+                 后果是隔离子 Agent 的**读**落到主项目根、**写**却是对的——
+                 界面上完全看不出来。护栏见 `tests/test_loop_cwd_dispatch.py`。
+
     - system_serial：**系统级串行工具**。为 True 时循环直接放行并强制串行执行，
                  既不进权限管线也不进只读并发桶。
 
@@ -104,6 +123,7 @@ class Tool(ABC):
     read_only: bool = True
     system_serial: bool = False
     plan_safe: bool = False
+    workspace_aware: bool = False
 
     @abstractmethod
     def execute(self, args: dict) -> ToolResult:

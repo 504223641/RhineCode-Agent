@@ -24,7 +24,8 @@ import yaml
 
 from rhinecode.permission.models import Rule
 from rhinecode.permission.rules import RuleSet
-from rhinecode.tools.path_guard import workspace_root
+# c14：项目级/本地级 permissions.yaml 同理，位置固定在主项目根。
+from rhinecode.tools.path_guard import main_project_root
 
 # 配置目录与文件名常量，集中定义便于统一调整。
 _CONFIG_DIR_NAME = ".rhinecode"
@@ -93,12 +94,12 @@ def user_config_path(user_dir: Optional[Path] = None) -> Path:
 
 def project_config_path() -> Path:
     """项目级配置路径：<项目根>/.rhinecode/permissions.yaml（随仓库走）。"""
-    return workspace_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
+    return main_project_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
 
 
 def local_config_path() -> Path:
     """本地级配置路径：<项目根>/.rhinecode/permissions.local.yaml（不提交，永久放行写此）。"""
-    return workspace_root() / _CONFIG_DIR_NAME / _LOCAL_FILE
+    return main_project_root() / _CONFIG_DIR_NAME / _LOCAL_FILE
 
 
 def scaffold_user_config(path: Path) -> bool:

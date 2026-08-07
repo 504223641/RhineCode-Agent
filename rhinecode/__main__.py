@@ -29,7 +29,8 @@ from rhinecode.config import load, user_config_path, scaffold_user_config, PLACE
 from rhinecode.permission import config as perm_config
 from rhinecode.hooks import config as hook_config
 from rhinecode.mcp import config as mcp_config
-from rhinecode.tools.path_guard import workspace_root
+# c14：trace 默认输出路径落在主项目根，不随子 Agent 的隔离工作区变化。
+from rhinecode.tools.path_guard import main_project_root
 from rhinecode.trace import NullRecorder, default_trace_path
 from rhinecode.trace.recorder import create_recorder
 
@@ -138,7 +139,7 @@ def main() -> None:
     if args.trace is None:
         recorder = NullRecorder()
     elif args.trace == _TRACE_DEFAULT:
-        recorder = create_recorder(default_trace_path(workspace_root()))
+        recorder = create_recorder(default_trace_path(main_project_root()))
     else:
         recorder = create_recorder(Path(args.trace))
 

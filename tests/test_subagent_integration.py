@@ -252,7 +252,7 @@ class HookIntegrationTest(IntegrationBase):
             def has_listeners(self, event) -> bool:
                 return event == HookEventType.PRE_TOOL_USE
 
-            def dispatch(self, event, build=None):
+            def dispatch(self, event, build=None, cwd=None):
                 fields = build() if build else {}
                 self.seen.append(fields.get("tool", ""))
 

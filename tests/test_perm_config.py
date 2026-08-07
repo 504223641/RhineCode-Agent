@@ -8,6 +8,11 @@ from unittest import mock
 
 from rhinecode.permission import config
 from rhinecode.permission.models import Decision, PermissionMode, PermissionRequest
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 class ParseRuleStringTests(unittest.TestCase):
@@ -71,7 +76,7 @@ class ConfigLoadTests(TempWorkspaceHomeTest):
         config.append_local_allow("Bash(git status)")
         self.assertTrue(config.local_config_path().exists())
         ruleset, _policy, _errors = config.load_all()
-        req = PermissionRequest("run_command", "Bash", "git status", "command", False, PermissionMode.DEFAULT)
+        req = PermissionRequest("run_command", "Bash", "git status", "command", False, PermissionMode.DEFAULT, _CWD)
         result = ruleset.evaluate(req)
         self.assertIsNotNone(result)
         self.assertEqual(result.decision, Decision.ALLOW)
