@@ -59,6 +59,11 @@ class RunAgentTool(Tool):
     name = "run_agent"
     system_serial = True
     read_only = False
+    # Plan Mode 的规划阶段仍然开放——那恰恰是最需要把调研赶出主上下文的场景
+    # （规划要读很多东西，而那些内容要一路背到执行阶段）。
+    # ⚠ 声明它等于承诺「规划阶段不产生副作用」，兑现方式见 `execute` 的
+    # `plan_stage` 分支：那时**只允许委派给最终工具集全只读的角色**。
+    plan_safe = True
 
     # ## ⚠ 成对维护点：本描述与 `subagents/render.py` 的 `_INDEX_HEADER` 必须同口径
     #
@@ -138,11 +143,17 @@ class RunAgentTool(Tool):
         self._service = service
         self._parent_snapshot = parent_snapshot
 
-    def execute(self, args: dict) -> ToolResult:
+    def execute(self, args: dict, plan_stage: bool = False) -> ToolResult:
         """
         发起一次委派。
 
         :param args: 模型给的参数
+        :param plan_stage: 是否处于 Plan Mode 的**规划阶段**。由 Agent Loop 传入
+            （`plan_safe` 工具的契约，见 `Tool.plan_safe`）。为真时只允许委派给
+            最终工具集**全只读**的角色——Plan Mode 的承诺是「批准前不动手」，
+            而一个能写文件的子 Agent 会直接绕过它。
+            **缺省 False**，使不经循环的调用（测试、将来的其它调用方）
+            按普通模式处理
         :returns: 统一的 `ToolResult`；`ok` 表示**是否成功发起**
             （转后台也算成功——子 Agent 自己失败与否由后续送达的结论说明）
 
@@ -164,7 +175,7 @@ class RunAgentTool(Tool):
                 parent = self._parent_snapshot()
 
             outcome = self._service.delegate(
-                kind, agent_name, task_text, background, parent
+                kind, agent_name, task_text, background, parent, plan_stage=plan_stage
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(ok=False, output=f"委派失败：{exc}", summary="委派失败")

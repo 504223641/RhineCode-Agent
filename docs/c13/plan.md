@@ -409,6 +409,8 @@ rhinecode/
 │       └── explorer.md           — 内置只读调研角色
 ├── tools/run_agent.py            ← 新增：委派工具
 ├── agent/gate.py                 ← 新增：等待闸门的**协议**与 NullGate
+├── tools/base.py                 ← 改：新增 `plan_safe` 标志与它的契约
+├── tools/registry.py             ← 改：新增 `planning_schemas()`
 ├── agent/loop.py                 ← 改：RunOptions.interactive / subagent_gate、
 │                                    非交互拒绝分支、迭代级交付点、收工前的等待闸门
 ├── permission/engine.py          ← 改：derive()
@@ -459,4 +461,5 @@ tests/
 | 发起与等待分离 | `delegate` 永不阻塞；等待在 Agent Loop 收工前统一处理 | 初版在工具调用里同步等，一个设计错误造成两个缺陷：等待独占串行桶 → 多个委派串行；配套的异步交付点挂在「每条用户消息一次」→ 结论在同一次运行内拿不到、任务被变相中断 |
 | 闸门协议放哪 | 协议在 `agent/gate.py`（消费方），实现在 `subagents/gate.py` | 反过来会撞循环导入，实测报错 `cannot import name 'Agent' from partially initialized module` |
 | 等待超时 | **不设**体验意义上的超时，逃生口是 `Esc` | 等待不是卡顿，是进度。初版设过 180 秒，会把一个 `max_turns: 20` 的子 Agent 腰斩 |
+| 规划阶段可委派 | 新增 `Tool.plan_safe` 标志；`run_agent` 声明它，并在 `plan_stage=True` 时只许委派全只读角色 | 用标志而非在循环里判工具名——与 `system_serial` 同一条既有原则（循环不该认识具体工具，那会让 agent 层反向依赖 tools 层）。顺带堵掉一个既有漏洞：守卫的豁免条件原本是 `system_serial`，被 `run_agent` 激活后让规划阶段真的执行了委派 |
 | Plan Mode | 子 Agent 一律 `plan_mode=False` | 它非交互，没有人能审批计划；顺带使两个特殊工具天然不出现 |

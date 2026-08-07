@@ -112,6 +112,7 @@ class SubAgentService:
         task_text: str,
         background: bool = False,
         parent: Optional[ParentSnapshot] = None,
+        plan_stage: bool = False,
     ) -> DelegateOutcome:
         """
         发起一次委派（spec F6/F19/F20）。
@@ -121,6 +122,9 @@ class SubAgentService:
         :param task_text: 任务描述，必须非空
         :param background: 模型是否声明「这次不要这个结果」；`kind == "branch"` 时强制为真
         :param parent: 分支式的父快照，由协调层提供
+        :param plan_stage: 是否处于 Plan Mode 的**规划阶段**（spec F19a）。
+            为真时只允许委派给最终工具集**全只读**的角色——Plan Mode 的承诺是
+            「批准前不动手」，一个能写文件的子 Agent 会直接绕过它
         :returns: `DelegateOutcome`
 
         失败时**不起线程、不发任何 API 请求**——这是 spec F14/F20 的全部价值。
@@ -165,6 +169,17 @@ class SubAgentService:
         toolset = resolve_toolset(all_names, spec, is_background=background)
         if toolset.is_empty:
             return DelegateOutcome(ok=False, text=toolset.reason)
+
+        # ── 规划阶段：只许委派全只读的角色（spec F19a）──
+        #
+        # 放在这里而不是更早：要先算出**最终**工具集才知道它会不会写。
+        # 角色声明了 `write_file` 但被黑名单减掉时应当放行，只看声明会误判。
+        if plan_stage:
+            writable = self._writable_tools(toolset.allowed)
+            if writable:
+                return DelegateOutcome(
+                    ok=False, text=self._plan_stage_text(kind, agent_name, writable)
+                )
 
         # ── 并发上限 ──
         if self.tasks.running_count() >= self._max_concurrent:
@@ -240,6 +255,62 @@ class SubAgentService:
     # ------------------------------------------------------------------ #
     # 文本
     # ------------------------------------------------------------------ #
+
+    def _writable_tools(self, allowed: frozenset) -> list[str]:
+        """
+        挑出最终工具集里**有副作用**的那些。
+
+        :param allowed: 已算好的最终工具集
+        :returns: 非只读的工具名，按字典序；全只读时为空列表
+
+        判据取注册中心里那个工具的 `read_only`，而不是名字白名单——
+        新增工具时不需要回来改这里，MCP 远端工具（一律非只读）也自动被算进去。
+
+        副作用：无（只读注册中心）。
+        """
+        registry = self.runtime.registry
+        out: list[str] = []
+        for name in sorted(allowed):
+            tool = registry.get(name) if registry is not None else None
+            # 查不到的名字按**有副作用**处理：宁可多挡一次，也不要因为
+            # 一个查不到的工具把规划阶段的承诺放过去。
+            if tool is None or not tool.read_only:
+                out.append(name)
+        return out
+
+    def _plan_stage_text(self, kind: str, name: str, writable: list[str]) -> str:
+        """
+        规划阶段拒绝委派时的回灌文本。
+
+        **必须列出「现在能用哪些角色」**，模型才可能自我纠正——
+        只说「不许」的话它只能猜，或者干脆放弃委派、把调研全做在主对话里
+        （那正是本功能要避免的）。
+        """
+        who = f"角色 {name!r}" if kind == KIND_ROLE and name else "分支式委派"
+        readonly = self._read_only_agent_names()
+        tail = (
+            f"当前可用的只读角色：{'、'.join(readonly)}。"
+            if readonly
+            else "当前没有全只读的角色可用。"
+        )
+        return (
+            "当前处于 Plan Mode 的**规划阶段**——批准计划之前不动手，"
+            "因此只能委派给最终工具集**全只读**的角色。\n"
+            f"{who} 的工具集里含有副作用工具：{'、'.join(writable)}，现在不可用。\n"
+            f"{tail}\n"
+            "如果这件事确实需要动手，请先用 present_plan 把计划提交给用户，"
+            "获批之后再委派。"
+        )
+
+    def _read_only_agent_names(self) -> list[str]:
+        """当前哪些角色的最终工具集是全只读的（规划阶段可用的那批）。"""
+        all_names = frozenset(self._tool_names_provider())
+        out: list[str] = []
+        for agent_name, spec in self.catalog.specs.items():
+            result = resolve_toolset(all_names, spec)
+            if not result.is_empty and not self._writable_tools(result.allowed):
+                out.append(agent_name)
+        return out
 
     def _unknown_agent_text(self, name: str) -> str:
         """

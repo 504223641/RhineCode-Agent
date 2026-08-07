@@ -539,7 +539,12 @@ class Agent:
 
         planning = plan_mode and not execution_phase
         base = (
-            self._registry.readonly_schemas() if planning else self._registry.schemas()
+            # c13：规划阶段 = 只读工具 + 声明了 `plan_safe` 的工具。
+            # 后者目前只有委派工具——Plan Mode 恰恰最需要把调研赶出主上下文
+            # （规划要读很多东西，而那些内容要一路背到执行阶段）。
+            # 它在那一阶段的自我约束（只许委派全只读角色）由它自己执行，
+            # 循环只负责把阶段告诉它，见下面 `_run_one_serial` 的 `plan_stage`。
+            self._registry.planning_schemas() if planning else self._registry.schemas()
         )
 
         if excluded:
@@ -939,12 +944,22 @@ class Agent:
             # 「本该有的一道」——Plan Mode 的承诺是「批准前不动手」，
             # 不该退化成「批准前每次都问你要不要动手」。
             #
-            # `and not tool.system_serial` 把一条**原本隐式**的豁免写成了显式条件：
-            # 改造前系统级串行工具在这一步之前就已经 `continue` 掉了，因此从不受
-            # 规划阶段过滤约束。现在 Hook 分发要收在单一点上（见下），系统级工具的
-            # 分流必须挪到这一步之后，那条豁免就得自己写出来，否则今天唯一的系统级
-            # 工具（`load_skill`）的行为会悄悄改变。
-            if planning and not tool.read_only and not tool.system_serial:
+            # ⚠ **豁免条件是 `plan_safe`，不是 `system_serial`**（c13 修订）。
+            #
+            # 这里原本写的是 `and not tool.system_serial`——那是为 `load_skill`
+            # 写的，而 `load_skill` 是 `read_only=True`，本来就被前一个条件挡在外面，
+            # 于是那条豁免长期是**空转**的。
+            #
+            # C13 的委派工具 `run_agent` 恰好把它激活了：`system_serial=True`
+            # **且** `read_only=False`。后果实测过——规划阶段模型凭训练先验硬造出
+            # 一个 `run_agent` 调用，它**既没被这里挡下、又因为 system_serial
+            # 不进权限管线**，直接执行了；而它委派出去的子 Agent 可以写文件。
+            # Plan Mode「批准前不动手」的承诺就此被绕过。
+            #
+            # 改成 `plan_safe` 之后：`load_skill` 仍靠 `read_only=True` 通过
+            # （行为一字不变），而任何**没有明确声明过自己规划期安全**的副作用工具
+            # 一律被挡——豁免从「凡是系统级工具」收窄成「明确承诺过的工具」。
+            if planning and not tool.read_only and not tool.plan_safe:
                 plan_blocked.append(tc)
                 ctx.unknown_count += 1
                 continue
@@ -1140,7 +1155,7 @@ class Agent:
                 ctx.cancelled = True
                 break
             yield from self._run_one_serial(
-                tc, tool, decision, results, ctx, ask, interactive
+                tc, tool, decision, results, ctx, ask, interactive, planning
             )
 
     def _run_special(
@@ -1314,6 +1329,7 @@ class Agent:
         ctx: _RoundContext,
         ask: AskFn,
         interactive: bool = True,
+        planning: bool = False,
     ) -> Iterator[AgentEvent]:
         """
         串行处理单个工具调用：未知 / 参数错误 / 权限拒绝 / 待确认 / 放行（c6）。
@@ -1330,6 +1346,9 @@ class Agent:
         :param interactive: 能否与人交互（c13）。为假时 ASK 直接判拒并回灌
             `DENIED_NON_INTERACTIVE_FEEDBACK`，`ask` 一次都不会被调用。
             **缺省 True 即既有行为。**
+        :param planning: 是否处于 Plan Mode 的规划阶段（c13）。只用于把阶段
+            告知 `plan_safe` 工具——它们据此自我约束（见 `Tool.plan_safe`）。
+            **缺省 False 即既有行为。**
         """
         # 未知工具：结构化错误（沿用既有行为，含 TOOL_START）
         if tool is None:
@@ -1395,7 +1414,14 @@ class Agent:
         yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
         t0 = time.monotonic()
         try:
-            res = tool.execute(tc.arguments)
+            if tool.plan_safe:
+                # 声明了 `plan_safe` 的工具**必须**接受这个关键字参数
+                # （契约写在 `Tool.plan_safe` 的说明里）。多传它是为了让工具
+                # 能在规划阶段自我约束——循环不该也不能替它做那个判断，
+                # 那需要认识具体工具的语义。
+                res = tool.execute(tc.arguments, plan_stage=planning)
+            else:
+                res = tool.execute(tc.arguments)
         except Exception as e:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res

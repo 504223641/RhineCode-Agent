@@ -146,6 +146,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
+- **新增「规划阶段仍可用」的工具（c13）** → 声明 `Tool.plan_safe = True` + **该工具的 `execute` 必须接受 `plan_stage: bool` 关键字参数**（循环会传）。⚠️ 声明它等于承诺「规划阶段不产生副作用」，工具**必须自己兑现**——循环只负责把阶段告诉它。另：规划阶段守卫的豁免条件是 `plan_safe`，**不是 `system_serial`**（那条豁免原本为 `load_skill` 写、长期空转，被 `run_agent` 激活后成了 Plan Mode 的漏洞，实测规划阶段真的执行了委派）。护栏见 `tests/test_subagent_plan_stage.py::PlanGuardTest`（两个假工具只差这一个标志、行为必须相反）
 - **改动子 Agent 闸门的协议（c13）** → `agent/gate.py`（协议 + `NullGate`）+ `subagents/gate.py`（实现）+ `agent/loop.py` 的两处调用点（迭代级 `take_pending` / 收工前的 `has_awaited`+`wait_any`）。⚠️ **协议必须留在 `agent/` 这一侧**：`agent` 依赖 `subagents` 会直接撞循环导入（`agent.loop` → `subagents/__init__` → `runner` → `agent.loop`），实测报错 `cannot import name 'Agent' from partially initialized module`
 - **子 Agent 结论的渲染只有一份** → `subagents/gate.py` 的 `render_subagent_message`。闸门（迭代级交付）与协调层的 `_deliver_subagent_results`（跨用户消息的兜底）**共用它**，各拼一次标记块的话会出现「同一条结论在历史里长得不一样」
 - **新增角色 frontmatter 字段（c13）** → `subagents/models.py` 的 `AgentSpec` 字段 +（若本项目仍不支持）`UNSUPPORTED_FIELDS` + `subagents/parser.py` 的读取与归一 + `subagents/report.py` 的展示。**漏删 `UNSUPPORTED_FIELDS` 里那一项的后果最迷惑**：功能已经做了，用户却被告知「本项目不支持该字段，已忽略」。护栏见 `test_subagent_parser.py::UnsupportedFieldsTest`（遍历常量表逐个断言）
@@ -362,7 +363,11 @@ python -m unittest discover -s tests      # 1728 项，skipped 4
   ⑥ **Hook 对子 Agent 全量生效**（工具级三事件）。不生效的话主 Agent 只要把
   「跑 git push」委派出去就能绕过用户写的拦截规则。护栏见
   `tests/test_subagent_integration.py::HookIntegrationTest`。
-  ⑦ **等待期间唯一的逃生口是 `Esc`**。委派缺省是「我要这个结果」，模型准备收工时
+  ⑦ **Plan Mode 的规划阶段只能委派给全只读的角色**。委派工具在那一阶段仍开放
+  （规划最需要把调研赶出主上下文），但含写工具的角色会被明确拒绝——
+  Plan Mode 的承诺是「批准前不动手」，一个能写文件的子 Agent 会直接绕过它。
+  获批进入执行阶段后不再受限。
+  ⑧ **等待期间唯一的逃生口是 `Esc`**。委派缺省是「我要这个结果」，模型准备收工时
   循环会停下来等子 Agent——**刻意不设体验意义上的超时**（跑子 Agent 就是在执行任务，
   与主 Agent 自己跑一遍测试套件性质相同）。因此 `gate.wait_any` 必须检查取消信号，
   不检查就等于按了 `Esc` 没用。

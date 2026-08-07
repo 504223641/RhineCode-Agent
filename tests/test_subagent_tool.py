@@ -25,11 +25,16 @@ class _FakeService:
 
     def __init__(self, outcome: DelegateOutcome = None, raises: bool = False) -> None:
         self.calls: list[tuple] = []
+        self.plan_stages: list[bool] = []
         self._outcome = outcome or DelegateOutcome(ok=True, text="结论", task_id="a3f1c9")
         self._raises = raises
 
-    def delegate(self, kind, agent_name, task_text, background=False, parent=None):
+    def delegate(
+        self, kind, agent_name, task_text, background=False, parent=None,
+        plan_stage=False,
+    ):
         self.calls.append((kind, agent_name, task_text, background, parent))
+        self.plan_stages.append(plan_stage)
         if self._raises:
             raise RuntimeError("服务炸了")
         return self._outcome
@@ -130,6 +135,26 @@ class ExecuteTest(unittest.TestCase):
         result = self.tool.execute({})
         self.assertIsNotNone(result)
         self.assertEqual(self.service.calls[0][:3], ("", "", ""))
+
+
+class PlanStageForwardingTest(unittest.TestCase):
+    """`plan_stage` 必须如实转发给服务层——它是 Plan Mode 承诺的最后一环。"""
+
+    def test_defaults_to_false(self) -> None:
+        """
+        缺省 False：不经循环的调用（测试、将来的其它调用方）按普通模式处理。
+        缺省成 True 的话，普通对话里的委派会莫名其妙只能用只读角色。
+        """
+        service = _FakeService()
+        RunAgentTool(service).execute({"type": "role", "agent": "e", "task": "t"})
+        self.assertEqual(service.plan_stages, [False])
+
+    def test_forwarded_when_given(self) -> None:
+        service = _FakeService()
+        RunAgentTool(service).execute(
+            {"type": "role", "agent": "e", "task": "t"}, plan_stage=True
+        )
+        self.assertEqual(service.plan_stages, [True])
 
 
 class BranchSnapshotTest(unittest.TestCase):
