@@ -146,6 +146,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
+- **改动角色正文里「结论怎么回流」的说法（c13）** → 必须与 `runner._extract_conclusion` 的实际口径一致：它取的是**最后一条 assistant 消息的全文**，不是「最后一段」。三个内置角色正文 + `SUBAGENT_CONVENTIONS` 都得同口径。**说错了不报错**，只是模型照着字面理解、在结论前面写一堆过程叙述，而那些全都会被带回主对话（真实模型实测过）。护栏见 `test_subagent_builtin.py::test_body_says_the_whole_reply_is_returned`
+- **子 Agent 的产品级约定写在运行器里，不写进角色正文** → `subagents/runner.py` 的 `SUBAGENT_CONVENTIONS`。语言约定与结论长度这两条与角色是谁无关；写进内置角色正文的话，**用户自己写的角色一个都盖不到**。⚠️ 子 Agent 的系统提示只有角色正文，`RHINE.md` 里的项目约定（比如「用中文回答」）**到不了它**
 - **新增「规划阶段仍可用」的工具（c13）** → 声明 `Tool.plan_safe = True` + **该工具的 `execute` 必须接受 `plan_stage: bool` 关键字参数**（循环会传）。⚠️ 声明它等于承诺「规划阶段不产生副作用」，工具**必须自己兑现**——循环只负责把阶段告诉它。另：规划阶段守卫的豁免条件是 `plan_safe`，**不是 `system_serial`**（那条豁免原本为 `load_skill` 写、长期空转，被 `run_agent` 激活后成了 Plan Mode 的漏洞，实测规划阶段真的执行了委派）。护栏见 `tests/test_subagent_plan_stage.py::PlanGuardTest`（两个假工具只差这一个标志、行为必须相反）
 - **改动子 Agent 闸门的协议（c13）** → `agent/gate.py`（协议 + `NullGate`）+ `subagents/gate.py`（实现）+ `agent/loop.py` 的两处调用点（迭代级 `take_pending` / 收工前的 `has_awaited`+`wait_any`）。⚠️ **协议必须留在 `agent/` 这一侧**：`agent` 依赖 `subagents` 会直接撞循环导入（`agent.loop` → `subagents/__init__` → `runner` → `agent.loop`），实测报错 `cannot import name 'Agent' from partially initialized module`
 - **子 Agent 结论的渲染只有一份** → `subagents/gate.py` 的 `render_subagent_message`。闸门（迭代级交付）与协调层的 `_deliver_subagent_results`（跨用户消息的兜底）**共用它**，各拼一次标记块的话会出现「同一条结论在历史里长得不一样」

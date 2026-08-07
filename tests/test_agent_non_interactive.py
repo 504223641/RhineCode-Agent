@@ -136,6 +136,18 @@ class FeedbackTextTest(unittest.TestCase):
         text = DENIED_NON_INTERACTIVE_FEEDBACK.format(name="write_file")
         self.assertIn("重试", text)
 
+    def test_says_other_write_tools_fail_too(self) -> None:
+        """
+        **真实模型验收后加的一条**：光说「别原样重试」不够。
+
+        实测：general-purpose 被拒之后依次试了 `edit_file` → `edit_file` →
+        `write_file` → `run_command` 才放弃——它遵守了「不原样重试」，
+        但不知道**一个写工具被拒意味着同类工具都会被拒**。
+        缺的是那条规则，不是劝告。
+        """
+        text = DENIED_NON_INTERACTIVE_FEEDBACK.format(name="write_file")
+        self.assertIn("换一个工具也没用", text)
+
     def test_points_to_readonly_and_conclusion(self) -> None:
         """③④ 引导改用只读方式，或把这一步写进结论交给主对话。"""
         text = DENIED_NON_INTERACTIVE_FEEDBACK.format(name="write_file")

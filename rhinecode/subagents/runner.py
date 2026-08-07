@@ -70,6 +70,41 @@ _FAILURE_TEXT = {
 
 _UNEXPECTED_TEXT = "子 Agent 运行时出错，未产出结论：{error}"
 
+# 所有子 Agent 都要遵守的两条约定，注入每个子 Agent 的 <system-reminder>。
+#
+# ## 为什么放在这里，而不是写进每个角色的正文
+#
+# 它们是**产品级的事实**，与角色是谁无关；写进正文的话，用户自己写的角色
+# 一个都盖不到（内置那三个写得再全也没用）。放在运行器里，任何角色——包括
+# 从别处复制来的——都自动带上。
+#
+# ## 第一条：语言
+#
+# 子 Agent 的系统提示**只有角色正文**（spec F7 照 Claude Code 口径），
+# 因此 `RHINE.md` 里的「用中文回答」这类项目约定**到不了它**。
+# 真实模型验收实测到：一个中文项目里的 planner 开口就是
+# "I now have complete knowledge of the codebase."
+#
+# 写「用与任务描述相同的语言」而不是写死「用中文」：任务描述由主 Agent 生成，
+# 而主 Agent 拿得到 RHINE.md、也在用用户的语言说话，于是这条对任何语言都成立。
+#
+# ## 第二条：长度
+#
+# 结论会**整段进入主对话的上下文**。委派本来就是为了省上下文，回流一份万字
+# 长文会把收益吃掉一大半——实测过一次 9776 字符的方案。
+# 角色正文只说了「最后一段是唯一会被带回去的」（强调自包含），
+# 没说它**有代价**，模型于是没有精简的动机。
+SUBAGENT_CONVENTIONS = (
+    "<subagent-conventions>\n"
+    "两条对你同样有效的约定：\n"
+    "1. **用与任务描述相同的语言作答**（任务描述是中文就用中文）。\n"
+    "2. 你的最终结论会**整段进入主对话的上下文**并占用它的预算，因此要精炼："
+    "把结论压到必要的长度，**不要贴改动前后的完整代码对照**，"
+    "用「文件:行 → 一句话」代替；过程叙述与自我陈述"
+    "（「我现在已经完全了解了代码库」这类）一律不要写进结论。\n"
+    "</subagent-conventions>"
+)
+
 
 @dataclass(frozen=True)
 class ParentSnapshot:
@@ -193,7 +228,7 @@ def _build_prompts(
     )
 
     def dynamic() -> str:
-        parts = [runtime.environment_text()]
+        parts = [runtime.environment_text(), SUBAGENT_CONVENTIONS]
         if needs_untrusted:
             parts.append(runtime.untrusted_section)
         return "\n\n".join(p for p in parts if p)

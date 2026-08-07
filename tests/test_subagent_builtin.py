@@ -123,6 +123,21 @@ class EveryBuiltinTest(unittest.TestCase):
             with self.subTest(agent=name):
                 self.assertIn("自包含", spec.body, f"{name} 的正文要求结论自包含")
 
+    def test_body_says_the_whole_reply_is_returned(self) -> None:
+        """
+        **正文必须说「整条回复」而不是「最后一段」。**
+
+        真实模型验收实测：正文原本写的是「最后一段是唯一会被带回主对话的东西」，
+        而实现取的是**最后那条 assistant 消息的全文**——两者不符。
+        模型照着字面理解，在结论前面写了三段过程叙述（还是英文），全都被带了回去。
+
+        这不是措辞偏好问题，是**文案描述错了实现**。
+        """
+        for name, spec in self.catalog.specs.items():
+            with self.subTest(agent=name):
+                self.assertIn("整条", spec.body)
+                self.assertNotIn("最后一段是唯一", spec.body)
+
     def test_can_actually_start(self) -> None:
         """AC5：缺省工具集下每个内置角色的最终工具集都非空。"""
         for name, spec in self.catalog.specs.items():

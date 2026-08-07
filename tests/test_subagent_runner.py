@@ -254,6 +254,39 @@ class SystemPromptTest(RunnerBase):
         self._run(provider)
         self.assertIn("工作目录：/tmp", provider.messages_per_turn[0])
 
+    def test_conventions_reach_every_subagent(self) -> None:
+        """
+        **两条产品级约定必须进每个子 Agent 的提示**（真实模型验收后加）。
+
+        实测到的两个问题：
+        1. 中文项目里的 planner 开口说英文——子 Agent 的系统提示**只有角色正文**，
+           `RHINE.md` 的「用中文回答」到不了它；
+        2. 一份 9776 字符的方案整段回流主对话——委派本是为了省上下文，
+           这把收益吃掉了一大半。
+
+        放在运行器而不是三个角色正文里：**用户自己写的角色也得盖到**。
+        """
+        provider = _SayProvider(["done"])
+        self._run(provider)
+        body = provider.messages_per_turn[0]
+
+        self.assertIn("subagent-conventions", body)
+        self.assertIn("相同的语言", body)
+        self.assertIn("整段进入主对话的上下文", body)
+
+    def test_conventions_are_not_in_any_builtin_body(self) -> None:
+        """
+        **反证**：这两条不该被复制进内置角色的正文。
+
+        复制过去就成了两份实现——改一处忘一处，而用户自定义的角色照样漏掉。
+        """
+        from rhinecode.subagents.discovery import discover_agents
+        from rhinecode.subagents.models import builtin_agents_dir
+
+        for name, spec in discover_agents(None, None, builtin_agents_dir()).specs.items():
+            with self.subTest(agent=name):
+                self.assertNotIn("相同的语言", spec.body)
+
     def test_untrusted_section_present_with_network_tool(self) -> None:
         """
         工具集含网络访问工具时，「外部不可信内容」段必须出现。

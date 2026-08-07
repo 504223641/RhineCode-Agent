@@ -211,6 +211,34 @@ class SameVoiceTest(unittest.TestCase):
             with self.subTest(where=label):
                 self.assertIn("倾向委派", text)
 
+    def test_both_forbid_looking_first(self) -> None:
+        """
+        ⑤ **「不要先看一眼再决定」**——真实模型验收实测加上的一条。
+
+        观测到的失败：模型判断对了（「适合委派给 explorer」），但接着说
+        「不过在此之前，我先快速看一下项目结构」，读完 7 个文件之后反过来
+        用「项目不大」证明自己不该委派。**一旦读了，委派的价值就已经归零**，
+        这是个与判断力无关的结构性滑坡。
+
+        原措辞还喂了它一个数字借口（「二十个文件」），7 个当然「不到二十」——
+        那个锚点已经一并去掉。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            with self.subTest(where=label):
+                self.assertIn("先看一眼再决定", text)
+                self.assertIn("不是项目大小", text)
+
+    def test_neither_anchors_on_a_file_count(self) -> None:
+        """
+        **反证**：两处都不得再出现具体的文件数量锚点。
+
+        写「二十个文件」会让模型拿实际数量去比对，从而给自己找到不委派的理由。
+        代价要按**机制**说（内容常驻上下文、每轮重发），而不是按数量说。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            with self.subTest(where=label):
+                self.assertNotIn("二十个文件", text)
+
     def test_both_explain_the_context_cost(self) -> None:
         """
         ④ 说明**上下文成本**——那是委派唯一真正的收益。
