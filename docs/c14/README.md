@@ -12,6 +12,8 @@
 | [`task.md`](task.md) | 按什么顺序做：37 个任务分五阶段，每个带验证方式 |
 | [`checklist.md`](checklist.md) | 做对了没：79 条可观测判据 + 9 个端到端场景 |
 
+验收记录在 [`acceptance/logic-and-e2e.md`](acceptance/logic-and-e2e.md)（全量回归 + 9 个端到端场景 + 安全边界反证 + 两处验收期漏洞）。
+
 ## Worktree 是什么（零基础版）
 
 C13 之前，主 Agent 和所有子 Agent 共用一个工作目录、一个 Git 工作现场：
