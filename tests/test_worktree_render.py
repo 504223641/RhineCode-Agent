@@ -123,3 +123,25 @@ class ToolDescriptionSameVoiceTest(unittest.TestCase):
         from rhinecode.tools.run_agent import RunAgentTool
 
         self.assertIn("不要自己钻进那个目录", RunAgentTool.description)
+
+    def test_tool_description_states_uncommitted_changes_are_invisible(self):
+        """
+        「基点是当前 HEAD、你未提交的改动它看不到」必须写在**决策期**读到的文本里。
+
+        ## 这条也是实测补的，且代价可量化
+
+        隔离宣传的场景是「你手上有未提交改动时用它」，而基点规则是「取当前 HEAD、
+        未提交改动不带入」——两句话组合到**同一个文件**上时必然冲突，而工具描述
+        原先只讲前半句。实测：主 Agent 自己把后半句推了出来，但为此在一轮回复里
+        把同一个两难重述了七遍、最后停下来让用户拍板。它推对了，只是很贵。
+
+        断言落在 `parameters` 与 `description` 两处：模型不一定两处都读，
+        写在一处等于赌它读的是那一处。
+        """
+        from rhinecode.tools.run_agent import RunAgentTool
+
+        self.assertIn("看不到", RunAgentTool.description)
+        self.assertIn(
+            "看不到你未提交的改动",
+            RunAgentTool.parameters["properties"]["isolation"]["description"],
+        )
