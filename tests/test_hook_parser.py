@@ -252,7 +252,7 @@ class LoadAllTest(unittest.TestCase):
         (self.project_root / ".rhinecode").mkdir(parents=True)
         self.user_dir.mkdir(parents=True)
         patcher = mock.patch.object(
-            hook_config, "workspace_root", return_value=self.project_root
+            hook_config, "main_project_root", return_value=self.project_root
         )
         patcher.start()
         self.addCleanup(patcher.stop)

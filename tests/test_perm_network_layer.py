@@ -21,6 +21,11 @@ from rhinecode.permission.models import (
     Rule,
 )
 from rhinecode.permission.rules import RuleSet
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 def _url_request(url: str, host: str = "", mode: PermissionMode = PermissionMode.DEFAULT) -> PermissionRequest:
@@ -36,7 +41,7 @@ def _url_request(url: str, host: str = "", mode: PermissionMode = PermissionMode
         specifier=url,
         kind="url",
         is_read_only=False,
-        mode=mode,
+        mode=mode, cwd=_CWD,
         host=host,
     )
 
@@ -369,7 +374,7 @@ def _write_request(mode: PermissionMode) -> PermissionRequest:
         specifier="out.txt",
         kind="write_path",
         is_read_only=False,
-        mode=mode,
+        mode=mode, cwd=_CWD,
     )
 
 
@@ -532,7 +537,7 @@ class VerdictCarriesKindAndHostTests(unittest.TestCase):
             specifier="rm -rf /",
             kind="command",
             is_read_only=False,
-            mode=PermissionMode.DEFAULT,
+            mode=PermissionMode.DEFAULT, cwd=_CWD,
         )
         r = eng.decide(req)
         self.assertEqual(r.layer, Layer.BLACKLIST)
@@ -546,7 +551,7 @@ class VerdictCarriesKindAndHostTests(unittest.TestCase):
             specifier="README.md",
             kind="read_path",
             is_read_only=True,
-            mode=PermissionMode.DEFAULT,
+            mode=PermissionMode.DEFAULT, cwd=_CWD,
         )
         r = eng.decide(req)
         self.assertEqual(r.decision, Decision.ALLOW)

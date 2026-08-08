@@ -79,7 +79,7 @@ class IntegrationBase(unittest.TestCase):
                 registry=self.registry,
                 engine=manager.permission_engine,
                 main_mode=lambda: manager.permission_engine.mode,
-                environment_text=lambda: "env",
+                environment_text=lambda _cwd: "env",
                 default_model="m",
                 new_context_manager=manager.new_subagent_context_manager,
             )
@@ -252,7 +252,7 @@ class HookIntegrationTest(IntegrationBase):
             def has_listeners(self, event) -> bool:
                 return event == HookEventType.PRE_TOOL_USE
 
-            def dispatch(self, event, build=None):
+            def dispatch(self, event, build=None, cwd=None):
                 fields = build() if build else {}
                 self.seen.append(fields.get("tool", ""))
 
@@ -299,7 +299,7 @@ class HookIntegrationTest(IntegrationBase):
             registry=registry,
             engine=manager.permission_engine,
             main_mode=lambda: manager.permission_engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda _cwd: "env",
             default_model="m",
             hooks=hooks,
         )

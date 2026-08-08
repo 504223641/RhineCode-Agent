@@ -13,6 +13,7 @@
 「永久放行」写下的规则是废的。
 """
 
+from pathlib import Path
 from typing import Callable, Optional
 
 from rhinecode.tools.base import Tool
@@ -43,13 +44,21 @@ _TOOL_MAP: dict[str, _Mapper] = {
 }
 
 
-def to_request(tool: Tool, args: Optional[dict], mode: PermissionMode) -> PermissionRequest:
+def to_request(
+    tool: Tool,
+    args: Optional[dict],
+    mode: PermissionMode,
+    cwd: Path,
+) -> PermissionRequest:
     """
     把一次工具调用规范化为 PermissionRequest，作为 engine.decide 的输入。
 
     :param tool: 被调用的工具实例（提供 name 与 read_only）
     :param args: 模型给出的、已解析的参数字典（None 时按空字典处理）
     :param mode: 当前权限模式，原样写入请求供④层兜底
+    :param cwd: **本次调用的工作目录**（c14 F2）。第②层路径沙箱据它判定边界。
+                主对话与非隔离子 Agent 传主项目根，隔离子 Agent 传它的隔离工作区。
+                **必填**——理由见 `PermissionRequest.cwd` 的说明
     :returns: 规范化后的 PermissionRequest
 
     映射规则见 _TOOL_MAP；未登记的工具落到 "other" 分支：rule_name 用工具自身的 name，
@@ -80,6 +89,7 @@ def to_request(tool: Tool, args: Optional[dict], mode: PermissionMode) -> Permis
         kind=kind,
         is_read_only=tool.read_only,
         mode=mode,
+        cwd=cwd,
         host=host,
     )
 

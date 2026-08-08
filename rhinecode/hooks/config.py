@@ -33,7 +33,8 @@ import yaml
 
 from rhinecode.hooks.models import HookRule
 from rhinecode.hooks.parser import parse_rules
-from rhinecode.tools.path_guard import workspace_root
+# c14：项目级 hooks.yaml 只有一份，位置固定在主项目根，不随调用者变化。
+from rhinecode.tools.path_guard import main_project_root
 
 # 配置目录与文件名常量，集中定义便于统一调整（与 permission/config.py 同构）。
 _CONFIG_DIR_NAME = ".rhinecode"
@@ -148,7 +149,7 @@ def user_config_path(user_dir: Optional[Path] = None) -> Path:
 
 def project_config_path() -> Path:
     """项目级配置路径：`<项目根>/.rhinecode/hooks.yaml`（随仓库走、可提交）。"""
-    return workspace_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
+    return main_project_root() / _CONFIG_DIR_NAME / _CONFIG_FILE
 
 
 def scaffold_user_config(path: Path) -> bool:

@@ -22,6 +22,8 @@
 | MCP | `mcp/` | MCP 客户端：配置、JSON-RPC、两种传输、工具适配、多 Server 编排 |
 | Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 |
 | Hooks | `hooks/` | Hook 规则的解析/条件求值/动作执行/分发编排（依赖 permission 与 trace，**不是**叶子包） |
+| SubAgents | `subagents/` | 角色解析/三层扫描/工具过滤/任务表/运行器/服务门面（c13）；**不依赖** conversation/tui/commands，外部依赖由 `SubAgentRuntime` 注入 |
+| Worktree | `worktree/` | 隔离工作区的建/查/删与启动清理（c14）。**全项目唯一执行 git 的地方**；叶子包，只依赖标准库 + `tools.path_guard` + `trace` |
 | Skills | `skills/` | Skill 定义的解析/发现/渲染/预授权翻译/激活编排（叶子包） |
 | Context | `context/` | 两层压缩：估算、工具结果存盘、LLM 摘要 |
 | Web | `web/` | 网络抓取与内容抽取（web_fetch 扩展，叶子包）：解码、HTML 转换、逐跳硬校验、抽取编排、结果渲染 |

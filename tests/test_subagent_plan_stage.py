@@ -288,7 +288,7 @@ class DelegateInPlanStageTest(unittest.TestCase):
             registry=self.registry,
             engine=self.engine,
             main_mode=lambda: self.engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda _cwd: "env",
             default_model="m",
         )
         self.service = SubAgentService(

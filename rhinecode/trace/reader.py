@@ -238,6 +238,52 @@ def _s_subagent_end(r: dict) -> str:
     )
 
 
+def _s_worktree_create(r: dict) -> str:
+    """
+    隔离工作区的创建（c14）。
+
+    `recovered` 一栏值得留意：为真说明走了快速恢复（目录本来就在，一条 git
+    都没调）。排查「为什么这次委派特别快 / 为什么工作区里有上次的残留」时，
+    第一眼就该看它。
+    """
+    tag = "恢复" if r.get("recovered") else "新建"
+    return (
+        f"{tag} {r.get('name')} · 分支 {r.get('branch') or '-'}"
+        f" · 基于 {r.get('base_commit') or '-'}"
+    )
+
+
+def _s_worktree_provision(r: dict) -> str:
+    """环境初始化（c14）。警告数不为零时要展开看——降级为复制就藏在里面。"""
+    return (
+        f"{r.get('name')} · 生效 {r.get('applied', 0)} 项"
+        f" · 警告 {r.get('warnings', 0)} 条"
+    )
+
+
+def _s_worktree_settle(r: dict) -> str:
+    """
+    结束时的去留决定（c14）。
+
+    「保留」与「删除」之外还要看 `dirty` 与 `commits`：它们才是决定的依据，
+    只看结论无法判断这次是不是判错了。
+    """
+    action = "删除" if r.get("removed") else "保留"
+    return (
+        f"{action} {r.get('name')} · 未提交改动 {'有' if r.get('dirty') else '无'}"
+        f" · 提交 {r.get('commits', 0)} 个"
+        f" · 分支 {'保留' if r.get('keep_branch') else '删除'}"
+    )
+
+
+def _s_worktree_cleanup(r: dict) -> str:
+    """启动清理的结果（c14）。"""
+    return (
+        f"扫描 {r.get('scanned', 0)} 个过期工作区"
+        f" · 删除 {r.get('removed', 0)} 个 · 保留 {r.get('kept', 0)} 个"
+    )
+
+
 SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.SESSION_START.value: _s_session_start,
     TraceEventType.SESSION_END.value: _s_session_end,
@@ -258,6 +304,10 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.HOOK_EXECUTE.value: _s_hook_execute,
     TraceEventType.SUBAGENT_START.value: _s_subagent_start,
     TraceEventType.SUBAGENT_END.value: _s_subagent_end,
+    TraceEventType.WORKTREE_CREATE.value: _s_worktree_create,
+    TraceEventType.WORKTREE_PROVISION.value: _s_worktree_provision,
+    TraceEventType.WORKTREE_SETTLE.value: _s_worktree_settle,
+    TraceEventType.WORKTREE_CLEANUP.value: _s_worktree_cleanup,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」

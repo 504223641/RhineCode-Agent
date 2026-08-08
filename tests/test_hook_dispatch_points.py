@@ -50,7 +50,7 @@ class RecordingHooks:
     def has_listeners(self, event):
         return event in self.listen
 
-    def dispatch(self, event, payload_factory=None):
+    def dispatch(self, event, payload_factory=None, cwd=None):
         self.seen.append((event.value, payload_factory() if payload_factory else {}))
         return EMPTY_DISPATCH
 

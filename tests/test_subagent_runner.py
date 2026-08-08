@@ -189,7 +189,7 @@ class RunnerBase(unittest.TestCase):
             registry=self.registry,
             engine=engine if engine is not None else self.engine,
             main_mode=lambda: mode if mode is not None else self.engine.mode,
-            environment_text=lambda: "工作目录：/tmp",
+            environment_text=lambda cwd: f"工作目录：{cwd}",
             default_model="m",
             hooks=self.hooks,
             untrusted_section=untrusted,
@@ -249,10 +249,18 @@ class SystemPromptTest(RunnerBase):
         self.assertEqual(provider.stables[0], "你是一个只读调研员。")
 
     def test_environment_info_is_injected(self) -> None:
-        """环境信息段确实进了请求（它是子 Agent 唯一的「我在哪」来源）。"""
+        """
+        环境信息段确实进了请求（它是子 Agent 唯一的「我在哪」来源）。
+
+        c14 修正后 `environment_text` 收一个入参——本次子 Agent 的工作目录。
+        本组不隔离，故入参应当是主项目根；「隔离时换成工作区」那条护栏在
+        `test_subagent_isolation.py::IsolationNoticeTest` 里。
+        """
+        from rhinecode.tools.path_guard import main_project_root
+
         provider = _SayProvider(["done"])
         self._run(provider)
-        self.assertIn("工作目录：/tmp", provider.messages_per_turn[0])
+        self.assertIn(f"工作目录：{main_project_root()}", provider.messages_per_turn[0])
 
     def test_conventions_reach_every_subagent(self) -> None:
         """

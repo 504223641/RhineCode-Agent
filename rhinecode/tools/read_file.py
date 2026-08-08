@@ -6,7 +6,7 @@
 """
 
 from rhinecode.tools.base import Tool, ToolResult, human_size
-from rhinecode.tools.path_guard import PathGuardError, resolve_readable
+from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_cwd, resolve_readable
 
 MAX_READ_BYTES = 1024 * 1024
 MAX_RANGE_LINES = 2000
@@ -41,8 +41,10 @@ class ReadFileTool(Tool):
         "required": ["path"],
     }
     read_only = True
+    # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
+    workspace_aware = True
 
-    def execute(self, args: dict) -> ToolResult:
+    def execute(self, args: dict, cwd=None) -> ToolResult:
         """
         读取文件内容。
 
@@ -65,7 +67,7 @@ class ReadFileTool(Tool):
 
             # 只读工具不经过确认，因此必须先把路径钉死在项目工作目录内；
             # c9 起额外放行「只读白名单」目录（当前仅用户级记忆目录），写类工具不受影响。
-            abs_path = resolve_readable(path)
+            abs_path = resolve_readable(path, _require_cwd(cwd))
 
             if not abs_path.exists():
                 return ToolResult(ok=False, output=f"文件不存在: {path}", summary="文件不存在")

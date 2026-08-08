@@ -48,7 +48,9 @@ from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.web_fetch import WebFetchTool
 from rhinecode.web.manager import WebFetchManager
-from rhinecode.tools.path_guard import clear_read_roots, workspace_root
+# c14：装配期定位项目级配置与目录，与「调用者站在哪个工作目录」无关，故取主项目根。
+from rhinecode.tools.path_guard import clear_read_roots, main_project_root
+from rhinecode.worktree import ProvisionEntry, render_cleanup_notice, scan_and_clean
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.trace import (
     NullRecorder,
@@ -236,7 +238,7 @@ def build_app(
     # （这段注释随代码从 `__main__.py` 迁来。它是 C11 留下的唯一记载——
     #  迁走代码却把理由留在原地，等于把知识丢了。）
     skill_manager = SkillManager(
-        workspace_root(),
+        main_project_root(),
         user_dir,
         builtin_skills_dir(),
         has_short_command=command_registry.has_skill_command,
@@ -295,7 +297,7 @@ def build_app(
             recorder=recorder,
             client_factory=hook_client_factory,
             user_path=str(user_dir / "hooks.yaml"),
-            project_path=str(workspace_root() / ".rhinecode" / "hooks.yaml"),
+            project_path=str(main_project_root() / ".rhinecode" / "hooks.yaml"),
         )
         if (hook_rules or hook_warnings)
         # 两层配置都没有内容时用空对象：全部分发变成零成本空操作，
@@ -340,9 +342,29 @@ def build_app(
     #
     # 与 `load_skill` 同样采用属性注入解耦构造顺序：服务在协调层之后建好，
     # 再回填给协调层。
+    # c14 F19：隔离工作区的启动清理。
+    #
+    # **位置**：在配置加载之后（要读 cleanup_days）、任何子 Agent 可能启动之前。
+    # 后者不是理论顾虑——清理会真的删目录，而一个正在写文件的子 Agent
+    # 撞上它就是数据丢失。放在启动期则**竞态从根上不存在**：那一刻不可能有
+    # 子 Agent 在跑（服务还没建出来）。
+    #
+    # ⚠ **整段 fail-safe**：清理是空间回收的增强项，失败绝不能阻断启动。
+    # `scan_and_clean` 内部已经对每个条目单独兜底，这里再包一层是纵深防御——
+    # 它连「根目录本身不可读」这种情形也要吞掉。
+    worktree_cleanup = None
+    try:
+        worktree_cleanup = scan_and_clean(
+            main_project_root(), cfg.worktree_cleanup_days, recorder
+        )
+    except Exception:  # noqa: BLE001
+        worktree_cleanup = None
+    if worktree_cleanup is not None and not worktree_cleanup.is_empty:
+        manager.add_startup_notice(render_cleanup_notice(worktree_cleanup))
+
     if tool_registry is not None:
         agent_catalog = discover_agents(
-            workspace_root() / ".rhinecode" / "agents",
+            main_project_root() / ".rhinecode" / "agents",
             user_dir / "agents",
             builtin_agents_dir(),
         )
@@ -354,8 +376,11 @@ def build_app(
             registry=tool_registry,
             engine=manager.permission_engine,
             main_mode=lambda: manager.permission_engine.mode,
-            environment_text=lambda: build_default_prompt(
-                collect_environment(cfg, str(workspace_root()))
+            # c14 修正：入参是**本次子 Agent 的工作目录**。隔离子 Agent 传的是
+            # 它的工作区，于是环境信息段里的「工作目录」与 git 分支都跟着它走
+            # ——原先固定取主项目根，与 `<isolated-workspace>` 段自相矛盾。
+            environment_text=lambda agent_cwd: build_default_prompt(
+                collect_environment(cfg, agent_cwd)
             ).dynamic,
             default_model=cfg.model,
             hooks=hook_manager,
@@ -372,6 +397,13 @@ def build_app(
             # **必须是回调**：MCP 工具在上面的 `connect_all` 里才注册进来，
             # 取值型会拿到一份不含它们的陈旧快照。
             tool_names_provider=tool_registry.names,
+            # c14 F10：隔离工作区的环境初始化清单。两段清单在这里合成
+            # `ProvisionEntry` 序列——config 层只存字符串，语义（copy / link）
+            # 由字段名承载，转换点收在这一处。
+            provision_entries=tuple(
+                [ProvisionEntry(source=x, mode="copy") for x in cfg.worktree_copy]
+                + [ProvisionEntry(source=x, mode="link") for x in cfg.worktree_link]
+            ),
         )
         manager.subagent_service = subagent_service
         tool_registry.register(
@@ -391,7 +423,7 @@ def build_app(
     recorder.emit_lazy(
         TraceEventType.SESSION_START,
         lambda: {
-            "project_root": str(workspace_root()),
+            "project_root": str(main_project_root()),
             "user_dir": str(user_dir),
             "config": redact_config(cfg),
             "permission_mode": manager.permission_mode_value,

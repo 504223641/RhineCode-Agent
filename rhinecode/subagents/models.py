@@ -86,10 +86,12 @@ MAX_CONCURRENT = 3
 # ⚠ **成对维护点**：将来支持了其中某一项，要从这张表里删掉并在 `AgentSpec`
 # 加字段、在 `parser.py` 加读取、在 `report.py` 加展示。漏删的表现是
 # 「功能做了但用户被告知不支持」。
+# ⚠ **`isolation` 已于 c14 移出本表**——它现在是真支持的字段（spec F13）。
+# 那是本表最典型的一次成对维护：功能做了却忘了删这一行的话，用户会被告知
+# 「本项目不支持 isolation 字段，已忽略」，而它其实生效了。
 UNSUPPORTED_FIELDS = {
     "skills": "预加载 Skill（子 Agent 的工具集里排除了 Skill 加载工具，见 spec F13）",
     "memory": "跨会话持久记忆（属 C9 记忆系统的范畴）",
-    "isolation": "Worktree 文件隔离（本章不做）",
     "color": "界面显示颜色（本章的任务行不着色）",
     "hooks": "角色专属 Hook（Hook 规则统一从 hooks.yaml 加载）",
     "mcp_servers": "角色专属 MCP Server（MCP 连接在装配期统一建立）",
@@ -126,6 +128,12 @@ class AgentSpec:
     :param max_turns: 本角色的迭代上限，已夹在 `[1, HARD_MAX_TURNS]`。
     :param permission_mode: 声明的权限档位；`None` 表示继承。
         **实际生效档位不是这个值**——见 spec F16，取 min(主对话档, 本值)。
+    :param isolation: 隔离需求（c14 F13）。`"worktree"` = 该角色的每次委派都在
+        一个独立的 Git 工作目录里跑；`None` = 未声明。
+
+        它是**缺省值**而不是最终值：委派时还可以在本次调用上要求隔离，
+        合并方向是**单向加严**（角色声明了，调用方关不掉；角色没声明，
+        调用方可以这次要）。合并逻辑在 `service.resolve_isolation`。
     :param source: 来源层。
     :param path: 定义文件路径，报告与排错用。
     :param warnings: 加载期产生的可读提示（未支持字段、越界被夹的数值等）。
@@ -142,6 +150,7 @@ class AgentSpec:
     model: Optional[str] = None
     max_turns: int = DEFAULT_MAX_TURNS
     permission_mode: Optional[PermissionMode] = None
+    isolation: Optional[str] = None
     warnings: tuple[str, ...] = ()
 
 

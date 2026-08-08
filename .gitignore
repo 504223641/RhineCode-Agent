@@ -36,3 +36,8 @@ TemText.txt
 # 与命令输出，模型读过配置文件时还可能含**明文 API Key**。必须留在本机、勿外传。
 # `**/` 前缀与上面三行同口径，否则嵌套项目路径下失效。
 **/.rhinecode/traces/
+
+# c14 子 Agent 隔离工作区：每个都是一份**完整的源码 checkout**，
+# 且环境初始化可能把本地配置（含密钥）复制进去。与 context/sessions/memory/traces
+# 同口径——`**/` 前缀不可省，否则嵌套项目路径下失效。
+**/.rhinecode/worktrees/

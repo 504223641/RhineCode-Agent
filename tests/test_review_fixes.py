@@ -15,6 +15,12 @@ from rhinecode.tools.registry import ToolRegistry
 from rhinecode.tools.write_file import WriteFileTool
 
 from rhinecode.config import Config
+from rhinecode.tools.path_guard import main_project_root
+
+
+def _cwd():
+    """c14：用例会 chdir 到临时工作区，因此每次现取进程当前目录。"""
+    return main_project_root()
 
 try:
     from rhinecode.config import load
@@ -44,13 +50,13 @@ class PathGuardTests(TempWorkspaceTest):
         outside = self.outside_path("outside.txt")
         outside.write_text("secret\n", encoding="utf-8")
 
-        self.assertTrue(ReadFileTool().execute({"path": "inside.txt"}).ok)
+        self.assertTrue(ReadFileTool().execute({"path": "inside.txt"}, cwd=_cwd()).ok)
 
-        read_result = ReadFileTool().execute({"path": str(outside)})
+        read_result = ReadFileTool().execute({"path": str(outside)}, cwd=_cwd())
         self.assertFalse(read_result.ok)
         self.assertEqual(read_result.summary, "路径越界")
 
-        write_result = WriteFileTool().execute({"path": str(outside), "content": "changed"})
+        write_result = WriteFileTool().execute({"path": str(outside), "content": "changed"}, cwd=_cwd())
         self.assertFalse(write_result.ok)
         self.assertEqual(outside.read_text(encoding="utf-8"), "secret\n")
 
@@ -58,12 +64,12 @@ class PathGuardTests(TempWorkspaceTest):
             "path": str(outside),
             "old_string": "secret",
             "new_string": "changed",
-        })
+        }, cwd=_cwd())
         self.assertFalse(edit_result.ok)
         self.assertEqual(edit_result.summary, "路径越界")
 
     def test_parent_references_are_rejected(self) -> None:
-        result = ReadFileTool().execute({"path": "../outside.txt"})
+        result = ReadFileTool().execute({"path": "../outside.txt"}, cwd=_cwd())
         self.assertFalse(result.ok)
         self.assertEqual(result.summary, "路径越界")
 
@@ -71,11 +77,11 @@ class PathGuardTests(TempWorkspaceTest):
         outside = self.outside_path("outside.txt")
         outside.write_text("needle\n", encoding="utf-8")
 
-        glob_result = GlobTool().execute({"pattern": "../*"})
+        glob_result = GlobTool().execute({"pattern": "../*"}, cwd=_cwd())
         self.assertFalse(glob_result.ok)
         self.assertEqual(glob_result.summary, "路径越界")
 
-        grep_result = GrepTool().execute({"pattern": "needle", "path": str(outside)})
+        grep_result = GrepTool().execute({"pattern": "needle", "path": str(outside)}, cwd=_cwd())
         self.assertFalse(grep_result.ok)
         self.assertEqual(grep_result.summary, "路径越界")
 
@@ -88,11 +94,11 @@ class PathGuardTests(TempWorkspaceTest):
         except (OSError, NotImplementedError):
             self.skipTest("symlink creation is not available in this environment")
 
-        result = GlobTool().execute({"pattern": "**/*"})
+        result = GlobTool().execute({"pattern": "**/*"}, cwd=_cwd())
         self.assertTrue(result.ok)
         self.assertNotIn("external_link.txt", result.output)
 
-        read_result = ReadFileTool().execute({"path": "external_link.txt"})
+        read_result = ReadFileTool().execute({"path": "external_link.txt"}, cwd=_cwd())
         self.assertFalse(read_result.ok)
         self.assertEqual(read_result.summary, "路径越界")
 
@@ -100,11 +106,11 @@ class PathGuardTests(TempWorkspaceTest):
         lines = [f"line {i}\n" for i in range(1, 140000)]
         Path("large.txt").write_text("".join(lines), encoding="utf-8")
 
-        full = ReadFileTool().execute({"path": "large.txt"})
+        full = ReadFileTool().execute({"path": "large.txt"}, cwd=_cwd())
         self.assertFalse(full.ok)
         self.assertEqual(full.summary, "文件过大")
 
-        ranged = ReadFileTool().execute({"path": "large.txt", "start_line": 10, "max_lines": 3})
+        ranged = ReadFileTool().execute({"path": "large.txt", "start_line": 10, "max_lines": 3}, cwd=_cwd())
         self.assertTrue(ranged.ok)
         self.assertIn("10│ line 10", ranged.output)
         self.assertIn("12│ line 12", ranged.output)
@@ -230,7 +236,7 @@ class PermissionFilterTests(TempWorkspaceTest):
         Path("visible.txt").write_text("api_key: visible\n", encoding="utf-8")
         _manager, registry = self._manager_with_default_tools()
 
-        result = registry.get("grep_content").execute({"pattern": "api_key", "path": "."})
+        result = registry.get("grep_content").execute({"pattern": "api_key", "path": "."}, cwd=_cwd())
 
         self.assertTrue(result.ok)
         self.assertIn("visible.txt", result.output)
@@ -244,7 +250,7 @@ class PermissionFilterTests(TempWorkspaceTest):
         Path("visible.txt").write_text("ok\n", encoding="utf-8")
         _manager, registry = self._manager_with_default_tools()
 
-        result = registry.get("glob_files").execute({"pattern": "*"})
+        result = registry.get("glob_files").execute({"pattern": "*"}, cwd=_cwd())
 
         self.assertTrue(result.ok)
         self.assertIn("visible.txt", result.output)

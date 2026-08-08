@@ -14,6 +14,11 @@ from rhinecode.permission.models import (
     Rule,
 )
 from rhinecode.permission.rules import RuleSet
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 def engine(rules=None, mode=PermissionMode.DEFAULT) -> PermissionEngine:
@@ -21,11 +26,11 @@ def engine(rules=None, mode=PermissionMode.DEFAULT) -> PermissionEngine:
 
 
 def cmd(command: str, mode=PermissionMode.DEFAULT) -> PermissionRequest:
-    return PermissionRequest("run_command", "Bash", command, "command", False, mode)
+    return PermissionRequest("run_command", "Bash", command, "command", False, mode, _CWD)
 
 
 def read(path: str, mode=PermissionMode.DEFAULT) -> PermissionRequest:
-    return PermissionRequest("read_file", "Read", path, "read_path", True, mode)
+    return PermissionRequest("read_file", "Read", path, "read_path", True, mode, _CWD)
 
 
 class ShortCircuitTests(unittest.TestCase):

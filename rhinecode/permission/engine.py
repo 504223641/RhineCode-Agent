@@ -226,15 +226,27 @@ class PermissionEngine:
         # ② 沙箱：仅路径/glob 类；越界即拒。复用 path_guard 的边界判定。
         # read 类走「工作区 ∪ 只读白名单」（c9 放行用户级记忆目录的只读访问，F18）；
         # write / glob 类仍严格限定工作区内，白名单对它们完全不可见（N6③）。
+        #
+        # ⚠ **c14：边界的「工作区」是 `request.cwd`，不是进程的当前工作目录。**
+        # 主对话与非隔离子 Agent 的 cwd 是主项目根（行为与 c14 之前逐字一致）；
+        # 隔离子 Agent 的 cwd 是它自己的隔离工作区，于是它读写主项目根内、
+        # 工作区之外的路径会在这里被拒——**这就是隔离的物理实现**，
+        # 不是靠约定、也不是靠模型自觉。
+        #
+        # cwd 缺失或非法时 `path_guard` 一律返回 False（拒绝），**不会退回按
+        # 主项目根判定**（spec N2）——回退会把一次隔离故障静默变成一次越权。
+        #
+        # 管线层序**一字未动**：①黑名单 → ②沙箱 → ②′网络 → ③规则 → ④模式。
+        # c14 不新增层、不改层序，既有的顺序论证原样成立。
         if request.kind == "read_path":
-            if not is_readable_path(request.specifier):
+            if not is_readable_path(request.specifier, request.cwd):
                 return _verdict(
-                    Decision.DENY, Layer.SANDBOX, f"路径越界，超出项目工作目录：{request.specifier}"
+                    Decision.DENY, Layer.SANDBOX, f"路径越界，超出工作目录：{request.specifier}"
                 )
         elif request.kind in ("write_path", "glob"):
-            if not is_within_workspace(request.specifier):
+            if not is_within_workspace(request.specifier, request.cwd):
                 return _verdict(
-                    Decision.DENY, Layer.SANDBOX, f"路径越界，超出项目工作目录：{request.specifier}"
+                    Decision.DENY, Layer.SANDBOX, f"路径越界，超出工作目录：{request.specifier}"
                 )
 
         # ②′ 网络边界：仅 URL 类（web_fetch 扩展 spec F5/F6）。

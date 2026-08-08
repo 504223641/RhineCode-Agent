@@ -5,12 +5,17 @@ import unittest
 from rhinecode.permission.engine import PermissionEngine
 from rhinecode.permission.models import Decision, PermissionMode, PermissionRequest, Rule
 from rhinecode.permission.rules import RuleSet
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 def _mcp_req(name: str, mode=PermissionMode.DEFAULT) -> PermissionRequest:
     """构造一个 MCP 工具的权限请求（未映射 → kind=other、非只读、无 specifier）。"""
     return PermissionRequest(
-        tool_name=name, rule_name=name, specifier="", kind="other", is_read_only=False, mode=mode
+        tool_name=name, rule_name=name, specifier="", kind="other", is_read_only=False, mode=mode, cwd=_CWD,
     )
 
 

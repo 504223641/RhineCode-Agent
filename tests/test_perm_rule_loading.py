@@ -14,6 +14,11 @@ from unittest import mock
 
 from rhinecode.permission import config
 from rhinecode.permission.models import Decision, PermissionMode, PermissionRequest
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 
 def _url_request(url: str, host: str) -> PermissionRequest:
@@ -23,7 +28,7 @@ def _url_request(url: str, host: str) -> PermissionRequest:
         specifier=url,
         kind="url",
         is_read_only=False,
-        mode=PermissionMode.DEFAULT,
+        mode=PermissionMode.DEFAULT, cwd=_CWD,
         host=host,
     )
 

@@ -33,6 +33,7 @@
 import json
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from rhinecode.hooks.models import (
@@ -48,7 +49,7 @@ from rhinecode.hooks.models import (
 )
 from rhinecode.permission import blacklist
 from rhinecode.permission.network import check_hard
-from rhinecode.tools.path_guard import workspace_root
+from rhinecode.tools.path_guard import main_project_root
 from rhinecode.tools.run_command import decode_subprocess_output
 
 # stdout / stderr 进 `detail` 前的截断长度。Hook 的输出只用于排查，
@@ -182,12 +183,17 @@ def run_agent_action(action: AgentAction, payload: HookPayload) -> ActionOutcome
     return ActionOutcome(ok=True, detail=AGENT_PLACEHOLDER)
 
 
-def run_command_action(action: CommandAction, payload: HookPayload) -> ActionOutcome:
+def run_command_action(
+    action: CommandAction,
+    payload: HookPayload,
+    cwd: Optional[Path] = None,
+) -> ActionOutcome:
     """
     执行 shell 命令（spec F4.1）。
 
     :param action: 命令动作
     :param payload: 事件负载，序列化成 JSON 从**标准输入**喂给命令
+    :param cwd: 触发本次事件的 Agent 的工作目录（c14 F25）。`None` 取主项目根
     :returns: 执行结果
 
     执行步骤：
@@ -221,7 +227,11 @@ def run_command_action(action: CommandAction, payload: HookPayload) -> ActionOut
         proc = subprocess.run(
             action.command,
             shell=True,
-            cwd=str(workspace_root()),
+            # c14 F25：命令跑在**触发它的那个 Agent 的工作目录**里。
+            # 主对话触发 → 主项目根；隔离子 Agent 触发 → 它的隔离工作区。
+            # 一个检查文件的 pre_tool_use 钩子应当看到子 Agent 正在动的那个文件，
+            # 而不是主项目根里的同名文件。
+            cwd=str(cwd if cwd is not None else main_project_root()),
             input=_payload_json(payload).encode("utf-8"),
             capture_output=True,
             timeout=action.timeout,
@@ -343,6 +353,7 @@ def run_action(
     action: HookAction,
     payload: HookPayload,
     client_factory: Optional[Callable[[], Any]] = None,
+    cwd: Optional[Path] = None,
 ) -> ActionOutcome:
     """
     按类型分派到对应执行器。
@@ -350,12 +361,14 @@ def run_action(
     :param action: 四种动作之一
     :param payload: 事件负载
     :param client_factory: 透传给 HTTP 执行器
+    :param cwd: 触发本次事件的 Agent 的工作目录（c14 F25）。只有 shell 动作用得上
+                ——注入型动作没有工作目录的概念，HTTP 动作发的是网络请求
     :returns: 执行结果；未知类型（理论上不可能，加载期已校验）→ `ok=False`
 
     副作用：取决于具体动作，见各执行器。
     """
     if isinstance(action, CommandAction):
-        return run_command_action(action, payload)
+        return run_command_action(action, payload, cwd)
     if isinstance(action, PromptAction):
         return run_prompt_action(action, payload)
     if isinstance(action, HttpAction):

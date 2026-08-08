@@ -38,19 +38,28 @@ from rhinecode.tools.path_guard import (
 from rhinecode.tools.read_file import ReadFileTool
 from rhinecode.tools.run_command import RunCommandTool
 from rhinecode.tools.write_file import WriteFileTool
+from rhinecode.tools.path_guard import main_project_root
+
+
+def _cwd():
+    """
+    c14：这些用例会 chdir 到临时工作区再断言，因此**每次现取**进程当前目录，
+    而不是在模块加载时算一次——加载时的目录是仓库根，不是用例的工作区。
+    """
+    return main_project_root()
 
 
 def _read_request(path: str) -> PermissionRequest:
     return PermissionRequest(
         tool_name="read_file", rule_name="Read", specifier=path,
-        kind="read_path", is_read_only=True, mode=PermissionMode.DEFAULT,
+        kind="read_path", is_read_only=True, mode=PermissionMode.DEFAULT, cwd=_cwd(),
     )
 
 
 def _write_request(path: str) -> PermissionRequest:
     return PermissionRequest(
         tool_name="write_file", rule_name="Write", specifier=path,
-        kind="write_path", is_read_only=False, mode=PermissionMode.DEFAULT,
+        kind="write_path", is_read_only=False, mode=PermissionMode.DEFAULT, cwd=_cwd(),
     )
 
 
@@ -88,8 +97,8 @@ class SkillSandboxTest(unittest.TestCase):
 
     def test_read_face_widened(self) -> None:
         """read_file 能读到白名单目录内的文件（绝对路径）。"""
-        self.assertTrue(is_readable_path(str(self.resource)))
-        result = ReadFileTool().execute({"path": str(self.resource)})
+        self.assertTrue(is_readable_path(str(self.resource), _cwd()))
+        result = ReadFileTool().execute({"path": str(self.resource)}, cwd=_cwd())
         self.assertTrue(result.ok, result.output)
         self.assertIn("模板内容", result.output)
 
@@ -117,7 +126,7 @@ class SkillSandboxTest(unittest.TestCase):
         """
         probe = self.skills_dir / "pack" / "UNIQUEPROBE.md"
         probe.write_text("探针", encoding="utf-8")
-        result = GlobTool().execute({"pattern": "**/*.md"})
+        result = GlobTool().execute({"pattern": "**/*.md"}, cwd=_cwd())
         self.assertNotIn("UNIQUEPROBE", result.output)
 
     def test_grep_face_untouched(self) -> None:
@@ -129,14 +138,14 @@ class SkillSandboxTest(unittest.TestCase):
         (self.skills_dir / "pack" / "LEAKPROBE.md").write_text(
             "SECRETNEEDLE", encoding="utf-8"
         )
-        result = GrepTool().execute({"pattern": "SECRETNEEDLE"})
+        result = GrepTool().execute({"pattern": "SECRETNEEDLE"}, cwd=_cwd())
         self.assertNotIn("LEAKPROBE", result.output)
         self.assertIn("无匹配", result.output)
 
     def test_parent_traversal_still_rejected(self) -> None:
         """含 `..` 的路径仍被拒——白名单不是「随便去哪都行」。"""
         with self.assertRaises(PathGuardError):
-            resolve_readable("../home/.rhinecode/skills/pack/template.md")
+            resolve_readable("../home/.rhinecode/skills/pack/template.md", _cwd())
 
     def test_unregistered_outside_path_still_rejected(self) -> None:
         """未注册的工作区外目录仍被拒（白名单是精确的，不是「工作区外全放开」）。"""
@@ -144,16 +153,16 @@ class SkillSandboxTest(unittest.TestCase):
         other.mkdir()
         secret = other / "secret.txt"
         secret.write_text("机密", encoding="utf-8")
-        self.assertFalse(is_readable_path(str(secret)))
-        self.assertFalse(ReadFileTool().execute({"path": str(secret)}).ok)
+        self.assertFalse(is_readable_path(str(secret), _cwd()))
+        self.assertFalse(ReadFileTool().execute({"path": str(secret)}, cwd=_cwd()).ok)
 
     def test_workspace_semantics_unchanged(self) -> None:
         """原工作区语义不变：区内文件读写都照常。"""
         inside = self.workspace / "a.txt"
         inside.write_text("原有内容", encoding="utf-8")
-        self.assertTrue(ReadFileTool().execute({"path": "a.txt"}).ok)
+        self.assertTrue(ReadFileTool().execute({"path": "a.txt"}, cwd=_cwd()).ok)
         self.assertTrue(
-            WriteFileTool().execute({"path": "b.txt", "content": "新"}).ok
+            WriteFileTool().execute({"path": "b.txt", "content": "新"}, cwd=_cwd()).ok
         )
 
     def test_permission_engine_read_allow_write_deny(self) -> None:
@@ -181,7 +190,7 @@ class SkillHasNoPermissionExemptionTest(unittest.TestCase):
         engine = PermissionEngine(RuleSet([]), mode=PermissionMode.PERMISSIVE)
         tool = RunCommandTool()
         request = to_request(
-            tool, {"command": "rm -rf /"}, PermissionMode.PERMISSIVE
+            tool, {"command": "rm -rf /"}, PermissionMode.PERMISSIVE, _cwd()
         )
         result = engine.decide(request)
         self.assertIs(result.decision, Decision.DENY)

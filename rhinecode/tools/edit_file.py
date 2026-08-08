@@ -25,7 +25,7 @@
 
 from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.diff import build_diff
-from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
+from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_cwd, resolve_in_workspace
 
 
 class EditFileTool(Tool):
@@ -85,8 +85,10 @@ class EditFileTool(Tool):
         "required": ["path"],
     }
     read_only = False
+    # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
+    workspace_aware = True
 
-    def execute(self, args: dict) -> ToolResult:
+    def execute(self, args: dict, cwd=None) -> ToolResult:
         """
         执行单处或批量替换（原子写入）。
 
@@ -116,7 +118,7 @@ class EditFileTool(Tool):
             except ValueError as ve:
                 return ToolResult(ok=False, output=str(ve), summary="参数非法")
 
-            abs_path = resolve_in_workspace(path)
+            abs_path = resolve_in_workspace(path, _require_cwd(cwd))
             if not abs_path.exists():
                 return ToolResult(ok=False, output=f"文件不存在: {path}", summary="文件不存在")
             if abs_path.is_dir():

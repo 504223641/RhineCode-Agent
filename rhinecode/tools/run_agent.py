@@ -94,6 +94,22 @@ class RunAgentTool(Tool):
         "拿不准要不要委派时**倾向委派**——该委派而没委派会让那些文件内容常驻你的"
         "上下文、之后每一轮都要重发；多委派一次只是多一次调用。\n"
         "\n"
+        "**要改文件、而你手上也有未提交的改动时，设 `isolation: true`**——"
+        "它会在一个独立的 Git 工作目录里跑，你俩同时改文件也不会互相覆盖；"
+        "成果通过一个分支交回来，结论末尾会给出分支名。"
+        "不涉及写文件的调研类任务不需要它（建工作区要 checkout 一整份源码）。\n"
+        "\n"
+        "⚠ **隔离的子 Agent 看到的是当前已提交的状态，你手上未提交的改动它看不到。**"
+        "所以派出去的活要和你手上正在改的东西**落在不同文件、不同函数上**；"
+        "碰同一处的话，要么先把你手上那份提交掉再派，要么就别派、自己接着改"
+        "——否则两边各改各的，合并时必然冲突。\n"
+        "\n"
+        "⚠ **隔离委派的任务描述里绝不要写「不要提交」。** 隔离工作区是另一个"
+        "工作现场，它的提交**不会**进入你这边的工作现场——`git commit` 是成果"
+        "唯一的交付通道，禁止提交等于让它白干一场。拿到结论后照交付信息段里的"
+        "分支名 `git merge`，**不要自己钻进那个目录去逐个读文件再重打一遍**，"
+        "那会把隔离本该省下的上下文全部吃回来。\n"
+        "\n"
         "两种类型：`role` 从空白对话起步、加载一个预定义角色（可用角色见系统提示里的清单）；"
         "`branch` 继承当前对话的历史与工具集、不需要角色，适合「接着刚才的分析继续挖」"
         "这类需要上下文的活，它**总是**在后台运行。\n"
@@ -124,6 +140,18 @@ class RunAgentTool(Tool):
                 "description": (
                     "交给子 Agent 的任务陈述。必须自包含：写清背景、要做什么、"
                     "期望产出什么形式的结论。"
+                ),
+            },
+            "isolation": {
+                "type": "boolean",
+                "description": (
+                    "是否在独立的 Git 工作目录中运行（缺省 false）。"
+                    "涉及写文件、而主对话手上可能有未提交改动时设为 true——"
+                    "它的改动不会与你互相覆盖，成果经一个新分支交回。"
+                    "它从**当前已提交的状态**起步，**看不到你未提交的改动**，"
+                    "所以派给它的活要和你手上正在改的东西落在不同文件上。"
+                    "注意：角色自己声明了隔离时，这里传 false **不生效**"
+                    "（隔离只能加不能减）。"
                 ),
             },
             "background": {
@@ -179,8 +207,13 @@ class RunAgentTool(Tool):
             if kind.lower() == KIND_BRANCH and self._parent_snapshot is not None:
                 parent = self._parent_snapshot()
 
+            # c14 F14：`isolation` 取原值（可能是 None）而不是 bool(...)——
+            # 「未表态」与「显式 false」在单向加严里都不能撤销角色的声明，
+            # 但区分它们能让将来加「显式 false 时给一句提示」之类的行为有落点。
             outcome = self._service.delegate(
-                kind, agent_name, task_text, background, parent, plan_stage=plan_stage
+                kind, agent_name, task_text, background, parent,
+                plan_stage=plan_stage,
+                isolation=args.get("isolation"),
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(ok=False, output=f"委派失败：{exc}", summary="委派失败")

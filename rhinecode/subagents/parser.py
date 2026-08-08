@@ -231,6 +231,51 @@ def _parse_permission_mode(
     return None
 
 
+# 隔离声明目前只有一个合法取值。做成常量而不是字面量，是为了将来若增加
+# 别的隔离方式（比如容器）时，「有哪些合法值」只有一处需要改。
+_ISOLATION_WORKTREE = "worktree"
+
+# 明确表示「不要隔离」的写法。认它们是为了让用户能在项目级角色里显式关掉
+# 某个从别处复制来的声明，而不必删掉整行。
+_ISOLATION_NONE = {"none", "false", "no", "off"}
+
+
+def _parse_isolation(value: Any, warnings: list[str]) -> Optional[str]:
+    """
+    读取隔离声明（c14 F13）。
+
+    :param value: frontmatter 取值
+    :param warnings: 输出参数
+    :returns: `"worktree"` 或 `None`（= 不隔离）
+
+    **认不出来时按「不隔离」处理并警告**，与 `permission_mode` 认不出时按
+    「继承」同一条理由：按「隔离」处理会让一个拼写错误
+    （`isolation: worktre`）静默给每次委派都建一个 Git 工作目录，
+    用户看到的是「我的项目里怎么多出一堆目录」，而定义文件里写的是别的东西。
+
+    布尔值 `true` 也认作 worktree——YAML 里 `isolation: true` 是很自然的写法，
+    而本项目目前只有这一种隔离方式，不存在歧义。
+
+    副作用：可能向 `warnings` 追加。
+    """
+    if value is None:
+        return None
+    if value is True:
+        return _ISOLATION_WORKTREE
+    if value is False:
+        return None
+    raw = str(value).strip().lower()
+    if not raw or raw in _ISOLATION_NONE:
+        return None
+    if raw == _ISOLATION_WORKTREE:
+        return _ISOLATION_WORKTREE
+    warnings.append(
+        f"isolation 的取值 {value!r} 不认识"
+        f"（本项目只支持 {_ISOLATION_WORKTREE}），已按「不隔离」处理"
+    )
+    return None
+
+
 def parse_agent(
     text: str,
     path: Path,
@@ -253,7 +298,8 @@ def parse_agent(
     2. 键名归一（连字符 → 下划线、大小写不敏感）；
     3. `description` 必填校验；
     4. `name` 取值与合法性校验（缺省回落到 `fallback_name`）；
-    5. `tools` / `disallowed_tools` / `model` / `max_turns` / `permission_mode` 读取；
+    5. `tools` / `disallowed_tools` / `model` / `max_turns` / `permission_mode`
+       / `isolation`（c14）读取；
     6. 未支持字段逐个产出具名警告。
 
     **正文可以为空**（与 C11 的 Skill 不同）：一个只有 `description` 和
@@ -304,6 +350,7 @@ def parse_agent(
 
     max_turns = _parse_max_turns(front.get("max_turns"), warnings)
     permission_mode = _parse_permission_mode(front.get("permission_mode"), warnings)
+    isolation = _parse_isolation(front.get("isolation"), warnings)
 
     # ── 未支持字段：逐个具名告知 ──
     for key, reason in UNSUPPORTED_FIELDS.items():
@@ -321,6 +368,7 @@ def parse_agent(
         model=model or None,
         max_turns=max_turns,
         permission_mode=permission_mode,
+        isolation=isolation,
         warnings=tuple(warnings),
     )
 

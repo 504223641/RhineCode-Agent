@@ -30,6 +30,11 @@ from rhinecode.tools.registry import ToolRegistry
 from rhinecode.trace.models import SCOPE_MAIN, SCOPE_NOTES, SCOPE_SUMMARY, TraceEventType
 from rhinecode.trace.recorder import TraceRecorder, bind_scope
 from rhinecode.trace.tracing_provider import TracingProvider
+from rhinecode.tools.path_guard import main_project_root
+
+# c14：这些用例验的是权限判定本身，与工作目录无关。统一传主项目根，
+# 判定结果与 c14 之前逐字一致。
+_CWD = main_project_root()
 
 T = TraceEventType
 
@@ -233,7 +238,9 @@ class PermissionHookTest(TraceHookBase):
             # 照搬 conversation._install_path_filters 的生产做法（经 set_path_filter 注入）
             calls = [0]
 
-            def allow_read_path(rel_path: str) -> bool:
+            def allow_read_path(rel_path: str, base) -> bool:
+                # c14：过滤器签名多了「本次调用的工作目录」。漏改不会报错，
+                # 只会让每个文件都被判拒绝、搜索结果为空——本用例正好钉住它。
                 calls[0] += 1
                 req = PermissionRequest(
                     tool_name="read_file",
@@ -242,6 +249,7 @@ class PermissionHookTest(TraceHookBase):
                     kind="read_path",
                     is_read_only=True,
                     mode=engine.mode,
+                    cwd=base,
                 )
                 return engine.decide(req).decision != Decision.DENY
 
@@ -877,6 +885,19 @@ class AllTypesTest(TraceHookBase):
             T.SUBAGENT_END: {
                 "task_id": "a3f1c9", "status": "completed", "turns": 4, "usage_tokens": 120,
             },
+            # c14 隔离工作区四类
+            T.WORKTREE_CREATE: {
+                "name": "worker-a1b2", "branch": "agent/worker-a1b2",
+                "base_commit": "b225368", "recovered": False,
+            },
+            T.WORKTREE_PROVISION: {
+                "name": "worker-a1b2", "applied": 1, "warnings": 0, "details": [],
+            },
+            T.WORKTREE_SETTLE: {
+                "name": "worker-a1b2", "removed": False, "dirty": False,
+                "commits": 2, "keep_branch": True,
+            },
+            T.WORKTREE_CLEANUP: {"scanned": 3, "removed": 2, "kept": 1},
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

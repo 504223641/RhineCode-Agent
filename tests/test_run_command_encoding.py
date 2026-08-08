@@ -19,6 +19,12 @@ import sys
 import unittest
 
 from rhinecode.tools.run_command import RunCommandTool
+from rhinecode.tools.path_guard import main_project_root
+
+
+def _cwd():
+    """c14：用例会 chdir 到临时工作区，因此每次现取进程当前目录。"""
+    return main_project_root()
 
 
 class RunCommandEncodingTest(unittest.TestCase):
@@ -26,7 +32,7 @@ class RunCommandEncodingTest(unittest.TestCase):
         self.tool = RunCommandTool()
 
     def _run(self, command: str):
-        return self.tool.execute({"command": command})
+        return self.tool.execute({"command": command}, cwd=_cwd())
 
     def test_utf8_stdout_is_not_swallowed(self) -> None:
         """子命令输出 UTF-8 中文 → 内容出现在结果里，而不是变成空输出。"""
@@ -77,7 +83,8 @@ class RunCommandEncodingTest(unittest.TestCase):
     def test_timeout_path_still_works(self) -> None:
         """超时分支不碰 stdout，改动后仍返回超时提示而非崩溃。"""
         result = self.tool.execute(
-            {"command": f'{sys.executable} -c "import time;time.sleep(5)"', "timeout": 1}
+            {"command": f'{sys.executable} -c "import time;time.sleep(5)"', "timeout": 1},
+            cwd=_cwd(),
         )
         self.assertFalse(result.ok)
         self.assertIn("超时", result.output)

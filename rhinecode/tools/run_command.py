@@ -12,7 +12,7 @@ import locale
 import subprocess
 
 from rhinecode.tools.base import Tool, ToolResult
-from rhinecode.tools.path_guard import workspace_root
+from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_cwd
 
 # 命令执行的默认超时（秒）。超过则终止子进程并返回超时错误。
 # 定义为模块常量，便于后续统一调整；本章不暴露为 YAML 配置项。
@@ -98,8 +98,10 @@ class RunCommandTool(Tool):
         "required": ["command"],
     }
     read_only = False
+    # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
+    workspace_aware = True
 
-    def execute(self, args: dict) -> ToolResult:
+    def execute(self, args: dict, cwd=None) -> ToolResult:
         """
         执行 shell 命令。
 
@@ -128,7 +130,7 @@ class RunCommandTool(Tool):
             proc = subprocess.run(
                 command,
                 shell=True,
-                cwd=workspace_root(),
+                cwd=_require_cwd(cwd),
                 capture_output=True,
                 timeout=timeout,
             )

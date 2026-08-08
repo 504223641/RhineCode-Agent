@@ -77,6 +77,14 @@ def _agent_block(
         f" · 轮次上限：{spec.max_turns}"
         f" · 权限：{_mode_text(spec, effective)}",
     ]
+    # c14 F23：只在声明了隔离时显示这一行。
+    # 未声明的角色不显示「隔离：无」——绝大多数角色都不隔离，
+    # 给每个都加一行只会把真正重要的信息（说明与工具集）挤下去。
+    if spec.isolation:
+        lines.append(
+            f"    隔离：{spec.isolation}"
+            "（每次委派在独立的 Git 工作目录中运行，成果经分支交付）"
+        )
     for warning in spec.warnings:
         lines.append(f"    ⚠ {warning}")
     return lines
@@ -90,6 +98,30 @@ def _task_line(record: TaskRecord) -> str:
         f" · {record.turns} 轮 · {record.usage_tokens} token"
         f" · {record.duration_seconds:.1f}s"
     )
+    # c14 F23：隔离任务多一行工作区信息。
+    #
+    # 非隔离任务这两个字段是空串，整行不出现——`/agents` 里绝大多数任务都不隔离，
+    # 无条件加一行「隔离工作区：无」纯属噪音。
+    #
+    # 分支名排在路径**前面**：用户要拿它做 `git merge`，路径只是排查时才看。
+    if record.worktree_path or record.worktree_branch:
+        if record.worktree_removed:
+            # ⚠ 已回收时**不能再报分支名与路径**（c14 修正，真实模型实测撞到）。
+            #
+            # 两个只读任务跑完即回收（无变更 → 目录与分支一并删，F16），
+            # 而 `/agents` 仍原样展示「分支 agent/surveyor-xxx · 路径 …」。
+            # 用户照着它去 `git checkout` 会拿到「分支不存在」，去看路径会发现
+            # 目录没了——而任务行明明白白写着它们在。这与交付信息段刻意
+            # 「不给已删分支的名字」是同一条理由，那边做对了、这边漏了。
+            head += "\n    隔离工作区：已回收（无变更，目录与分支均已删除）"
+        else:
+            parts = []
+            if record.worktree_branch:
+                parts.append(f"分支 {record.worktree_branch}")
+            if record.worktree_path:
+                parts.append(f"路径 {record.worktree_path}")
+            head += "\n    隔离工作区：" + " · ".join(parts)
+
     body = record.conclusion or record.task_text
     if body:
         preview = body.strip().splitlines()[0][:_CONCLUSION_PREVIEW]

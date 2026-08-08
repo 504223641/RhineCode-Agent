@@ -24,6 +24,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.tools.path_guard import main_project_root
 from rhinecode.tools.registry import ToolRegistry
 from rhinecode.agent.collector import StreamCollector
 from rhinecode.agent.events import (
@@ -198,6 +200,7 @@ class RunOptions:
     """
 
     max_iterations: int = MAX_ITERATIONS
+    cwd: Optional[Path] = None
     record_usage: bool = True
     allow_summary: bool = True
     excluded_tools: frozenset = frozenset()
@@ -350,7 +353,9 @@ class Agent:
         fields.update(extra)
         return fields
 
-    def _dispatch_pre_tool(self, tc: ToolCall, tool: Tool) -> "HookVerdict":
+    def _dispatch_pre_tool(
+        self, tc: ToolCall, tool: Tool, cwd: Optional[Path] = None
+    ) -> "HookVerdict":
         """
         分发 `pre_tool_use` 并取回结论（spec F6）。
 
@@ -368,14 +373,22 @@ class Agent:
         if not self._hooks.has_listeners(HookEventType.PRE_TOOL_USE):
             return NO_VERDICT
         try:
+            # c14 F25：命令跑在触发它的那个 Agent 的工作目录里。
             return self._hooks.dispatch(
-                HookEventType.PRE_TOOL_USE, lambda: self._tool_fields(tc, tool)
+                HookEventType.PRE_TOOL_USE,
+                lambda: self._tool_fields(tc, tool),
+                cwd,
             ).verdict
         except Exception:
             return NO_VERDICT
 
     def _dispatch_post_tool(
-        self, tc: ToolCall, tool: Tool, res: ToolResult, duration_ms: float
+        self,
+        tc: ToolCall,
+        tool: Tool,
+        res: ToolResult,
+        duration_ms: float,
+        cwd: Optional[Path] = None,
     ) -> None:
         """
         分发 `post_tool_use` 或 `post_tool_use_failure`（spec F2）。
@@ -401,7 +414,9 @@ class Agent:
         if not res.ok:
             extra["error"] = res.summary or "工具执行失败"
         try:
-            self._hooks.dispatch(event, lambda: self._tool_fields(tc, tool, **extra))
+            self._hooks.dispatch(
+                event, lambda: self._tool_fields(tc, tool, **extra), cwd
+            )
         except Exception:
             pass
 
@@ -622,6 +637,15 @@ class Agent:
         # c13：子 Agent 闸门。缺省 NullGate → 两处调用退化为零成本空操作，
         # **不传等于零回归**。
         gate = options.subagent_gate if options.subagent_gate is not None else NullGate()
+        # c14 F1/F4：本次运行的工作目录。
+        #
+        # 主对话与非隔离子 Agent 不传 → 取主项目根，行为与 c14 之前**逐字一致**
+        # （spec N3）；隔离子 Agent 由 `subagents/runner.py` 传它的隔离工作区。
+        #
+        # 在这里一次算好而不是每处现取：`main_project_root()` 读的是进程当前工作
+        # 目录，而本项目全程不 chdir，一次运行内它是常量——每次现取只会让
+        # 「它到底会不会变」这个问题反复出现在读代码的人脑子里。
+        run_cwd = options.cwd if options.cwd is not None else main_project_root()
         wait_rounds = 0               # 已为子 Agent 停留过几次（防无限接力）
         deny_cooldown = False         # 上一轮有工具被用户拒绝 → 本轮不发工具（见 DENIED_BY_USER_FEEDBACK）
 
@@ -797,6 +821,9 @@ class Agent:
                 # 否则会出现「发了工具却拒绝执行」或「没发工具也照常执行」。
                 planning=plan_mode and not execution_phase,
                 interactive=options.interactive,
+                # c14 F1：本次运行的工作目录。`None` 由各工具的 `require_cwd`
+                # 兜成明确失败，**不会**静默回退到主项目根（spec N2）。
+                cwd=run_cwd,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -867,6 +894,7 @@ class Agent:
         excluded: frozenset = frozenset(),
         planning: bool = False,
         interactive: bool = True,
+        cwd: Optional[Path] = None,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -996,7 +1024,7 @@ class Agent:
             # （「跑了但失败了」）；而 `pre_tool_use` 按决策 1A 排在五层**之前**，
             # 在跑权限判定之前根本无从知道它会不会 DENY——结构上做不到。
             # 因此那条边界按「管后置事件」理解，前置事件对每一次进入判定的调用都触发。
-            hook_verdict = self._dispatch_pre_tool(tc, tool)
+            hook_verdict = self._dispatch_pre_tool(tc, tool, cwd)
             if hook_verdict.decision == HookDecision.DENY:
                 hook_blocked.append((tc, hook_verdict))
                 continue
@@ -1023,7 +1051,10 @@ class Agent:
                 continue
 
             # 权限决策：规范化 → engine.decide。
-            request = to_request(tool, tc.arguments, engine.mode)
+            # c14 F2：把**本次运行的工作目录**一并交给权限判定。
+            # 第②层路径沙箱据它算边界——隔离子 Agent 传的是它自己的隔离工作区，
+            # 于是同一个写请求在主对话里放行、在隔离子 Agent 里越界即拒。
+            request = to_request(tool, tc.arguments, engine.mode, cwd)
             decision = engine.decide(request)
             # 权限决策埋点（trace F14）。
             #
@@ -1134,7 +1165,7 @@ class Agent:
 
         # 只读且放行：并发
         if readonly:
-            yield from self._run_readonly_concurrent(readonly, results)
+            yield from self._run_readonly_concurrent(readonly, results, cwd)
 
         # 特殊工具：串行（需用户交互）
         # 裁决（trace T31）：`_run_special`（ask_user / present_plan）内的两处
@@ -1158,7 +1189,7 @@ class Agent:
                 ctx.cancelled = True
                 break
             yield from self._run_one_serial(
-                tc, tool, decision, results, ctx, ask, interactive, planning
+                tc, tool, decision, results, ctx, ask, interactive, planning, cwd
             )
 
     def _run_special(
@@ -1247,6 +1278,7 @@ class Agent:
         self,
         items: list[tuple[ToolCall, Tool]],
         results: dict[str, ToolResult],
+        cwd: Optional[Path] = None,
     ) -> Iterator[AgentEvent]:
         """
         并发执行一组只读工具（迁移自 c3，改产出 AgentEvent）。
@@ -1292,6 +1324,17 @@ class Agent:
             self._safe_bind(parent_scope)
             t0 = time.monotonic()
             try:
+                # ⚠ **c14：并发路径同样要传 cwd，这一条极易漏。**
+                #
+                # 既有的 `plan_stage` 只在**串行**路径传递（它只对非只读工具有
+                # 意义），照抄那个写法就会漏掉这里——而 `read_file` /
+                # `glob_files` / `grep_content` 全是只读工具、全走**这条**路。
+                #
+                # 漏掉的后果：隔离子 Agent 的**读**落到主项目根、**写**却是对的。
+                # 它既不报错也不越权，只是读到了另一份文件——界面上完全看不出来。
+                # 护栏见 `tests/test_loop_cwd_dispatch.py`。
+                if tool.workspace_aware:
+                    return tool.execute(tc.arguments, cwd=cwd)
                 return tool.execute(tc.arguments)
             finally:
                 # **不加 try/except 吞异常**：既有的 `future.result()` 兜底逻辑
@@ -1320,7 +1363,7 @@ class Agent:
                 )
                 # 工具级后置事件（c12）：只挂在「真的执行了」之后（spec AC3）。
                 # 这里跑在生成器所在的 Worker 线程上，不在池线程里。
-                self._dispatch_post_tool(tc, tools_by_id[tc.id], res, duration)
+                self._dispatch_post_tool(tc, tools_by_id[tc.id], res, duration, cwd)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
     def _run_one_serial(
@@ -1333,6 +1376,7 @@ class Agent:
         ask: AskFn,
         interactive: bool = True,
         planning: bool = False,
+        cwd: Optional[Path] = None,
     ) -> Iterator[AgentEvent]:
         """
         串行处理单个工具调用：未知 / 参数错误 / 权限拒绝 / 待确认 / 放行（c6）。
@@ -1422,7 +1466,14 @@ class Agent:
                 # （契约写在 `Tool.plan_safe` 的说明里）。多传它是为了让工具
                 # 能在规划阶段自我约束——循环不该也不能替它做那个判断，
                 # 那需要认识具体工具的语义。
-                res = tool.execute(tc.arguments, plan_stage=planning)
+                # c14：两个标志**各自独立判断**，不要写成 if/elif——
+                # 一个工具完全可能既 plan_safe 又 workspace_aware。
+                if tool.workspace_aware:
+                    res = tool.execute(tc.arguments, plan_stage=planning, cwd=cwd)
+                else:
+                    res = tool.execute(tc.arguments, plan_stage=planning)
+            elif tool.workspace_aware:
+                res = tool.execute(tc.arguments, cwd=cwd)
             else:
                 res = tool.execute(tc.arguments)
         except Exception as e:
@@ -1432,5 +1483,5 @@ class Agent:
         self._trace_tool(tc, res, OUTCOME_EXECUTED, duration_ms=duration)
         # 工具级后置事件（c12）：只挂在「真的执行了」之后。上面每一条提前 return
         # 的分支（未知工具 / 参数错误 / 权限拒绝 / 用户拒绝）都不挂——它们压根没跑。
-        self._dispatch_post_tool(tc, tool, res, duration)
+        self._dispatch_post_tool(tc, tool, res, duration, cwd)
         yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)

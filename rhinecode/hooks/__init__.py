@@ -104,6 +104,7 @@ class NullHookManager:
         self,
         event: HookEventType,
         payload_factory: Optional[Callable[[], dict[str, Any]]] = None,
+        cwd=None,
     ) -> DispatchResult:
         """
         什么都不做，返回共享的空结果。
