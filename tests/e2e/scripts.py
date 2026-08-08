@@ -671,3 +671,17 @@ def seed_team_project(workspace: Path, user_dir: Path) -> None:
             "Bash(ls *)",
         ],
     )
+
+
+def seed_team_readonly(workspace: Path, user_dir: Path) -> None:
+    """
+    与 `seed_team_project` 同一个项目，但**只放行只读操作**（c15 验收缺口 F）。
+
+    用途：构造「无人值守轮里撞到需要确认的操作」这条路径。
+
+    首轮真实模型验收放行了读写，于是自动唤起那一轮从没撞到过 ASK——
+    `DENIED_UNATTENDED_FEEDBACK` 这条文案**一次都没被真实触发过**。
+    这里把写入与命令执行都收回去，让主 Agent 在无人轮里必然撞上。
+    """
+    seed_team_project(workspace, user_dir)
+    seeding.seed_permissions(workspace / ".rhinecode", allow=["Read"])

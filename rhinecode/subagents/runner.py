@@ -290,6 +290,17 @@ def _team_notice(member_name: str, team, can_idle: bool) -> str:
     放进可缓存的 `stable` 会让一个队员按一份陈旧的名单去发消息，
     收到的全是「查无此人」。
 
+    ## ⚠ 「等回复时该收工待命」是真实模型验收补上的
+
+    实测撞到：`impl-worker` 需要先从 `spec-writer` 拿到一份规范才能开工，
+    它发完请求之后**反复调 `task_list` 当轮询**在等——空转六次，
+    烧掉 106K token、几乎耗尽 15 轮预算（对照组 `spec-writer` 只用了 7 轮 43K）。
+    如果对方再慢一点，它会**耗尽轮次而失败**。
+
+    根因是本段原先只说了「做完手上的事就收尾」，**没说「等别人回话时也该收尾」**。
+    而收尾恰恰是本章设计好的等待方式：待命零成本，对方回话时自动唤醒、
+    上下文一个字不丢。模型不知道这条，就只能用它熟悉的方式——轮询。
+
     副作用：无（只读花名册）。
     """
     peers = [
@@ -300,10 +311,18 @@ def _team_notice(member_name: str, team, can_idle: bool) -> str:
     peer_line = (
         f"- 现在在场的还有：{'、'.join(peers)}\n" if peers else "- 目前只有你和主对话\n"
     )
+    # ⚠ 第二段是**真实模型验收补的**，见函数 docstring 的「等回复空转」那一条。
     idle_line = (
         "**你自然结束之后不会消失**，而是留在场上待命——"
         "别人再发一条消息就能把你叫醒、带着现在的全部上下文接着干。"
         "所以做完手上的事就正常收尾，不必为了「保持在线」硬撑着多跑几轮。\n"
+        "\n"
+        "⚠️ **在等别人回话才能往下做时，也请直接收尾。** 你会进入待命，"
+        "对方回话的那一刻你就被叫醒、带着现在的全部上下文接着干，"
+        "**什么都不会丢**。\n"
+        "**不要靠反复查清单、反复看文件来「等」**——消息不是查出来的，"
+        "它会自己出现在你眼前。空转只会烧光你的轮次预算，"
+        "等对方真回话时你已经没有轮次可用了。\n"
         if can_idle
         else ""
     )
@@ -586,7 +605,13 @@ def run_subagent(
     try:
         # ① 本线程从现在起属于该作用域。用 bind_scope 而非 with scope(...)：
         #    整个线程的生命周期就是这一次运行，不需要「出来自动恢复」。
-        recorder.bind_scope(subagent_scope(agent_label))
+        # c15 修正：**有队员名字时用名字，没有才退回角色名**。
+        #
+        # 真实模型验收撞到过：同一个角色派出两个队员（spec-writer 与
+        # impl-worker 都是 general-purpose），两者的 trace 事件全落在
+        # `subagent:general-purpose` 这一个作用域里**混成一片**，
+        # 排查「这一步是谁做的」只能靠时间戳和内容猜。
+        recorder.bind_scope(subagent_scope(member_name or agent_label))
 
         recorder.emit(
             TraceEventType.SUBAGENT_START,

@@ -55,7 +55,7 @@ from rhinecode.subagents.tasks import (
     TaskManager,
     TaskStatus,
 )
-from rhinecode.subagents.toolset import resolve_toolset
+from rhinecode.subagents.toolset import ALWAYS_GRANTED_TOOLS, resolve_toolset
 from rhinecode.tools.path_guard import main_project_root
 from rhinecode.worktree import ProvisionEntry, WorktreeError, create as create_worktree
 
@@ -439,11 +439,29 @@ class SubAgentService:
         判据取注册中心里那个工具的 `read_only`，而不是名字白名单——
         新增工具时不需要回来改这里，MCP 远端工具（一律非只读）也自动被算进去。
 
+        ## ⚠ 协作工具是唯一的例外（c15，真实模型验收补的）
+
+        `send_message` / `task_create` / `task_update` 都是 `read_only=False`，
+        但它们**不碰文件、不起进程**——「动手」这件事它们一件都做不了。
+        本方法回答的是「这个角色会不会绕过『批准前不动手』的承诺」，
+        按 `read_only` 一刀切会把它们算进去。
+
+        不排除的后果是一次**真实的回归**：协作工具豁免角色白名单之后，
+        `explorer` 与 `planner` 也拿到了它们，于是**规划阶段一个角色都不能
+        委派了**——而那恰恰是 Plan Mode 最需要委派的时候（规划要读很多东西，
+        那些内容要一路背到执行阶段）。
+
+        唯一的间接风险是「发消息唤醒一个能写文件的队员去动手」，
+        而那条旁路由 spec F24 单独管住（规划阶段只能发给 `main` 或只读队员，
+        判定在 `TeamService.can_send_in_plan_stage`）。两处各管一段，不重不漏。
+
         副作用：无（只读注册中心）。
         """
         registry = self.runtime.registry
         out: list[str] = []
         for name in sorted(allowed):
+            if name in ALWAYS_GRANTED_TOOLS:
+                continue
             tool = registry.get(name) if registry is not None else None
             # 查不到的名字按**有副作用**处理：宁可多挡一次，也不要因为
             # 一个查不到的工具把规划阶段的承诺放过去。
