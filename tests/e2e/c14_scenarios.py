@@ -393,6 +393,181 @@ def seed_hook_cwd(workspace: Path, user_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 真实工作场景（checklist 之外）：模拟「一个人真的在用它干活」
+# ---------------------------------------------------------------------------
+_TASKS_PY = '''"""待办清单：内存实现。"""
+
+
+class TaskStore:
+    """一个极简的待办存储。"""
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def add(self, title, priority=1):
+        """新增一条待办，返回它的 id。"""
+        item_id = self._next_id
+        self._next_id += 1
+        self._items[item_id] = {"title": title, "priority": priority, "done": False}
+        return item_id
+
+    def complete(self, item_id):
+        """标记完成。id 不存在时抛 KeyError。"""
+        self._items[item_id]["done"] = True
+
+    def pending(self):
+        """返回未完成的条目，按 priority 从大到小。"""
+        items = [(i, v) for i, v in self._items.items() if not v["done"]]
+        items.sort(key=lambda pair: pair[1]["priority"], reverse=True)
+        return items
+'''
+
+_STORAGE_PY = '''"""持久化：把 TaskStore 存成 JSON。"""
+
+import json
+
+
+def save(store, path):
+    """把 store 的内容写成 JSON 文件。"""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(store._items, fh, ensure_ascii=False)
+
+
+def load(store, path):
+    """从 JSON 文件恢复内容。文件不存在时什么都不做。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            store._items = {int(k): v for k, v in json.load(fh).items()}
+    except FileNotFoundError:
+        pass
+'''
+
+_TEST_TASKS_PY = '''import unittest
+
+from todo.tasks import TaskStore
+
+
+class TaskStoreTest(unittest.TestCase):
+    def test_add_returns_increasing_ids(self):
+        store = TaskStore()
+        self.assertEqual(store.add("a"), 1)
+        self.assertEqual(store.add("b"), 2)
+
+    def test_pending_sorted_by_priority(self):
+        store = TaskStore()
+        store.add("low", priority=1)
+        store.add("high", priority=9)
+        self.assertEqual(store.pending()[0][1]["title"], "high")
+
+    def test_complete_removes_from_pending(self):
+        store = TaskStore()
+        item = store.add("a")
+        store.complete(item)
+        self.assertEqual(store.pending(), [])
+'''
+
+_REAL_README = """# todo
+
+一个极简待办清单库。
+
+## 模块
+
+- `todo/tasks.py` —— 内存存储 `TaskStore`
+- `todo/storage.py` —— JSON 持久化
+
+## 跑测试
+
+    python -m unittest discover -s tests
+"""
+
+
+def _realistic_files() -> dict:
+    """一个「像真项目」的骨架：有包、有测试、有 .gitignore。"""
+    return {
+        "todo/__init__.py": "",
+        "todo/tasks.py": _TASKS_PY,
+        "todo/storage.py": _STORAGE_PY,
+        "tests/__init__.py": "",
+        "tests/test_tasks.py": _TEST_TASKS_PY,
+        "README.md": _REAL_README,
+        # ⚠ .gitignore 必须**进版本库**，否则隔离工作区里没有它 —— 实测过：
+        # 子 Agent 的 `git add -A` 会把 __pycache__ 一并提交，然后花好几轮
+        # 去清理，最后耗尽轮次预算。真实项目都有这个文件，缺了它构造出来的
+        # 是一个比现实更糟的环境，抓到的问题也就不算数。
+        ".gitignore": "__pycache__/\n*.py[cod]\n.rhinecode/\n",
+    }
+
+
+def seed_realistic(workspace: Path, user_dir: Path) -> None:
+    """
+    真实工作场景的预置：一个有包结构、有测试、有 .gitignore 的小项目。
+
+    与 `seed_isolation` 的差别是**刻意的**：那一套服务于 checklist 的九个场景
+    （每个只验一条判据），这一套服务于「一个人真的在用它干活」——所以要有
+    能跑的测试套件、多个互相 import 的模块、以及一份真实的 .gitignore。
+
+    角色只给一个 `dev`：真实使用里用户不会为每件事各写一个角色。
+    轮次上限调到 20（实测 12 轮在「读几个文件 + 改 + 跑测试 + 提交」这条
+    完整链路上是不够的，会在提交前耗尽）。
+
+    副作用：写文件、跑 git（本机需装 git）。
+    """
+    seeding.seed_files(workspace, _realistic_files())
+    seeding.seed_git_repo(
+        workspace,
+        [{"message": "feat: 待办清单骨架", "files": _realistic_files()}],
+    )
+    seeding.seed_project_agent(
+        workspace,
+        "dev",
+        {
+            "description": (
+                "需要实际改代码、加功能、修 bug、补测试时用它。"
+                "它在一个独立的 Git 工作目录中运行，成果经分支交付，"
+                "不会与主对话手上未提交的改动互相覆盖。"
+            ),
+            "tools": "read_file, write_file, edit_file, glob_files, grep_content, run_command",
+            "isolation": "worktree",
+            "max_turns": 20,
+        },
+        """你是这个项目的开发者。按任务要求改代码。
+
+工作流程：
+1. 先读相关文件了解现状，别凭空猜。
+2. 做出修改。
+3. 跑 `python -m unittest discover -s tests` 确认没弄坏别的。
+4. **改完必须 `git add -A` 且 `git commit -m "<说明>"`**——你在一个独立的
+   工作目录里，不提交的话成果无法交回给主 Agent。
+5. 最后一条回复的全文会被原样带回主对话，写清你改了什么、测试结果如何。
+""",
+    )
+    _seed_allow(workspace)
+    seeding.seed_rhine_md(
+        workspace,
+        "# todo\n\n用中文回答。改动前先跑一遍测试，改完再跑一遍。\n",
+    )
+
+
+def seed_conflict(workspace: Path, user_dir: Path) -> None:
+    """
+    真实场景「合并冲突」的预置：与 `seed_realistic` 相同，只是多一条提交历史。
+
+    冲突本身由驱动方制造（让主 Agent 与子 Agent 改同一个函数）——
+    这里只保证仓库里有足够真实的历史，让 `git merge` 的输出像模像样。
+
+    ⚠ 合并冲突是隔离交付的**必经之路**，而 C14 的 spec / checklist 一条都没覆盖：
+    子 Agent 的基点是委派时的 HEAD，主 Agent 在它跑的这段时间里完全可能
+    提交新东西——这在真实使用里是常态，不是边角情况。
+    """
+    seed_realistic(workspace, user_dir)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "chore: 起个头"],
+        cwd=str(workspace), check=True, capture_output=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 场景 5：启动清理的三种结局
 # ---------------------------------------------------------------------------
 def seed_stale_worktrees(workspace: Path, user_dir: Path) -> None:
