@@ -325,6 +325,9 @@ class SettlementTest(IsolationBase):
 
         self.assertFalse(handle.path.exists(), "无变更的工作区应被回收")
         self.assertIn("已自动清理", record.conclusion)
+        # c14 修正：任务记录也要知道它没了，否则 `/agents` 会照旧展示一个
+        # 已删的分支名与路径，用户按它 `git checkout` 会扑空。
+        self.assertTrue(record.worktree_removed)
 
     def test_changed_worktree_is_kept(self):
         """AC22：改了东西 → 目录保留。"""
@@ -334,6 +337,7 @@ class SettlementTest(IsolationBase):
 
         self.assertTrue(handle2.path.is_dir(), "有变更的工作区必须保留")
         self.assertIn(handle2.branch, record.conclusion)
+        self.assertFalse(record.worktree_removed, "保留了就不能标成已回收")
 
     def _make_dirty_and_run(self):
         spec = _spec(isolation="worktree")

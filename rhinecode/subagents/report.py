@@ -105,12 +105,22 @@ def _task_line(record: TaskRecord) -> str:
     #
     # 分支名排在路径**前面**：用户要拿它做 `git merge`，路径只是排查时才看。
     if record.worktree_path or record.worktree_branch:
-        parts = []
-        if record.worktree_branch:
-            parts.append(f"分支 {record.worktree_branch}")
-        if record.worktree_path:
-            parts.append(f"路径 {record.worktree_path}")
-        head += "\n    隔离工作区：" + " · ".join(parts)
+        if record.worktree_removed:
+            # ⚠ 已回收时**不能再报分支名与路径**（c14 修正，真实模型实测撞到）。
+            #
+            # 两个只读任务跑完即回收（无变更 → 目录与分支一并删，F16），
+            # 而 `/agents` 仍原样展示「分支 agent/surveyor-xxx · 路径 …」。
+            # 用户照着它去 `git checkout` 会拿到「分支不存在」，去看路径会发现
+            # 目录没了——而任务行明明白白写着它们在。这与交付信息段刻意
+            # 「不给已删分支的名字」是同一条理由，那边做对了、这边漏了。
+            head += "\n    隔离工作区：已回收（无变更，目录与分支均已删除）"
+        else:
+            parts = []
+            if record.worktree_branch:
+                parts.append(f"分支 {record.worktree_branch}")
+            if record.worktree_path:
+                parts.append(f"路径 {record.worktree_path}")
+            head += "\n    隔离工作区：" + " · ".join(parts)
 
     body = record.conclusion or record.task_text
     if body:

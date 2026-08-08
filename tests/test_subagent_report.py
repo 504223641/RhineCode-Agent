@@ -176,6 +176,51 @@ class TaskSectionTest(unittest.TestCase):
         self.assertIn("尚未发起过委派", _render(AgentCatalog()))
 
 
+class IsolationRowTest(unittest.TestCase):
+    """
+    c14 F23：隔离任务多一行工作区信息——**但工作区被回收后必须改口**。
+
+    这组用例来自真实模型实测：两个只读任务跑完即回收（无变更 → 目录与分支
+    一并删，F16），而 `/agents` 仍原样展示「分支 agent/surveyor-xxx · 路径 …」。
+    用户照着它 `git checkout` 会拿到「分支不存在」。交付信息段那边刻意
+    「不给已删分支的名字」，是同一条理由——那边做对了、这边漏了。
+    """
+
+    def setUp(self) -> None:
+        self.tm = TaskManager()
+
+    def _record(self, *, removed: bool):
+        record = self.tm.create(KIND_ROLE, "worker", "去干活")
+        record.worktree_path = "/proj/.rhinecode/worktrees/worker-a1b2"
+        record.worktree_branch = "agent/worker-a1b2"
+        record.worktree_removed = removed
+        self.tm.finish(record.task_id, TaskStatus.COMPLETED, "干完了。")
+        return record
+
+    def test_kept_worktree_shows_branch_and_path(self) -> None:
+        self._record(removed=False)
+        text = _render(AgentCatalog(), self.tm.snapshot())
+        self.assertIn("agent/worker-a1b2", text)
+        self.assertIn("worktrees/worker-a1b2", text)
+
+    def test_removed_worktree_never_names_the_dead_branch(self) -> None:
+        """
+        断言的是**不出现分支名**，而不是「出现了某句话」——措辞会改，
+        「别把一个已删的分支名递给用户」这件事不会改。
+        """
+        self._record(removed=True)
+        text = _render(AgentCatalog(), self.tm.snapshot())
+        self.assertNotIn("agent/worker-a1b2", text)
+        self.assertNotIn("worktrees/worker-a1b2", text)
+        self.assertIn("已回收", text)
+
+    def test_non_isolated_task_has_no_row_at_all(self) -> None:
+        """反证：不隔离的任务不该冒出这一行（绝大多数任务都不隔离，加了全是噪音）。"""
+        record = self.tm.create(KIND_ROLE, "explorer", "去查")
+        self.tm.finish(record.task_id, TaskStatus.COMPLETED, "查完了。")
+        self.assertNotIn("隔离工作区", _render(AgentCatalog(), self.tm.snapshot()))
+
+
 class MarkupSafetyTest(unittest.TestCase):
     """
     转义纪律的护栏：本模块**不转义**，产出纯文本。

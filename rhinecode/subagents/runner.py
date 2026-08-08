@@ -492,6 +492,9 @@ def run_subagent(
                     main_project_root(), handle.path, handle.branch, status_info
                 )
                 removed = verdict.allowed
+            # 让 `/agents` 知道这个工作区已经没了（c14 修正）。**纯内存赋值**，
+            # 与 service 里设 path/branch 同形态，不进 TaskManager 的临界区。
+            record.worktree_removed = removed
             conclusion = (
                 conclusion
                 + "\n\n"
