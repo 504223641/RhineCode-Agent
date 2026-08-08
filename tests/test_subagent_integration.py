@@ -79,7 +79,7 @@ class IntegrationBase(unittest.TestCase):
                 registry=self.registry,
                 engine=manager.permission_engine,
                 main_mode=lambda: manager.permission_engine.mode,
-                environment_text=lambda: "env",
+                environment_text=lambda _cwd: "env",
                 default_model="m",
                 new_context_manager=manager.new_subagent_context_manager,
             )
@@ -299,7 +299,7 @@ class HookIntegrationTest(IntegrationBase):
             registry=registry,
             engine=manager.permission_engine,
             main_mode=lambda: manager.permission_engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda _cwd: "env",
             default_model="m",
             hooks=hooks,
         )

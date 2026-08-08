@@ -376,8 +376,11 @@ def build_app(
             registry=tool_registry,
             engine=manager.permission_engine,
             main_mode=lambda: manager.permission_engine.mode,
-            environment_text=lambda: build_default_prompt(
-                collect_environment(cfg, str(main_project_root()))
+            # c14 修正：入参是**本次子 Agent 的工作目录**。隔离子 Agent 传的是
+            # 它的工作区，于是环境信息段里的「工作目录」与 git 分支都跟着它走
+            # ——原先固定取主项目根，与 `<isolated-workspace>` 段自相矛盾。
+            environment_text=lambda agent_cwd: build_default_prompt(
+                collect_environment(cfg, agent_cwd)
             ).dynamic,
             default_model=cfg.model,
             hooks=hook_manager,

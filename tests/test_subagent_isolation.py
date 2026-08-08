@@ -88,7 +88,7 @@ class IsolationBase(unittest.TestCase):
             registry=self.registry,
             engine=self.engine,
             main_mode=lambda: self.engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda cwd: f"工作目录：{cwd}",
             default_model="m",
         )
         return SubAgentService(
@@ -191,7 +191,7 @@ class NoDegradationTest(unittest.TestCase):
             registry=self.registry,
             engine=self.engine,
             main_mode=lambda: self.engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda cwd: f"工作目录：{cwd}",
             default_model="m",
         )
         return SubAgentService(
@@ -259,6 +259,38 @@ class IsolationNoticeTest(IsolationBase):
         self.assertIn(record.worktree_branch, joined)
         self.assertIn("git commit", joined, "要告诉它成果靠提交交回去")
 
+    def test_environment_section_reports_the_worktree_not_the_main_root(self):
+        """
+        环境信息段里的「工作目录」必须是**隔离工作区**，不是主项目根。
+
+        ## 这条是真实模型实测补的（不是设计推演）
+
+        原先 `environment_text` 固定按主项目根取，于是同一份系统提示里出现两个
+        互相矛盾的工作目录：环境信息说主项目根，`<isolated-workspace>` 段说工作区。
+        真实模型的反应是把两者「调和」成一个相对路径——连着去读
+        `.rhinecode/worktrees/<名字>/calc/x.py`，全部落空，白烧两轮。
+
+        **它不报错**：权限管线仍按工作区判定，工具照常工作，只是模型一直在猜路。
+        故这条断言直接对着注入文本查，不看行为。
+        """
+        service = self._service(_spec(isolation="worktree"))
+        outcome = self._delegate(service)
+        record = service.tasks.get(outcome.task_id)
+
+        joined = "\n".join("\n".join(batch) for batch in self.provider.messages)
+        self.assertIn(f"工作目录：{record.worktree_path}", joined)
+        # 反证：主项目根**不能**作为一条独立的「工作目录：」行出现。
+        # 只断言「不含主项目根」是不成立的——工作区路径本身就以它开头。
+        self.assertNotIn(f"工作目录：{self.repo}\n", joined)
+
+    def test_non_isolated_agent_still_reports_the_main_root(self):
+        """反证：不隔离的子 Agent 仍按主项目根报，改造没有殃及既有行为。"""
+        service = self._service(_spec(isolation=None))
+        self._delegate(service)
+
+        joined = "\n".join("\n".join(batch) for batch in self.provider.messages)
+        self.assertIn(f"工作目录：{self.repo}", joined)
+
 
 class SettlementTest(IsolationBase):
     """AC21 / AC22 / AC23：结束时按变更决定去留，交付信息由系统给。"""
@@ -272,7 +304,7 @@ class SettlementTest(IsolationBase):
             registry=self.registry,
             engine=self.engine,
             main_mode=lambda: self.engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda cwd: f"工作目录：{cwd}",
             default_model="m",
         )
         handle, _ = lifecycle.create(self.repo, "task1")
@@ -343,7 +375,7 @@ class SettlementTest(IsolationBase):
             registry=self.registry,
             engine=self.engine,
             main_mode=lambda: self.engine.mode,
-            environment_text=lambda: "env",
+            environment_text=lambda cwd: f"工作目录：{cwd}",
             default_model="m",
         )
         handle, _ = lifecycle.create(self.repo, "task3")

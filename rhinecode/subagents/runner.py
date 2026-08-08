@@ -149,7 +149,12 @@ class SubAgentRuntime:
         它持有 `_anchor_tokens` / `_circuit_broken` 等可变状态且无锁，
         并发共享会互相污染估算锚点。新建实例很轻，只共享存盘目录。
         为 `None` 时子 Agent 不跑任何上下文压缩（测试与非工具模式）。
-    :param environment_text: 取环境信息段的回调（工作目录等）
+    :param environment_text: 取环境信息段的回调，**入参是本次子 Agent 的工作目录**
+        （c14 修正）。**刻意不给默认值**——与 `PermissionRequest.cwd` 同一条理由：
+        给了默认值等于「忘记传的地方静默按主项目根算」，而隔离子 Agent 拿到
+        主项目根的环境信息，会与 `<isolated-workspace>` 段自相矛盾。
+        实测后果：模型把工作区路径当成相对主项目根的路径去拼
+        （`.rhinecode/worktrees/<名字>/calc/x.py`），连读几次都落空，白烧轮次。
     :param untrusted_section: 「外部不可信内容」段原文。**只在子 Agent 的
         最终工具集含网络访问工具时才注入**（spec F7 的例外）。
     :param default_model: 主对话模型名，角色未指定 `model` 时用它
@@ -162,7 +167,7 @@ class SubAgentRuntime:
     registry: object
     engine: PermissionEngine
     main_mode: Callable[[], PermissionMode]
-    environment_text: Callable[[], str]
+    environment_text: Callable[[str], str]
     default_model: str = ""
     hooks: object = None
     recorder: object = None
@@ -265,8 +270,15 @@ def _build_prompts(
     # c14 F15：隔离说明。一次算好而不是每轮重算——句柄是不可变的。
     isolation_notice = _isolation_notice(handle) if handle is not None else ""
 
+    # c14 修正：环境信息段必须报**本次子 Agent 的工作目录**，不是主项目根。
+    # 这是 CLAUDE.md 那条「cwd 的分发点」在提示词侧漏掉的一处：
+    # 权限管线、工具执行、Hook 子进程都已按工作区判定，唯独告诉模型的那句话没跟上，
+    # 于是同一份系统提示里出现两个互相矛盾的「工作目录」。
+    # 一次算好：句柄不可变，主项目根在一次运行内也不变。
+    agent_cwd = str(handle.path) if handle is not None else str(main_project_root())
+
     def dynamic() -> str:
-        parts = [runtime.environment_text(), SUBAGENT_CONVENTIONS]
+        parts = [runtime.environment_text(agent_cwd), SUBAGENT_CONVENTIONS]
         if isolation_notice:
             parts.append(isolation_notice)
         if needs_untrusted:
