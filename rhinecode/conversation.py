@@ -1150,7 +1150,7 @@ class ConversationManager:
                 return self._engine.mode
             return narrower_mode(self._engine.mode, spec.permission_mode)
 
-        return render_report(
+        report = render_report(
             service.catalog,
             service.tasks.snapshot(),
             tools_for=tools_for,
@@ -1158,6 +1158,15 @@ class ConversationManager:
             project_dir=str(main_project_root() / ".rhinecode" / "agents"),
             user_dir=str(self._user_dir / "agents"),
         )
+        # c15 F26：花名册接在报告末尾。
+        #
+        # **单独一段而不是并进任务行**：任务行是「一次委派」的视角
+        # （一个队员被唤醒三次就有三行），花名册是「现在场上有谁」的视角。
+        # 用户排查「为什么它叫不醒」时看的是后者，混在一起两个视角都读不清。
+        roster = self.team_roster_text()
+        if roster and "没有队员" not in roster:
+            report += "\n\n【队员花名册】\n" + roster
+        return report
 
     def cancel_subagents(self, target: Optional[str]) -> str:
         """

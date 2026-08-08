@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 from rhinecode.team.identity import current_identity
 from rhinecode.team.models import TASK_STATE_LABELS, TaskState
 from rhinecode.tools.base import Tool, ToolResult
+from rhinecode.trace import TraceEventType
 
 if TYPE_CHECKING:  # pragma: no cover —— 仅类型检查期
     from rhinecode.team.service import TeamService
@@ -75,6 +76,21 @@ class _BoardTool(Tool):
     @property
     def board(self):
         return self._service.board
+
+    def _trace(self, action: str, task_id: str, detail: str = "") -> None:
+        """
+        记一次清单变更（c15 T42）。
+
+        **带上 actor**：清单是所有人共用的一份，一条任务莫名其妙变了状态时，
+        没有这个字段就无从追是谁改的。
+        """
+        self._service._emit(  # noqa: SLF001 —— 埋点漏斗，刻意不做成公开 API
+            TraceEventType.TEAM_TASK,
+            action=action,
+            task_id=task_id,
+            actor=current_identity(),
+            detail=detail,
+        )
 
     @staticmethod
     def _guard(fn):
@@ -145,6 +161,7 @@ class TaskCreateTool(_BoardTool):
                     ok=False, output="subject 不能为空。", summary="缺少标题"
                 )
             task = self.board.create(subject, str(args.get("description") or ""))
+            self._trace("create", task.task_id, subject[:40])
             return ToolResult(
                 ok=True,
                 output=(
@@ -348,6 +365,7 @@ class TaskUpdateTool(_BoardTool):
             # 删除单独分流：它不是一种状态（对齐 Claude Code）。
             if status == "deleted":
                 if self.board.remove(task_id):
+                    self._trace("delete", task_id)
                     return ToolResult(
                         ok=True,
                         output=f"已删除任务 {task_id}，相关的依赖引用也一并摘除了。",
@@ -373,6 +391,7 @@ class TaskUpdateTool(_BoardTool):
                 if not claim.ok:
                     return ToolResult(ok=False, output=claim.reason, summary="认领失败")
                 notes.append(f"已认领（{claim.current_owner}）")
+                self._trace("claim", task_id, claim.current_owner)
             elif owner is not None:
                 # 显式传空串 = 放手
                 released = self.board.update(task_id, owner="")
@@ -402,6 +421,7 @@ class TaskUpdateTool(_BoardTool):
                 return ToolResult(ok=False, output=result.reason, summary="更新失败")
             if state is not None:
                 notes.append(f"状态 → {TASK_STATE_LABELS.get(state, state.value)}")
+                self._trace("status", task_id, state.value)
 
             if not notes:
                 notes.append("没有任何字段发生变化")

@@ -446,6 +446,8 @@ class RhineApp(App):
             return self._manager.hooks_report()
         if target == ReportTarget.AGENTS:
             return self._manager.agents_report()
+        if target == ReportTarget.TASKS:
+            return self._manager.team_board_text()
         raise ValueError(f"未知的报告目标：{target!r}")
 
     def cancel_subagents(self, target: "Optional[str]") -> str:

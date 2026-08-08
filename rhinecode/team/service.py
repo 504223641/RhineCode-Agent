@@ -41,6 +41,7 @@ from rhinecode.team.models import (
 )
 from rhinecode.team.render import render_board, render_roster
 from rhinecode.team.roster import RegisterResult, Roster
+from rhinecode.trace import TraceEventType, clip
 
 
 class TeamService:
@@ -55,16 +56,37 @@ class TeamService:
         self,
         max_idle: int = MAX_IDLE_MEMBERS,
         max_auto_wake_chain: int = MAX_AUTO_WAKE_CHAIN,
+        recorder=None,
     ) -> None:
         self.roster = Roster(max_idle=max_idle)
         self.board = TaskBoard()
         self.mailbox = Mailbox(self.roster)
+
+        # 行为记录器（c15 T42/T43）。`None` 时全部埋点退化成零成本空调用。
+        # ⚠ 埋点一律走 `_emit`，它吞掉一切异常——观测设施绝不能反过来
+        # 阻断被观测的系统（spec N7）。
+        self._recorder = recorder
 
         self._lock = threading.Lock()
         self._auto_wake_chain = 0
         self._max_auto_wake_chain = max(1, int(max_auto_wake_chain))
         # 待命降级的通知，等 TUI 轮询取走（spec N3 要求降级看得见）
         self._pending_notices: list[str] = []
+
+    def _emit(self, event_type, **fields) -> None:
+        """
+        受保护的埋点漏斗（spec N7）。
+
+        **吞掉一切异常**：记录失败最多是时间线上少一行，而异常逃逸会让一次
+        正常的协作动作变成失败。与 `agent/loop.py` 的 `_safe_emit`、
+        C14 各处埋点同一条口径。
+        """
+        if self._recorder is None:
+            return
+        try:
+            self._recorder.emit(event_type, **fields)
+        except Exception:  # noqa: BLE001 —— 观测设施绝不能阻断被观测的系统
+            pass
 
     # ------------------------------------------------------------------ #
     # 花名册
@@ -82,7 +104,14 @@ class TeamService:
 
         副作用：改花名册。
         """
-        return self.roster.register(name, role, task_id=task_id, read_only=read_only)
+        result = self.roster.register(name, role, task_id=task_id, read_only=read_only)
+        self._emit(
+            TraceEventType.TEAM_MEMBER,
+            name=result.name or (name or ""),
+            event="register" if result.ok else "register_failed",
+            detail=role if result.ok else result.reason,
+        )
+        return result
 
     def mark_idle(self, name: str, history) -> tuple[str, ...]:
         """
@@ -97,6 +126,14 @@ class TeamService:
         可能往待通知队列追加。
         """
         retired = self.roster.mark_idle(name, history)
+        self._emit(TraceEventType.TEAM_MEMBER, name=name, event="idle")
+        for victim in retired:
+            self._emit(
+                TraceEventType.TEAM_MEMBER,
+                name=victim,
+                event="retired",
+                detail=f"待命超过上限 {self.roster.max_idle}",
+            )
         if retired:
             with self._lock:
                 for victim in retired:
@@ -110,10 +147,17 @@ class TeamService:
     def mark_terminal(self, name: str, state: MemberState) -> None:
         """队员进入终态并释放历史（spec F14）。副作用：改花名册。"""
         self.roster.mark_terminal(name, state)
+        self._emit(TraceEventType.TEAM_MEMBER, name=name, event=state.value)
 
     def wake(self, name: str):
         """唤回一个待命队员并取出它的历史；不可唤醒时返回 `None`。"""
-        return self.roster.wake(name)
+        history = self.roster.wake(name)
+        self._emit(
+            TraceEventType.TEAM_MEMBER,
+            name=name,
+            event="woken" if history is not None else "wake_refused",
+        )
+        return history
 
     def members(self) -> tuple[MemberEntry, ...]:
         """全部队员的只读快照（含 `main`，它排在最前）。"""
@@ -145,7 +189,16 @@ class TeamService:
 
         副作用：往收件人信箱追加；可能唤醒待命中的收件人（在锁外）。
         """
-        return self.mailbox.send(sender, recipient, body, summary)
+        result = self.mailbox.send(sender, recipient, body, summary)
+        self._emit(
+            TraceEventType.TEAM_MESSAGE,
+            sender=sender,
+            recipient=recipient,
+            ok=result.ok,
+            summary=(result.envelope.summary if result.envelope else result.reason),
+            body=clip(body),
+        )
+        return result
 
     def take_unread(self, name: str) -> tuple[Envelope, ...]:
         """取走某人的未读（取走即置位，幂等）。"""
@@ -227,7 +280,15 @@ class TeamService:
         """
         with self._lock:
             self._auto_wake_chain += 1
-            return self._auto_wake_chain
+            count = self._auto_wake_chain
+        # ⚠ 埋点在**锁外**：它会写盘，而临界区只做纯内存读写（spec N2）。
+        self._emit(
+            TraceEventType.AUTO_WAKE,
+            count=count,
+            limit=self._max_auto_wake_chain,
+            trigger=MAIN_NAME,
+        )
+        return count
 
     def reset_auto_wake(self) -> None:
         """
@@ -284,8 +345,21 @@ class TeamService:
         return render_board(self.board.snapshot(), self.board.is_blocked)
 
     def roster_text(self) -> str:
-        """花名册的展示文本（`/agents` 用）。"""
-        return render_roster(self.roster.snapshot())
+        """
+        花名册的展示文本（`/agents` 用）。
+
+        主对话不作为「队员」列出（列出来只会让用户困惑「我什么时候招了个叫
+        main 的人」），**但它的未读要说一句**：自动唤起被连锁上限挡住时，
+        消息会一直堆在那儿，而用户在界面上没有任何别的地方看得到这件事。
+        """
+        text = render_roster(self.roster.snapshot())
+        main = self.roster.get(MAIN_NAME)
+        if main is not None and main.unread_count:
+            note = f"主对话有 {main.unread_count} 条未读队友消息"
+            if not self.can_auto_wake():
+                note += "（自动唤起已达上限，说句话即可继续处理）"
+            text = (text + "\n" if text and "没有队员" not in text else "") + note
+        return text
 
     # ------------------------------------------------------------------ #
     # 会话边界

@@ -66,7 +66,8 @@ class ModeTarget(Enum):
 class ReportTarget(Enum):
     """
     query_report 的目标报告：MCP 连接状态 / 上下文用量 / 记忆系统状态 /
-    Skill 状态 / Skill 实际注入内容 / Hook 规则 / 子 Agent 角色与任务。
+    Skill 状态 / Skill 实际注入内容 / Hook 规则 / 子 Agent 角色与任务 /
+    共享任务清单（c15）。
 
     **成对维护点**：新增枚举值须同步三处——本枚举、`tui/app.py` 的
     `query_report` 分支（未知值明确抛错）、`conversation.py` 的对应领域方法。
@@ -79,6 +80,7 @@ class ReportTarget(Enum):
     SKILLS_PROMPT = "skills_prompt"
     HOOKS = "hooks"
     AGENTS = "agents"
+    TASKS = "tasks"
 
 
 @dataclass(frozen=True)

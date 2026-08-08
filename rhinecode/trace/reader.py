@@ -261,6 +261,55 @@ def _s_worktree_provision(r: dict) -> str:
     )
 
 
+def _s_team_message(r: dict) -> str:
+    """
+    一条队友消息（c15）。
+
+    **谁发给谁**是这条时间线上最要紧的信息——排查协作问题时，第一个要回答的
+    永远是「这句话到底是谁说的」。摘要跟在后面，正文太长不进摘要行
+    （要看正文用 `--seq` 展开）。
+    """
+    status = "" if r.get("ok", True) else " · 未送达"
+    return f"{r.get('sender')} → {r.get('recipient')}{status} · {r.get('summary', '')}"
+
+
+def _s_team_task(r: dict) -> str:
+    """
+    共享清单的一次变更（c15）。
+
+    带上**谁改的**：清单是所有人共用的一份，一条任务莫名其妙变了状态时，
+    没有这个字段就无从追。
+    """
+    detail = r.get("detail") or ""
+    return (
+        f"{r.get('action')} [{r.get('task_id')}] by {r.get('actor')}"
+        + (f" · {detail}" if detail else "")
+    )
+
+
+def _s_team_member(r: dict) -> str:
+    """
+    队员的一次状态流转（c15）。
+
+    `idle` / `woken` / `retired` 这三个是排查「为什么叫不醒它」时最常看的。
+    """
+    return f"{r.get('name')} · {r.get('event')}" + (
+        f" · {r.get('detail')}" if r.get("detail") else ""
+    )
+
+
+def _s_auto_wake(r: dict) -> str:
+    """
+    主对话的一次自动唤起（c15）。
+
+    **次数与上限一起显示**：单看「第 3 次」判断不出离停下来还有多远，
+    而「因为达到上限而停了」正是排查「它怎么不动了」时要找的那一行。
+    """
+    return (
+        f"第 {r.get('count')}/{r.get('limit')} 次 · 来自 {r.get('trigger', '?')}"
+    )
+
+
 def _s_worktree_settle(r: dict) -> str:
     """
     结束时的去留决定（c14）。
@@ -308,6 +357,10 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.WORKTREE_PROVISION.value: _s_worktree_provision,
     TraceEventType.WORKTREE_SETTLE.value: _s_worktree_settle,
     TraceEventType.WORKTREE_CLEANUP.value: _s_worktree_cleanup,
+    TraceEventType.TEAM_MESSAGE.value: _s_team_message,
+    TraceEventType.TEAM_TASK.value: _s_team_task,
+    TraceEventType.TEAM_MEMBER.value: _s_team_member,
+    TraceEventType.AUTO_WAKE.value: _s_auto_wake,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」

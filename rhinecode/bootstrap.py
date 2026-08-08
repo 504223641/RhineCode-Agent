@@ -44,7 +44,10 @@ from rhinecode.subagents.models import builtin_agents_dir
 from rhinecode.subagents.runner import SubAgentRuntime
 from rhinecode.subagents.service import SubAgentService
 from rhinecode.tools.run_agent import RunAgentTool
+from rhinecode.team import TeamService
 from rhinecode.tools.load_skill import LoadSkillTool
+from rhinecode.tools.send_message import SendMessageTool
+from rhinecode.tools.team_tasks import build_board_tools
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.web_fetch import WebFetchTool
 from rhinecode.web.manager import WebFetchManager
@@ -363,6 +366,20 @@ def build_app(
         manager.add_startup_notice(render_cleanup_notice(worktree_cleanup))
 
     if tool_registry is not None:
+        # ── c15：协作服务 ──
+        #
+        # 位置在子 Agent 装配**之前**：`SubAgentService` 要拿它做队员命名，
+        # `SubAgentRuntime` 要拿它给运行器（待命与消息注入都靠它）。
+        #
+        # 它与 `tool_registry is not None` 同生共死——协作能力只在
+        # DeepSeek 工具模式下有意义（消息与清单都是给工具用的），
+        # 非工具模式下整段不执行，五个工具也就不会被注册。
+        team_service = TeamService(recorder=recorder)
+        manager.team_service = team_service
+        for tool in build_board_tools(team_service):
+            tool_registry.register(tool)
+        tool_registry.register(SendMessageTool(team_service))
+
         agent_catalog = discover_agents(
             main_project_root() / ".rhinecode" / "agents",
             user_dir / "agents",
@@ -390,6 +407,8 @@ def build_app(
             # 含网络访问工具时才注入它（spec F7 的例外），这里只负责把文本递过去。
             untrusted_section=UNTRUSTED_CONTENT if cfg.web_fetch_enabled else "",
             thinking_effort=manager.thinking_effort,
+            # c15：运行器据它做待命/唤醒、注入队友消息、绑定协作身份。
+            team=team_service,
         )
         subagent_service = SubAgentService(
             agent_catalog,
@@ -404,6 +423,8 @@ def build_app(
                 [ProvisionEntry(source=x, mode="copy") for x in cfg.worktree_copy]
                 + [ProvisionEntry(source=x, mode="link") for x in cfg.worktree_link]
             ),
+            # c15：委派时占用队员名字（F1/F2）。
+            team=team_service,
         )
         manager.subagent_service = subagent_service
         tool_registry.register(
