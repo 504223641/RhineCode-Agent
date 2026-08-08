@@ -47,6 +47,7 @@ from rhinecode.team.models import (
     MAIN_NAME,
     MAX_IDLE_MEMBERS,
     MEMBER_STATE_LABELS,
+    Envelope,
     MemberEntry,
     MemberState,
 )
@@ -65,6 +66,32 @@ _NAME_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f<>\"'`\s]+")
 
 # 名字长度上限。够长以容纳有意义的中文名，又不至于把 `/agents` 的表格撑破。
 _NAME_MAX_LEN = 40
+
+
+@dataclass(frozen=True)
+class DeliverOutcome:
+    """
+    一次投递尝试的结果（`Roster.deliver` 的返回值）。
+
+    **本类刻意不组织给人看的文案**——那属于 `mailbox.py` 的职责。
+    这里只回答「成功了没有、没成功是哪一类、要唤醒谁」，
+    使 `Roster` 保持在「纯数据操作」这一层。
+
+    :param ok: 是否投递成功
+    :param kind: 失败类别：`"unknown"`（查无此人）/ `"terminal"`（对方已出局）。
+        成功时为 `"ok"`
+    :param state_label: 失败为 `"terminal"` 时，对方当前状态的中文名，
+        供上层组织「是失败 / 取消 / 已退休哪一种」的说明
+    :param wake_event: **需要在锁外 `set` 的事件**；对方不在待命时为 `None`
+
+        ⚠ 本方法**刻意不自己 `set`**：那是跨线程调度，必须发生在锁外，
+        而这里还在锁内。把它交出去，让调用方在出锁之后再唤醒。
+    """
+
+    ok: bool
+    kind: str = "ok"
+    state_label: str = ""
+    wake_event: Optional[threading.Event] = None
 
 
 @dataclass(frozen=True)
@@ -300,6 +327,90 @@ class Roster:
             return history
 
     # ------------------------------------------------------------------ #
+    # 信箱原语
+    #
+    # 信箱数据本来就住在 `MemberEntry.inbox` 里，因此这三个操作放在花名册。
+    # **但投递的策略与文案不在这里**——那属于 `mailbox.py`：本层只回答
+    # 「能不能收、收下了、要唤醒谁」，不组织给人看的句子。
+    # ------------------------------------------------------------------ #
+
+    def deliver(self, recipient: str, envelope: "Envelope") -> DeliverOutcome:
+        """
+        把一条消息放进收件人的信箱（spec F9/F11）。
+
+        :param recipient: 收件人名字
+        :param envelope: 已经构造好的消息
+        :returns: `DeliverOutcome`。**成功且对方在待命时，
+            `wake_event` 非空——调用方必须在锁外 `set` 它**
+
+        ⚠ 本方法**不 `set` 事件**。唤醒等待线程属跨线程调度，
+        必须发生在锁外，而这里还在临界区内。见模块 docstring 的加锁不变量。
+
+        副作用：改内部状态（追加一条消息）。
+        """
+        with self._lock:
+            entry = self._members.get(recipient)
+            if entry is None:
+                return DeliverOutcome(ok=False, kind="unknown")
+            if entry.state.is_terminal:
+                return DeliverOutcome(
+                    ok=False,
+                    kind="terminal",
+                    state_label=MEMBER_STATE_LABELS.get(
+                        entry.state, entry.state.value
+                    ),
+                )
+            entry.inbox.append(envelope)
+            # 待命的要唤醒；正在跑的不用——它的闸门会在下一轮迭代取走这条消息。
+            # 两条路径混淆会让消息被处理两遍。
+            event = entry.wake_event if entry.state is MemberState.IDLE else None
+            return DeliverOutcome(ok=True, wake_event=event)
+
+    def take_unread(self, name: str) -> "tuple[Envelope, ...]":
+        """
+        取走某人的未读消息（spec F11）。
+
+        :param name: 收件人名字
+        :returns: 未读消息元组，按到达顺序；没有时空元组
+
+        **取走即置位**：取出的同时把信箱里对应的条目替换成 `read=True` 的版本，
+        因此重复调用幂等——同一条消息不会被注入收件人的历史两遍。
+        这与 C13 `take_deliverables` 是同一条契约。
+
+        `Envelope` 是 frozen 的，所以「标记已读」靠**替换整个对象**完成，
+        而不是原地改字段。这让「两个线程同时标同一条已读」从结构上不可能
+        产生半个状态。
+
+        副作用：改内部状态（把未读翻成已读）。
+        """
+        with self._lock:
+            entry = self._members.get(name)
+            if entry is None:
+                return ()
+            unread = [env for env in entry.inbox if not env.read]
+            if not unread:
+                return ()
+            entry.inbox = [
+                env if env.read else replace(env, read=True) for env in entry.inbox
+            ]
+            return tuple(unread)
+
+    def has_unread(self, name: str) -> bool:
+        """
+        某人有没有未读消息。**只读，不改任何状态。**
+
+        供 TUI 轮询判断「要不要触发自动唤起」用（spec F17）——
+        那条路径每 0.5 秒跑一次，绝不能有副作用。
+
+        副作用：无。
+        """
+        with self._lock:
+            entry = self._members.get(name)
+            if entry is None:
+                return False
+            return any(not env.read for env in entry.inbox)
+
+    # ------------------------------------------------------------------ #
     # 读
     # ------------------------------------------------------------------ #
 
@@ -417,4 +528,4 @@ class Roster:
         return replace(entry, inbox=list(entry.inbox), history=list(entry.history))
 
 
-__all__ = ["RegisterResult", "Roster"]
+__all__ = ["DeliverOutcome", "RegisterResult", "Roster"]
