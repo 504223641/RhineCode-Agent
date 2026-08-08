@@ -42,6 +42,40 @@ GLOBAL_DENIED_TOOLS = frozenset(
     }
 )
 
+# c15：协作工具（spec F22 要求它们对**全部**子 Agent 可见）。
+#
+# ⚠ **它们豁免角色的 `tools` 白名单**——白名单取交集之后再加回来。
+#
+# 这是真实模型验收补的：`explorer` / `planner` 都声明了只读白名单
+# （read_file / glob_files / grep_content），于是交集之后**一个协作工具都不剩**。
+# 后果是协作里最自然的分工——「一个只读调研员 + 一个执行者」——根本跑不通：
+# 调研员连「我查完了」都说不出口，也没法在共享清单上标完成。
+# 实测撞到：主 Agent 把 impl-worker 派成 explorer，它跑完才发现没有
+# `send_message`，主 Agent 只好又补派一个人重做。
+#
+# 单元测试没抓到，是因为那些用例用的都是 `tools=None`（继承全部）的角色，
+# 而**内置三个角色里有两个声明了白名单**。`CollaborationToolsTest` 现已补上
+# 声明白名单的对照组。
+#
+# `disallowed_tools` 仍然压得过它——用户显式禁掉的照样禁掉。
+# 这不与 C13「子 Agent 的能力只会比主对话小」冲突：协作工具不读写文件、
+# 不执行命令，副作用限于改本进程内存；而队员通过它让**别人**干的每一件事，
+# 仍逐个过完整的五层权限管线 + Hook 前置层。
+#
+# ⚠ **`run_agent` 与 `load_skill` 必须继续留在 `GLOBAL_DENIED_TOOLS` 里**：
+# C15 只让队员「能说话」，没有让它们「能招人」。少了那两条，一条
+# `tools: [send_message, run_agent]` 的角色定义就能让子 Agent 拿到委派能力、
+# 无限嵌套下去。
+ALWAYS_GRANTED_TOOLS = frozenset(
+    {
+        "task_create",
+        "task_list",
+        "task_get",
+        "task_update",
+        "send_message",
+    }
+)
+
 # ── 第 3 层：后台附加禁止 ──
 #
 # **本章为空集**，这是刻意的，不是没写完。
@@ -95,8 +129,13 @@ def resolve_toolset(
 
     1. 从 `all_tools` 减去 `GLOBAL_DENIED_TOOLS`；
     2. `spec.tools` 非 `None` 时取交集，并记下没匹配上的名字；
-    3. 减去 `spec.disallowed_tools`；
-    4. 后台时再减 `BACKGROUND_DENIED_TOOLS`。
+    3. **把 `ALWAYS_GRANTED_TOOLS` 加回来**（c15：协作工具豁免白名单，spec F22）；
+    4. 减去 `spec.disallowed_tools`；
+    5. 后台时再减 `BACKGROUND_DENIED_TOOLS`。
+
+    ⚠ 第 3 步排在**白名单之后、黑名单之前**，位置是刻意的：
+    它要能穿过白名单（否则只读角色一个协作工具都拿不到），
+    但**不能穿过黑名单**（用户显式 `disallowed_tools` 禁掉的照样禁掉）。
 
     **`spec.tools is None` 与 `spec.tools == ()` 语义不同**：前者是「未声明，
     继承全部」，后者是「声明了但一个都不要」。后者会走到空集分支——
@@ -115,6 +154,11 @@ def resolve_toolset(
         # 保持声明顺序输出未解析名字，便于用户对照自己写的那一行
         unresolved = tuple(name for name in spec.tools if name not in after_global)
         current = current & wanted
+
+    # c15 F22：协作工具豁免角色白名单——见 `ALWAYS_GRANTED_TOOLS` 的说明。
+    # 只加**注册中心里真的有**的那些（`after_global` 已经过第 1 层过滤），
+    # 因此未启用协作时这一步是零影响。
+    current = current | (after_global & ALWAYS_GRANTED_TOOLS)
 
     if spec is not None and spec.disallowed_tools:
         current = current - frozenset(spec.disallowed_tools)
@@ -178,6 +222,7 @@ def _explain_empty(
 
 
 __all__ = [
+    "ALWAYS_GRANTED_TOOLS",
     "GLOBAL_DENIED_TOOLS",
     "BACKGROUND_DENIED_TOOLS",
     "ToolsetResult",

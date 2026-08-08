@@ -177,6 +177,109 @@ class BackgroundLayerTest(unittest.TestCase):
         self.assertEqual(fg.allowed, bg.allowed)
 
 
+class CollaborationToolsTest(unittest.TestCase):
+    """
+    c15：协作工具**必须**对子 Agent 可见，委派与 Skill 加载工具**必须**不可见。
+
+    这两半是一体的：C15 让队员「能说话」，但没有让它们「能招人」。
+    少了后半条，一条 `tools: [send_message, run_agent]` 的角色定义
+    就能让子 Agent 拿到委派能力、无限嵌套下去。
+    """
+
+    COLLAB = ("task_create", "task_list", "task_get", "task_update", "send_message")
+
+    def test_collaboration_tools_reach_subagents(self) -> None:
+        """spec F22：队员要共享看板、互相说话，就必须拿得到这五个。"""
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        result = resolve_toolset(all_names, _spec())
+        for name in self.COLLAB:
+            with self.subTest(tool=name):
+                self.assertIn(
+                    name,
+                    result.allowed,
+                    f"{name} 被挡在子 Agent 之外了——F22 要求它对全部子 Agent 可见",
+                )
+
+    def test_delegation_tools_still_blocked(self) -> None:
+        """spec F23：C13 那道防无限嵌套的闸门原样保留。"""
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        result = resolve_toolset(all_names, _spec())
+        for name in ("run_agent", "load_skill"):
+            with self.subTest(tool=name):
+                self.assertNotIn(name, result.allowed)
+
+    def test_readonly_role_with_allowlist_still_gets_them(self) -> None:
+        """
+        ⚠⚠ **这条是真实模型验收补的，它抓的是一个已经发生过的缺陷。**
+
+        原先的用例全部用 `tools=None`（继承全部）的角色，于是没人发现：
+        **声明了白名单的角色，交集之后一个协作工具都不剩**。
+        而内置三个角色里有两个（`explorer` / `planner`）正是这种。
+
+        后果是协作里最自然的分工——「一个只读调研员 + 一个执行者」——
+        根本跑不通：调研员连「我查完了」都说不出口。实测撞到过：
+        主 Agent 把队员派成 explorer，它跑完才发现没有 `send_message`，
+        主 Agent 只好又补派一个人重做。
+        """
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        spec = _spec(tools=("read_file", "glob_files", "grep_content"))
+        result = resolve_toolset(all_names, spec)
+        for name in self.COLLAB:
+            with self.subTest(tool=name):
+                self.assertIn(name, result.allowed, "协作工具必须豁免角色白名单")
+        self.assertNotIn("write_file", result.allowed, "但白名单本身仍然生效")
+
+    def test_builtin_readonly_roles_can_collaborate(self) -> None:
+        """直接拿**内置角色**验——上一条的真实形态。"""
+        from pathlib import Path
+
+        from rhinecode.subagents.discovery import discover_agents
+        from rhinecode.subagents.models import builtin_agents_dir
+
+        catalog = discover_agents(
+            Path("/nonexistent-project"), Path("/nonexistent-user"), builtin_agents_dir()
+        )
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        for role in ("explorer", "planner"):
+            with self.subTest(role=role):
+                spec = catalog.specs.get(role)
+                self.assertIsNotNone(spec, f"内置角色 {role} 应当存在")
+                allowed = resolve_toolset(all_names, spec).allowed
+                self.assertTrue(
+                    set(self.COLLAB) <= allowed,
+                    f"{role} 拿不到协作工具，只读调研员将无法参与协作",
+                )
+
+    def test_disallowed_still_beats_the_exemption(self) -> None:
+        """
+        豁免**穿得过白名单，但穿不过黑名单**——用户显式禁掉的照样禁掉。
+
+        位置搞反（豁免排在黑名单之后）不会报错，只是一条
+        `disallowed_tools: [send_message]` 突然不生效了。
+        """
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        spec = _spec(disallowed=("send_message",))
+        result = resolve_toolset(all_names, spec)
+        self.assertNotIn("send_message", result.allowed)
+        self.assertIn("task_list", result.allowed, "只禁掉被点名的那个")
+
+    def test_exemption_is_noop_without_collaboration(self) -> None:
+        """未启用协作时（注册中心里没有这些工具）豁免是零影响。"""
+        result = resolve_toolset(ALL_TOOLS, _spec(tools=("read_file",)))
+        self.assertEqual(result.allowed, frozenset({"read_file"}))
+
+    def test_explicit_allowlist_cannot_grant_delegation(self) -> None:
+        """
+        ⚠ 反证：即使角色定义把 `run_agent` 写进白名单，也拿不到它——
+        全局禁表排在角色白名单**之前**是刻意的。
+        """
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        spec = _spec(tools=("send_message", "run_agent"))
+        result = resolve_toolset(all_names, spec)
+        self.assertIn("send_message", result.allowed)
+        self.assertNotIn("run_agent", result.allowed)
+
+
 class ResultShapeTest(unittest.TestCase):
     def test_is_empty_property(self) -> None:
         self.assertTrue(ToolsetResult(allowed=frozenset()).is_empty)

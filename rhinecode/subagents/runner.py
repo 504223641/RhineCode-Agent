@@ -43,6 +43,9 @@ from rhinecode.subagents.tasks import (
     TaskStatus,
 )
 from rhinecode.subagents.toolset import ToolsetResult
+from rhinecode.team.gate import TeamGate
+from rhinecode.team.identity import bind_identity
+from rhinecode.team.models import MemberState
 from rhinecode.tools.path_guard import main_project_root
 from rhinecode.trace import NullRecorder, TraceEventType, clip, subagent_scope
 from rhinecode.worktree import (
@@ -76,6 +79,36 @@ _FAILURE_TEXT = {
 }
 
 _UNEXPECTED_TEXT = "子 Agent 运行时出错，未产出结论：{error}"
+
+# c15：待命时检查取消信号的间隔（秒）。
+#
+# 队员要同时响应「收到消息」与「被取消」两件事，而标准库没有「等多个 Event
+# 中任意一个」的原语。用短超时轮询而不是起一条监视线程——后者是把一个简单
+# 问题复杂化，还多一条要管生命周期的线程。
+#
+# 这**不是** spec N6 禁止的那种轮询：它发生在一条已经空闲的线程上，
+# 0.2 秒醒一次的 CPU 占用可以忽略。N6 禁的是「没有队员时也持续烧 CPU」。
+_WAKE_POLL_INTERVAL = 0.2
+
+# 被唤醒之后那一轮的任务描述。
+#
+# 刻意**不**去复述唤醒它的那条消息：消息由闸门在第一轮迭代注入，模型看得到
+# 全文；在这里再抄一遍只会让 `/agents` 的任务行变得又长又重复。
+_WOKEN_TASK_TEXT = "（被消息唤醒，带着原有上下文继续）"
+
+# c15：任务终态 → 队员终态。
+#
+# 两套状态回答不同的问题（「结论产出了没有」vs「人还在不在场」），
+# 但队员**退场**时两者必须对得上，否则 `/agents` 会同时显示
+# 「任务失败」与「队员已完成」。
+#
+# 缺省 `DONE`（自然干完但不保留上下文）——只有隔离委派会走到那里，
+# 它与待命互斥，理由见 `run_subagent` 里 `can_idle` 的注释。
+_MEMBER_STATE_FOR_TASK = {
+    TaskStatus.COMPLETED: MemberState.DONE,
+    TaskStatus.FAILED: MemberState.FAILED,
+    TaskStatus.CANCELLED: MemberState.CANCELLED,
+}
 
 # 所有子 Agent 都要遵守的两条约定，注入每个子 Agent 的 <system-reminder>。
 #
@@ -161,6 +194,9 @@ class SubAgentRuntime:
     :param thinking_effort: 思考强度，继承主对话
     :param network_tool_names: 哪些工具名算「能联网」。用集合而不是硬编码
         `"web_fetch"`，是为了将来加 web_search 时只改这一处。
+    :param team: 协作服务门面（c15）。`None` 表示协作能力未启用——
+        那时子 Agent 跑完即结束，没有队友消息注入、没有待命与唤醒，
+        行为与 C13/C14 **逐字一致**（spec N5 零回归的落点）。
     """
 
     provider_for: Callable[[Optional[str]], BaseProvider]
@@ -174,6 +210,7 @@ class SubAgentRuntime:
     new_context_manager: Optional[Callable[[], object]] = None
     untrusted_section: str = ""
     thinking_effort: str = "off"
+    team: object = None
     network_tool_names: frozenset = field(
         default_factory=lambda: frozenset({"web_fetch"})
     )
@@ -234,6 +271,80 @@ def _isolation_notice(handle: "WorktreeHandle") -> str:
     )
 
 
+def _team_notice(member_name: str, team, can_idle: bool) -> str:
+    """
+    告诉队员它在团队里的身份与协作方式（c15 F1/F9/F13）。
+
+    :param member_name: 它自己的名字
+    :param team: 协作服务门面
+    :param can_idle: 它干完之后会不会留在场上待命
+    :returns: 一段要并进 dynamic 的说明
+
+    ⚠ **与 `SUBAGENT_CONVENTIONS`、`_isolation_notice` 并列追加，
+    不写进角色正文。** 与那两条同一条理由：写进正文的话，用户自己写的角色
+    一个都盖不到——而「你叫什么、队友有谁」是**运行环境**的事实，
+    与角色是谁无关。
+
+    ⚠ **必须每轮重算**（放在 `dynamic` 里而不是 `stable` 里）：
+    队友名单会变——新队员随时可能被派进来，旧的可能已经退休。
+    放进可缓存的 `stable` 会让一个队员按一份陈旧的名单去发消息，
+    收到的全是「查无此人」。
+
+    ## ⚠ 「等回复时该收工待命」是真实模型验收补上的
+
+    实测撞到：`impl-worker` 需要先从 `spec-writer` 拿到一份规范才能开工，
+    它发完请求之后**反复调 `task_list` 当轮询**在等——空转六次，
+    烧掉 106K token、几乎耗尽 15 轮预算（对照组 `spec-writer` 只用了 7 轮 43K）。
+    如果对方再慢一点，它会**耗尽轮次而失败**。
+
+    根因是本段原先只说了「做完手上的事就收尾」，**没说「等别人回话时也该收尾」**。
+    而收尾恰恰是本章设计好的等待方式：待命零成本，对方回话时自动唤醒、
+    上下文一个字不丢。模型不知道这条，就只能用它熟悉的方式——轮询。
+
+    副作用：无（只读花名册）。
+    """
+    peers = [
+        m.name
+        for m in team.members()
+        if m.name != member_name and not m.state.is_terminal
+    ]
+    peer_line = (
+        f"- 现在在场的还有：{'、'.join(peers)}\n" if peers else "- 目前只有你和主对话\n"
+    )
+    # ⚠ 第二段是**真实模型验收补的**，见函数 docstring 的「等回复空转」那一条。
+    idle_line = (
+        "**你自然结束之后不会消失**，而是留在场上待命——"
+        "别人再发一条消息就能把你叫醒、带着现在的全部上下文接着干。"
+        "所以做完手上的事就正常收尾，不必为了「保持在线」硬撑着多跑几轮。\n"
+        "\n"
+        "⚠️ **在等别人回话才能往下做时，也请直接收尾。** 你会进入待命，"
+        "对方回话的那一刻你就被叫醒、带着现在的全部上下文接着干，"
+        "**什么都不会丢**。\n"
+        "**不要靠反复查清单、反复看文件来「等」**——消息不是查出来的，"
+        "它会自己出现在你眼前。空转只会烧光你的轮次预算，"
+        "等对方真回话时你已经没有轮次可用了。\n"
+        if can_idle
+        else ""
+    )
+    return (
+        "<team>\n"
+        f"你在这个团队里的名字是 **{member_name}**。\n"
+        f"{peer_line}"
+        "- 主对话叫 `main`，它是唯一在跟用户对话的一方\n"
+        "\n"
+        "**你的正文输出别的 Agent 看不到。** 要跟谁说话就调 send_message，"
+        "按名字发。消息会自动送到对方眼前，对方不需要查收，你也不需要——"
+        "别人发给你的消息会自己出现在你这里。\n"
+        "\n"
+        "**任务清单是大家共用的一份。** 认领之前先看它现在有没有被别的任务挡着；"
+        "做完一条就立刻标成完成——别人正等着它解锁自己的活。"
+        "没真做完就别标完成（测试还红着、只写了一半、卡住了），"
+        "那种情况应该保持进行中，并把实情发消息告诉相关的人。\n"
+        f"{idle_line}"
+        "</team>"
+    )
+
+
 def _build_prompts(
     runtime: SubAgentRuntime,
     spec: Optional[AgentSpec],
@@ -241,6 +352,8 @@ def _build_prompts(
     toolset: ToolsetResult,
     parent: Optional[ParentSnapshot],
     handle: "Optional[WorktreeHandle]" = None,
+    member_name: str = "",
+    can_idle: bool = False,
 ) -> tuple[str, Callable[[], str], list[Message]]:
     """
     组装子 Agent 的系统提示与初始历史（spec F7/F8）。
@@ -281,6 +394,10 @@ def _build_prompts(
         parts = [runtime.environment_text(agent_cwd), SUBAGENT_CONVENTIONS]
         if isolation_notice:
             parts.append(isolation_notice)
+        # c15：团队说明**每轮重算**——队友名单会变（新人随时被派进来、
+        # 旧人可能已退休）。放进 `stable` 会让它按一份陈旧的名单发消息。
+        if member_name and runtime.team is not None:
+            parts.append(_team_notice(member_name, runtime.team, can_idle))
         if needs_untrusted:
             parts.append(runtime.untrusted_section)
         return "\n\n".join(p for p in parts if p)
@@ -322,6 +439,94 @@ def _extract_conclusion(
     # 自然完成却一个字都没说——理论上不该发生，但兜住它比让主 Agent
     # 拿到一段空文本好：空结论在界面上表现为「任务完成了，但什么都没有」。
     return "子 Agent 自然结束，但没有产出任何正文。", False
+
+
+def _emit_end(
+    recorder, record, agent_label: str, status, turns: int, stop_reason, conclusion: str
+) -> None:
+    """
+    埋一条「子 Agent 结束」事件。**吞掉一切异常。**
+
+    抽成函数是因为 c15 之后它有**两个调用点**：待命循环里每一轮结束时一次、
+    最终收尾时一次。两处漏一处的表现是「有些轮次在 trace 里没有结束事件」，
+    而时间线看起来只是少了一行、不报错。
+
+    副作用：写 trace（失败静默——观测设施绝不能反过来影响被观测的系统）。
+    """
+    try:
+        recorder.emit(
+            TraceEventType.SUBAGENT_END,
+            task_id=record.task_id,
+            agent=agent_label,
+            status=status.value,
+            turns=turns,
+            usage_tokens=record.usage_tokens,
+            stop_reason=stop_reason.value,
+            conclusion=clip(conclusion),
+        )
+    except Exception:  # noqa: BLE001 —— 观测设施绝不能反过来影响被观测的系统
+        pass
+
+
+def _await_wake(team, member_name: str, record) -> "Optional[list[Message]]":
+    """
+    待命：阻塞等一条消息，被唤醒后取回保管的历史（c15 F13）。
+
+    :param team: 协作服务门面
+    :param member_name: 队员名字
+    :param record: 当前任务记录（用它的取消信号）
+    :returns: 保管的历史；**不可唤醒时 `None`**（被取消 / 被降级 / 会话清空）
+
+    ## 为什么是「带超时的轮询」而不是纯 `Event.wait()`
+
+    队员要同时响应两件事：**收到消息**（`wake_event`）与**被取消**
+    （`record.cancel_event`，来自 `Esc` / `/agents cancel` / 会话切换）。
+    标准库没有「等多个 Event 中的任意一个」的原语，而为此起一条监视线程
+    是把一个简单问题复杂化。
+
+    因此用短超时轮询：每 0.2 秒醒一次看看取消信号。这**不是** spec N6
+    禁止的那种轮询——它发生在一个已经空闲的线程上，CPU 占用可以忽略，
+    而且待命队员本来就在等一件不知道何时发生的事。真正被 N6 禁掉的是
+    「没有队员时也持续烧 CPU」，那种情况这里根本不会进来。
+
+    副作用：阻塞调用线程；成功唤醒时改花名册状态。
+    """
+    entry = team.member(member_name)
+    if entry is None:
+        return None
+    event = entry.wake_event
+
+    while True:
+        if record.cancel_event.is_set():
+            team.mark_terminal(member_name, MemberState.CANCELLED)
+            return None
+        if event.wait(_WAKE_POLL_INTERVAL):
+            # 醒来了。可能是收到消息，也可能是被降级 / 会话清空叫醒来退出的
+            # ——`wake()` 返回 None 就是后者（花名册已经不认它了）。
+            return team.wake(member_name)
+
+
+def _next_round_record(tasks, kind: str, agent_label: str, member_name: str):
+    """
+    为「被唤醒后的这一轮」新建一条任务记录（c15 F13）。
+
+    :returns: 新的 `TaskRecord`
+
+    ## 为什么每轮一条记录，而不是复用第一条
+
+    一条任务记录 = 一段交付出去的结论。复用的话，第二轮跑完时那条记录
+    已经是终态了，`tasks.finish` 不会再产生交付，**主 Agent 永远看不到
+    队员被唤醒之后做了什么**。
+
+    新记录一律 `awaited=False`：主 Agent 没有「委派」这一轮，
+    不该在收工前为它停下来等。结论仍会在下一轮迭代注入它的历史。
+
+    副作用：往任务表加一条记录。
+    """
+    record = tasks.create(kind, agent_label, _WOKEN_TASK_TEXT)
+    record.member_name = member_name
+    record.awaited = False
+    return record
 
 
 def run_subagent(
@@ -374,10 +579,39 @@ def run_subagent(
     stop_reason = StopReason.COMPLETED
     status = TaskStatus.COMPLETED
 
+    # ── c15：协作身份与待命资格 ──
+    member_name = record.member_name
+    team = runtime.team if member_name else None
+
+    # ⚠ **隔离的子 Agent 不进入待命**，这是实现期定下的一条边界。
+    #
+    # 理由是「工作区什么时候结算」没有第二个说得通的答案：
+    # - 跑完就结算：无改动的工作区会被回收（c14 F16），而它一旦被叫醒
+    #   就没有目录可写了——权限管线第②层会把它的每一次写入都拒掉；
+    # - 推迟到最后再结算：第一轮的结论里就没有分支名，而主 Agent 正是靠
+    #   那段交付信息去 `git merge` 的（c14 踩过「成果搁浅」那次事故）。
+    #
+    # 因此隔离与待命互斥：隔离委派保持 C14 的语义（跑完 → 交付分支 → 结束）。
+    # 需要同一个人接着干下一件事时，重新委派一次即可——它的成果在分支上，
+    # 不会丢。
+    can_idle = team is not None and handle is None
+
+    if member_name:
+        # ⚠ 线程本地身份：协作工具全进程共享一份实例，发件人与认领人
+        # 只能从这里取。漏绑不报错，只会让这个队员以 `main` 的身份
+        # 发消息和认领任务——表现是「worker-a 认领的任务显示成 main 认领的」。
+        bind_identity(member_name)
+
     try:
         # ① 本线程从现在起属于该作用域。用 bind_scope 而非 with scope(...)：
         #    整个线程的生命周期就是这一次运行，不需要「出来自动恢复」。
-        recorder.bind_scope(subagent_scope(agent_label))
+        # c15 修正：**有队员名字时用名字，没有才退回角色名**。
+        #
+        # 真实模型验收撞到过：同一个角色派出两个队员（spec-writer 与
+        # impl-worker 都是 general-purpose），两者的 trace 事件全落在
+        # `subagent:general-purpose` 这一个作用域里**混成一片**，
+        # 排查「这一步是谁做的」只能靠时间戳和内容猜。
+        recorder.bind_scope(subagent_scope(member_name or agent_label))
 
         recorder.emit(
             TraceEventType.SUBAGENT_START,
@@ -392,7 +626,8 @@ def run_subagent(
         )
 
         stable, dynamic, history = _build_prompts(
-            runtime, spec, task_text, toolset, parent, handle
+            runtime, spec, task_text, toolset, parent, handle,
+            member_name=member_name, can_idle=can_idle,
         )
 
         # ④ 权限派生。**绝不改 runtime.engine.mode**——那是主对话的档位。
@@ -415,56 +650,113 @@ def run_subagent(
         )
         max_turns = spec.max_turns if spec is not None else None
 
-        events = agent.run(
-            history,
-            runtime.thinking_effort,
-            False,                      # plan_mode：子 Agent 非交互，没人能审批计划
-            stable,
-            dynamic,
-            (spec.model if spec is not None else None) or runtime.default_model,
-            None,                       # 不写缓存调试日志
-            sub_engine,
-            _deny_ask,
-            None,                       # clarify：问不了人
-            None,                       # approve_plan：没人审批
-            record.cancel_event,
-            context_manager,
-            None,                       # recorder=None：子 Agent 的消息不进会话存档
-            options=RunOptions(
-                max_iterations=max_turns or RunOptions().max_iterations,
-                record_usage=False,     # 别拿子 Agent 的 usage 污染主历史锚点
-                allow_summary=False,    # 只跑 C8 第一层（工具结果存盘）
-                # 注册中心里除最终工具集之外的一律排除：既不发给模型，
-                # 调用了也拒绝（spec F13 的第二半）。
-                excluded_tools=frozenset(all_tool_names) - toolset.allowed,
-                interactive=False,      # 判 ASK 直接拒，见 spec F15
-                # c14 F1/F2：隔离工作区就是本次运行的工作目录。
-                # 它同时决定三件事：工具的路径解析基准、权限管线第②层的
-                # 沙箱边界、以及工具级 Hook 命令的执行目录。
-                # `None` 时循环取主项目根，行为与 c14 之前逐字一致。
-                cwd=handle.path if handle is not None else None,
-            ),
-        )
-
-        # ⑥ 消费事件流但**不转发**（spec F23：子 Agent 的过程不渲染）。
-        for event in events:
-            if event.type == AgentEventType.PROGRESS:
-                turns = event.iteration or turns
-                tasks.bump(record.task_id, turns=turns)
-            elif event.type == AgentEventType.USAGE and event.usage is not None:
-                tasks.bump(
-                    record.task_id, tokens=getattr(event.usage, "total_tokens", 0)
-                )
-            elif event.type == AgentEventType.FINISHED:
-                stop_reason = event.stop_reason or StopReason.COMPLETED
-
-        conclusion, ok = _extract_conclusion(history, stop_reason, turns)
-        if not ok:
-            status = (
-                TaskStatus.CANCELLED
-                if stop_reason is StopReason.USER_CANCELLED
-                else TaskStatus.FAILED
+        # ── c15：待命循环 ──
+        #
+        # C13/C14 时这里是一次性的：跑一遍 `agent.run` 就结束。现在改成外层
+        # 循环——队员**自然停止**后不销毁，而是留在场上待命，一条消息就能
+        # 把它从原来的上下文唤醒继续干（spec F13）。
+        #
+        # `can_idle` 为假时循环只走一圈，行为与 C13/C14 **逐字一致**。
+        #
+        # `turns_base` 让 `/agents` 上的轮次是**累计**的，而模型每次被唤醒
+        # 拿到的是**完整的**迭代预算（spec F16）：后者由 `agent.run` 自己
+        # 从 1 开始计数天然成立，前者靠这个偏移量补上。
+        # 不加偏移的话，一个被唤醒三次的队员在界面上永远显示「跑了 2 轮」。
+        turns_base = 0
+        while True:
+            events = agent.run(
+                history,
+                runtime.thinking_effort,
+                False,                  # plan_mode：子 Agent 非交互，没人能审批计划
+                stable,
+                dynamic,
+                (spec.model if spec is not None else None) or runtime.default_model,
+                None,                   # 不写缓存调试日志
+                sub_engine,
+                _deny_ask,
+                None,                   # clarify：问不了人
+                None,                   # approve_plan：没人审批
+                record.cancel_event,
+                context_manager,
+                None,                   # recorder=None：子 Agent 的消息不进会话存档
+                options=RunOptions(
+                    max_iterations=max_turns or RunOptions().max_iterations,
+                    record_usage=False, # 别拿子 Agent 的 usage 污染主历史锚点
+                    allow_summary=False,# 只跑 C8 第一层（工具结果存盘）
+                    # 注册中心里除最终工具集之外的一律排除：既不发给模型，
+                    # 调用了也拒绝（spec F13 的第二半）。
+                    excluded_tools=frozenset(all_tool_names) - toolset.allowed,
+                    interactive=False,  # 判 ASK 直接拒，见 spec F15
+                    # c14 F1/F2：隔离工作区就是本次运行的工作目录。
+                    # 它同时决定三件事：工具的路径解析基准、权限管线第②层的
+                    # 沙箱边界、以及工具级 Hook 命令的执行目录。
+                    # `None` 时循环取主项目根，行为与 c14 之前逐字一致。
+                    cwd=handle.path if handle is not None else None,
+                    # c15：队友消息的注入口。`None` 时循环用 NullGate 兜底，
+                    # 与 C13/C14 逐字一致。
+                    subagent_gate=(
+                        TeamGate(team, member_name) if team is not None else None
+                    ),
+                ),
             )
+
+            # ⑥ 消费事件流但**不转发**（spec F23：子 Agent 的过程不渲染）。
+            for event in events:
+                if event.type == AgentEventType.PROGRESS:
+                    turns = turns_base + (event.iteration or 0)
+                    tasks.bump(record.task_id, turns=turns)
+                elif event.type == AgentEventType.USAGE and event.usage is not None:
+                    tasks.bump(
+                        record.task_id, tokens=getattr(event.usage, "total_tokens", 0)
+                    )
+                elif event.type == AgentEventType.FINISHED:
+                    stop_reason = event.stop_reason or StopReason.COMPLETED
+
+            conclusion, ok = _extract_conclusion(history, stop_reason, turns)
+            if not ok:
+                status = (
+                    TaskStatus.CANCELLED
+                    if stop_reason is StopReason.USER_CANCELLED
+                    else TaskStatus.FAILED
+                )
+                # 失败 / 被取消 → 终态，不待命（spec F14）
+                if team is not None:
+                    team.mark_terminal(
+                        member_name,
+                        MemberState.CANCELLED
+                        if stop_reason is StopReason.USER_CANCELLED
+                        else MemberState.FAILED,
+                    )
+                break
+
+            if not can_idle:
+                break
+
+            # ── 自然停止且可待命：交付这一轮的结论，然后等消息 ──
+            #
+            # ⚠ **必须现在就 `finish`。** 任务记录停在「运行中」的话，
+            # 主 Agent 的闸门会认为「还有委派没回来」而在收工前一直等它，
+            # 而这个队员正等着主 Agent 发消息——**双方互等，永远结束不了**。
+            # 这就是 plan 决策 2 说的那个雷的另一半：状态维度必须分开，
+            # 「结论产出了」（TaskStatus）与「人还在场」（MemberState）
+            # 各走各的。
+            _emit_end(recorder, record, agent_label, status, turns, stop_reason, conclusion)
+            tasks.finish(record.task_id, status, conclusion, stop_reason.value)
+
+            for notice in team.mark_idle(member_name, history):
+                # N3 降级必须看得见（通知由 TUI 的既有轮询取走）
+                _ = notice
+
+            woken = _await_wake(team, member_name, record)
+            if woken is None:
+                # 被取消 / 被降级 / 会话清空 —— 已经 finish 过了，直接退出
+                return
+
+            history = woken
+            turns_base = turns
+            record = _next_round_record(tasks, kind, agent_label, member_name)
+            stop_reason = StopReason.COMPLETED
+            status = TaskStatus.COMPLETED
 
     except BaseException as exc:  # noqa: BLE001
         # 后台线程的异常无人接管。逃逸出去 = 任务永远「运行中」+ 等待方永远阻塞。
@@ -526,19 +818,20 @@ def run_subagent(
             )
 
     # ⑨ 收尾。埋点与 finish 都在 try 之外，保证任何路径都会执行到。
-    try:
-        recorder.emit(
-            TraceEventType.SUBAGENT_END,
-            task_id=record.task_id,
-            agent=agent_label,
-            status=status.value,
-            turns=turns,
-            usage_tokens=record.usage_tokens,
-            stop_reason=stop_reason.value,
-            conclusion=clip(conclusion),
+    _emit_end(recorder, record, agent_label, status, turns, stop_reason, conclusion)
+
+    # c15：走到这里意味着这个队员**不再待命**（失败 / 被取消 / 不具备待命
+    # 资格 / 出了未预期的异常）。把它从花名册上转成终态，否则别人还会看到
+    # 一个「运行中」的名字、给它发消息，而没有任何线程会来处理。
+    #
+    # ⚠ 用 `getattr` 取门面而不是直接用上面的 `team` 局部变量：本段在
+    # `except BaseException` **之外**，而那个分支可能在 `team` 赋值之前
+    # 就被触发（比如 `_build_prompts` 抛异常）。
+    if member_name and getattr(runtime, "team", None) is not None:
+        runtime.team.mark_terminal(
+            member_name,
+            _MEMBER_STATE_FOR_TASK.get(status, MemberState.DONE),
         )
-    except Exception:  # noqa: BLE001 —— 观测设施绝不能反过来影响被观测的系统
-        pass
 
     tasks.finish(record.task_id, status, conclusion, stop_reason.value)
 
@@ -553,7 +846,7 @@ def start_subagent_thread(
     all_tool_names: frozenset,
     parent: Optional[ParentSnapshot] = None,
     handle: "Optional[WorktreeHandle]" = None,
-) -> threading.Thread:
+) -> threading.Thread:  # noqa: D401 —— 见下方 docstring
     """
     起一个 daemon 线程跑 `run_subagent`。
 

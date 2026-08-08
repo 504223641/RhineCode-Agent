@@ -29,16 +29,19 @@ class _FakeService:
         # c14：记录本次调用的 isolation 参数。`None` = 未表态，与显式 False
         # 语义不同（单向加严里两者都不能撤销角色的声明，但要能区分）。
         self.isolations: list = []
+        # c15：记录本次调用的 name 参数。`None` = 让系统自动起名。
+        self.names: list = []
         self._outcome = outcome or DelegateOutcome(ok=True, text="结论", task_id="a3f1c9")
         self._raises = raises
 
     def delegate(
         self, kind, agent_name, task_text, background=False, parent=None,
-        plan_stage=False, isolation=None,
+        plan_stage=False, isolation=None, name=None,
     ):
         self.calls.append((kind, agent_name, task_text, background, parent))
         self.plan_stages.append(plan_stage)
         self.isolations.append(isolation)
+        self.names.append(name)
         if self._raises:
             raise RuntimeError("服务炸了")
         return self._outcome
@@ -159,6 +162,34 @@ class PlanStageForwardingTest(unittest.TestCase):
             {"type": "role", "agent": "e", "task": "t"}, plan_stage=True
         )
         self.assertEqual(service.plan_stages, [True])
+
+
+class NameForwardingTest(unittest.TestCase):
+    """
+    c15：队员名字必须如实转发给服务层。
+
+    名字是消息投递与任务认领的唯一标识，转丢了的表现是「模型明明起了名字，
+    发消息时却说查无此人」。
+    """
+
+    def test_absent_name_is_none_not_empty_string(self) -> None:
+        """
+        ⚠ `None`（让系统起名）与 `""`（模型给了个空名字）语义不同，
+        在花名册的 `register` 里走不同分支。用 `args.get` 取原值即可区分。
+        """
+        service = _FakeService()
+        RunAgentTool(service).execute({"type": "role", "agent": "e", "task": "t"})
+        self.assertEqual(service.names, [None])
+
+    def test_name_is_forwarded(self) -> None:
+        service = _FakeService()
+        RunAgentTool(service).execute(
+            {"type": "role", "agent": "e", "task": "t", "name": "reviewer"}
+        )
+        self.assertEqual(service.names, ["reviewer"])
+
+    def test_name_is_declared_in_schema(self) -> None:
+        self.assertIn("name", RunAgentTool.parameters["properties"])
 
 
 class BranchSnapshotTest(unittest.TestCase):

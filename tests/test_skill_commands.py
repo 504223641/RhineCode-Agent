@@ -142,7 +142,7 @@ class ReplaceSkillCommandsTest(unittest.TestCase):
         self.assertIsNone(registry.resolve("/a"))
         # 内置命令一个不少（c13 起十五条：C10 十二条 + /skills + /hooks + /agents）。
         self.assertIsNotNone(registry.resolve("/clear"))
-        self.assertEqual(len(registry.visible_commands()), 15)
+        self.assertEqual(len(registry.visible_commands()), 16)
 
     def test_index_has_no_ghost_entry_for_skipped_spec(self) -> None:
         """

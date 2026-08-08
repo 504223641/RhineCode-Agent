@@ -46,11 +46,15 @@ from rhinecode.skills.manager import SkillManager
 from rhinecode.hooks import HookEventType, NullHookManager
 from rhinecode.memory.session import drop_unpaired
 from rhinecode.permission.engine import narrower_mode
+from rhinecode.agent.gate import CompositeGate
 from rhinecode.subagents.gate import SubAgentGate, render_subagent_message
 from rhinecode.subagents.render import render_agent_index
 from rhinecode.subagents.report import render_report
 from rhinecode.subagents.runner import ParentSnapshot
 from rhinecode.subagents.toolset import resolve_toolset
+from rhinecode.team.gate import TeamGate
+from rhinecode.team.render import render_team_brief
+from rhinecode.team.models import MAIN_NAME
 from rhinecode.trace import (
     SCOPE_MAIN,
     NullRecorder,
@@ -182,6 +186,7 @@ class ConversationManager:
         provider_factory: Optional[Callable[[Config], BaseProvider]] = None,
         hook_manager=None,
         subagent_service=None,
+        team_service=None,
     ):
         """
         初始化对话管理器。
@@ -330,6 +335,10 @@ class ConversationManager:
         # c13：子 Agent 服务门面。为 None 时整章能力不启用（非 DeepSeek 工具模式），
         # 全部接入点都判空跳过，行为与 c12 逐字一致（spec N1）。
         self.subagent_service = subagent_service
+        # c15：协作服务门面。为 `None` 时本章能力整体不启用——
+        # 闸门退化成原来的 `SubAgentGate`，队员跑完即结束，没有自动唤起。
+        # 不启用时行为与 C13/C14 **逐字一致**（spec N5 零回归的落点）。
+        self.team_service = team_service
 
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
@@ -513,6 +522,10 @@ class ConversationManager:
             self._context_manager.reset()
         self.memory_manager.on_clear()
         self.skill_manager.clear_active()
+        # c15 F25：花名册、共享清单、未读消息、自动唤起计数一并复位。
+        # ⚠ 漏掉的后果不报错：上一轮的队员消息会出现在新对话里，
+        # 或者自动唤起在新会话里仍处于停用状态。
+        self._clear_team()
         self._hooks.bind_context(session_id=self.memory_manager.session_id)
         self._dispatch_session(HookEventType.SESSION_START, source="clear")
         if cancelled:
@@ -709,6 +722,11 @@ class ConversationManager:
                     type=AgentEventType.NOTICE,
                     message=f"已取消 {cancelled} 个为上一个会话发起的子 Agent。",
                 )
+            # c15 F25：协作状态同理——花名册、共享清单、未读消息都属于会话 A。
+            # ⚠ 必须排在取消**之后**：清空会唤醒待命队员让它们的线程退出，
+            # 而取消要先给正在跑的那些发信号。反过来的话，一个刚被清空唤醒的
+            # 队员会带着空花名册再跑一轮。
+            self._clear_team()
             # 历史恢复埋点（trace F16）。`origin` 区分两条来源：
             # 这里是运行中的 `/resume`；另一条是启动时的 `--continue`
             # （它在 ConversationManager 构造期间原地改写 history、一条事件都不产，
@@ -983,14 +1001,32 @@ class ConversationManager:
         """
         构造本次运行用的子 Agent 闸门（c13 修订）。
 
-        :returns: `SubAgentGate`；服务未启用时 `None`（循环会用 `NullGate` 兜底）
+        :returns: 闸门；两个服务都没启用时 `None`（循环会用 `NullGate` 兜底）
 
-        每次 `run()` 现造一个：它本身无状态（数据全在任务表里），
-        造一个的成本可以忽略，而现造能保证它永远指向当下的任务表。
+        每次 `run()` 现造一个：它本身无状态（数据全在任务表与信箱里），
+        造一个的成本可以忽略，而现造能保证它永远指向当下的数据。
+
+        c15：协作能力启用时返回 `CompositeGate`，把两条注入合成一条——
+        子 Agent 的**结论**与队友的**消息**在循环里的处理逐字相同
+        （追加进历史 + 交给存档），因此不给循环加第二个调用点。
+
+        顺序刻意是「先结论、后消息」：两者在同一轮注入时，先看到
+        「我派出去的活回来了」更符合模型的思考顺序（它多半正等着那个结果）。
         """
-        if self.subagent_service is None:
+        gates = []
+        if self.subagent_service is not None:
+            gates.append(
+                SubAgentGate(self.subagent_service.tasks, render_subagent_message)
+            )
+        if self.team_service is not None:
+            gates.append(TeamGate(self.team_service, MAIN_NAME))
+        if not gates:
             return None
-        return SubAgentGate(self.subagent_service.tasks, render_subagent_message)
+        if len(gates) == 1:
+            # 只有子 Agent 闸门时返回它本身而不是包一层——
+            # 保证「不启用协作」这条路径与 C13/C14 **逐字一致**。
+            return gates[0]
+        return CompositeGate(gates)
 
     def _agent_index_text(self) -> str:
         """
@@ -1042,6 +1078,7 @@ class ConversationManager:
             skill_index=self.skill_manager.index_text(),
             active_skills="",
             agent_index=self._agent_index_text(),
+            team_brief=self._team_brief_text(),
             untrusted_enabled=self._config.web_fetch_enabled,
         )
         names = tuple(self._registry.names()) if self._registry is not None else ()
@@ -1115,7 +1152,7 @@ class ConversationManager:
                 return self._engine.mode
             return narrower_mode(self._engine.mode, spec.permission_mode)
 
-        return render_report(
+        report = render_report(
             service.catalog,
             service.tasks.snapshot(),
             tools_for=tools_for,
@@ -1123,6 +1160,15 @@ class ConversationManager:
             project_dir=str(main_project_root() / ".rhinecode" / "agents"),
             user_dir=str(self._user_dir / "agents"),
         )
+        # c15 F26：花名册接在报告末尾。
+        #
+        # **单独一段而不是并进任务行**：任务行是「一次委派」的视角
+        # （一个队员被唤醒三次就有三行），花名册是「现在场上有谁」的视角。
+        # 用户排查「为什么它叫不醒」时看的是后者，混在一起两个视角都读不清。
+        roster = self.team_roster_text()
+        if roster and "没有队员" not in roster:
+            report += "\n\n【队员花名册】\n" + roster
+        return report
 
     def cancel_subagents(self, target: Optional[str]) -> str:
         """
@@ -1444,7 +1490,11 @@ class ConversationManager:
 
         return ask
 
-    def _run(self, grant_skill: "Optional[SkillSpec]" = None) -> Iterator[AgentEvent]:
+    def _run(
+        self,
+        grant_skill: "Optional[SkillSpec]" = None,
+        unattended: bool = False,
+    ) -> Iterator[AgentEvent]:
         """
         构造一次 Agent 运行并返回其事件流。
 
@@ -1457,6 +1507,19 @@ class ConversationManager:
         5. 调用 Agent.run，注入历史、思考模式、Plan Mode、系统提示两段、日志路径、权限引擎、
            四类回调与取消信号。
 
+        :param grant_skill: 本次运行要预授权的 Skill（三条触发路径共用）
+        :param unattended: 本次是不是**无人值守轮**（c15 F17/F18）——
+            由队友发给 `main` 的消息自动唤起、用户没有在场。
+
+            为真时改两件事、且**只改这两件**：
+            ① `interactive=False` + `unattended=True` → 判 ASK 一律自动拒绝、
+               确认面板一次都不弹（复用 C13 子 Agent 已跑了两章的机制）；
+            ② `ask` 传 `None` —— 那个回调此刻走不到，传进去只会让
+               「后台线程往主界面弹面板」这条路径在结构上仍然存在。
+
+            **其余一切与普通运行共用同一段代码**：系统提示、闸门、上下文管理、
+            会话存档、预授权的授予与撤销。刻意不复制一份——两份会各自演化，
+            而分叉处恰好是安全行为。
         :returns: Agent 产出的 AgentEvent 事件流
 
         副作用：重建 self._cancel_event；ask 闭包可能向引擎登记会话规则或写本地配置文件。
@@ -1490,6 +1553,9 @@ class ConversationManager:
             # c13：角色清单进 135 稳定槽位（排在 Skill 清单之前，见 builder 注释）。
             # 服务未启用时是空串，槽位整体跳过、输出与 c12 逐字一致。
             agent_index=self._agent_index_text(),
+            # c15：组队说明进 134 稳定槽位（排在角色清单之前，见 builder 注释）。
+            # 协作未启用时是空串，槽位整体跳过、输出与 c14 逐字一致。
+            team_brief=self._team_brief_text(),
             # web_fetch 扩展 F4 链路②的第一个调用点（另一个在 _run_forked_skill）。
             untrusted_enabled=self._config.web_fetch_enabled,
         )
@@ -1534,7 +1600,10 @@ class ConversationManager:
             str(main_project_root() / ".rhinecode_debug.log") if self._config.debug_log else None
         )
 
-        ask = self._build_ask()
+        # c15：无人轮里 `ask` 走不到（`interactive=False` 在更早的分支就判拒了）。
+        # 仍然传 `None` 而不是照常构造——**纵深防御**：万一将来有人改动那条
+        # 分支，这里也不会把确认面板弹到一条用户没在看的运行上。
+        ask = None if unattended else self._build_ask()
 
         events = self._agent.run(
             self.history,
@@ -1553,10 +1622,114 @@ class ConversationManager:
             self.memory_manager.record_message,
             options=RunOptions(
                 # c13：子 Agent 闸门。为 None 时循环用 NullGate 兜底、零回归。
+                # c15：协作启用时这里是 CompositeGate（结论 + 队友消息）。
                 subagent_gate=self.subagent_gate(),
+                # c15 F18：无人轮判 ASK 一律自动拒绝，不弹面板。
+                # 两个标志**必须同时设**：`interactive=False` 决定「拒绝」，
+                # `unattended=True` 决定「用哪条文案说这件事」。
+                interactive=not unattended,
+                unattended=unattended,
             ),
         )
         return self._wrap_events(events, extra_skill=grant_skill)
+
+    # ------------------------------------------------------------------ #
+    # 协作（c15）
+    # ------------------------------------------------------------------ #
+
+    def run_auto_wake(self) -> Iterator[AgentEvent]:
+        """
+        跑一次**无人值守轮**（c15 F17）。
+
+        :returns: Agent 产出的事件流
+
+        由 TUI 的定时轮询在「主对话空闲 + 有发给 `main` 的未读消息 +
+        自动唤起未达连锁上限」时触发。**不追加任何用户消息**——历史从上次
+        结束的地方接着走，那条队友消息由闸门在第一轮迭代注入。
+
+        与普通运行的差别只有 `unattended=True` 带来的两条（见 `_run`），
+        其余完全共用：预授权的授予与撤销、系统提示、上下文管理、会话存档。
+
+        ⚠ **本方法不判断「该不该唤起」**——那是调用方的事（它要看主对话空不空闲，
+        而空闲与否只有界面层知道）。这里只负责「跑」。
+
+        副作用：一次真实的模型调用；可能执行工具（全部过完整权限管线，
+        且判 ASK 一律自动拒绝）；追加进主历史并写会话存档。
+        """
+        return self._run(unattended=True)
+
+    def team_has_unread_for_main(self) -> bool:
+        """主对话有没有未读队友消息（TUI 轮询用；**只读**）。"""
+        if self.team_service is None:
+            return False
+        return self.team_service.has_unread_for_main()
+
+    def team_can_auto_wake(self) -> bool:
+        """自动唤起连锁计数还没到上限吗（TUI 轮询用；**只读**）。"""
+        if self.team_service is None:
+            return False
+        return self.team_service.can_auto_wake()
+
+    def team_bump_auto_wake(self) -> int:
+        """记一次自动唤起，返回记完之后的次数（界面显示「第 N/M 次」用）。"""
+        if self.team_service is None:
+            return 0
+        return self.team_service.bump_auto_wake()
+
+    def team_reset_auto_wake(self) -> None:
+        """
+        自动唤起计数清零——**用户提交任何一条消息时调**（c15 F20）。
+
+        漏调的后果是自动唤起在用户回来之后仍处于停用状态，
+        而界面上看不出原因。
+        """
+        if self.team_service is not None:
+            self.team_service.reset_auto_wake()
+
+    def team_auto_wake_limit(self) -> int:
+        """连锁上限（界面显示用）。"""
+        if self.team_service is None:
+            return 0
+        return self.team_service.max_auto_wake_chain
+
+    def team_drain_notices(self) -> tuple:
+        """取走待展示的协作通知（目前只有 N3 降级）。取走即清空。"""
+        if self.team_service is None:
+            return ()
+        return self.team_service.drain_notices()
+
+    def team_board_text(self) -> str:
+        """共享任务清单的展示文本（`/tasks` 用）。"""
+        if self.team_service is None:
+            return "当前未启用子 Agent 协作。"
+        return self.team_service.board_text()
+
+    def team_roster_text(self) -> str:
+        """花名册的展示文本（`/agents` 用）。"""
+        if self.team_service is None:
+            return ""
+        return self.team_service.roster_text()
+
+    def _team_brief_text(self) -> str:
+        """
+        「组队协作」槽位的内容（c15，134 槽位）。
+
+        :returns: 一段恒定说明；协作未启用时为空串（槽位整体跳过）
+
+        ⚠ **这个槽位是真实模型验收补出来的。** 首轮实测主 Agent 面对一个
+        明显适合并行的任务完全没用协作能力——查 trace 才发现协作的事
+        一个字都没进系统提示。详见 `team/render.py::render_team_brief`。
+
+        副作用：无。
+        """
+        if self.team_service is None:
+            return ""
+        return render_team_brief()
+
+    def _clear_team(self) -> None:
+        """清空全部协作状态（`/clear` 与 `/resume` 共用，c15 F25）。"""
+        if self.team_service is not None:
+            self.team_service.clear()
 
     def _grant_for_skill(self, spec: "SkillSpec") -> None:
         """

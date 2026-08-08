@@ -65,6 +65,23 @@ def _handle_hooks(invocation: CommandInvocation, controller: CommandController) 
 _AGENTS_USAGE = "用法：/agents [cancel <任务标识|all>]"
 
 
+def _handle_tasks(
+    invocation: CommandInvocation, controller: CommandController
+) -> None:
+    """
+    /tasks：查看共享任务清单（c15 F26）。
+
+    纯只读，无子命令——**任务的增删改由模型通过工具做，不由用户敲命令做**。
+    给用户一个改清单的入口会造成两条并行的写路径，而其中一条（命令层）
+    绕开了「谁改的」这个记录，清单上会出现无从追溯的变更。
+
+    未启用协作能力时给出明确说明而不是空白（空白会让用户以为命令坏了）。
+
+    副作用：向聊天区输出一段文本。
+    """
+    controller.show_message(controller.query_report(ReportTarget.TASKS))
+
+
 def _handle_agents(invocation: CommandInvocation, controller: CommandController) -> None:
     """
     /agents：查看子 Agent 角色与本次运行的任务，或取消任务（c13 F24）。
@@ -327,6 +344,14 @@ def build_builtin_registry() -> CommandRegistry:
                 usage="/agents [cancel <任务标识|all>]",
                 command_type=CommandType.LOCAL,
                 handler=_handle_agents,
+            ),
+            CommandSpec(
+                name="/tasks",
+                aliases=("/board",),
+                description="查看队员共用的共享任务清单（编号/状态/认领人/阻塞来源）",
+                usage="/tasks",
+                command_type=CommandType.LOCAL,
+                handler=_handle_tasks,
             ),
             CommandSpec(
                 name="/context",

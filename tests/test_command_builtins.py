@@ -38,6 +38,10 @@ EXPECTED_TABLE = {
     # **不是纯只读**（有 cancel 子命令）——一个跑偏的后台子 Agent 若没有取消入口，
     # 用户只能退出整个程序。命令类型仍是 LOCAL：它不进 AI、不改界面模式。
     "/agents": (set(), CommandType.LOCAL),
+    # c15 新增：共享任务清单的只读视图。别名 /board，本地类型。
+    # **纯只读、无子命令**——任务的增删改由模型通过工具做，不由用户敲命令做，
+    # 否则会出现两条并行的写路径，而命令层那条绕开了「谁改的」这个记录。
+    "/tasks": ({"/board"}, CommandType.LOCAL),
     "/clear": ({"/reset", "/new"}, CommandType.UI),
     "/exit": ({"/quit"}, CommandType.UI),
 }
@@ -49,10 +53,10 @@ class BuiltinMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = build_builtin_registry()
 
-    def test_exactly_fifteen_canonical_commands(self) -> None:
+    def test_exactly_sixteen_canonical_commands(self) -> None:
         """
-        内置命令恰好十五条（C10 的十二条 + c11 的 /skills + c12 的 /hooks
-        + c13 的 /agents）。
+        内置命令恰好十六条（C10 的十二条 + c11 的 /skills + c12 的 /hooks
+        + c13 的 /agents + c15 的 /tasks）。
 
         这条 len 断言是「批准表」的护栏——它保证任何人新增命令时必须
         显式更新 EXPECTED_TABLE 并同步这个数字，而不能悄悄加进去。
@@ -60,7 +64,7 @@ class BuiltinMetadataTests(unittest.TestCase):
         """
         names = [s.name for s in self.registry.visible_commands()]
         self.assertEqual(set(names), set(EXPECTED_TABLE))
-        self.assertEqual(len(names), 15)
+        self.assertEqual(len(names), 16)
 
     def test_alias_mapping(self) -> None:
         """全部首批别名映射正确（spec F10/AC5）。"""

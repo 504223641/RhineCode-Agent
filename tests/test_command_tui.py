@@ -222,6 +222,33 @@ class FakeManager:
     def drain_subagent_notifications(self) -> tuple:
         return ()
 
+    # c15：协作能力未启用时的取值。真实 `ConversationManager` 在
+    # `team_service is None` 时返回的正是这些，因此替身照抄即可——
+    # 界面层不该为「有没有启用协作」写两套分支。
+    def team_drain_notices(self) -> tuple:
+        return ()
+
+    def team_has_unread_for_main(self) -> bool:
+        return False
+
+    def team_can_auto_wake(self) -> bool:
+        return False
+
+    def team_bump_auto_wake(self) -> int:
+        return 0
+
+    def team_reset_auto_wake(self) -> None:
+        return None
+
+    def team_auto_wake_limit(self) -> int:
+        return 0
+
+    def team_board_text(self) -> str:
+        return "当前未启用子 Agent 协作。"
+
+    def team_roster_text(self) -> str:
+        return ""
+
     def agents_report(self) -> str:
         return "子 Agent 报告"
 

@@ -143,6 +143,42 @@ DENIED_NON_INTERACTIVE_FEEDBACK = (
     "说明「这一步需要用户授权，建议的做法是……」，由主对话去和用户确认。"
 )
 
+# ── 无人值守轮里判 ASK 时回灌给模型的文本（c15 spec F19）──
+#
+# ## 三条拒绝文案的语义必须两两不同
+#
+# | 常量 | 说的是 | 要求模型 |
+# | --- | --- | --- |
+# | `DENIED_BY_USER_FEEDBACK` | **人做了决定**，否决了这件事 | 停止推进，去问用户为什么 |
+# | `DENIED_NON_INTERACTIVE_FEEDBACK` | **子 Agent 环境**里没人能应答 | 换只读方式把活干完 |
+# | 本条 | **用户此刻不在场**（这一轮是队友的消息自动唤起的） | 回消息给队友 + 留言给用户 |
+#
+# 混用的后果都不报错，只是模型走岔路：套用第一条会让主 Agent 以为被否决、
+# 直接放弃整件事；套用第二条会让它去「换只读方式达成」，而它此刻真正该做的
+# 是**把决定权留给回来的用户**，同时别让等着它的队友干耗着。
+#
+# ## 与那两条一样**不置 `user_denied`**
+#
+# 那个标志会让下一轮 `tools=None`。对无人轮是错的：它应当带着工具继续——
+# 回消息、读文件、改共享清单都是它现在做得到且该做的事。
+DENIED_UNATTENDED_FEEDBACK = (
+    "这次 {name} 调用需要人工确认，而**用户当前不在场**"
+    "（这一轮是队友发来的消息自动唤起的，不是用户让你开始的），"
+    "确认面板弹出来也没人应答，因此它被自动拒绝。\n"
+    "\n"
+    "**这不是有人拒绝了你，也不是工具坏了。** 原样重试不会有不同结果，"
+    "换一个会改动东西的工具也一样。\n"
+    "\n"
+    "现在你**做得到**的事：\n"
+    "- 用只读工具把情况调查清楚；\n"
+    "- 给等着这件事的队友回一条消息，告诉它当前进展、让它先做别的，"
+    "不要让它干耗着；\n"
+    "- 更新共享任务清单，把状态和卡点写下来。\n"
+    "\n"
+    "**然后把「需要用户批准什么」明确写在你的回答里**——"
+    "用户回来第一眼就能看到，一句话就能让你继续。"
+)
+
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
 MAX_ITERATIONS = 25
 # 连续「整轮都是未知工具」达到该次数即停止，避免模型在不存在的工具上空转（spec F2）。
@@ -205,6 +241,14 @@ class RunOptions:
     allow_summary: bool = True
     excluded_tools: frozenset = frozenset()
     interactive: bool = True
+    # c15 F18/F19：本次运行是不是「无人值守轮」——由队友的消息自动唤起、
+    # 用户没有在场。**只影响判 ASK 时回灌哪条文案**，不改变任何权限判定：
+    # `interactive=False` 已经决定了「一律拒绝」，本标志只决定「怎么把这件事
+    # 说给模型听」（子 Agent 该换只读方式干完，无人轮该回消息 + 留言给用户）。
+    #
+    # ⚠ **必须与 `interactive=False` 同时使用**。单独置真没有意义——
+    # 面板照常弹，文案分支根本走不到。
+    unattended: bool = False
     subagent_gate: object = None
 
 
@@ -821,6 +865,8 @@ class Agent:
                 # 否则会出现「发了工具却拒绝执行」或「没发工具也照常执行」。
                 planning=plan_mode and not execution_phase,
                 interactive=options.interactive,
+                # c15 F19：只决定判 ASK 时回灌哪条文案，不改变任何权限判定。
+                unattended=options.unattended,
                 # c14 F1：本次运行的工作目录。`None` 由各工具的 `require_cwd`
                 # 兜成明确失败，**不会**静默回退到主项目根（spec N2）。
                 cwd=run_cwd,
@@ -895,6 +941,7 @@ class Agent:
         planning: bool = False,
         interactive: bool = True,
         cwd: Optional[Path] = None,
+        unattended: bool = False,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -1189,7 +1236,7 @@ class Agent:
                 ctx.cancelled = True
                 break
             yield from self._run_one_serial(
-                tc, tool, decision, results, ctx, ask, interactive, planning, cwd
+                tc, tool, decision, results, ctx, ask, interactive, planning, cwd, unattended
             )
 
     def _run_special(
@@ -1377,6 +1424,7 @@ class Agent:
         interactive: bool = True,
         planning: bool = False,
         cwd: Optional[Path] = None,
+        unattended: bool = False,
     ) -> Iterator[AgentEvent]:
         """
         串行处理单个工具调用：未知 / 参数错误 / 权限拒绝 / 待确认 / 放行（c6）。
@@ -1433,10 +1481,17 @@ class Agent:
         # 一旦真的走进去就是「后台线程往主界面弹了一个没人预期的面板」。
         # 这里拦住，那条路径压根不会被触达。
         if decision.decision == Decision.ASK and not interactive:
+            # c15：同样是「没人能应答」，但**成因不同、下一步也不同**。
+            # 子 Agent 该换只读方式把活干完；无人值守的主对话该回消息给队友、
+            # 并把「需要用户批准什么」留给回来的用户。见两个常量的对照表。
+            template = (
+                DENIED_UNATTENDED_FEEDBACK if unattended
+                else DENIED_NON_INTERACTIVE_FEEDBACK
+            )
             res = ToolResult(
                 ok=False,
-                output=DENIED_NON_INTERACTIVE_FEEDBACK.format(name=tc.name),
-                summary="非交互环境自动拒绝",
+                output=template.format(name=tc.name),
+                summary="无人值守自动拒绝" if unattended else "非交互环境自动拒绝",
             )
             results[tc.id] = res
             # **不置 `ctx.user_denied`**：那个标志会让下一轮 `tools=None`。

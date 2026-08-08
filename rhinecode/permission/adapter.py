@@ -41,6 +41,18 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # specifier 刻意用**完整 URL 原文**而非主机名——确认面板与行为记录里要留下
     # 模型实际请求的那个地址；主机名另放在 PermissionRequest.host（见 to_request）。
     "web_fetch": lambda a: ("WebFetch", str(a.get("url") or ""), "url"),
+    # ⚠ **c15 的五个协作工具刻意不在这张表里**，与 `run_agent` / `load_skill`
+    # 同先例：它们既不读文件也不执行命令，没有可映射的 Bash / Read / Edit /
+    # Write 语义，副作用限于改本进程内存里的清单与信箱。
+    #
+    # 别为了「看起来完整」给它们硬编一个类别——那会让 `deny: Write(...)`
+    # 之类的路径规则意外命中一个根本不碰文件系统的工具。
+    #
+    # ⚠ **但要知道：登不登记对它们其实都不生效。** 这五个工具与
+    # `run_agent` / `load_skill` 一样是 `system_serial=True`，而那类工具在
+    # `agent/loop.py` 的预扫里**直接拿到一个 ALLOW、根本不调 `engine.decide`**
+    # （c15 验收期实测确认）。收窄它们唯一有效的手段是 Hook 的 `pre_tool_use`。
+    # 见 CLAUDE.md「已知后续工程项」里那条「system_serial 绕过③规则层」。
 }
 
 

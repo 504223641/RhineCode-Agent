@@ -898,6 +898,16 @@ class AllTypesTest(TraceHookBase):
                 "commits": 2, "keep_branch": True,
             },
             T.WORKTREE_CLEANUP: {"scanned": 3, "removed": 2, "kept": 1},
+            # c15 协作四类
+            T.TEAM_MESSAGE: {
+                "sender": "worker-a", "recipient": "main", "ok": True,
+                "summary": "接口改异步", "body": "要改成异步的",
+            },
+            T.TEAM_TASK: {
+                "action": "claim", "task_id": "2", "actor": "worker-a", "detail": "",
+            },
+            T.TEAM_MEMBER: {"name": "worker-a", "event": "idle", "detail": ""},
+            T.AUTO_WAKE: {"count": 1, "limit": 5, "trigger": "main"},
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

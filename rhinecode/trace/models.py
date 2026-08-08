@@ -56,6 +56,10 @@ class TraceEventType(str, Enum):
     WORKTREE_PROVISION = "worktree_provision"    # c14：环境初始化（复制/软链的结果与警告）
     WORKTREE_SETTLE = "worktree_settle"          # c14：结束时的保留/删除决定
     WORKTREE_CLEANUP = "worktree_cleanup"        # c14：启动清理的结果
+    TEAM_MESSAGE = "team_message"                # c15：一条队友消息的发出与送达
+    TEAM_TASK = "team_task"                      # c15：共享任务清单的一次变更
+    TEAM_MEMBER = "team_member"                  # c15：队员状态流转（注册/待命/唤醒/退场）
+    AUTO_WAKE = "auto_wake"                      # c15：主对话的一次自动唤起
 
 
 # ---------------------------------------------------------------------------

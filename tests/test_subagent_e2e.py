@@ -172,9 +172,32 @@ class ForegroundE2ETest(E2EBase):
         self.assertGreaterEqual(idx, 0, "子 Agent 应当真的跑过")
         self.assertEqual(self.provider.systems[idx], "你是查找员。最后一段必须是自包含的结论。")
 
-    def test_subagent_toolset_is_the_whitelist(self) -> None:
+    def test_subagent_toolset_is_the_whitelist_plus_collaboration(self) -> None:
+        """
+        角色白名单决定「它能做什么」，**协作工具除外**。
+
+        ⚠ **本条断言在 c15 被修改过**，这是 C13 契约的一次真实变更，
+        不是替身跟进——原文断言最终工具集**恰好等于**白名单。
+
+        改的理由：c15 spec F22 要求协作工具对**全部**子 Agent 可见，
+        而 `explorer` / `planner` 这类只读角色都声明了白名单，
+        交集之后一个协作工具都不剩——「只读调研员 + 执行者」这种最自然的
+        分工因此根本跑不通（调研员连「我查完了」都说不出口）。
+        真实模型验收实测撞到过。
+
+        白名单**本身仍然生效**：下面那条 `write_file` 的断言钉住这一点，
+        豁免只覆盖协作工具，不是把白名单整个作废。
+        """
         idx = self.provider.sub_turn_index()
-        self.assertEqual(self.provider.tool_names[idx], ["glob_files", "read_file"])
+        names = set(self.provider.tool_names[idx])
+        self.assertLessEqual({"glob_files", "read_file"}, names, "白名单里的照常给")
+        self.assertLessEqual(
+            {"task_create", "task_list", "task_get", "task_update", "send_message"},
+            names,
+            "协作工具豁免白名单（c15 F22）",
+        )
+        self.assertNotIn("write_file", names, "白名单之外的非协作工具仍然拿不到")
+        self.assertNotIn("run_command", names)
 
     def test_delegation_tool_visible_to_main_not_to_sub(self) -> None:
         idx = self.provider.sub_turn_index()

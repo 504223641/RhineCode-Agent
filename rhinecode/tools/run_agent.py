@@ -53,7 +53,10 @@ class RunAgentTool(Tool):
     另：本工具**有意不在 `permission/adapter.py` 的 `_TOOL_MAP` 中登记**，
     理由与 `load_skill` 相同——它既不读文件也不执行命令，没有可映射的
     Bash/Read/Edit/Write 语义。未登记的工具落进 `other` 分支，
-    仍可用 `deny: run_agent` 整个禁掉。
+    ⚠ **但 `deny: run_agent` 其实拦不住它**（c15 验收期实测发现的既有错误）：
+    `system_serial=True` 的工具在预扫里直接拿到 ALLOW、**根本不调
+    `engine.decide`**，③规则层完全不参与。唯一有效的收窄手段是 Hook 的
+    `pre_tool_use`。见 CLAUDE.md「已知后续工程项」。
     """
 
     name = "run_agent"
@@ -142,6 +145,16 @@ class RunAgentTool(Tool):
                     "期望产出什么形式的结论。"
                 ),
             },
+            "name": {
+                "type": "string",
+                "description": (
+                    "给这个队员起的名字（可选，不给则自动生成）。"
+                    "起了名字之后，你和其它队员就能用 send_message 按名字"
+                    "跟它说话——**包括它干完之后**：再发一条消息就能把它"
+                    "从原来的上下文唤醒继续干。"
+                    "名字必须在本次会话内唯一，重名会直接失败。"
+                ),
+            },
             "isolation": {
                 "type": "boolean",
                 "description": (
@@ -214,6 +227,10 @@ class RunAgentTool(Tool):
                 kind, agent_name, task_text, background, parent,
                 plan_stage=plan_stage,
                 isolation=args.get("isolation"),
+                # c15：队员名字。取原值（可能是 None）——`None` 表示
+                # 「由系统起一个」，空串表示模型显式给了个空名字（那是错的，
+                # 由花名册去报）。两者在 `register` 里的分支不同。
+                name=args.get("name"),
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(ok=False, output=f"委派失败：{exc}", summary="委派失败")

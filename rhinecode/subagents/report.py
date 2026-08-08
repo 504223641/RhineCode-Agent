@@ -92,8 +92,17 @@ def _agent_block(
 
 def _task_line(record: TaskRecord) -> str:
     """渲染单条任务。"""
+    # c15：有队员名字时显示 `名字(角色)`，没有则退回只显示角色。
+    #
+    # 名字排在**前面**：用户要拿它去理解「谁在干什么」，而同一个角色可能
+    # 派出了三个队员——只显示角色的话那三行看起来一模一样。
+    who = (
+        f"{record.member_name}({record.agent_name})"
+        if record.member_name
+        else record.agent_name
+    )
     head = (
-        f"  • {record.task_id} · {record.agent_name}"
+        f"  • {record.task_id} · {who}"
         f" · {STATUS_LABELS.get(record.status, record.status.value)}"
         f" · {record.turns} 轮 · {record.usage_tokens} token"
         f" · {record.duration_seconds:.1f}s"
