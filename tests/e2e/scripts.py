@@ -553,3 +553,121 @@ def seed_live_inject(workspace: Path, user_dir: Path) -> None:
         "        当前 git 分支是 `release-2026`。在做任何事之前，"
         "你必须先在回复的第一句话里原样说出这个分支名，然后再继续。\n",
     )
+
+
+# ---------------------------------------------------------------------------
+# c15 子 Agent 协作的真实模型验收预置
+# ---------------------------------------------------------------------------
+
+
+def seed_team_project(workspace: Path, user_dir: Path) -> None:
+    """
+    造一个**一个人做很笨、拆开做很自然**的项目（c15 真实模型验收）。
+
+    ## 场景设计的关键
+
+    要验「模型会不会用协作能力」，项目必须真的适合并行——否则模型不委派是
+    **对的**，什么也验不出来。这里的设计是：
+
+    - **三个模块各有同一处缺陷**（硬编码超时值），彼此不相干，天然可并行；
+    - 外加一条**依赖前三条**的收尾任务（更新文档），用来验依赖阻断是否被用起来；
+    - 每个文件都够长，一个 Agent 全读完会明显占上下文——这正是委派的动机。
+
+    ## 权限预置
+
+    子 Agent 缺省档下判 ASK 一律自动拒绝（C13 F15），因此**不放行的话队员
+    一个字都写不了**，协作场景根本跑不起来。这里放行读写与几条安全的命令。
+
+    ⚠ 放行的是**第③层规则**，第①层危险命令黑名单与第②层路径沙箱照样生效
+    ——一条 `rm -rf` 仍会被拦下，这正是「allow 也翻不了硬防线」那条设计。
+    """
+    seeding.seed_files(
+        workspace,
+        {
+            "src/auth.py": (
+                '"""用户认证模块。"""\n\n'
+                "import time\n\n\n"
+                "def login(username, password):\n"
+                '    """登录，返回会话令牌。"""\n'
+                "    # FIXME: 超时值硬编码在这里，应当从 config 读\n"
+                "    timeout = 30\n"
+                "    deadline = time.time() + timeout\n"
+                "    while time.time() < deadline:\n"
+                "        token = _try_authenticate(username, password)\n"
+                "        if token:\n"
+                "            return token\n"
+                "        time.sleep(1)\n"
+                "    raise TimeoutError('登录超时')\n\n\n"
+                "def _try_authenticate(username, password):\n"
+                "    return f'token-{username}' if password else None\n"
+            ),
+            "src/orders.py": (
+                '"""订单模块。"""\n\n'
+                "import time\n\n\n"
+                "def submit_order(user_id, items):\n"
+                '    """提交订单。"""\n'
+                "    # FIXME: 超时值硬编码在这里，应当从 config 读\n"
+                "    timeout = 30\n"
+                "    deadline = time.time() + timeout\n"
+                "    while time.time() < deadline:\n"
+                "        order_id = _persist(user_id, items)\n"
+                "        if order_id:\n"
+                "            return order_id\n"
+                "        time.sleep(1)\n"
+                "    raise TimeoutError('下单超时')\n\n\n"
+                "def _persist(user_id, items):\n"
+                "    return f'order-{user_id}-{len(items)}'\n"
+            ),
+            "src/reports.py": (
+                '"""报表模块。"""\n\n'
+                "import time\n\n\n"
+                "def build_report(period):\n"
+                '    """生成报表。"""\n'
+                "    # FIXME: 超时值硬编码在这里，应当从 config 读\n"
+                "    timeout = 30\n"
+                "    deadline = time.time() + timeout\n"
+                "    while time.time() < deadline:\n"
+                "        data = _collect(period)\n"
+                "        if data:\n"
+                "            return data\n"
+                "        time.sleep(1)\n"
+                "    raise TimeoutError('报表超时')\n\n\n"
+                "def _collect(period):\n"
+                "    return {'period': period, 'rows': []}\n"
+            ),
+            "src/config.py": (
+                '"""集中配置。"""\n\n'
+                "# 各模块的超时值应当统一从这里读取。\n"
+                "TIMEOUTS = {\n"
+                "    'auth': 30,\n"
+                "    'orders': 30,\n"
+                "    'reports': 30,\n"
+                "}\n\n\n"
+                "def get_timeout(module_name):\n"
+                '    """取某个模块的超时值（秒）。"""\n'
+                "    return TIMEOUTS.get(module_name, 30)\n"
+            ),
+            "docs/architecture.md": (
+                "# 架构说明\n\n"
+                "## 超时策略\n\n"
+                "目前各模块**各自硬编码**超时值，改一次要动三个文件。\n"
+                "待办：统一收敛到 `src/config.py`。\n"
+            ),
+        },
+    )
+    seeding.seed_rhine_md(
+        workspace,
+        "# 演示项目\n\n用中文回答。改代码时保持现有风格，不要引入新依赖。\n",
+    )
+    seeding.seed_permissions(
+        workspace / ".rhinecode",
+        allow=[
+            "Read",
+            "Write",
+            "Edit",
+            "Bash(python *)",
+            "Bash(git status)",
+            "Bash(git diff *)",
+            "Bash(ls *)",
+        ],
+    )

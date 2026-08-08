@@ -99,8 +99,19 @@ def optional_slots() -> list[PromptModule]:
     - 110「自定义指令」（c9 填充：三层 RHINE.md）
     - 120「已激活 Skill」（c11 填充：已激活 Skill 的完整 SOP 正文）
     - 130「长期记忆」（c9 填充：两级记忆索引）
+    - 134「组队协作」（c15 填充：一段恒定的组队说明）
     - 135「可用子 Agent 角色」（c13 填充：角色清单）
     - 140「可用 Skill 清单」（c11 填充：第一阶段清单）
+
+    **为什么「组队协作」是 134、排在角色清单之前**（c15）：
+    它是一段**恒定不变**的文本（不随任何配置或运行状态变化），比角色清单
+    还稳定，因此排在最前面吃满前缀缓存。语义上也是先总后分——先说「可以组队」，
+    再说「有哪些人可以派」。
+
+    ⚠️ 这个槽位是**真实模型验收补出来的**：首轮实测主 Agent 面对一个明显
+    适合并行的任务**完全没用协作能力**，查 trace 才发现协作的事一个字都没进
+    系统提示，模型只能从工具 schema 里被动发现它们。详见 `team/render.py`
+    的 `render_team_brief`。
 
     **为什么子 Agent 角色清单是 135、排在 Skill 清单之前**（c13）：
     两者都进稳定通道，而前缀缓存「从第一处变化起、其后全部失效」，
@@ -122,6 +133,7 @@ def optional_slots() -> list[PromptModule]:
         PromptModule(name="自定义指令", priority=110, cacheable=False, content=""),
         PromptModule(name="已激活 Skill", priority=120, cacheable=False, content=""),
         PromptModule(name="长期记忆", priority=130, cacheable=False, content=""),
+        PromptModule(name="组队协作", priority=134, cacheable=True, content=""),
         PromptModule(name="可用子 Agent 角色", priority=135, cacheable=True, content=""),
         PromptModule(name="可用 Skill 清单", priority=140, cacheable=True, content=""),
     ]

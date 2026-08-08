@@ -53,6 +53,7 @@ from rhinecode.subagents.report import render_report
 from rhinecode.subagents.runner import ParentSnapshot
 from rhinecode.subagents.toolset import resolve_toolset
 from rhinecode.team.gate import TeamGate
+from rhinecode.team.render import render_team_brief
 from rhinecode.team.models import MAIN_NAME
 from rhinecode.trace import (
     SCOPE_MAIN,
@@ -1077,6 +1078,7 @@ class ConversationManager:
             skill_index=self.skill_manager.index_text(),
             active_skills="",
             agent_index=self._agent_index_text(),
+            team_brief=self._team_brief_text(),
             untrusted_enabled=self._config.web_fetch_enabled,
         )
         names = tuple(self._registry.names()) if self._registry is not None else ()
@@ -1551,6 +1553,9 @@ class ConversationManager:
             # c13：角色清单进 135 稳定槽位（排在 Skill 清单之前，见 builder 注释）。
             # 服务未启用时是空串，槽位整体跳过、输出与 c12 逐字一致。
             agent_index=self._agent_index_text(),
+            # c15：组队说明进 134 稳定槽位（排在角色清单之前，见 builder 注释）。
+            # 协作未启用时是空串，槽位整体跳过、输出与 c14 逐字一致。
+            team_brief=self._team_brief_text(),
             # web_fetch 扩展 F4 链路②的第一个调用点（另一个在 _run_forked_skill）。
             untrusted_enabled=self._config.web_fetch_enabled,
         )
@@ -1704,6 +1709,22 @@ class ConversationManager:
         if self.team_service is None:
             return ""
         return self.team_service.roster_text()
+
+    def _team_brief_text(self) -> str:
+        """
+        「组队协作」槽位的内容（c15，134 槽位）。
+
+        :returns: 一段恒定说明；协作未启用时为空串（槽位整体跳过）
+
+        ⚠ **这个槽位是真实模型验收补出来的。** 首轮实测主 Agent 面对一个
+        明显适合并行的任务完全没用协作能力——查 trace 才发现协作的事
+        一个字都没进系统提示。详见 `team/render.py::render_team_brief`。
+
+        副作用：无。
+        """
+        if self.team_service is None:
+            return ""
+        return render_team_brief()
 
     def _clear_team(self) -> None:
         """清空全部协作状态（`/clear` 与 `/resume` 共用，c15 F25）。"""
