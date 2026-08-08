@@ -154,6 +154,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **新增路径判定函数 / 新增 `PermissionRequest` 的构造点（c14）** → **`root` 与 `cwd` 一律不给默认值**。给了默认值就等于「忘记传的地方静默按主项目根判定」，一次隔离故障会静默变成一次越权。无默认值让遗漏在开发期就变成 `TypeError`——这个代价是**故意付的**（改造时它让 141 处测试当场红，那正是它的价值）
 - **给搜索类工具加逐文件过滤器（c14）** → 过滤器签名是 `(相对路径, 本次调用的工作目录)`，**第二个参数不可省**。漏掉不会报错：构造权限请求时缺参数抛 `TypeError`，被调用点外面的 `except Exception: return False`（fail-safe）吞掉，于是**所有文件都被判拒绝**、工具照常返回 ok=True 而结果为空——用户看到的是「grep 什么都搜不到」。改造期真踩过
 - **新增 worktree 行为记录事件（c14）** → `trace/models.py` 的枚举 + `trace/reader.py` 的 `SUMMARIZERS`。与既有那条同一个坑，漏后者只显示成「（未登记类型）」
+- **改动「隔离成果怎么交回来」的说法（c14）** → `worktree/render.py` 的 `render_delivery` + `tools/run_agent.py` 的 `description`。**两处必须同口径**（不要写「不要提交」/ 不要自己进工作区目录抄文件）——主 Agent 在**两个不同时刻**读到同一条约束：委派前读工具描述、委派后读交付信息，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单表头 ↔ `run_agent.description`」是**同一个坑的第三次**。真实模型实测两次撞到：主 Agent 从用户那句「我这边的改动先不提交」推断出「让子 Agent 也别提交」，成果全部搁浅、`git merge` 拿不到东西，而它照样报「已完成」。护栏见 `tests/test_worktree_render.py::ToolDescriptionSameVoiceTest`
+- **新增「不该进搜索结果」的运行期产物目录** → `tools/path_guard.py` 的 `_RUNTIME_ARTIFACT_RELATIVE` 一处即可（`grep_content` 与 `glob_files` 都取 `runtime_artifact_dirs_of`）。⚠ 它与 `SKIP_DIRS` **刻意分开**：那张表按**目录名**匹配，这里必须按**路径相等**判断，否则会误伤用户自己叫 `sessions` / `context` 的业务目录。`.rhinecode/memory/` 与 `.rhinecode/agents/` **刻意不在表内**（前者是刻意写下的项目知识、后者是用户写的角色定义），`test_search_artifact_exclusion.py` 有用例钉住这个「刻意」，免得后来的人当成漏改顺手补上
 - **改动角色正文里「结论怎么回流」的说法（c13）** → 必须与 `runner._extract_conclusion` 的实际口径一致：它取的是**最后一条 assistant 消息的全文**，不是「最后一段」。三个内置角色正文 + `SUBAGENT_CONVENTIONS` 都得同口径。**说错了不报错**，只是模型照着字面理解、在结论前面写一堆过程叙述，而那些全都会被带回主对话（真实模型实测过）。护栏见 `test_subagent_builtin.py::test_body_says_the_whole_reply_is_returned`
 - **子 Agent 的产品级约定写在运行器里，不写进角色正文** → `subagents/runner.py` 的 `SUBAGENT_CONVENTIONS`。语言约定与结论长度这两条与角色是谁无关；写进内置角色正文的话，**用户自己写的角色一个都盖不到**。⚠️ 子 Agent 的系统提示只有角色正文，`RHINE.md` 里的项目约定（比如「用中文回答」）**到不了它**
 - **新增「规划阶段仍可用」的工具（c13）** → 声明 `Tool.plan_safe = True` + **该工具的 `execute` 必须接受 `plan_stage: bool` 关键字参数**（循环会传）。⚠️ 声明它等于承诺「规划阶段不产生副作用」，工具**必须自己兑现**——循环只负责把阶段告诉它。另：规划阶段守卫的豁免条件是 `plan_safe`，**不是 `system_serial`**（那条豁免原本为 `load_skill` 写、长期空转，被 `run_agent` 激活后成了 Plan Mode 的漏洞，实测规划阶段真的执行了委派）。护栏见 `tests/test_subagent_plan_stage.py::PlanGuardTest`（两个假工具只差这一个标志、行为必须相反）
@@ -491,6 +493,17 @@ python -m unittest discover -s tests      # 1969 项，skipped 4
     - **隔离工作区里没有 `.rhinecode/`**（它被忽略规则排除，checkout 不出来）。
       这不影响项目级 `permissions.yaml` / `hooks.yaml` 生效——那些配置在装配期就已
       从主项目根加载进内存，子 Agent 共享同一份引擎与 Hook 编排者。
+
+    **另有一条 2026-08-08 真实模型验收发现、只做了半截的**：
+    **`worktree.link` 目前一律降级为 copy。** `link` 的源在主项目根、落点在隔离
+    工作区，建出来的软链**天然指向工作区之外**，而第②层路径沙箱明令拒绝这类
+    符号链接——链接建得成，隔离子 Agent 却一个字节都读不到（实测：
+    `read_file` / `glob_files` 对该目录下的任何路径都拿到「路径越界」，
+    子 Agent 耗尽 12 轮预算失败，而 `worktree_provision` 记的是 `applied=2`）。
+    现在改成建之前先自检、不在工作区内就直接复制并留痕（`worktree/provision.py`）。
+    **真正让 `link` 可用要动第②层的边界判定**——判定期得知道「哪些软链是用户
+    显式声明的」，而现有的只读白名单机制只覆盖 read 类、不覆盖 glob，
+    属安全边界变更，应单独立项评审。
 
 15. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
 
