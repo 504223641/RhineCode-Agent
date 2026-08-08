@@ -83,7 +83,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 - **网络访问工具 `web_fetch`** ——给一个地址与一段「要提取什么」的说明，取回正文并按提问抽取要点。它同时在权限管线里新增了**②′网络边界层**（结构性硬校验 + 域名策略），并把抓回的内容当作不可信输入对待。行为细节见 [`docs/extensions/web-fetch/`](docs/extensions/web-fetch/spec.md)。
 - **Skill 作者期** ——对齐改造让 Skill **可导入**，这个扩展让它**可创作**。两件事：① **体检**（`skills/audit.py`，纯函数零 IO）八项检查，产出**可操作建议**（「建议改成 xxx」而非「警告：xxx」），并入 `/skills` 报告作为第四类反馈；② 内置 **`skill-creator`** 样板（目录型，带完整字段手册作随附资源），承担创作 / 适配外部 Skill / 按建议修复三种用途，全部落盘走完整权限管线。另有 **R 系列增补**专治「Skill 写对了却没被自动加载」——清单表头从「公告」改成「指令」（照 Claude Code 口径：命中就先加载、**用它替代默认做法**、用户不必点名、拿不准就加载）、修掉 `load_skill` 一处**压制加载**的过期描述、内置样板说明改**触发词前置**、清单超预算时**保名字只砍描述**。⚠️ 「模型欠触发 Skill」是**已知的系统性偏差**（Anthropic 官方指导：描述要写得「有点 pushy」），不是本项目独有的 bug。行为细节见 [`docs/extensions/skill-authoring/`](docs/extensions/skill-authoring/spec.md)。
 
-另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成二十三类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
+另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成二十七类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
 
 Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mode、权限系统、Skill 仅在 `protocol: deepseek` 且启用默认工具注册中心时可用。
 
@@ -321,7 +321,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 2229 项，skipped 4
+python -m unittest discover -s tests      # 2235 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -564,7 +564,8 @@ python -m unittest discover -s tests      # 2229 项，skipped 4
 
     未排除的一项：本次用的是 `deepseek-v4-flash`（快速小模型），
     指令遵循弱于同系列大模型，**换强模型复测尚未做**。
-    详见 `docs/c15/acceptance/live-model.md`。
+    详见 `docs/c15/acceptance/live-model.md`；**已登记为 `docs/todo/5-team-adoption.md`**
+    （⚠ 那份的第一步不是改代码，是换强模型跑对照）。
 
 18. **`system_serial=True` 的工具绕过③可配置规则层**（C15 验收期实测发现，
     2026-08-09 登记，**未修**）：`agent/loop.py` 的决策预扫里，
@@ -585,7 +586,8 @@ python -m unittest discover -s tests      # 2229 项，skipped 4
     `engine.decide`，只是把 ASK 结果当 ALLOW 处理（保住「它们不弹面板」这条
     既有性质）。这会改变 C13 起的既有行为（`deny: run_agent` 突然开始生效），
     属安全边界变更，应当单独立项、单独评审，并补「deny 生效」与
-    「仍然不弹面板」两条护栏。
+    「仍然不弹面板」两条护栏。**已登记为 `docs/todo/2-perm-system-serial-bypass.md`**
+    （与第 12 条同源，建议一起做）。
 
 19. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、
     成员间实时流式通信、队员之间互相委派（无限嵌套招人）、任务清单与花名册的
