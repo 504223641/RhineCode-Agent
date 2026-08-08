@@ -65,6 +65,74 @@ class SubAgentGateProtocol(Protocol):
         ...
 
 
+class CompositeGate:
+    """
+    把多个闸门并成一个（c15 T18）。
+
+    C15 让子 Agent 之间能互相发消息，而**消息注入与子 Agent 结论注入
+    在循环里的处理逐字相同**——都是「取出来 → 追加进历史 → 交给存档」。
+    因此不给循环加第二个调用点，改为在这里组合：
+
+    - **主对话**传 `CompositeGate([SubAgentGate, TeamGate("main")])`；
+    - **子 Agent** 传 `TeamGate(<它自己的名字>)`（C13 时它用的是 `NullGate`）。
+
+    于是 `agent/loop.py` 的注入逻辑一行都不用改。
+
+    ## ⚠ 本类必须留在 `agent/` 这一侧
+
+    与协议同一条理由：`agent` 层**不得依赖 `subagents` / `team`**
+    （它们都是 `agent.loop` 的使用者），硬去 import 会直接撞循环导入——
+    C13 实测过，报错是 `cannot import name 'Agent' from partially
+    initialized module`。本类只依赖协议本身，不认识任何具体实现。
+
+    :param gates: 若干个满足 `SubAgentGateProtocol` 的对象。
+        `None` 会被过滤掉，因此调用方可以直接传
+        `[maybe_subagent_gate, maybe_team_gate]` 而不必先自己筛。
+    """
+
+    def __init__(self, gates) -> None:
+        self._gates = tuple(g for g in gates if g is not None)
+
+    def take_pending(self) -> "list[Message]":
+        """
+        按传入顺序依次取，结果拼接。
+
+        顺序即优先级：主对话那边先放子 Agent 结论、再放队友消息。
+        两者在同一轮注入时，先看到「我派出去的活回来了」更符合模型的
+        思考顺序（它多半正等着那个结果）。
+        """
+        out: "list[Message]" = []
+        for gate in self._gates:
+            out.extend(gate.take_pending())
+        return out
+
+    def has_awaited(self) -> bool:
+        """任一闸门还有要等的东西。"""
+        return any(gate.has_awaited() for gate in self._gates)
+
+    def wait_any(self, cancel_event) -> bool:
+        """
+        等到任一闸门有东西可交付。
+
+        ⚠ **只对 `has_awaited()` 为真的闸门调 `wait_any`。**
+
+        `wait_any` 是**阻塞**的：无差别地逐个调用，第一个会一直等下去，
+        排在后面的永远轮不到。先问 `has_awaited` 就把「没什么可等的」
+        那些跳过去了——而本章的 `TeamGate.has_awaited` 恒为假，
+        因此它根本不会被调到，队员也就不会为「可能有人给我发消息」
+        赖着不收工。
+        """
+        for gate in self._gates:
+            if gate.has_awaited() and gate.wait_any(cancel_event):
+                return True
+        return False
+
+    def describe_awaited(self) -> str:
+        """把各闸门的描述拼起来，空的跳过。"""
+        parts = [gate.describe_awaited() for gate in self._gates]
+        return "、".join(part for part in parts if part)
+
+
 class NullGate:
     """
     不启用子 Agent 时的空对象。
@@ -86,4 +154,4 @@ class NullGate:
         return ""
 
 
-__all__ = ["MAX_WAIT_ROUNDS", "NullGate", "SubAgentGateProtocol"]
+__all__ = ["MAX_WAIT_ROUNDS", "CompositeGate", "NullGate", "SubAgentGateProtocol"]
