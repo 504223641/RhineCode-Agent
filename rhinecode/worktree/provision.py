@@ -17,6 +17,11 @@
 | `copy` | 各自独立一份，改副本不影响源 | **配置文件**——子 Agent 改坏了不牵连主目录 |
 | `link` | 共享同一份 | **大型依赖目录**——500MB 复制三份是灾难 |
 
+⚠ **本版本里 `link` 实际上一律降级为 copy**（真实模型实测发现，见下方代码里的
+长注释）：软链指向的目标在隔离工作区之外，而权限管线第②层明令拒绝这类符号链接
+——链接建得成，子 Agent 却一个字节也读不到。降级并留痕，好过留一个建成了
+却用不了的链接。要让 `link` 真正可用得动第②层的边界判定，属安全边界变更。
+
 ⚠ **本模块从不导致创建失败。** 单条条目出任何问题都只记警告、继续下一条。
 清单来自配置文件，一条写错了不该让整个委派挂掉——但必须让用户看得见，
 所以每条警告都要具体到是哪一条、为什么。
@@ -28,7 +33,7 @@ import shutil
 from pathlib import Path
 from typing import Sequence
 
-from rhinecode.tools.path_guard import PathGuardError, resolve_in_workspace
+from rhinecode.tools.path_guard import PathGuardError, is_inside, resolve_in_workspace
 from rhinecode.worktree.models import ProvisionEntry, ProvisionResult
 
 
@@ -157,6 +162,30 @@ def provision(
         try:
             if mode == "copy":
                 _copy_one(source, target)
+            elif not is_inside(source, target_root):
+                # ## ⚠ `link` 与权限管线第②层是互斥的（真实模型实测发现）
+                #
+                # 软链的落点在工作区内、**指向的目标在工作区外**，而第②层明令
+                # 「拒绝指向项目外的符号链接」——于是隔离子 Agent 对这条链接下面
+                # 的任何路径都会拿到「路径越界」，一个字节都读不到。
+                #
+                # 实测现场：`link: ["vendor"]` 之后，子 Agent 连着试
+                # `read_file('vendor/bigdep/VERSION')`、`glob_files('vendor/**')`、
+                # `glob_files('vendor/bigdep/*')` 全被拒，最后耗尽 12 轮预算失败；
+                # 而 `worktree_provision` 记的是 `applied=2`——**系统认为它成功了**。
+                # 这正是本项目最忌讳的形态：配了却没生效，且界面上看不出来。
+                #
+                # 这里与下面那条「建不了软链就复制」用同一套处置：降级 + 留痕。
+                # 不降级的话用户拿到的是一个建成了却用不了的链接，比复制更糟。
+                # 真正让 `link` 可用要动第②层的边界判定，属安全边界变更，
+                # 已登记进 CLAUDE.md 的「已知后续工程项」单独立项。
+                _copy_one(source, target)
+                warnings.append(
+                    f"环境初始化：条目 {raw!r} 的 link 指向隔离工作区之外，"
+                    "工具访问它时会被路径沙箱一律拒绝，**已降级为复制**"
+                    "——若该目录很大，这会明显增加磁盘占用与耗时；"
+                    "想避免复制请把它移进工作区内或改为按需只读访问"
+                )
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists() or target.is_symlink():

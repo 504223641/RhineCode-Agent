@@ -100,6 +100,43 @@ class LinkModeTest(ProvisionTestBase):
                 f"降级了却没有警告：{result.warnings}",
             )
 
+    def test_link_pointing_outside_the_worktree_degrades_to_copy(self):
+        """
+        指向工作区之外的 link **必须**降级为复制，且留下具体的警告。
+
+        ## 这条是真实模型实测补的，不是设计推演
+
+        `link` 的源在主项目根、落点在隔离工作区，所以它建出来的软链**天然指向
+        工作区之外**——而权限管线第②层明令拒绝这类符号链接。实测现场
+        （`worktree.link: ["vendor"]`）：隔离子 Agent 连着试
+        `read_file('vendor/bigdep/VERSION')`、`glob_files('vendor/**')`、
+        `glob_files('vendor/bigdep/*')`，全部拿到「[权限拒绝·sandbox] 路径越界」，
+        最后耗尽 12 轮预算失败收场。
+
+        **而系统当时认为它成功了**：`worktree_provision` 记的是 `applied=2`、
+        `warnings=1`（那一条警告说的是另一个越界条目）。配了却没生效、
+        且界面上完全看不出来——本项目最忌讳的形态。
+
+        断言刻意包含「不是软链」这一条：只断言有警告的话，将来若有人改成
+        「建软链 + 记警告」，测试照样绿，而子 Agent 依旧一个字节读不到。
+        """
+        src = self.main / "vendor"
+        src.mkdir()
+        (src / "dep.txt").write_text("v1\n", encoding="utf-8")
+
+        result = provision(self.main, self.target, [ProvisionEntry("vendor", "link")])
+
+        target = self.target / "vendor"
+        self.assertEqual(result.applied, ("vendor",))
+        self.assertFalse(
+            os.path.islink(target), "指向工作区外的软链会被第②层一律拒绝，不能留着"
+        )
+        self.assertEqual((target / "dep.txt").read_text(encoding="utf-8"), "v1\n")
+        self.assertTrue(
+            any("已降级为复制" in w and "沙箱" in w for w in result.warnings),
+            f"降级必须留痕、且说清是为什么：{result.warnings}",
+        )
+
 
 class SkipAndWarnTest(ProvisionTestBase):
     """三类跳过。每一类都必须：跳过、记警告、不影响其余条目。"""
