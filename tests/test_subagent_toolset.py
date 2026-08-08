@@ -177,6 +177,49 @@ class BackgroundLayerTest(unittest.TestCase):
         self.assertEqual(fg.allowed, bg.allowed)
 
 
+class CollaborationToolsTest(unittest.TestCase):
+    """
+    c15：协作工具**必须**对子 Agent 可见，委派与 Skill 加载工具**必须**不可见。
+
+    这两半是一体的：C15 让队员「能说话」，但没有让它们「能招人」。
+    少了后半条，一条 `tools: [send_message, run_agent]` 的角色定义
+    就能让子 Agent 拿到委派能力、无限嵌套下去。
+    """
+
+    COLLAB = ("task_create", "task_list", "task_get", "task_update", "send_message")
+
+    def test_collaboration_tools_reach_subagents(self) -> None:
+        """spec F22：队员要共享看板、互相说话，就必须拿得到这五个。"""
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        result = resolve_toolset(all_names, _spec())
+        for name in self.COLLAB:
+            with self.subTest(tool=name):
+                self.assertIn(
+                    name,
+                    result.allowed,
+                    f"{name} 被挡在子 Agent 之外了——F22 要求它对全部子 Agent 可见",
+                )
+
+    def test_delegation_tools_still_blocked(self) -> None:
+        """spec F23：C13 那道防无限嵌套的闸门原样保留。"""
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        result = resolve_toolset(all_names, _spec())
+        for name in ("run_agent", "load_skill"):
+            with self.subTest(tool=name):
+                self.assertNotIn(name, result.allowed)
+
+    def test_explicit_allowlist_cannot_grant_delegation(self) -> None:
+        """
+        ⚠ 反证：即使角色定义把 `run_agent` 写进白名单，也拿不到它——
+        全局禁表排在角色白名单**之前**是刻意的。
+        """
+        all_names = frozenset(set(ALL_TOOLS) | set(self.COLLAB))
+        spec = _spec(tools=("send_message", "run_agent"))
+        result = resolve_toolset(all_names, spec)
+        self.assertIn("send_message", result.allowed)
+        self.assertNotIn("run_agent", result.allowed)
+
+
 class ResultShapeTest(unittest.TestCase):
     def test_is_empty_property(self) -> None:
         self.assertTrue(ToolsetResult(allowed=frozenset()).is_empty)

@@ -41,6 +41,14 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # specifier 刻意用**完整 URL 原文**而非主机名——确认面板与行为记录里要留下
     # 模型实际请求的那个地址；主机名另放在 PermissionRequest.host（见 to_request）。
     "web_fetch": lambda a: ("WebFetch", str(a.get("url") or ""), "url"),
+    # ⚠ **c15 的五个协作工具刻意不在这张表里**，与 `run_agent` / `load_skill`
+    # 同先例：它们既不读文件也不执行命令，没有可映射的 Bash / Read / Edit /
+    # Write 语义，副作用限于改本进程内存里的清单与信箱。
+    #
+    # 未登记的工具落进 `other` 分支，仍可被 `deny: send_message` 这类
+    # 规则整个禁掉——**「不登记」不等于「管不住」**，别为了「看起来完整」
+    # 给它们硬编一个类别，那反而会让 `deny: Write(...)` 之类的路径规则
+    # 意外命中一个根本不碰文件系统的工具。
 }
 
 
