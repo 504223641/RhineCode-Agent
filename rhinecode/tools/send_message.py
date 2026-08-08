@@ -27,7 +27,10 @@
 仍逐个过完整的五层权限管线 + Hook 前置层，且它的工具集与权限档
 在委派时就已按 C13 的规则收窄过。本工具不引入任何绕过管线的通路。
 
-仍可被 `deny: send_message` 整个禁掉（落 `other` 分支）。
+⚠ **`deny` 规则对它们无效**（实测确认，见下）。`system_serial=True` 的工具在
+`agent/loop.py` 的预扫里被**直接给一个 ALLOW 决策**，**根本不调 `engine.decide`**
+——③可配置规则层因此完全不参与。收窄它们唯一有效的手段是
+**Hook 的 `pre_tool_use` 拦截**（那一层排在更前面，实测拦得住）。
 """
 
 from __future__ import annotations

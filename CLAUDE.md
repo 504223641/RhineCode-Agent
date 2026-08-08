@@ -206,7 +206,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **改动发消息工具的描述或注入消息的标记块（c15）** → `tools/send_message.py` 的 `description` + `team/render.py` 的 `render_incoming`。**两处必须同口径**（你的正文别人看不到 / 消息自动送达不必查收 / 按名字指代 / 名字在它干完之后依然有效）——模型在**两个不同时刻**读到同一条约定：发消息前读工具描述、收消息时读标记块，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单 ↔ `run_agent.description`」、C14 的「交付信息 ↔ 委派工具描述」是**同一个坑的第四次**，前三次都是真实模型实测才发现的。护栏见 `tests/test_team_tools.py::SameVoiceTest`
 - **任务的 `blocked_by` 与 `blocks` 是双向冗余存储（c15）** → `team/board.py` 的 `add_dependency` / `remove` 两处都要成对维护。只存一边的话每次列清单都要遍历全表反查，而清单是每个队员每一轮都可能读的高频操作。⚠ `remove` 漏摘反向引用的后果最隐蔽：留下**指向不存在任务的悬空依赖**，而 `is_blocked` 把查不到的前置按「未完成」处理——那条任务**再也认领不了**，且清单上显示的阻塞来源是一个查无此条的编号
 - **队员的两套状态刻意分开（c15）** → C13 的 `TaskStatus`（这次委派的**结论**产出了没有）与 `team/models.py` 的 `MemberState`（**人**还在不在场、叫不叫得醒）。⚠ **绝不要给 `TaskStatus` 加一个 `is_terminal` 为假的 `IDLE`**：主 Agent 的闸门用 `not status.is_terminal` 判断「还要不要等」，加了之后它每次收工都会去等一个已经待命的队员，而那个队员正等着主 Agent 给它发消息——**双方互等，永远结束不了**。护栏见 `tests/test_team_wake.py::test_main_agent_can_finish_while_a_member_idles`
-- **协作工具刻意不进两张表（c15）** → `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`（F22 要求它们对全部子 Agent 可见）与 `permission/adapter.py` 的 `_TOOL_MAP`（它们不碰文件也不执行命令，没有可映射的语义；未登记落 `other` 分支，仍可被 `deny: send_message` 禁掉）。两处都写了「刻意」的说明，别当成漏改顺手补上；而 `run_agent` / `load_skill` **必须继续留在禁表内**——C15 只让队员能说话，没有让它们能招人
+- **协作工具刻意不进两张表（c15）** → `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`（F22 要求它们对全部子 Agent 可见）与 `permission/adapter.py` 的 `_TOOL_MAP`（它们不碰文件也不执行命令，没有可映射的语义；⚠ 但登不登记对它们都不生效——`system_serial` 的工具压根不进引擎，见安全边界 c15 ①）。两处都写了「刻意」的说明，别当成漏改顺手补上；而 `run_agent` / `load_skill` **必须继续留在禁表内**——C15 只让队员能说话，没有让它们能招人
 - 新增 trace 事件类型 → `trace/models.py`（`TraceEventType` 枚举）+ `trace/reader.py` 的 `SUMMARIZERS`「type → 摘要函数」表（**漏了不报错**，只会让新事件在阅读器里显示成「（未登记类型）」——那句话就是为暴露这个遗漏而刻意保留的）
 - `bootstrap.build_app` 的装配顺序 → 那段「位置为什么卡在这个窄窗口里 / 两头都不能挪」的理由注释**必须随代码走**；迁代码留注释等于把知识丢了。**窗口里现在只剩一件事**：P1a 的 `exclude_tools` 摘除，理由是「往后挪会让 `session_start` 快照与实际工具集不符」。另半件（C11 的 Skill 白名单 fail-fast）已随对齐改造删除——`allowed-tools` 现在认不出的项只警告不终止，`bootstrap.py` 里留着那段删除说明，别再照着它推理
 - 新增控制通道指令 → `tests/e2e/protocol.py`（取值/错误码）+ `control.py`（`DriverCore` 方法）+ `host.py` 的 `dispatch` 分支 + `client.py`（子命令）+ `test_e2e_control.py`（**五处齐改，漏一处是静默失效**：客户端能发但宿主不认、或宿主认了但没人调得到）
@@ -416,8 +416,11 @@ python -m unittest discover -s tests      # 2229 项，skipped 4
 - **子 Agent 协作（c15）六条**：
   ① **协作工具不进权限管线**（`system_serial=True`，与 `run_agent` / `load_skill`
   同先例）。它们不读写文件、不执行命令，副作用限于改本进程内存里的清单与信箱，
-  没有可映射的 Bash / Read / Edit / Write 语义。仍可被 `deny: send_message`
-  这类规则整个禁掉（落 `other` 分支）。
+  没有可映射的 Bash / Read / Edit / Write 语义。
+  ⚠ **`deny` 规则对它们无效**——`system_serial=True` 的工具在预扫里直接拿到
+  ALLOW、根本不调 `engine.decide`（c15 验收期实测确认，`run_agent` / `load_skill`
+  同样如此，那是个既有错误）。**唯一有效的收窄手段是 Hook 的 `pre_tool_use`**，
+  见「已知后续工程项」那条。
   ② **「能让别人干活」不等于提权。** 队员发消息唤醒另一个队员去做事时，
   那个队员做的每一件事仍逐个过完整的五层管线 + Hook 前置层，且它的工具集与
   权限档在委派时就已按 C13 的规则收窄过。本章**不引入任何绕过管线的通路**。
@@ -542,7 +545,28 @@ python -m unittest discover -s tests      # 2229 项，skipped 4
 
 15. **`SkillReloadOutcome.dropped_fatal` 是死代码**（对齐改造的残留，2026-07-29 登记，已确认**暂不处理**）：该字段现在恒为空元组——`skills/manager.py` 的 reload 硬编码传 `()`，因为「白名单含不存在的内置工具名就丢弃」这套语义已随收窄能力一起删除。连带 `conversation.py` 里 `if outcome.dropped_fatal:` 那个分支**永远进不去**。字段暂留只是为了不动 `trace/reader.py` 的 `skill_reload` 事件摘要契约。清理时要一起动的四处：`skills/models.py`（字段）+ `skills/manager.py`（传值）+ `conversation.py`（消费分支）+ `trace/reader.py`（摘要函数），并检查 `tests/test_trace_reader.py` 是否逐字断言了那段摘要。
 
-16. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、
+17. **`system_serial=True` 的工具绕过③可配置规则层**（C15 验收期实测发现，
+    2026-08-09 登记，**未修**）：`agent/loop.py` 的决策预扫里，
+    `if tool.system_serial:` 分支**直接给一个 ALLOW 决策并 `continue`**，
+    根本不调 `engine.decide`。因此 `permissions.yaml` 里写的
+    `deny: run_agent` / `deny: send_message` / `deny: task_update`
+    **一条都不生效**——实测：配了 deny 规则之后消息照样送达。
+
+    影响 7 个工具：`run_agent`、`load_skill`、以及 C15 的五个协作工具。
+
+    **唯一仍然有效的收窄手段是 Hook 的 `pre_tool_use`**（那一层排在预扫更前面，
+    实测拦得住）。危险性有限——这些工具本身不读写文件、不执行命令，
+    副作用限于起子对话或改进程内存；真正有副作用的是它们**引发**的工具调用，
+    而那些逐个过完整五层管线。但**文档一度承诺了「仍可被 deny 规则整个禁掉」，
+    那是错的**，错误的安全承诺比没有承诺更危险，相关四处注释已在 C15 修正。
+
+    修的话要动 `agent/loop.py` 那一个分支：让 `system_serial` 的工具也过一次
+    `engine.decide`，只是把 ASK 结果当 ALLOW 处理（保住「它们不弹面板」这条
+    既有性质）。这会改变 C13 起的既有行为（`deny: run_agent` 突然开始生效），
+    属安全边界变更，应当单独立项、单独评审，并补「deny 生效」与
+    「仍然不弹面板」两条护栏。
+
+18. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、
     成员间实时流式通信、队员之间互相委派（无限嵌套招人）、任务清单与花名册的
     持久化与跨会话恢复、更复杂的任务依赖约束（优先级 / 时限 / 子任务树）、
     消息的已读回执 / 撤回 / 编辑 / 附件、消息级与任务级的新 Hook 事件、
@@ -557,7 +581,7 @@ python -m unittest discover -s tests      # 2229 项，skipped 4
     而主 Agent 正是靠那段交付信息去 `git merge` 的（C14 踩过「成果搁浅」）。
     需要同一个人接着干下一件事时重新委派一次即可，成果在分支上不会丢。
 
-16. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
+19. **粘贴 `/skills` 报告会被命令解析器吞掉**（作者期扩展真实模型验收中观测到，2026-07-30 登记）：`skill-creator` 的「按建议修复」流程会让用户把 `/skills` 的建议段贴回对话里，而报告若以 `/skills` 开头，命令层会把整条消息当成 `/skills <子命令>` 处理并回「未知子命令」，消息**根本不进 AI**。命令系统的行为是对的（c10 的「未知命令不进 AI」是刻意设计），但这条工作流因此有真实摩擦。可选方向：让 `skill-creator` 改成引导用户「用 `/skills prompt` 或直接描述问题」而不是原样粘贴；或在命令层对「首行像命令但后续多行」的输入给一句更贴切的提示。**本次不改**——它牵动 c10 的解析契约，值得单独立项。
 
 ## 代码注释规范
 

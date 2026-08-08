@@ -53,7 +53,10 @@ class RunAgentTool(Tool):
     另：本工具**有意不在 `permission/adapter.py` 的 `_TOOL_MAP` 中登记**，
     理由与 `load_skill` 相同——它既不读文件也不执行命令，没有可映射的
     Bash/Read/Edit/Write 语义。未登记的工具落进 `other` 分支，
-    仍可用 `deny: run_agent` 整个禁掉。
+    ⚠ **但 `deny: run_agent` 其实拦不住它**（c15 验收期实测发现的既有错误）：
+    `system_serial=True` 的工具在预扫里直接拿到 ALLOW、**根本不调
+    `engine.decide`**，③规则层完全不参与。唯一有效的收窄手段是 Hook 的
+    `pre_tool_use`。见 CLAUDE.md「已知后续工程项」。
     """
 
     name = "run_agent"

@@ -17,8 +17,10 @@ C13 把委派做成一个工具带 `type` 参数，理由是「不论加载了�
 不执行命令**，副作用限于「在本进程内存里改一份清单」，没有可映射的
 Bash / Read / Edit / Write 语义。
 
-它们仍可被 `permissions.yaml` 的 `deny` 规则整个禁掉——未登记的工具
-落 `other` 分支，一条 `deny: task_update` 照样拦得住。
+⚠ **`deny` 规则对它们无效**（实测确认，见下）。`system_serial=True` 的工具在
+`agent/loop.py` 的预扫里被**直接给一个 ALLOW 决策**，**根本不调 `engine.decide`**
+——③可配置规则层因此完全不参与。收窄它们唯一有效的手段是
+**Hook 的 `pre_tool_use` 拦截**（那一层排在更前面，实测拦得住）。
 
 ## `plan_safe` 的兑现
 

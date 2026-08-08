@@ -45,10 +45,14 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # 同先例：它们既不读文件也不执行命令，没有可映射的 Bash / Read / Edit /
     # Write 语义，副作用限于改本进程内存里的清单与信箱。
     #
-    # 未登记的工具落进 `other` 分支，仍可被 `deny: send_message` 这类
-    # 规则整个禁掉——**「不登记」不等于「管不住」**，别为了「看起来完整」
-    # 给它们硬编一个类别，那反而会让 `deny: Write(...)` 之类的路径规则
-    # 意外命中一个根本不碰文件系统的工具。
+    # 别为了「看起来完整」给它们硬编一个类别——那会让 `deny: Write(...)`
+    # 之类的路径规则意外命中一个根本不碰文件系统的工具。
+    #
+    # ⚠ **但要知道：登不登记对它们其实都不生效。** 这五个工具与
+    # `run_agent` / `load_skill` 一样是 `system_serial=True`，而那类工具在
+    # `agent/loop.py` 的预扫里**直接拿到一个 ALLOW、根本不调 `engine.decide`**
+    # （c15 验收期实测确认）。收窄它们唯一有效的手段是 Hook 的 `pre_tool_use`。
+    # 见 CLAUDE.md「已知后续工程项」里那条「system_serial 绕过③规则层」。
 }
 
 

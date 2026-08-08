@@ -322,6 +322,115 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(current_identity(), "outer")
 
 
+class DenyRuleIneffectiveTest(unittest.TestCase):
+    """
+    ⚠ **本类记录的是一个「已知不生效」的事实，不是期望行为。**
+
+    C15 验收期实测发现：`system_serial=True` 的工具在 `agent/loop.py` 的
+    决策预扫里**直接拿到一个 ALLOW 并 `continue`**，根本不调 `engine.decide`。
+    因此 `permissions.yaml` 里的 `deny: send_message` **一条都不生效**。
+
+    这是个**继承自 C13** 的既有错误（`run_agent` / `load_skill` 同样如此），
+    已登记为 `CLAUDE.md` 已知后续工程项第 17 条。相关四处注释一度写着
+    「仍可被 deny 规则整个禁掉」，现已修正——**错误的安全承诺比没有承诺
+    更危险**。
+
+    本类存在的意义有二：
+    ① 把真实行为钉下来，让后来的人不必再实测一遍；
+    ② **将来修了那个已知项，这两条会红**——那时请连同四处注释与
+       `CLAUDE.md` 一起改回来。
+    """
+
+    def _run_once(self, rules, hooks=None):
+        """跑一轮真实 Agent Loop，返回 (工具是否成功, 消息是否送达)。"""
+        import threading
+
+        from rhinecode.agent.loop import Agent, RunOptions
+        from rhinecode.permission.engine import PermissionEngine
+        from rhinecode.permission.models import PermissionMode
+        from rhinecode.permission.rules import RuleSet
+        from rhinecode.provider.base import StreamChunk, ToolCall
+        from rhinecode.tools.registry import ToolRegistry
+
+        service = TeamService()
+        service.register_member("beta", "worker")
+        registry = ToolRegistry()
+        registry.register(SendMessageTool(service))
+
+        class _Provider:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def stream_chat(self, messages, effort, tools=None, system=None):
+                self.n += 1
+                if self.n == 1:
+                    yield StreamChunk(
+                        type="tool_call",
+                        tool_call=ToolCall(
+                            id="c1",
+                            name="send_message",
+                            arguments={"to": "beta", "message": "喂", "summary": "喂"},
+                        ),
+                    )
+                else:
+                    yield StreamChunk(type="text", content="完")
+
+        ok = []
+        for event in Agent(_Provider(), registry, hooks=hooks).run(
+            [], "off", False, "", lambda: "", "m", None,
+            PermissionEngine(RuleSet(rules=rules), mode=PermissionMode.DEFAULT),
+            lambda *a: True, None, None, threading.Event(), None, None,
+            options=RunOptions(),
+        ):
+            if event.tool_result is not None:
+                ok.append(event.tool_result.ok)
+        return (ok[0] if ok else None), service.has_unread("beta")
+
+    def test_deny_rule_does_not_block_a_system_serial_tool(self) -> None:
+        """
+        ⚠ 这条断言的是**当前的错误行为**：deny 规则配了也拦不住。
+        修好那个已知项之后它会红——那时请把断言反过来并同步四处文档。
+        """
+        from rhinecode.permission.rules import Rule
+
+        executed, delivered = self._run_once(
+            [Rule(effect="deny", tool="send_message", pattern="*", source="test")]
+        )
+        self.assertTrue(executed, "system_serial 工具绕过了③规则层（已知项 #17）")
+        self.assertTrue(delivered, "消息照样送达了")
+
+    def test_hook_pre_tool_use_does_block_it(self) -> None:
+        """
+        **唯一仍然有效的收窄手段**：Hook 的 `pre_tool_use` 排在预扫更前面。
+
+        这条是上一条的配套——没有它，读到「deny 拦不住」的人会以为
+        这些工具完全无法约束。
+        """
+        from rhinecode.hooks import HookEventType
+        from rhinecode.hooks.models import HookDecision
+
+        class _Verdict:
+            decision = HookDecision.DENY
+            reason = "hook 拦下"
+
+        class _Result:
+            verdict = _Verdict()
+
+        class _Hooks:
+            def has_listeners(self, event) -> bool:
+                return event == HookEventType.PRE_TOOL_USE
+
+            def dispatch(self, event, factory, cwd=None):  # noqa: ARG002
+                return _Result()
+
+            def consume_injections(self):
+                return []
+
+        executed, delivered = self._run_once([], hooks=_Hooks())
+        self.assertFalse(executed, "Hook 应当拦下它")
+        self.assertFalse(delivered, "消息不该送达")
+
+
 class SameVoiceTest(unittest.TestCase):
     """
     ⚠ **成对维护点的护栏**：发消息工具的描述与注入消息的标记块必须同口径。
