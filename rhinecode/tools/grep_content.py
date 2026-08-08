@@ -16,6 +16,7 @@ from rhinecode.tools.path_guard import (
     is_inside,
     require_cwd as _require_cwd,
     resolve_in_workspace,
+    runtime_artifact_dirs_of,
     worktrees_dir_of,
 )
 
@@ -108,6 +109,7 @@ class GrepTool(Tool):
 
             base = _require_cwd(cwd)
             worktrees_dir = worktrees_dir_of(base)
+            artifact_dirs = runtime_artifact_dirs_of(base)
             target = resolve_in_workspace(args.get("path") or ".", base)
             if not target.exists():
                 return ToolResult(ok=False, output=f"路径不存在: {args.get('path')}", summary="路径不存在")
@@ -132,6 +134,12 @@ class GrepTool(Tool):
                         # 匹配，而这里必须按**路径相等**判断，否则会误伤用户自己
                         # 叫 worktrees 的业务目录。两者语义不同，刻意分开。
                         if is_inside(child, worktrees_dir):
+                            continue
+                        # 运行期产物（会话存档 / 上下文存盘 / 行为记录）同样跳过。
+                        # 它们逐字复刻了对话与工具输出，进搜索结果会把真正的源码
+                        # 命中淹掉，还会形成「搜索 → 存盘 → 搜到存盘」的自放大。
+                        # 详见 `runtime_artifact_dirs_of` 的 docstring。
+                        if any(is_inside(child, d) for d in artifact_dirs):
                             continue
                         try:
                             resolve_in_workspace(str(child), base)

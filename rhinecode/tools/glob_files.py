@@ -14,6 +14,7 @@ from rhinecode.tools.path_guard import (
     resolve_in_workspace,
     is_inside,
     require_cwd as _require_cwd,
+    runtime_artifact_dirs_of,
     worktrees_dir_of,
     validate_glob_pattern,
 )
@@ -96,6 +97,7 @@ class GlobTool(Tool):
             validate_glob_pattern(pattern)
             base = _require_cwd(cwd)
             worktrees_dir = worktrees_dir_of(base)
+            artifact_dirs = runtime_artifact_dirs_of(base)
             # 仅保留文件、排除目录；转为相对工作目录的路径，便于模型理解与后续操作
             matches = []
             skipped = 0
@@ -106,6 +108,11 @@ class GlobTool(Tool):
                     # c14 F18：隔离工作区里是同一份源码的副本，让它进搜索结果会
                     # 让主 Agent 对每个字符串拿到 N 份重复命中。要看子 Agent 的
                     # 成果走 `git diff <分支>`，那才是交付信息段里给出分支名的用意。
+                    continue
+                if any(is_inside(p, d) for d in artifact_dirs):
+                    # 运行期产物（会话存档 / 上下文存盘 / 行为记录）：机器写下的
+                    # 对话与工具输出副本，对源码检索毫无意义。
+                    # 详见 `runtime_artifact_dirs_of` 的 docstring。
                     continue
                 try:
                     resolve_in_workspace(str(p), base)

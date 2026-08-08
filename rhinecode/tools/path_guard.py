@@ -105,6 +105,45 @@ def worktrees_dir_of(root: Union[str, Path]) -> Path:
     return Path(root).joinpath(*_WORKTREES_RELATIVE)
 
 
+# 运行期产物目录（相对任一工作目录根）。它们是 RhineCode 自己写下的、
+# 对项目源码检索毫无意义的字节，且**逐字复刻了对话与工具输出**。
+#
+# 与 `worktrees` 同样按**路径相等**判定，不按目录名——理由见 `is_inside`。
+_RUNTIME_ARTIFACT_RELATIVE: tuple[tuple[str, ...], ...] = (
+    (".rhinecode", "sessions"),   # c9 会话存档：完整对话原文
+    (".rhinecode", "context"),    # c8 存盘的工具结果原文
+    (".rhinecode", "traces"),     # 行为记录：模型请求响应 + 工具输出原文
+)
+
+
+def runtime_artifact_dirs_of(root: Union[str, Path]) -> tuple[Path, ...]:
+    """
+    给定工作目录下的运行期产物目录，搜索类工具一律跳过它们。
+
+    :param root: 工作目录根
+    :returns: 绝对路径元组（**每一项都可能不存在**）
+
+    ## 为什么必须排除（真实模型实测发现）
+
+    一次普通的 `grep_content('USAGE')` 实测返回「68 处匹配 · 5 个文件」，
+    其中三个文件是 `.rhinecode/sessions/*.jsonl`、`.rhinecode/memory/*.md`、
+    `.rhinecode/context/*.txt`——真正的源码命中只有一个。三重危害：
+
+    1. **结果被自己的历史淹没**。用户说过的每一句话都在会话存档里，
+       于是搜任何他打过的字符串都会命中「他打过这句话」这条噪声。
+    2. **自放大**。搜索结果过大 → c8 第一层把它存进 `.rhinecode/context/`
+       → 下一次搜索命中这个存盘 → 结果更大 → 再存盘。实测现场滚到了 1.8 MB，
+       模型分段读它、读出来的又是上一次搜索结果的副本，白烧五次工具调用。
+    3. **它是 deny 规则的间接绕过**。`deny: Read(config.yaml)` 挡得住直接读，
+       但那份内容一旦被读过就逐字躺在会话存档里，一次 grep 就能捞回来。
+
+    `.rhinecode/memory/` **刻意不在此列**：那是刻意写下的项目知识摘要，
+    体量小、语义明确，用户搜它是合理需求；上面三个则纯粹是机器副本。
+    """
+    base = Path(root)
+    return tuple(base.joinpath(*parts) for parts in _RUNTIME_ARTIFACT_RELATIVE)
+
+
 def is_inside(path: Union[str, Path], container: Union[str, Path]) -> bool:
     """
     判断 `path` 是否位于 `container` 之内（含相等）。
@@ -337,6 +376,7 @@ __all__ = [
     "main_project_root",
     "require_cwd",
     "worktrees_dir_of",
+    "runtime_artifact_dirs_of",
     "is_inside",
     "resolve_in_workspace",
     "resolve_readable",
