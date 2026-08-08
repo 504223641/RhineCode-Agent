@@ -444,6 +444,11 @@ class Roster:
         with self._lock:
             return tuple(self._members.keys())
 
+    @property
+    def max_idle(self) -> int:
+        """待命队员上限（展示与文案用；构造后不变，读它不需要加锁）。"""
+        return self._max_idle
+
     def idle_count(self) -> int:
         """当前待命人数（不含 `main`）。"""
         with self._lock:
