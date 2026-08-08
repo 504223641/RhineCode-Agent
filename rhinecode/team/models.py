@@ -109,19 +109,25 @@ class MemberState(Enum):
     花名册上一位队员的五种状态（spec F13/F14）。
 
     ```
-    RUNNING ⇄ IDLE                          （IDLE 可被消息唤醒回 RUNNING）
+    RUNNING ⇄ IDLE                                  （IDLE 可被消息唤醒回 RUNNING）
        ↓
-    FAILED / CANCELLED / RETIRED             （终态，不可唤醒）
+    DONE / FAILED / CANCELLED / RETIRED              （终态，不可唤醒）
     ```
 
-    三种终态**刻意分开**而不是合成一个「结束了」：
+    四种终态**刻意分开**而不是合成一个「结束了」：
     向一个终态队员发消息时，用户与模型需要知道**是哪一种**——
-    失败了可以改派、被取消是人的决定、已退休则是本次会话待命的人太多
-    被系统降级的（那不是谁的错，重新委派一个即可）。
+    干完收工了、跑挂了可以改派、被取消是人的决定、已退休则是本次会话
+    待命的人太多被系统降级的（那不是谁的错，重新委派一个即可）。
+
+    `DONE` 与 `IDLE` 的差别只有一条：**还叫不叫得醒**。
+    两者都是「自然干完了」，但 `DONE` 的上下文已经不保留了
+    （目前唯一的成因是隔离委派——它与待命互斥，理由见 `runner.py`）。
+    合成一个状态的话，用户会对着一个「待命」的名字发消息却石沉大海。
     """
 
     RUNNING = "running"      # 正在跑
     IDLE = "idle"            # 待命：自然停止、历史保留、叫得醒
+    DONE = "done"            # 自然完成但不保留上下文（隔离委派），叫不醒
     FAILED = "failed"        # 跑挂了
     CANCELLED = "cancelled"  # 被取消（`Esc` / `/agents cancel` / 会话切换）
     RETIRED = "retired"      # 待命超上限被降级，历史已释放
@@ -147,6 +153,7 @@ class MemberState(Enum):
         不同的判断，见模块 docstring 的「⚠ 与 C13 `TaskStatus` 的关系」。
         """
         return self in (
+            MemberState.DONE,
             MemberState.FAILED,
             MemberState.CANCELLED,
             MemberState.RETIRED,
@@ -167,6 +174,7 @@ TASK_STATE_LABELS = {
 MEMBER_STATE_LABELS = {
     MemberState.RUNNING: "运行中",
     MemberState.IDLE: "待命",
+    MemberState.DONE: "已完成",
     MemberState.FAILED: "失败",
     MemberState.CANCELLED: "已取消",
     MemberState.RETIRED: "已退休",

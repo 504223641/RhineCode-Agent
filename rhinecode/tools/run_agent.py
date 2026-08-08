@@ -142,6 +142,16 @@ class RunAgentTool(Tool):
                     "期望产出什么形式的结论。"
                 ),
             },
+            "name": {
+                "type": "string",
+                "description": (
+                    "给这个队员起的名字（可选，不给则自动生成）。"
+                    "起了名字之后，你和其它队员就能用 send_message 按名字"
+                    "跟它说话——**包括它干完之后**：再发一条消息就能把它"
+                    "从原来的上下文唤醒继续干。"
+                    "名字必须在本次会话内唯一，重名会直接失败。"
+                ),
+            },
             "isolation": {
                 "type": "boolean",
                 "description": (
@@ -214,6 +224,10 @@ class RunAgentTool(Tool):
                 kind, agent_name, task_text, background, parent,
                 plan_stage=plan_stage,
                 isolation=args.get("isolation"),
+                # c15：队员名字。取原值（可能是 None）——`None` 表示
+                # 「由系统起一个」，空串表示模型显式给了个空名字（那是错的，
+                # 由花名册去报）。两者在 `register` 里的分支不同。
+                name=args.get("name"),
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(ok=False, output=f"委派失败：{exc}", summary="委派失败")

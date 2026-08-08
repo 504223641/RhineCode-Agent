@@ -76,12 +76,14 @@ class DelegateOutcome:
     :param text: 回灌给模型的文本
     :param task_id: 任务标识；失败时为 `None`
     :param backgrounded: 是否走了后台（决定工具行显示什么）
+    :param member_name: 队员在协作花名册上的名字（c15）；未启用协作时为空串
     """
 
     ok: bool
     text: str
     task_id: Optional[str] = None
     backgrounded: bool = False
+    member_name: str = ""
 
 
 def resolve_isolation(
@@ -133,12 +135,16 @@ class SubAgentService:
         tool_names_provider,
         max_concurrent: int = MAX_CONCURRENT,
         provision_entries: tuple = (),
+        team=None,
     ) -> None:
         self.catalog = catalog
         self.runtime = runtime
         self.tasks = TaskManager()
         self._tool_names_provider = tool_names_provider
         self._max_concurrent = max_concurrent
+        # c15：协作服务门面。为 `None` 时本章能力整体不启用——
+        # 委派不占名字、队员跑完即结束、没有待命与唤醒（N5 零回归）。
+        self.team = team
         # c14 F10：隔离工作区的环境初始化清单，来自 config.yaml。
         # 缺省为空 = 隔离工作区就是一次纯 checkout。
         self._provision_entries: tuple[ProvisionEntry, ...] = tuple(provision_entries)
@@ -156,6 +162,7 @@ class SubAgentService:
         parent: Optional[ParentSnapshot] = None,
         plan_stage: bool = False,
         isolation: Optional[bool] = None,
+        name: Optional[str] = None,
     ) -> DelegateOutcome:
         """
         发起一次委派（spec F6/F19/F20）。
@@ -170,6 +177,9 @@ class SubAgentService:
             「批准前不动手」，一个能写文件的子 Agent 会直接绕过它
         :param isolation: 本次调用是否要求隔离工作区（c14 F14）。
             与角色声明**单向加严**合并，见 `resolve_isolation`
+        :param name: 队员名字（c15 F1）。`None` 表示由系统按角色名自动生成。
+            **已被占用时委派失败**（F2）——不采用 Claude Code 的「后来者接管」，
+            那会让一条发给某个名字的消息静默送到另一个 Agent 手里
         :returns: `DelegateOutcome`
 
         失败时**不起线程、不发任何 API 请求**——这是 spec F14/F20 的全部价值。
@@ -226,6 +236,20 @@ class SubAgentService:
                     ok=False, text=self._plan_stage_text(kind, agent_name, writable)
                 )
 
+        # ── 协作能力没启用却给了名字（c15）──
+        #
+        # **明确说一句**而不是默默忽略：静默忽略的话，模型接下来会用那个
+        # 名字去发消息，而那个工具压根不存在，它只会更困惑。
+        if self.team is None and name:
+            return DelegateOutcome(
+                ok=False,
+                text=(
+                    "当前没有启用子 Agent 协作能力，因此不能给队员起名字"
+                    "（名字的用途是让队友之间互相发消息）。"
+                    "去掉 name 参数即可正常委派。"
+                ),
+            )
+
         # ── 并发上限 ──
         if self.tasks.running_count() >= self._max_concurrent:
             return DelegateOutcome(
@@ -258,11 +282,39 @@ class SubAgentService:
                 # 谁也想不到根因是隔离静默失效了。
                 return DelegateOutcome(ok=False, text=self._isolation_failed_text(exc))
 
+        # ── 队员命名（c15 F1/F2）──
+        #
+        # ⚠ **位置卡在这里：所有可能失败的校验之后、建任务记录之前。**
+        #
+        # 往前挪（比如挪到并发上限之前）会**泄漏名字**：注册成功之后
+        # 并发超限或工作区创建失败，那个名字就被一个从未存在过的队员
+        # 永久占着了，而用户看到的是「这个名字已被占用」却在 `/agents`
+        # 里找不到任何对应的人。往后挪则任务记录已经建好，命名失败时
+        # 要回滚它——多一条回滚路径就多一处会写错的地方。
+        #
+        # 代价是：名字冲突要等到工作区 checkout 完才报出来。可以接受——
+        # 自动命名永不冲突，只有模型**显式指定**名字时才可能撞上，
+        # 而那是罕见路径。
+        member_name = ""
+        if self.team is not None:
+            role_label = spec.name if spec is not None else BRANCH_AGENT_NAME
+            registration = self.team.register_member(
+                name,
+                role_label,
+                # 花名册要存它：Plan Mode 的 F24 判定靠这个标志，
+                # 而那个判定在 `team` 包里，不能反向依赖 `subagents`。
+                read_only=not self._writable_tools(toolset.allowed),
+            )
+            if not registration.ok:
+                return DelegateOutcome(ok=False, text=registration.reason)
+            member_name = registration.name
+
         record = self.tasks.create(
             kind,
             spec.name if spec is not None else BRANCH_AGENT_NAME,
             task_text,
         )
+        record.member_name = member_name
         if handle is not None:
             record.worktree_path = str(handle.path)
             record.worktree_branch = handle.branch
@@ -284,9 +336,15 @@ class SubAgentService:
         # 在「准备自然结束」时统一处理（见 `agent/gate.py`）。于是并行天然成立。
         return DelegateOutcome(
             ok=True,
-            text=self._started_text(record.task_id, record.agent_name, awaited=record.awaited),
+            text=self._started_text(
+                record.task_id,
+                record.agent_name,
+                awaited=record.awaited,
+                member_name=member_name,
+            ),
             task_id=record.task_id,
             backgrounded=background,
+            member_name=member_name,
         )
 
     def _create_worktree(self, agent_name: str, task_text: str):
@@ -442,7 +500,9 @@ class SubAgentService:
         )
 
     @staticmethod
-    def _started_text(task_id: str, agent_name: str, awaited: bool) -> str:
+    def _started_text(
+        task_id: str, agent_name: str, awaited: bool, member_name: str = ""
+    ) -> str:
         """
         委派成功时回灌给模型的文本。
 
@@ -457,6 +517,18 @@ class SubAgentService:
         ——而本章刻意不提供查询工具（结论是推过去的）。
         """
         head = f"已启动子 Agent {agent_name}，任务标识 {task_id}。"
+        if member_name:
+            # c15：把名字告诉模型，否则它不知道该拿什么去发消息。
+            # **同时说清名字在它干完之后仍然有效**——这句是「唤醒续跑」
+            # 能不能被用起来的关键：少了它，模型想让这个队员再做一件事时
+            # 会重新委派一个新的，背景要重新交代一遍。
+            head += (
+                f"\n它在团队里的名字是 **{member_name}**——"
+                f"用 send_message 按这个名字跟它说话。"
+                f"**这个名字在它干完之后依然有效**："
+                f"再发一条消息就能把它从原来的上下文唤醒继续干，"
+                f"不必重新委派、不必重新交代背景。"
+            )
         if awaited:
             return (
                 f"{head}\n"

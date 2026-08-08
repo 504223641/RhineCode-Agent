@@ -121,6 +121,12 @@ class TaskRecord:
     worktree_path: str = ""
     worktree_branch: str = ""
     worktree_removed: bool = False
+    # c15：这个子 Agent 在协作花名册上的名字（队员名）。
+    #
+    # 与 `agent_name`（角色名）**刻意分开**：同一个角色可以派出多个队员，
+    # 它们角色相同、名字不同。消息投递与任务认领按**这个**名字走。
+    # 未启用协作能力时为空串，`/agents` 据此退回只显示角色名。
+    member_name: str = ""
     # 模型委派时是否声明「这次我要这个结果」（`background=false`，缺省）。
     # 为真时 Agent Loop 在准备自然结束前会停下来等它（见 agent/gate.py）；
     # `background=true` 置假——那是模型明说过不等的，循环不该为它停留。
