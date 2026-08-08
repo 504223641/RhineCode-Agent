@@ -56,7 +56,7 @@ def _runtime(provider, team, registry=None) -> SubAgentRuntime:
     return SubAgentRuntime(
         provider_for=lambda _model: provider,
         registry=registry or ToolRegistry(),
-        engine=PermissionEngine(RuleSet(rules=()), mode=PermissionMode.DEFAULT),
+        engine=PermissionEngine(RuleSet(rules=[]), mode=PermissionMode.DEFAULT),
         main_mode=lambda: PermissionMode.DEFAULT,
         environment_text=lambda _cwd: "",
         default_model="fake",

@@ -189,6 +189,9 @@ class RhineApp(App):
         self._clarify_options: list = []
         # 单轮运行锁：避免多个 Worker 同时修改同一份 conversation history。
         self._stream_active = False
+        # c15 F20：「自动唤起已达上限」只提示一次的标志。
+        # 轮询每 0.5 秒跑一次，不设它会刷满整屏。用户下次提交消息时复位。
+        self._auto_wake_limit_notified = False
         # 「当前不能提交」提示是否已在本次忙碌期显示过（c11 T55）：
         # 进入流式 / 每次新面板弹出时复位，避免用户连按回车刷屏。
         self._busy_hint_shown = False
@@ -503,9 +506,62 @@ class RhineApp(App):
             if finished or running != self._last_subagent_count:
                 self._last_subagent_count = running
                 self._refresh_status()
+            # c15：协作通知（目前只有 N3 降级）与自动唤起判定复用同一次轮询。
+            # **不新增 set_interval** —— 空闲会话的 CPU 占用与 C13/C14 完全相同
+            # （spec N6 的落实方式，见 spec 里那段措辞修订）。
+            for notice in self._manager.team_drain_notices():
+                self.show_message(notice)
+            self._maybe_auto_wake()
         except Exception:
             # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断定时器。
             pass
+
+    def _maybe_auto_wake(self) -> None:
+        """
+        主对话空闲且有队友消息时，自动跑一轮处理它（c15 F17/F20/F21）。
+
+        由 `_poll_subagents` 每 0.5 秒调一次。三个条件全满足才触发：
+
+        1. **主对话空闲** —— 没有流式 Worker 在跑，也没有面板等着人应答；
+        2. 有发给 `main` 的未读消息；
+        3. 自动唤起的连锁次数未达上限。
+
+        ⚠ **第 1 条不可省，且必须排在最前。** 流式 Worker 是 `exclusive=True`
+        的：不判空闲就起新 Worker，会把**正在跑的那个挤掉**——用户正在等的
+        回答凭空消失，而界面上只表现为「AI 说到一半不说了」。
+
+        ⚠ `_pending_interaction` 也要判：确认面板挂着时用户显然在场，
+        这时自动跑一轮会让两个运行争同一个面板。
+
+        副作用：可能启动一条流式 Worker（一次真实的模型调用）；
+        向聊天区追加提示行。
+        """
+        if self._stream_active or self._pending_interaction is not None:
+            return
+        if self._session_panel_active:
+            return
+        if not self._manager.team_has_unread_for_main():
+            return
+
+        if not self._manager.team_can_auto_wake():
+            # ⚠ 只提示一次：本方法每 0.5 秒被调一次，不设标志会刷满整屏。
+            if not self._auto_wake_limit_notified:
+                self._auto_wake_limit_notified = True
+                self.show_message(
+                    f"队友还在发消息，但自动唤起已达上限"
+                    f"（连续 {self._manager.team_auto_wake_limit()} 次）——"
+                    f"先停下来等你回来。说句话就能继续。"
+                )
+            return
+
+        count = self._manager.team_bump_auto_wake()
+        limit = self._manager.team_auto_wake_limit()
+        # F21：用户回来时要能一眼看出「这段是我不在的时候程序自己跑的」。
+        self.show_message(
+            f"⟳ 自动唤起（第 {count}/{limit} 次）——队友发来了消息，"
+            f"主对话在你不在场时自行处理。"
+        )
+        self._start_stream_worker(self._manager.run_auto_wake())
 
     def refresh_status(self) -> None:
         """刷新状态栏（命令处理函数显式调用，取代旧的命令字符串白名单）。"""
@@ -770,6 +826,14 @@ class RhineApp(App):
         # 前者而不触发后者（命令不进 AI），模型自行发起的 fork 子对话则相反。
         # 空输入不算（与 trace 的 `user_input` 同口径：空提交是零副作用的）。
         parsed = parse_input(text)
+        # c15 F20：用户回来了 → 自动唤起的连锁计数清零，
+        # 「已达上限」的提示标志也一并复位，下次达到上限时会重新提示一遍。
+        #
+        # ⚠ 放在**空输入判断之外**：用户敲一个回车也是「人在场」的证据，
+        # 而计数复位是零副作用的。放进 if 里会让「回车 → 发现没恢复」
+        # 成为一种谁都想不到的现象。
+        self._manager.team_reset_auto_wake()
+        self._auto_wake_limit_notified = False
         if parsed.kind != InputKind.EMPTY:
             self._dispatch_hook(
                 HookEventType.USER_MESSAGE,
