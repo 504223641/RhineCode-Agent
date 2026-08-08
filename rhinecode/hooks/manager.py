@@ -180,15 +180,34 @@ class HookManager:
         if cwd:
             self._cwd = cwd
 
-    def _common_fields(self, event: HookEventType) -> dict[str, Any]:
+    def _common_fields(
+        self, event: HookEventType, cwd: Optional[Path] = None
+    ) -> dict[str, Any]:
         """
         构造三个公共字段（spec F2 开头）。
+
+        :param cwd: 本次分发的工作目录（c14）。为 `None` 时取绑定值（主项目根）。
 
         **由本类统一填充，而不是让五个分发点各拼一次**——那是典型的漏改点：
         少填一个 `session_id` 不报错，只是某个事件的负载里悄悄少一个字段，
         而用户写的 `session_id: xxx` 条件从此永不命中。
+
+        ## ⚠ `cwd` 必须跟着触发者走（真实模型实测补的）
+
+        原先它恒等于绑定值（主项目根），于是隔离子 Agent 触发时**命令子进程
+        跑在工作区里、负载里的 `cwd` 却写着主项目根**——两者不一致。
+
+        这不是美观问题：C12 明令「配置里不做任何字符串插值，上下文只经标准输入
+        的 JSON 抵达」，也就是说**负载里的 `cwd` 是 Hook 脚本获取工作目录的唯一
+        正规渠道**。一个照着文档写的「工具写完就跑 lint」的 Hook，会拿着主项目根
+        去 lint，而它本该 lint 子 Agent 刚改的那份。`cwd` 同时还是可写进 `if:`
+        的条件字段，写 `cwd: "*/worktrees/*"` 想区分隔离触发会永远匹配不上。
         """
-        return {"event": event.value, "session_id": self._session_id, "cwd": self._cwd}
+        return {
+            "event": event.value,
+            "session_id": self._session_id,
+            "cwd": str(cwd) if cwd is not None else self._cwd,
+        }
 
     # ------------------------------------------------------------------ #
     # 受保护的埋点漏斗
@@ -331,7 +350,7 @@ class HookManager:
         # 公共字段**后写入，因此覆盖同名的展开字段**（spec F3.2：公共字段优先）。
         # 工具参数里恰好也叫 `cwd` 的情况真实存在，让它盖掉「项目根」会让
         # 一条按项目筛选的条件在某些工具上突然错位。
-        fields.update(self._common_fields(event))
+        fields.update(self._common_fields(event, cwd))
         payload = HookPayload(event, fields)
 
         # 条件求值在锁外：规则不可变、`evaluate` 是纯函数，没有任何共享状态。

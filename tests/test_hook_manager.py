@@ -12,6 +12,7 @@ spec AC12、AC16、AC17、AC18、AC24、AC25、AC27）。
 
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from rhinecode.hooks import HookManager, NullHookManager
@@ -513,6 +514,77 @@ class CommonFieldsTest(unittest.TestCase):
 
         self.assertEqual(seen["cwd"], "/proj")
         self.assertEqual(seen["event"], TURN.value)
+
+    def test_dispatch_cwd_overrides_the_bound_one(self):
+        """
+        c14：传了 `cwd` 的分发，负载里的 `cwd` 必须是它，不是绑定值。
+
+        ## 为什么这条要紧（真实模型实测补的）
+
+        C12 明令「配置里不做任何字符串插值，上下文只经标准输入的 JSON 抵达」
+        ——**负载里的 `cwd` 因此是 Hook 脚本获取工作目录的唯一正规渠道**。
+        原先它恒等于绑定值，于是隔离子 Agent 触发时出现「命令子进程跑在工作区、
+        负载却写着主项目根」的分裂：一个「工具写完就跑 lint」的 Hook 会拿着
+        主项目根去 lint，而它本该 lint 子 Agent 刚改的那份。
+        `cwd` 还是能写进 `if:` 的条件字段，分裂会让 `cwd: "*/worktrees/*"` 永不命中。
+        """
+        seen = {}
+
+        def fake(action, payload, client_factory=None, cwd=None):
+            seen.update(payload.fields)
+            return ActionOutcome(ok=True)
+
+        patcher = mock.patch.object(hook_manager, "run_action", side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        m = HookManager([_rule("r", event=TURN)])
+        m.bind_context(session_id="s", cwd="/proj")
+        m.dispatch(TURN, lambda: {"scope": "main"}, Path("/proj/.rhinecode/worktrees/w1"))
+
+        self.assertEqual(seen["cwd"], str(Path("/proj/.rhinecode/worktrees/w1")))
+
+    def test_dispatch_without_cwd_keeps_the_bound_one(self):
+        """反证：不传 `cwd` 的分发（会话级/回合级）逐字维持既有行为，零回归。"""
+        seen = {}
+
+        def fake(action, payload, client_factory=None, cwd=None):
+            seen.update(payload.fields)
+            return ActionOutcome(ok=True)
+
+        patcher = mock.patch.object(hook_manager, "run_action", side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        m = HookManager([_rule("r", event=TURN)])
+        m.bind_context(session_id="s", cwd="/proj")
+        m.dispatch(TURN, lambda: {"scope": "main"})
+
+        self.assertEqual(seen["cwd"], "/proj")
+
+    def test_dispatch_cwd_still_wins_over_expanded_tool_param(self):
+        """
+        传了 `cwd` 时，它同样要盖过工具参数里同名的 `cwd`。
+
+        单独立一条是因为这两件事在实现上是**同一个赋值**，很容易在将来某次
+        重构里被拆开——拆开后「公共字段优先」只对绑定值成立，对分发值不成立，
+        而那种错位一条断言都不会红。
+        """
+        seen = {}
+
+        def fake(action, payload, client_factory=None, cwd=None):
+            seen.update(payload.fields)
+            return ActionOutcome(ok=True)
+
+        patcher = mock.patch.object(hook_manager, "run_action", side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        m = HookManager([_rule("r", event=TURN)])
+        m.bind_context(session_id="s", cwd="/proj")
+        m.dispatch(TURN, lambda: {"cwd": "/tool/param"}, Path("/wt"))
+
+        self.assertEqual(seen["cwd"], str(Path("/wt")))
 
     def test_bind_context_keeps_unset_fields(self):
         m = HookManager([])
