@@ -208,7 +208,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **新增「会话切换」入口（`/clear` / `/resume` 之外的第三条）→ 必须走 `cancel_all_for_session_switch`（c13/c15）** → 它一个方法里做**两件事**：取消还在跑的 + `tasks.begin_session()` 开新的会话代。只做前一件不报错，但**上一段对话里已经跑完、还没交付的结论会流进新对话**——`take_deliverables` 的判据是「终态且未交付」，压根不看这条任务属于哪一段对话。真实模型撞到过：`/clear` 之后模型坚称上一段的子 Agent 还在跑、一次委派都没发起，trace 上的物证是清空后第一轮请求「消息 3 条」（本该只有用户那 1 条）。⚠ **别改成「切换时把当前任务标成已交付」**：取消是异步的，被取消的子 Agent 可能在切换返回之后才走到终态，那种写法覆盖不到它；代号盖在**创建**那一刻才与时机无关。⚠ C15 的待命队员让这条路径成了**常态**——清空会唤醒它们让线程退出，那恰好把它们变成「终态且未交付」。护栏见 `tests/test_clear_stale_deliverables.py`（含「切换之后才跑完」的时序反证，以及「新会话里的结论照常送达」的反向反证）
 - **子 Agent 每一种「开始运行」都要经 `_emit_start`（c15）** → `subagents/runner.py` 现在有**两个**调用点：首轮委派与**被消息唤醒的续跑轮**（`kind=wake`）。**漏一个不报错**，只是记录里出现「一条 `subagent_end` 找不到对应的 start」——真实模型验收撞到过：一个队员被叫醒两次，时间线上 1 条 start 配 3 条 end，而 `_next_round_record` 每轮发新 `task_id`，读的人对不上号。比对不上号更要紧的是**那一轮的运行条件（工具集 / 权限档 / 工作目录）一处都没记**。抽成一份函数正是为了防同一个坑的下一次：两处各拼一次负载的话，将来给 start 加字段必然只加到一处。护栏见 `tests/test_team_wake.py::WakeTraceTest`（含「不能只补空壳事件让计数配平」的第二条）
 - **给 `screen` 加取文本的路径 → 先拆包、再判断是不是 Rich 可渲染对象（c15 设施）** → `tests/e2e/control.py` 的 `_plain_text_of` / `_painted_text_of`。两个坑都实测过：① **`RichVisual` 不是 Rich 可渲染对象**，丢给 `console.print` 不报错、Rich 用 `Pretty` 打出它的 repr，于是「捕获成功」而内容是 `RichVisual(Static(), <Group object at 0x…>)`——**一个看起来像内容的字符串**，判据若是 `assertNotIn` 会**通过**（观测设施返回 repr 比返回空串危险得多，所以取不出来一律返回空串）；② **`Input` / `OptionList` 按行绘制**（实现 `render_line` 而不是 `render()`），它们的 `render()` 返回 Panel 外壳，只看 `render()` 会拿到一串 `╭───────`。因此逐行读优先，并分出 `text`（画出来的、会折行）与 `content`（逻辑内容、不折行）两份——**内容断言必须用后者**，否则会失败在折行位置这种与判据无关的地方
-- **trace 埋点新增字段 → 同步 `trace/reader.py` 的摘要函数** → 新字段若不进摘要行，读时间线的人就看不见它，只有 `--seq` 展开才发现「原来早就记了」。**漏改不报错**，代价是那个字段等于白记。本轮加的四项都进了摘要：`permission_decision.ask_downgraded`（标 ⚠ASK已降级）、`subagent_start` 的 `member`/`isolated`/`permission_mode`、`worktree_create.path`。判断标准是「排查时第一眼要不要看到它」——要就进摘要行，不要就只留在负载里（`tool_execute.cwd` 就没进，它每条都一样、进去只会挤掉真正有信息量的部分）
+- **trace 埋点新增字段 → 同步 `trace/reader.py` 的摘要函数** → 新字段若不进摘要行，读时间线的人就看不见它，只有 `--seq` 展开才发现「原来早就记了」。**漏改不报错**，代价是那个字段等于白记。本轮加的四项都进了摘要：`permission_decision.mode_downgraded`（标 ⚠④层已降级）、`subagent_start` 的 `member`/`isolated`/`permission_mode`、`worktree_create.path`。判断标准是「排查时第一眼要不要看到它」——要就进摘要行，不要就只留在负载里（`tool_execute.cwd` 就没进，它每条都一样、进去只会挤掉真正有信息量的部分）
 - **写多 Agent（C13/C15）的端到端剧本 → 必须用 `ScopedScriptedProvider`，且等待要用 `--until quiescent`** → `tests/e2e/scripted.py` + `tests/e2e/control.py`。两处都是「用错了不报错、只是判据变成竞态的」：①`ScriptedProvider` 按**全局调用序号**取轮次，而队员并发跑，同一份剧本每次跑可能对应到不同 Agent 身上；②`wait` 缺省的 `terminal` 只看界面，后台委派在跑或有消息等自动唤起时界面照样 `idle`，一秒后又忙起来。**竞态判据比没有判据更坏——它偶尔通过。** 另：剧本里作用域键取的是 `run_agent` 的 `name`（队员名）**不是角色名**，同一个角色可以派出多个队员。护栏见 `tests/test_e2e_team_scripts.py`
 - **改动发消息工具的描述或注入消息的标记块（c15）** → `tools/send_message.py` 的 `description` + `team/render.py` 的 `render_incoming`。**两处必须同口径**（你的正文别人看不到 / 消息自动送达不必查收 / 按名字指代 / 名字在它干完之后依然有效）——模型在**两个不同时刻**读到同一条约定：发消息前读工具描述、收消息时读标记块，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单 ↔ `run_agent.description`」、C14 的「交付信息 ↔ 委派工具描述」是**同一个坑的第四次**，前三次都是真实模型实测才发现的。护栏见 `tests/test_team_tools.py::SameVoiceTest`
 - **任务的 `blocked_by` 与 `blocks` 是双向冗余存储（c15）** → `team/board.py` 的 `add_dependency` / `remove` 两处都要成对维护。只存一边的话每次列清单都要遍历全表反查，而清单是每个队员每一轮都可能读的高频操作。⚠ `remove` 漏摘反向引用的后果最隐蔽：留下**指向不存在任务的悬空依赖**，而 `is_blocked` 把查不到的前置按「未完成」处理——那条任务**再也认领不了**，且清单上显示的阻塞来源是一个查无此条的编号
@@ -337,7 +337,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 2322 项，skipped 4
+python -m unittest discover -s tests      # 2323 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -439,7 +439,14 @@ python -m unittest discover -s tests      # 2322 项，skipped 4
   ① **协作工具不弹确认面板**（`system_serial=True`，与 `run_agent` / `load_skill`
   同先例）。它们不读写文件、不执行命令，副作用限于改本进程内存里的清单与信箱，
   没有可映射的 Bash / Read / Edit / Write 语义。
-  它们**仍然过一次 `engine.decide`**，只是判 ASK 时按 ALLOW 处理（不弹面板）。
+  它们**仍然过一次 `engine.decide`**，只是**对第④层（权限档兜底）整层免疫**
+  ——④判 ASK 或 DENY 都按放行处理（不弹面板、也不被 `/perm 严格` 关掉）。
+  ⚠ **`/perm 严格` 不是关掉它们的手段**：④对这七个工具而言不是「灰色地带更
+  谨慎」而是「功能整个关掉」（它们走 `other` 分支，③层绝大多数情况不表态，
+  ④是唯一会说话的那一层）。实测代价：内置 `explorer` / `planner` 声明
+  `permission_mode: strict`，而引擎有只读短路（只读工具不进④层），于是
+  `strict` 对它们做的**唯一**一件事就是关掉协作——真实模型下 `explorer` 调
+  `send_message` 被④层拒、白烧一轮还要在结论里解释一遍。
   因此想整个禁掉它们，写 `deny: send_message` / `deny: task_*` 即可
   ——⚠ 必须是**不带括号**的整工具形式，`deny: send_message(*)` 不命中
   （它们落 `other` 分支，那个分支只认空模式，这是 c7 起的既有语义）。
@@ -621,24 +628,37 @@ python -m unittest discover -s tests      # 2322 项，skipped 4
     自己关掉了委派能力，实际没有，且界面上完全看不出来。
     **错误的安全承诺比没有承诺更危险。**
 
-    修法：那七个工具现在**照常过一次 `engine.decide`**，但**判 ASK 时按 ALLOW
-    处理**——保住「这类工具不弹确认面板」这条既有性质（它们可能开一整条子对话，
-    在预扫处停下来等面板会把交互链拧成死结）。净效果只有一条：**DENY 现在拦得住了**。
+    修法：那七个工具现在**照常过一次 `engine.decide`**，但**对第④层整层免疫**
+    ——④判 ASK 或 DENY 一律按放行处理。保住「这类工具不弹确认面板」这条既有性质
+    （它们可能开一整条子对话，在预扫处停下来等面板会把交互链拧成死结）。
+    净效果只有一条：**来自①②③的 DENY 现在拦得住了**。
     Hook 的 ASK 仍照常升级为面板：④是灰色地带的兜底，而 Hook 的 ASK 是用户针对
     这件事写下的规则，两者刻意区别对待。
+
+    ⚠ **「④层免疫」是 `perm-system-serial-mode-immune` 一轮补的，初版只降级 ASK。**
+    初版在严格档下把这七个工具全关了，而那**没人打算要**：引擎有一条只读短路
+    （只读工具在③未命中时直接放行、不进④层），于是内置 `explorer` / `planner`
+    声明的 `strict` 唯一的实际效果就是关掉协作工具——全是代价、零收益。
+    真实模型实测：`explorer` 调 `send_message` 拿到 `deny（④模式）`，白烧一轮，
+    还要在结论里向用户解释一遍。那与 C15 已修过一次的「只读角色一个协作工具都
+    拿不到」是同一个用户可见症状，只是卡在另一层（那次是工具集，这次是权限档）。
 
     ⚠ 规则必须写成**不带括号**的整工具形式。这些工具落 `other` 分支，
     那个分支只认空模式——`deny: send_message` 生效，`deny: send_message(*)` 不生效
     （c7 起的既有语义，非本次引入）。工具名通配照常可用：`deny: task_*`。
 
     trace 侧同步：原先标「绕过引擎」的 `bypassed_engine` 字段随之作废，
-    换成 **`ask_downgraded`**（阅读器标 ⚠ASK已降级）。不换的话那个字段会恒为假、
-    阅读器的记号永不出现；而 ASK 被降级这件事**必须可见**——只记
+    换成 **`mode_downgraded`**（阅读器标 ⚠④层已降级）。不换的话那个字段会恒为假、
+    阅读器的记号永不出现；而④层结论被降级这件事**必须可见**——只记
     `allow（④模式）` 的话，读的人会以为用户切到了放行档。
+    ⚠ 字段名一度叫 `ask_downgraded`，随「④层整层免疫」改名——被降级的不再只有 ASK，
+    严格档下降级的是 **DENY**，那更需要看得见。
 
     护栏：`tests/test_perm_system_serial.py`（遍历七个工具逐个断言 deny 命中）、
     `tests/test_team_tools.py::SystemSerialPermissionTest`（deny 生效 / 仍不弹面板 /
-    Hook 仍能拦 / Hook 的 ASK 仍弹面板）、`tests/test_trace_system_serial.py`
+    Hook 仍能拦 / Hook 的 ASK 仍弹面板 / **严格档不再关掉它们** /
+    **严格档 + ③层 deny 同时成立时仍拦得住**——最后那条是分辨力所在，
+    没有它「④层免疫」与「一律放行」看不出区别）、`tests/test_trace_system_serial.py`
     （每条 tool_execute 前都有判定 + 降级可见）。
 
 19. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、

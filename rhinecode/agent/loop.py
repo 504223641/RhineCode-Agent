@@ -1121,22 +1121,45 @@ class Agent:
             # 规则会以为自己关掉了委派能力，实际没有，且界面上完全看不出来。
             # **错误的安全承诺比没有承诺更危险。**
             #
-            # ⚠ **ASK 按 ALLOW 处理，这一条不可省。** 这类工具不弹确认面板是
-            # `system_serial` 存在的理由之一：它可能开一整条子对话，让它在这里
-            # 停下来等一个面板会把交互链拧成死结。而它们全都不在 `_TOOL_MAP` 里、
-            # 走 `other` 分支，因此在缺省档下③层未命中时必然拿到④模式层的 ASK
-            # ——不降级的话，一次普通的 `send_message` 就会弹面板，等于把这次改动
-            # 从「让 deny 生效」变成「给七个工具全加上人在回路」。
+            # ⚠ **它们对第④层（权限档兜底）免疫，这一条不可省。**
             #
-            # 于是这个分支的净效果**只有一条**：DENY 现在拦得住了。
-            # ALLOW 与 ASK 的观感与改造前逐字一致（都是执行、都不弹面板）。
+            # 判据是**层**，不是决策取值：只要结论来自 `Layer.MODE`，无论 ASK
+            # 还是 DENY 一律按 ALLOW 处理。①黑名单、②沙箱、③规则、Hook 一字不动。
+            #
+            # 为什么是「整层免疫」而不是原先的「只降级 ASK」——两条理由：
+            #
+            # **一、④层对这七个工具而言不是「灰色地带更谨慎」，是「功能整个关掉」。**
+            # 它们全都不在 `_TOOL_MAP` 里、走 `other` 分支，只认不带括号的整工具
+            # 规则，因此③层绝大多数情况下压根不表态——④是**唯一会说话的那一层**。
+            # 缺省档下它给 ASK（不降级就等于给七个工具全加上人在回路，交互链会被
+            # 一条可能开子对话的工具拧死）；**严格档下它给 DENY**，那就是把委派、
+            # Skill 加载、以及全部协作能力一次性关掉。
+            #
+            # **二、只降级 ASK 会造成一处实测到的、没人打算要的后果。**
+            # 内置的 `explorer` / `planner` 声明 `permission_mode: strict`，
+            # 而 `engine` 有一条只读短路（`is_read_only` 在③未命中时直接放行、
+            # **不进④层**）。于是那两个角色手上唯一会走到④层的东西，恰恰就是
+            # C15 F22 特意豁免给它们的协作工具——`strict` 对它们做的**唯一**一件事
+            # 就是关掉协作，别的什么都没管。真实模型实测：`explorer` 调
+            # `send_message` 拿到 `deny（④模式）严格模式：无规则放行，默认拒绝`，
+            # 白烧一轮，还要在结论里向用户解释一遍。那与 C15 已经修过一次的
+            # 「只读角色一个协作工具都拿不到」是同一个用户可见症状，只是卡在另一层。
+            #
+            # 于是这个分支相对「绕过引擎」那一版的净效果仍然**只有一条**：
+            # **DENY 现在拦得住了**——但那个 DENY 必须来自用户写下的规则（③）
+            # 或安全底线（①②），不能来自权限档兜底（④）。
+            # 想整个关掉它们，写 `deny: run_agent` / `deny: send_message`
+            # （⚠ 不带括号的整工具形式）；`/perm 严格` 不是、也从来不是这个用途。
             if tool.system_serial:
                 request = to_request(tool, tc.arguments, engine.mode, cwd)
                 raw = engine.decide(request)
-                # DENY 原样保留（含①黑名单、②沙箱——虽然 `other` 类请求走不到
-                # 那两层，这里不写特例是为了「引擎说拒就是拒」这条不留缺口）。
-                ask_downgraded = raw.decision == Decision.ASK
-                if raw.decision == Decision.DENY:
+                # ④层的结论一律降级为放行；其余层的 DENY 原样保留
+                # （含①黑名单、②沙箱——虽然 `other` 类请求走不到那两层，
+                #  这里不写特例是为了「引擎说拒就是拒」这条不留缺口）。
+                mode_downgraded = (
+                    raw.decision != Decision.ALLOW and raw.layer is Layer.MODE
+                )
+                if raw.decision != Decision.ALLOW and not mode_downgraded:
                     system_decision = raw
                 else:
                     system_decision = DecisionResult(
@@ -1144,8 +1167,8 @@ class Agent:
                         raw.layer,
                         (
                             f"系统级工具（system_serial）：{raw.reason}；"
-                            "该结论按放行处理，不弹确认面板"
-                        ) if ask_downgraded else raw.reason,
+                            "该结论来自权限档兜底，对这类工具不生效，按放行处理"
+                        ) if mode_downgraded else raw.reason,
                         kind=raw.kind,
                         host=raw.host,
                     )
@@ -1161,9 +1184,11 @@ class Agent:
                 # 绕过已经修掉，但埋点要留下，理由变成两条：
                 # ① 通用不变量「每一次 tool_execute 前面都有一条同 id 的判定」
                 #    靠它成立（护栏见 `tests/test_trace_system_serial.py`）；
-                # ② **ASK 被降级这件事必须可见**。不记的话时间线上只会看到
+                # ② **④层结论被降级这件事必须可见**。不记的话时间线上只会看到
                 #    `allow（④模式）`，读的人会以为用户切到了放行档——
-                #    观测设施撒谎且不报错。
+                #    观测设施撒谎且不报错。严格档下降级的是 **DENY**，
+                #    那更需要看得见：读的人得能分清「引擎放行了」与
+                #    「引擎拒了但这类工具对该层免疫」。
                 self._safe_emit(
                     TraceEventType.PERMISSION_DECISION,
                     tool=tc.name,
@@ -1175,9 +1200,12 @@ class Agent:
                     decision=system_decision.decision.value,
                     layer=system_decision.layer.value,
                     reason=system_decision.reason,
-                    # 「引擎判了 ASK，但因为是系统级工具而按 ALLOW 执行了」。
-                    # 阅读器据此在时间线上标记，见 `trace/reader.py`。
-                    ask_downgraded=ask_downgraded,
+                    # 「引擎在④模式层判了 ASK 或 DENY，但因为是系统级工具、
+                    #  对该层免疫而按 ALLOW 执行了」。阅读器据此在时间线上标记，
+                    #  见 `trace/reader.py`。⚠ 字段名从 `ask_downgraded` 改成
+                    #  `mode_downgraded` 是因为被降级的**不再只有 ASK**——
+                    #  留着旧名字会让「严格档下 DENY 被降级」这件事记不出来。
+                    mode_downgraded=mode_downgraded,
                     cwd=str(request.cwd) if request.cwd is not None else None,
                 )
                 serial.append((
@@ -1242,10 +1270,10 @@ class Agent:
                 # 记了之后，一条 `scope=subagent:worker` 却 `cwd=<主项目根>`
                 # 的记录本身就是结论。
                 cwd=str(request.cwd) if request.cwd is not None else None,
-                # 普通工具永远不降级：判 ASK 就是弹面板。
+                # 普通工具永远不降级：④层判 ASK 就是弹面板、判 DENY 就是拒绝。
                 # 这个常量 False 是有意义的对照——没有它，把标记写成常量 True
                 # 也能让系统级工具那条护栏通过，标记随即失去意义。
-                ask_downgraded=False,
+                mode_downgraded=False,
             )
             # 升级已在埋点之前完成（见上方说明）。这里只做分桶：
             # 升级后的调用必须走串行桶弹面板，不能留在只读并发桶里。

@@ -458,17 +458,50 @@ class SystemSerialPermissionTest(unittest.TestCase):
         self.assertTrue(delivered)
         self.assertEqual(asked, 0, "system_serial 工具不弹确认面板")
 
-    def test_strict_mode_denies_it(self) -> None:
+    def test_strict_mode_does_not_disable_it(self) -> None:
         """
-        严格档的④模式层判 DENY，而 DENY **不**降级——只有 ASK 降级。
+        ⚠ **本条的结论在 `perm-system-serial-mode-immune` 一轮被刻意反转。**
 
-        没有这条的话，把降级写成「非 DENY 一律放行」与「一律放行」
-        看不出区别。
+        原文断言「严格档的④层判 DENY，必须拦住」。现在这七个工具**对第④层
+        整层免疫**：无论 ASK 还是 DENY，只要结论来自权限档兜底就按放行处理。
+
+        反转的理由是一次真实模型实测：内置的 `explorer` / `planner` 声明
+        `permission_mode: strict`，而引擎有一条只读短路（只读工具在③未命中时
+        直接放行、**不进④层**）。于是那两个角色手上唯一会走到④层的东西，
+        恰恰就是 C15 F22 特意豁免给它们的协作工具——`strict` 对它们做的
+        **唯一**一件事就是关掉协作，别的什么都没管。实测 `explorer` 调
+        `send_message` 拿到 `deny（④模式）`，白烧一轮，还要在结论里向用户
+        解释一遍。那与 C15 已经修过一次的「只读角色一个协作工具都拿不到」
+        是同一个用户可见症状，只是卡在另一层。
+
+        **要整个关掉它们，用 `deny: send_message`（③层），不是 `/perm 严格`。**
+        下一条用例钉住那条路仍然通。
         """
         from rhinecode.permission.models import PermissionMode
 
         executed, delivered, asked = self._run_once([], mode=PermissionMode.STRICT)
-        self.assertFalse(executed, "严格档下④层判 DENY，必须拦住")
+        self.assertTrue(executed, "④层对 system_serial 工具不生效")
+        self.assertTrue(delivered)
+        self.assertEqual(asked, 0, "仍然不弹确认面板")
+
+    def test_deny_rule_still_bites_under_strict_mode(self) -> None:
+        """
+        **上一条的反证，且是本类里分辨力最强的一条。**
+
+        严格档**加**一条③层 deny 规则同时成立时，必须仍然被拦住。
+
+        没有这条的话，「④层免疫」与「一律放行」看不出区别——而那正是
+        `perm-system-serial-bypass` 那轮修掉的缺陷（`deny: send_message`
+        一条都不生效）。两条合起来才说明降级**只**发生在④层。
+        """
+        from rhinecode.permission.models import PermissionMode
+        from rhinecode.permission.rules import Rule
+
+        executed, delivered, asked = self._run_once(
+            [Rule(effect="deny", tool="send_message", pattern="", source="test")],
+            mode=PermissionMode.STRICT,
+        )
+        self.assertFalse(executed, "③层的 deny 规则不受④层免疫影响")
         self.assertFalse(delivered)
         self.assertEqual(asked, 0)
 

@@ -129,13 +129,17 @@ _LAYER_NAMES = {
 
 def _s_permission_decision(r: dict) -> str:
     layer = str(r.get("layer"))
-    # `ask_downgraded` = 权限引擎判了 ASK，但因为是 `system_serial` 工具而
-    # **按放行执行、没弹确认面板**（那七个工具：`run_agent` / `load_skill` +
-    # C15 的五个协作工具）。
+    # `mode_downgraded` = 权限引擎在**第④层（权限档兜底）**判了 ASK 或 DENY，
+    # 但因为是 `system_serial` 工具、对该层免疫而**按放行执行**（那七个工具：
+    # `run_agent` / `load_skill` + C15 的五个协作工具）。
     #
     # 不标的话时间线上只剩一条 `allow（④模式）`，读的人会以为用户切到了放行档
-    # ——观测设施撒谎且不报错。缺省档下这才是那七个工具的常态。
-    mark = "⚠ASK已降级 " if r.get("ask_downgraded") else ""
+    # ——观测设施撒谎且不报错。缺省档下这是那七个工具的常态（④判 ASK）；
+    # **严格档下被降级的是 DENY**，那更需要看得见：读的人得能分清
+    # 「引擎放行了」与「引擎拒了但这类工具对该层免疫」。
+    #
+    # ⚠ 字段名从 `ask_downgraded` 改过来是因为被降级的不再只有 ASK。
+    mark = "⚠④层已降级 " if r.get("mode_downgraded") else ""
     return (
         f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"

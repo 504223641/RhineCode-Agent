@@ -329,7 +329,42 @@ impl-worker → main          任务2完成
 
 S5 是**刻意保留记录**那个决定的直接验证：丢弃的是「交付资格」，不是记录本身。
 
-### ⚠ 同一轮里发现的一个**新问题**（非本轮改动引入，未修）
+### 第二轮合并复验（④层免疫修完之后，八个场景）
+
+第一轮那次抓出了「严格档关掉协作工具」。修完之后重跑，并补两个**必须同时存在**
+的新场景（282 条 trace 事件，预置换成 `seed_subagents_with_deny`——它在
+`seed_subagents` 之上加一条项目级 `deny: task_create`）：
+
+| # | 场景 | 结果 |
+| --- | --- | --- |
+| S1–S6 | 同上一轮 | ✅ 全部复现（Esc 提示「仍有 2 个」= 实际 2；Esc 后子 Agent 仍产生 **79 条**事件；结论 2 块 task_id 去重后仍 2；`/clear` 后请求只有 `user`+`system`；`/agents` 仍显示清空前的 `716c33`/`42cff4`） |
+| **S7** | 严格档只读角色发消息 | ✅ ④层免疫，消息真的送达 |
+| **S8** | 同一个角色调被 deny 的工具 | ✅ ③层照常拦住 |
+
+**S7 与 S8 必须在同一次运行、同一个子 Agent 上才有分辨力**——只有 S7 的话，
+「④层免疫」与「一律放行」看不出区别，而后者正是 `perm-system-serial-bypass`
+修掉的那个缺陷。实测把两者摆在一起：
+
+```
+seq=248  subagent:explorer-2  task_create   → deny  (rule)  mode_downgraded=False
+         命中 deny 规则 task_create（来源：project）
+         tool_execute → outcome=denied_by_permission  ok=False
+
+seq=262  subagent:explorer-2  send_message  → allow (mode)  mode_downgraded=True
+         系统级工具（system_serial）：严格模式：无规则放行，默认拒绝；
+         该结论来自权限档兜底，对这类工具不生效，按放行处理
+         tool_execute → outcome=executed  ok=True
+seq=263  team_message  sender=explorer-2        ← 消息真的送达
+seq=237  subagent_start  agent=explorer  permission_mode=strict
+```
+
+同一个严格档子 Agent、同一类工具、同一次运行——一个被③层拦住，一个对④层免疫。
+这正是修法要的那条线。
+
+预置写成一个可复用的 seed（`tests/e2e/scripts.py::seed_subagents_with_deny`）
+而不是临时脚本，因为这条判据以后每次动权限管线都该重跑一遍。
+
+### ⚠→✅ 同一轮里发现的一个**新问题**（非本轮改动引入，已修）
 
 `explorer` 的结论里有一句自述：「send_message 被拒绝了」。查判定：
 
@@ -353,6 +388,46 @@ seq=83  scope=subagent:retry-limit-exp  decision=deny  layer=mode
 协作能力一起关掉了。改动本身是对的（`deny: send_message` 必须真的生效），
 问题在于「严格档」与「协作工具豁免」两条规则相遇时没人定过优先级。
 
-**未修**——它是设计决策，不是显然的 bug：要么让协作工具在④层也豁免
-（那 `/perm` 严格档就管不住它们了），要么承认「严格档的角色不能协作」
-并把这一点写进内置角色的说明里。**登记待议。**
+**修法（用户拍板方案 A）**：`system_serial` 工具**对第④层整层免疫**——
+④判 ASK 或 DENY 一律按放行处理，①黑名单 / ②沙箱 / ③规则 / Hook 一字不动。
+
+三条理由：
+
+1. **它让实现与一句已经写下的承诺对齐。** `CLAUDE.md` 里 PR #24 那条写着
+   「净效果只有一条：**DENY 现在拦得住了**」——实测净效果不止一条，
+   它还顺带让严格档关掉了这七个工具。
+2. **④层对这七个工具不是「灰色地带更谨慎」，是「功能整个关掉」。**
+   它们走 `other` 分支、只认不带括号的整工具规则，③层绝大多数情况下不表态
+   ——④是**唯一会说话的那一层**。
+3. **`strict` 在那两个内置角色上全是代价、零收益。** 引擎有一条只读短路
+   （`is_read_only` 在③未命中时直接放行、**不进④层**，见 `engine.py:281`），
+   而 `explorer` 声明的工具全是只读——它手上唯一会走到④层的东西，
+   恰恰就是 F22 特意豁免给它的协作工具。
+
+**判据的分辨力在哪**：新增 `test_deny_rule_still_bites_under_strict_mode`——
+严格档**加**③层 deny 规则同时成立时必须仍被拦住。没有它，「④层免疫」与
+「一律放行」看不出区别，而后者正是 PR #24 修掉的那个缺陷。
+反证实跑过：把降级改成「不看层」，3 条用例当场红。
+
+trace 字段随之从 `ask_downgraded` 改名 `mode_downgraded`（阅读器标
+⚠④层已降级）——被降级的不再只有 ASK，**严格档下降级的是 DENY，那更需要
+看得见**：读的人得能分清「引擎放行了」与「引擎拒了但这类工具对该层免疫」。
+
+**真实模型复验**（同一条链路，让 `explorer`——严格档的内置只读角色——
+必须先 `send_message` 再交结论）：
+
+```
+seq=17  subagent_start  agent=explorer  permission_mode=strict
+seq=42  permission_decision  ⚠④层已降级 send_message → allow（④模式）
+        系统级工具（system_serial）：严格模式：无规则放行，默认拒绝；
+        该结论来自权限档兜底，对这类工具不生效，按放行处理
+seq=43  team_message  sender=explorer          ← 消息真的送达了
+        tool_execute send_message → outcome=executed
+```
+
+修复前同一个位置是 `decision=deny layer=mode`，模型白烧一轮还要在结论里
+向用户解释一遍。
+
+⚠ 同一份记录还**坐实了上面第 3 条理由**：同一个 strict 子 Agent 里，
+`grep_content` / `read_file` 走的是 `allow（③规则）· 只读工具默认放行`
+——**根本没进④层**。所以 `strict` 对 `explorer` 确实只管了协作工具那一件事。
