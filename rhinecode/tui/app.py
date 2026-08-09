@@ -769,7 +769,19 @@ class RhineApp(App):
         if self._stream_active:
             if event.key == "escape":
                 event.stop()
-                self._manager.request_cancel()
+                # 返回值是「这次没被停下来的」子 Agent 条数。
+                #
+                # `Esc` 的语义是「我不等了」而不是「全停」（C13 契约：委派永不阻塞），
+                # 子 Agent 线程会照常跑到底——真实验收里它在 Esc 之后又跑了 7 轮、
+                # 写文件、提交、留下一个工作区。语义保持不变，但**必须把话说清**，
+                # 否则用户以为已经停了，而后台还在烧 token、还在往项目里写。
+                remaining = self._manager.request_cancel()
+                if remaining:
+                    self.show_message(
+                        f"已请求取消当前回合。⚠ 仍有 {remaining} 个子 Agent 在后台运行"
+                        f"——Esc 只停主对话，不会停它们。"
+                        f"要一并停止请用 /agents cancel all。"
+                    )
             return
 
         # 3. 命令面板导航

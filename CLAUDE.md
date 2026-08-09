@@ -295,6 +295,12 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
 
+⚠️ **`Esc` 的语义是「我不等了」，不是「全停」**：它只停主对话，**不会取消正在跑的子 Agent**
+（那是 C13「委派永不阻塞」的契约——`background=true` 那些是模型明说过不等的）。
+按下时若还有子 Agent 在跑，界面会明确提示还剩几个、并告诉你用 `/agents cancel all` 停它们。
+不提示的话用户会以为已经停干净了，而后台还在烧 token、**非隔离的那些还在往主项目根写**
+（真实验收里 `Esc` 之后子 Agent 又跑了 7 轮、写文件、提交、留下一个工作区）。
+
 ## 配置
 
 完整字段、层级与首次运行的模板生成流程见
@@ -330,7 +336,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 2312 项，skipped 4
+python -m unittest discover -s tests      # 2316 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」

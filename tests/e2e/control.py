@@ -995,7 +995,18 @@ class DriverCore:
         return protocol.ok(data)
 
     def cancel(self) -> dict:
-        """请求取消当前的 Agent 循环（等价于真人按 Esc）。"""
+        """
+        请求取消当前的 Agent 循环（等价于真人按 Esc）。
+
+        ⚠ **「等价」指的是领域效果，不含界面反应**：本方法直调
+        `manager.request_cancel()`，绕过 `tui/app.py` 的按键处理，因此
+        **不会**产生真人按 Esc 时那条「仍有 N 个子 Agent 在后台运行」的提示。
+        要验那条提示，走 `keys escape`（模拟按键的完整路径）。
+
+        这个差别本身是**刻意**的（`cancel` 要在忙碌态下也能可靠送达，
+        而按键要经过焦点与面板优先级），但它必须写在这里——
+        观测设施与产品行为的每一处分叉都得可见，否则分叉处恰恰会被当成验收依据。
+        """
         with self._lock:
             self._last_action = "cancel"
         manager = self.build_result.manager
