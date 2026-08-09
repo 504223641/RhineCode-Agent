@@ -203,6 +203,9 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 启动接线中 `LoadSkillTool` 必须在算 `known_tools` **之前**注册，且整段 Skill 校验必须夹在 `MCPAddServerTool` 注册之后、`connect_all` 之前（两头都不能挪，理由见 `__main__.py` 注释）
 - 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
 - **任何往 markup 串里嵌纯文本的地方，一律用 `tui/widgets.py` 的 `escape`，绝不要 `from rich.markup import escape`**：rich 那版只转义「看起来像完整标签」的 `[...]`（正则要求闭合的 `]`），因此**被截断的括号会被它整个放过**；而 Textual 的 Content markup 比 Rich 严格，会把落单的 `[` 当标签开头并抛 `MarkupError`——抛出点在 `OptionList.get_content_height` 这类**布局阶段的主线程**调用里，不在业务调用栈上，没有任何 try/except 兜得住，**Textual 直接拆掉整个 app、程序退出**。真实现场：`summarize_args` 先截断后转义，把 `allowed_tools: [read_file, glob_files, …]` 切成 `allowed_tools: [read_file, glo…`，`edit_file` 的 `old_string`+`new_string` 天然成对凑够两个未闭合括号（一个不够，实测 Textual 容忍），确认面板一弹就崩。护栏见 `tests/test_tui_markup_escape.py`（含现场重演与「旧口径确实会崩」的反证）
+- **工具主动裁剪了 `output` → 必须同时填 `full_output`（trace 完整性）** → `tools/base.py` 的 `ToolResult.full_output` + 该工具的 `execute`。Hook 侧同型：`ActionOutcome.full_detail`。**漏填不报错**，只是那段内容**永久消失且无人察觉**——记录看起来是完整的，因为被裁掉的地方连痕迹都没有（`_clip` 留下的「…（省略中间 k 行）…」是给模型看的提示，它不告诉你被省掉的**内容**是什么）。目前唯二的填写方是 `run_command`（前 30 + 后 10 行）与 `hooks/actions.py`（`DETAIL_LIMIT`）。⚠️ **这两处的裁剪本身要保留**：它们省的是模型的 token 预算，删掉会让一次 `pytest` 输出撑爆上下文。护栏见 `tests/test_trace_full_output.py`
+- **trace 埋点新增字段 → 同步 `trace/reader.py` 的摘要函数** → 新字段若不进摘要行，读时间线的人就看不见它，只有 `--seq` 展开才发现「原来早就记了」。**漏改不报错**，代价是那个字段等于白记。本轮加的四项都进了摘要：`permission_decision.bypassed_engine`（标 ⚠绕过引擎）、`subagent_start` 的 `member`/`isolated`/`permission_mode`、`worktree_create.path`。判断标准是「排查时第一眼要不要看到它」——要就进摘要行，不要就只留在负载里（`tool_execute.cwd` 就没进，它每条都一样、进去只会挤掉真正有信息量的部分）
+- **写多 Agent（C13/C15）的端到端剧本 → 必须用 `ScopedScriptedProvider`，且等待要用 `--until quiescent`** → `tests/e2e/scripted.py` + `tests/e2e/control.py`。两处都是「用错了不报错、只是判据变成竞态的」：①`ScriptedProvider` 按**全局调用序号**取轮次，而队员并发跑，同一份剧本每次跑可能对应到不同 Agent 身上；②`wait` 缺省的 `terminal` 只看界面，后台委派在跑或有消息等自动唤起时界面照样 `idle`，一秒后又忙起来。**竞态判据比没有判据更坏——它偶尔通过。** 另：剧本里作用域键取的是 `run_agent` 的 `name`（队员名）**不是角色名**，同一个角色可以派出多个队员。护栏见 `tests/test_e2e_team_scripts.py`
 - **改动发消息工具的描述或注入消息的标记块（c15）** → `tools/send_message.py` 的 `description` + `team/render.py` 的 `render_incoming`。**两处必须同口径**（你的正文别人看不到 / 消息自动送达不必查收 / 按名字指代 / 名字在它干完之后依然有效）——模型在**两个不同时刻**读到同一条约定：发消息前读工具描述、收消息时读标记块，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单 ↔ `run_agent.description`」、C14 的「交付信息 ↔ 委派工具描述」是**同一个坑的第四次**，前三次都是真实模型实测才发现的。护栏见 `tests/test_team_tools.py::SameVoiceTest`
 - **任务的 `blocked_by` 与 `blocks` 是双向冗余存储（c15）** → `team/board.py` 的 `add_dependency` / `remove` 两处都要成对维护。只存一边的话每次列清单都要遍历全表反查，而清单是每个队员每一轮都可能读的高频操作。⚠ `remove` 漏摘反向引用的后果最隐蔽：留下**指向不存在任务的悬空依赖**，而 `is_blocked` 把查不到的前置按「未完成」处理——那条任务**再也认领不了**，且清单上显示的阻塞来源是一个查无此条的编号
 - **队员的两套状态刻意分开（c15）** → C13 的 `TaskStatus`（这次委派的**结论**产出了没有）与 `team/models.py` 的 `MemberState`（**人**还在不在场、叫不叫得醒）。⚠ **绝不要给 `TaskStatus` 加一个 `is_terminal` 为假的 `IDLE`**：主 Agent 的闸门用 `not status.is_terminal` 判断「还要不要等」，加了之后它每次收工都会去等一个已经待命的队员，而那个队员正等着主 Agent 给它发消息——**双方互等，永远结束不了**。护栏见 `tests/test_team_wake.py::test_main_agent_can_finish_while_a_member_idles`
@@ -251,7 +254,10 @@ python -m tests.e2e.client hosts                 # 列出当前宿主（排障�
 python -m tests.e2e.client status                # 三态 / 面板原文与可选项 / 轮次 / 指纹
 python -m tests.e2e.client send "写个文件"        # 走真人提交入口（不是内部方法）
 python -m tests.e2e.client wait --timeout 180    # 等到 idle 或 pending 两个终态之一
+python -m tests.e2e.client wait --until quiescent # 还要求「后台也没活了」——写 C13/C15 场景必须用它
 python -m tests.e2e.client answer once           # 应答面板（--via keys 走模拟按键路径）
+python -m tests.e2e.client keys ctrl+q           # 投递任意按键序列（可给多个）
+python -m tests.e2e.client screen --selector "#history-messages"  # 导出可见文本与 markup 原文
 python -m tests.e2e.client observe --since 42 --types tool_execute   # 读记录增量
 python -m tests.e2e.client cancel                # 等价于真人按 Esc
 python -m tests.e2e.client quit                  # 优雅退出并清理临时目录
@@ -443,7 +449,7 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
   ⑥ **`/clear` 必须真的清干净。** 花名册、共享清单、未读消息、待命队员保管的
   **完整对话历史**都含对话原文与被读过的文件内容，与 C9 会话存档同级敏感。
   清空同时会唤醒待命队员让它们的线程退出——不唤醒的话那些 daemon 线程会挂到进程结束。
-- 行为记录（trace，测试设施）：**产物比会话存档更敏感**——里面既有完整的模型请求与响应，也有每次工具执行的参数与**输出原文**（被读过的文件内容、命令输出）。如果模型在对话中读过配置文件，那份内容会原样进入 `tool_execute` 事件，**其中可能含明文 API Key**。三条纪律：① 忽略规则要加在**启动 `rhine` 的那个项目**里——trace 产物落在该项目根的 `.rhinecode/traces/` 下，而本仓库 `.gitignore` 的那行只在开发 RhineCode 时生效；去别的项目跑 trace 前，先给那个项目的 `.gitignore` 补上 `.rhinecode/traces/`（**实测过：不补就会被 `git status` 列出来**）。勿提交、勿外传、勿贴进 issue；② `session_start` 的配置快照里 `api_key` 已被固定掩码替换（`redact_config` 是白名单式逐字段取值，新增含密字段默认不记录），但这**只保证配置快照**——工具输出里的泄漏不在它的职责范围内，由 `.gitignore` 兜底；③ 记录器**不改变任何权限判定**，它只观测；`--trace` 不是权限开关，开启它不会让模型多做任何一件事。另：记录失败一律静默（写盘失败、路径不可写、负载序列化异常全被吞掉），这是**有意的**——观测设施绝不能反过来阻断被观测的系统。
+- 行为记录（trace，测试设施）：**产物比会话存档更敏感**——里面既有完整的模型请求与响应，也有每次工具执行的参数与**输出原文**（被读过的文件内容、命令输出）。如果模型在对话中读过配置文件，那份内容会原样进入 `tool_execute` 事件，**其中可能含明文 API Key**。三条纪律：① 忽略规则要加在**启动 `rhine` 的那个项目**里——trace 产物落在该项目根的 `.rhinecode/traces/` 下，而本仓库 `.gitignore` 的那行只在开发 RhineCode 时生效；去别的项目跑 trace 前，先给那个项目的 `.gitignore` 补上 `.rhinecode/traces/`（**实测过：不补就会被 `git status` 列出来**）。勿提交、勿外传、勿贴进 issue；② `session_start` 的配置快照里 `api_key` 已被固定掩码替换（`redact_config` 是白名单式逐字段取值，新增含密字段默认不记录），但这**只保证配置快照**——工具输出里的泄漏不在它的职责范围内，由 `.gitignore` 兜底；③ 记录器**不改变任何权限判定**，它只观测；`--trace` 不是权限开关，开启它不会让模型多做任何一件事。⚠️ **2026-08-09 起记录层不再做任何截断**，这条纪律因此更重要了：此前单字段封顶 4000 字符、消息封顶 400 条，一份被读过的大配置文件只会泄漏开头一段；现在是**逐字全量**。同时产物显著变大（`api_request` 每轮携带完整历史，长会话可达数十 MB），别顺手把它贴进任何地方。另：记录失败一律静默（写盘失败、路径不可写、负载序列化异常全被吞掉），这是**有意的**——观测设施绝不能反过来阻断被观测的系统。
 - 端到端驱动设施（P1a，测试设施）四条：① **控制通道不鉴权**——它只绑 `127.0.0.1`、只在宿主活着的这段时间存在，任何能在本机跑程序的人都能连上去驱动它。这是刻意接受的取舍（加鉴权会让一个测试设施凭空多出密钥管理），代价是**驱动期间应把本机视为可信环境**；真实模式尤其要注意，那时宿主进程持有你的真实凭据。② **驱动器不扩大权限面**——它替人应答只是换了第⑤层人在回路的执行者，前四层一字不动：驱动者选「放行」的危险命令照样在第①层黑名单被拦下（`test_e2e_host.py` 有专门护栏钉着这条）。③ **`exclude_tools` 摘掉的两个工具是隔离边界的一部分**：`mcp_add_server` 会写**真实**用户主目录且不吃 `user_dir`，`mcp_resolve_server` 虽是 `read_only=True` 却要访问外部包索引——而只读且被放行的工具**根本不弹面板**，应答者拦不住它。改动这个集合前先想清楚隔离还成不成立。④ **宿主的记录产物与 trace 同等敏感**（它就是 trace），落在临时工作区里、随宿主退出一并删除；用 `--keep-workspace` 保留时请自行按上一条的三条纪律处理。
 - **网络访问（web_fetch 扩展）**：这是 RhineCode 第一个**能主动向外发送数据**的工具，三条要点——
   ① **它把一条外泄链路接通了**。此前模型读到的任何敏感内容都烂在本地（没有工具能发出去）；
@@ -474,7 +480,7 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
 7. MCP 后续项（C7 spec 明确不做）：Server 健康检查与自动重连、资源/提示词/采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化、stdio 之外的旧版 HTTP+SSE 传输、MCP 工具结果里图片/二进制内容的实际渲染。
 8. 上下文管理后续项（C8 spec 明确不做）：精确 tokenizer（当前仅「锚点+增量」近似估算）、摘要策略的机器学习/质量优化、存盘文件的清理与生命周期管理（`/clear` 只复位幂等状态、不删磁盘文件）、除窗口大小外其它阈值（存盘/保留/余量等）的可配置化、摘要内容的分段/多轮压缩与跨会话持久化。~~其中「保留区阈值」曾有一处实测局限~~ **已于 2026-07-29 修复**：`RETAIN_TOKENS` 与 `auto_margin` 原是固定常量、不随 `context_window` 缩放，导致小窗口（如 8192）上保留区比整个窗口还大、触发线为负——第二层摘要**永不真正压缩**且每轮空转。现改为「按窗口比例算再夹上限」（`summarize.retain_budget` / `manager._derive_margin`），**64K 及以上逐字维持原值**。护栏见 `tests/test_context_summarize.py::RetainScalesWithWindowTest`。
 9. Skill 系统后续项（C11 spec 明确不做）：Skill 的市场分发与版本管理、嵌套激活（Skill 里再激活 Skill）、参数 schema 与校验、模板引擎（`$ARGUMENTS` 只做字面替换）、多个 Skill 并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
-10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、阈值（字段截断 4000 字符 / 消息条数 400）可配置化、采样与按类型开关（当前只有「全开」与「全关」两态）。
+10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、采样与按类型开关（当前只有「全开」与「全关」两态）。~~阈值（字段截断 4000 字符 / 消息条数 400）可配置化~~ **已于 2026-08-09 作废**——两个阈值整体删除，记录层不再做任何截断（`models.full_text`）。理由是它们与 trace 的立项目的直接冲突：实测系统提示在最小配置下已有 3886 字符、贴着 4000 线，而稳定通道尾部依次是 134 组队协作 / 135 角色清单 / 140 Skill 清单——任何一份真实的 RHINE.md 一进来，被切掉的正好是那三段清单。代价是记录文件更大（`api_request` 每轮含完整历史），这是刻意付的。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
 
 12. **③可配置规则层对复合命令不拆段**（C12 验收期实测发现，2026-08-06 登记，**未修**）：
@@ -586,7 +592,16 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
     `engine.decide`，只是把 ASK 结果当 ALLOW 处理（保住「它们不弹面板」这条
     既有性质）。这会改变 C13 起的既有行为（`deny: run_agent` 突然开始生效），
     属安全边界变更，应当单独立项、单独评审，并补「deny 生效」与
-    「仍然不弹面板」两条护栏。**已登记为 `docs/todo/2-perm-system-serial-bypass.md`**
+    「仍然不弹面板」两条护栏。
+
+    **2026-08-09 补了观测面，判定行为一字未改**：那个分支现在会照常产出一条
+    `permission_decision`，带 `bypassed_engine=True`，`reason` 明说
+    「未经权限引擎、③层 deny 对它不生效、唯一收窄手段是 Hook 的 pre_tool_use」，
+    阅读器在时间线上标 ⚠。此前**它一条判定记录都没有**，于是这个 bypass
+    只能靠「少了一条」去反推——而缺失永远是最弱的证据。
+    护栏见 `tests/test_trace_system_serial.py`，其中
+    `test_every_tool_execution_is_preceded_by_a_decision` 正是改造前
+    写不出来的那条通用不变量（七个系统级工具会让它恒假）。**已登记为 `docs/todo/2-perm-system-serial-bypass.md`**
     （与第 12 条同源，建议一起做）。
 
 19. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、
