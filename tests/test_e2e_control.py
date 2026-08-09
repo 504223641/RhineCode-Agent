@@ -31,6 +31,7 @@ from unittest import mock
 from rhinecode.bootstrap import build_app
 from rhinecode.config import Config
 from rhinecode.tools import path_guard
+from rhinecode.tui.widgets import InputBar
 from rhinecode.trace.recorder import TraceRecorder
 from tests.e2e import sandbox
 from tests.e2e.assertions import TraceView
@@ -1030,3 +1031,124 @@ class ObserveTest(DriverFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeysAndScreenTest(DriverFixture):
+    """
+    P1b 的两个设施缺口：**任意按键投递**与**可见文本导出**。
+
+    `docs/e2e-sweep/summary.md` 把 6 条「未覆盖」归到这两个缺口上：
+    C2 AC9 的 Ctrl+Q / Ctrl+C、C4 场景 11 的澄清面板键盘导航、
+    C10 E03 的补全与高亮、C10 E05 的配色可辨性。补上之后它们都能自动判定。
+    """
+
+    async def test_keys_reaches_the_input_bar(self):
+        """
+        最基本的一条：投递的按键真的到了界面上。
+
+        用输入框而不是某个绑定动作来验，是因为输入框的 `value` 是**可读的状态**
+        ——「按键有没有生效」有一个确定的观测点。验绑定动作（比如 Ctrl+Q 退出）
+        的话，成功的表现是应用没了，反而不好从同一个进程里断言。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+
+            # ⚠ 这里**直接调**而不是走 `run_on_main`：测试体本身就跑在事件循环
+            # 线程上，`run_on_main` 会把协程投给同一个循环再同步等结果——
+            # 自己等自己，确定性死锁（实测：15 秒后以 TimeoutError 收场，
+            # 而报错完全不指向「你在主线程上调了它」）。
+            # `run_on_main` 是给**别的线程**用的，见它的 docstring。
+            app.query_one(InputBar).focus()
+            await pilot.pause()
+
+            res = await asyncio.to_thread(core.keys, ["a", "b", "c"])
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["data"]["pressed"], ["a", "b", "c"])
+
+            await pilot.pause()
+            self.assertEqual(app.query_one(InputBar).value, "abc")
+            await core.shutdown_on_main("test")
+
+    async def test_keys_rejects_bad_input(self):
+        """
+        非法输入走 `bad_request`，不抛。
+
+        ⚠ 上限那条不是防滥用（驱动者是自己人），是防手滑：一个写错的循环
+        把上万个按键投进去，Textual 会在主线程逐个处理，界面卡死几分钟
+        而调用方只看到一次超时——排查方向会被完全带偏。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            for bad in ([], "ctrl+q", [""], [1, 2], ["a"] * 500):
+                res = await asyncio.to_thread(core.keys, bad)
+                self.assertFalse(res["ok"], f"{bad!r} 应当被拒")
+                self.assertEqual(res["error"]["code"], "bad_request")
+            await core.shutdown_on_main("test")
+
+    async def test_screen_exports_visible_history_text(self):
+        """
+        导出的文本里能找到界面上真的出现过的那句话。
+
+        ⚠ 这与 `ui_message` 事件**不等价**：事件只能证明产品**打算**显示它，
+        证明不了它真的渲染进了组件树。两者会分叉——markup 异常会让渲染失败
+        而事件照常落盘，那正是 CLAUDE.md 里 `MarkupError` 那条坑的形态。
+        """
+        app, _ = self.assemble([[text("界面上要出现的这句话"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "说句话")
+            await asyncio.to_thread(core.wait, 30.0)
+            await pilot.pause()
+
+            res = await asyncio.to_thread(core.screen, "")
+            self.assertTrue(res["ok"], res)
+            self.assertIn("界面上要出现的这句话", res["data"]["text"])
+            self.assertTrue(res["data"]["widgets"], "widgets 不该为空")
+            await core.shutdown_on_main("test")
+
+    async def test_screen_selector_narrows_and_reports_bad_selector(self):
+        """选择器能收窄范围；语法错误走 `bad_request` 而不是抛。"""
+        app, _ = self.assemble([[text("正文在这里"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "说句话")
+            await asyncio.to_thread(core.wait, 30.0)
+            await pilot.pause()
+
+            narrowed = await asyncio.to_thread(core.screen, "#history-messages > *")
+            self.assertTrue(narrowed["ok"], narrowed)
+            self.assertIn("正文在这里", narrowed["data"]["text"])
+            # 收窄之后不该再包含状态栏那些内容
+            whole = await asyncio.to_thread(core.screen, "")
+            self.assertGreater(
+                len(whole["data"]["widgets"]),
+                len(narrowed["data"]["widgets"]),
+                "整屏导出应当比收窄后的多",
+            )
+
+            bad = await asyncio.to_thread(core.screen, "#!!!not a selector")
+            self.assertFalse(bad["ok"])
+            self.assertEqual(bad["error"]["code"], "bad_request")
+            await core.shutdown_on_main("test")
+
+    async def test_screen_exposes_markup_for_style_assertions(self):
+        """
+        样式判据靠 **markup 原文**，不靠渲染后的 ANSI。
+
+        导出 ANSI 既难读又依赖终端能力；而 markup 原文就是产品自己写下的
+        那份意图（比如状态栏里的 `[dim]…[/dim]`），断言它才稳。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await pilot.pause()
+            res = await asyncio.to_thread(core.screen, "")
+            self.assertTrue(res["ok"], res)
+            markups = [w["markup"] for w in res["data"]["widgets"] if w["markup"]]
+            self.assertTrue(
+                any("[" in m for m in markups),
+                "至少应当有一个控件带 markup 原文（状态栏就有 [dim]）",
+            )
+            await core.shutdown_on_main("test")

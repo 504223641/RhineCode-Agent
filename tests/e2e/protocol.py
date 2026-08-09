@@ -17,6 +17,8 @@
     {"cmd": "answer",  "choice": "once", "via": "channel"}
     {"cmd": "cancel"}
     {"cmd": "observe", "since": 42, "types": ["tool_execute"]}
+    {"cmd": "keys",    "sequence": ["ctrl+q"]}
+    {"cmd": "screen",  "selector": "#history-messages"}
     {"cmd": "quit"}
 
     # 成功响应

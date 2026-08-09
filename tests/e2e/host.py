@@ -259,6 +259,18 @@ def dispatch(host_state: HostState, request: dict) -> dict:
             return protocol.err("bad_request", bad)
         return core.wait(timeout, until)
 
+    if cmd == "keys":
+        sequence = request.get("sequence")
+        if not isinstance(sequence, list):
+            return protocol.err("bad_request", "keys 需要 sequence 数组")
+        return core.keys(sequence)
+
+    if cmd == "screen":
+        selector = request.get("selector", "")
+        if not isinstance(selector, str):
+            return protocol.err("bad_request", "screen 的 selector 必须是字符串")
+        return core.screen(selector)
+
     if cmd == "answer":
         choice = request.get("choice")
         via = request.get("via", "channel")

@@ -1,5 +1,5 @@
 """
-驱动内核：读界面状态、投递输入、应答面板、取消、观察记录、编排退出。
+驱动内核：读界面状态、投递输入与按键、应答面板、导出界面文本、取消、观察记录、编排退出。
 
 宿主进程把控制通道收到的每条指令翻译成本模块 `DriverCore` 的一次方法调用。
 本模块**不认识 socket、不认识 JSON**（那是 `host.py` 与 `protocol.py` 的事），
@@ -69,6 +69,13 @@ DEFAULT_DISPATCH_TIMEOUT = 15.0
 # （长等待时不至于打出几万次跨线程调度）。
 POLL_MIN = 0.03
 POLL_MAX = 0.10
+
+# 一次 `keys` 指令最多投递多少个按键。
+#
+# 上限的作用不是「防滥用」——驱动者是自己人。它防的是**手滑**：
+# 一个写错的循环把上万个按键投进去，Textual 会在主线程上逐个处理，
+# 界面卡死几分钟而调用方只看到一次超时，排查方向完全被带偏。
+MAX_KEY_SEQUENCE = 200
 
 # 不变量③ 的复核重试上限
 SETTLE_RECHECK_TRIES = 40
@@ -837,6 +844,124 @@ class DriverCore:
         run_on_main(self.loop, _press())
         return protocol.ok({"kind": kind, "choice": choice, "via": "keys", "source": "human"})
 
+    def keys(self, sequence: list) -> dict:
+        """
+        向界面投递**任意按键序列**（P1b 缺口①）。
+
+        :param sequence: 按键名列表，用 Textual 的键名
+            （`ctrl+q` / `escape` / `tab` / `down` / `a` …）
+        :returns: `{"pressed": [...]}`
+        :raises: 不抛；非法输入走 `bad_request`
+
+        ## 为什么需要一条通用指令，而不是继续加专用指令
+
+        `answer --via keys` 只能应答**面板**，它把「目标选项」换算成「按几次方向键」。
+        但有一整类判据根本不在面板上：
+        - C2 AC9 的 `Ctrl+Q` / `Ctrl+C` 退出；
+        - C4 场景 11 的澄清面板键盘导航（`answer` 明确拒绝 `clarify`+`keys`，
+          因为候选项之间夹着 disabled 详情行、按键次数推不出来——
+          但**逐键投递**没有这个问题，调用方自己决定按几次）；
+        - C10 的 Tab 补全（要先按 `/`、再按 `tab`，看候选菜单怎么变）。
+
+        `docs/e2e-sweep/summary.md` 把这 4 条列为「P1a 设施限制」，
+        指向的就是这一个缺口。
+
+        ## 与 `answer --via keys` 的分工
+
+        本指令是**低层原语**：它不知道面板是什么，只管把键按下去。
+        `answer --via keys` 是**语义化封装**，替调用方算移动次数。
+        两者都保留——用原语写面板应答要自己数按键次数，
+        那正是 `answer` 当初存在的理由。
+
+        副作用：真实地在界面上按键，可能触发任何绑定（包括退出应用）。
+        """
+        if not isinstance(sequence, list) or not sequence:
+            return protocol.err("bad_request", "keys 需要非空的按键名列表")
+        if len(sequence) > MAX_KEY_SEQUENCE:
+            return protocol.err(
+                "bad_request",
+                f"一次最多投递 {MAX_KEY_SEQUENCE} 个按键，收到 {len(sequence)} 个",
+            )
+        for item in sequence:
+            if not isinstance(item, str) or not item:
+                return protocol.err("bad_request", f"按键名必须是非空字符串，收到 {item!r}")
+
+        with self._lock:
+            self._last_action = f"keys:{','.join(sequence)}"
+
+        pilot = self.pilot
+
+        async def _press() -> None:
+            for key in sequence:
+                await pilot.press(key)
+
+        # ⚠ 这里**刻意不复核任何前置状态**（不像 answer 要先确认面板就绪）。
+        # 按键是最低层的输入，「现在能不能按」本身常常就是判据的一部分——
+        # 加了前置校验，「面板没弹出来时按回车会怎样」这类场景就没法验了。
+        run_on_main(self.loop, _press())
+        return protocol.ok({"pressed": list(sequence)})
+
+    def screen(self, selector: str = "") -> dict:
+        """
+        导出界面上**可见的文本**（P1b 缺口②）。
+
+        :param selector: Textual 选择器，缺省 `""` 表示整屏
+        :returns: `{"text": 拼接后的全文, "lines": [...], "widgets": [...]}`
+
+        ## 为什么控制通道需要它
+
+        既有的观察面只有两个：`status`（面板与三态）与 `observe`（trace 事件）。
+        两者都读不到**聊天区正文与补全菜单**，于是这些判据一条都验不了：
+        - C10 E03 补全与高亮（候选菜单里有哪些项、命令字段有没有高亮）；
+        - 「界面上真的出现了那句话」这类内容判据——
+          `ui_message` 事件只能证明**产品打算显示它**，
+          证明不了它真的渲染进了组件树（两者不同：markup 异常会让渲染失败
+          而事件照常落盘，那正是 CLAUDE.md 里 `MarkupError` 那条坑的形态）。
+
+        ## 样式怎么带出来
+
+        每个控件除了纯文本，还给出它的**类名**与（若有）markup 原文。
+        样式判据（如「命令字段以青色加粗高亮」）靠 markup 原文断言——
+        导出渲染后的 ANSI 序列既难读又依赖终端能力，
+        而 markup 原文就是产品自己写下的那份意图。
+
+        副作用：无（纯读组件树）。
+        """
+        async def _read() -> dict:
+            widgets: list[dict] = []
+            try:
+                nodes = self.app.query(selector) if selector else self.app.query("*")
+            except Exception as e:  # noqa: BLE001 —— 选择器语法错误
+                return {"error": f"选择器无效：{e}"}
+
+            for node in nodes:
+                if not getattr(node, "display", True):
+                    continue
+                entry = {"class": type(node).__name__, "text": "", "markup": None}
+                try:
+                    entry["text"] = _plain_text_of(node.render())
+                except Exception:  # noqa: BLE001 —— 容器没有 render / 渲染抛异常
+                    continue
+                # markup 原文：Textual 8.x 的 `Content` 有个 `.markup` 属性，
+                # 给出的正是产品自己写下的那串带标记的文本（如 `[dim]…[/dim]`）。
+                # 取不到就留 None——样式判据自行判断能不能用。
+                try:
+                    markup = getattr(node.render(), "markup", None)
+                    if isinstance(markup, str):
+                        entry["markup"] = markup
+                except Exception:  # noqa: BLE001
+                    pass
+                if entry["text"] or entry["markup"]:
+                    widgets.append(entry)
+
+            lines = [w["text"] for w in widgets if w["text"]]
+            return {"text": "\n".join(lines), "lines": lines, "widgets": widgets}
+
+        data = run_on_main(self.loop, _read())
+        if "error" in data:
+            return protocol.err("bad_request", data["error"])
+        return protocol.ok(data)
+
     def cancel(self) -> dict:
         """请求取消当前的 Agent 循环（等价于真人按 Esc）。"""
         with self._lock:
@@ -902,6 +1027,64 @@ class DriverCore:
                     thread.join(timeout=30.0)
 
         app.exit()
+
+
+def _plain_text_of(rendered: Any) -> str:
+    """
+    把一个控件的渲染产物压成纯文本。
+
+    :param rendered: `widget.render()` 的返回值
+    :returns: 可见文本；实在取不出来时返回空串（**绝不返回 `repr`**）
+
+    ## 为什么不能只写 `getattr(rendered, "plain", str(rendered))`
+
+    最初就是那么写的，然后第一次真跑就撞上了：聊天区的 AI 正文控件渲染出的是一个
+    包在 `RichVisual` 里的 `rich.console.Group`，它没有 `.plain`，于是
+    `str()` 兜底给出的是 `RichVisual(Static(), <rich.console.Group object at 0x…>)`
+    ——**一个看起来像内容的字符串**。断言「界面上出现了那句话」于是失败在
+    「导出实现不完整」上，而报错完全不指向这个原因。
+
+    比失败更坏的是它的另一面：如果判据恰好是 `assertNotIn`，
+    这个 repr 会让它**通过**。观测设施返回 repr 比返回空串危险得多。
+
+    三级取值：
+    1. `.plain`（`rich.text.Text` 这类，最常见）；
+    2. Rich console 捕获（`Group` / 表格 / 任何组合渲染）；
+    3. 都不行就空串——**宁可少一行，也不要把 repr 冒充成内容**。
+    """
+    # ① `textual.content.Content`（Textual 8.x 里 Static 之类的渲染产物）直接有 .plain
+    plain = getattr(rendered, "plain", None)
+    if isinstance(plain, str):
+        return plain
+
+    # ② 先拆包再捕获。**顺序不能反**——`RichVisual` 是 Textual 的 Visual，
+    #    **不是** Rich 可渲染对象，把它丢给 `console.print` 不会报错，
+    #    Rich 会用 `Pretty` 打出它的 repr，于是「捕获成功」而内容是
+    #    `RichVisual(Static(), <rich.console.Group object at 0x…>)`。
+    #    先捕获后拆包的话，第一步就「成功」了，拆包分支永远走不到（实测踩过）。
+    inner = getattr(rendered, "_renderable", None)
+    if inner is not None and inner is not rendered:
+        nested = _plain_text_of(inner)
+        if nested:
+            return nested
+
+    # ③ 真正的 Rich 可渲染对象才走捕获。宽度取一个足够宽的固定值：
+    #    太窄会折行、把一句话拆成两行，内容断言就得考虑折行位置。
+    if hasattr(rendered, "__rich_console__") or hasattr(rendered, "__rich__") or isinstance(rendered, str):
+        try:
+            import io
+
+            from rich.console import Console
+
+            console = Console(file=io.StringIO(), width=400, no_color=True, legacy_windows=False)
+            with console.capture() as capture:
+                console.print(rendered, end="")
+            return capture.get()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ④ 取不出来就空串。**宁可少一行，也不要把 repr 冒充成内容**
+    return ""
 
 
 def _is_quiescent(background: dict) -> bool:
