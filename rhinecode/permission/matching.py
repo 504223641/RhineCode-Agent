@@ -2,9 +2,10 @@
 匹配算法层：被①黑名单、②′网络边界与③规则共用的模式匹配算法。
 
 本模块是纯字符串/正则运算，无任何外部依赖与副作用，可被单测充分覆盖（spec N5）。
-四个公开函数：
+五个公开函数：
 - split_commands：把复合命令拆成子命令（防 `safe && rm -rf` 整条蒙混过关，c6 spec F2）。
 - match_command：命令模式匹配（前缀 + glob + 词边界，对应 Bash 规则，c6 spec F4）。
+- match_command_deep：命令的「整条 + 逐段」双重检查，**收紧方向专用**（见其 docstring）。
 - match_path：文件路径模式匹配（gitignore 风格，对应 Read/Edit/Write 规则，c6 spec F4）。
 - match_domain：域名模式匹配（对应 WebFetch(domain:...) 规则，web_fetch 扩展 spec F11）。
 
@@ -13,6 +14,7 @@
 """
 
 import re
+from typing import Callable
 
 # 复合命令分隔符正则：多字符操作符必须排在单字符之前，否则 `&&` 会被 `&` 抢先切坏。
 # 覆盖 spec 列出的 &&、||、|&、;、|、&、换行（\n/\r）。
@@ -79,12 +81,58 @@ def match_command(pattern: str, command: str) -> bool:
     :param command: 待匹配的命令字符串
     :returns: 命中返回 True
 
-    注意：本函数对单条命令做整体匹配，不负责拆分复合命令；调用方（规则层）按需
-    先用 split_commands 拆段后逐段调用本函数。
+    注意：本函数对单条命令做整体匹配，不负责拆分复合命令；调用方按需改用
+    match_command_deep（它内部会先整条、再逐段）。
     """
     if pattern == "":
         return True
     return _command_pattern_to_regex(pattern).fullmatch(command.strip()) is not None
+
+
+def match_command_deep(command: str, predicate: Callable[[str], bool]) -> bool:
+    """
+    命令的「**整条 + 逐段**」双重检查——与①危险命令黑名单同口径。
+
+    :param command: 待检命令字符串（可能是一条复合命令）
+    :param predicate: 对**单条**命令做判定的函数（如 `lambda one: match_command(pat, one)`）
+    :returns: 整条命中、或任一子命令命中即为 True
+    :raises: 不抛异常（predicate 自身抛出的除外）
+
+    副作用：无。
+
+    ## 为什么两半都要，一半都不能省
+
+    - **整条**这一半：像 fork 炸弹 `:(){ :|:& };:` 这类「分隔符本身就是语法的一部分」
+      的结构，拆碎之后反而谁都匹配不到；而 `git * main` 这种跨参数的模式也只有
+      对整条求值才有意义。
+    - **逐段**这一半：`git status && git push origin main` 里的 `git push origin main`
+      只有拆开才看得见。⚠ **这不是攻击者构造的形态**——C12 验收期实测，真实模型
+      在一次普通的「改完提交推上去」请求里自然就产出了这种写法。
+
+    ## ⚠ 它只能用在「收紧」的一侧
+
+    本函数**放宽**了命中面（能命中的命令集合只会变大、不会变小），因此：
+
+    - 用在 **deny / 拦截 / 升级为确认** 这类结论上 → 方向正确，偏严即偏安全。
+    - 用在 **allow / 放行** 这类结论上 → **方向错误**。一条 `allow: Bash(npm *)`
+      会因此命中 `npm ci && rm -rf x`，等于用户写下的一条窄放行被悄悄扩成了宽放行。
+
+    调用方（`permission/rules.py` 的命令分支、`hooks/conditions.py` 的命令类字段）
+    都在各自的位置写明了这个不对称，**不要「顺手统一」成两侧都拆**。
+
+    ## 共用一份实现的理由
+
+    同一个坑出现过两次（C6 的③规则层、C12 的 Hook 条件层），两处各写一份的话
+    第三处还会再来一次。判定形态收在这里，调用方只负责决定「该不该用它」。
+    """
+    if predicate(command):
+        return True
+    segments = split_commands(command)
+    # 单段时 split_commands 返回的就是它自己（至多去了两侧空白），上面那次已经判过，
+    # 再判一次纯属浪费；同时这也让「非复合命令」的行为与 match_command 逐字一致。
+    if len(segments) <= 1:
+        return False
+    return any(predicate(seg) for seg in segments)
 
 
 def _normalize_path(p: str) -> str:

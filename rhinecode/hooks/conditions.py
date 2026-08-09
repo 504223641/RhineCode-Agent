@@ -38,7 +38,7 @@ from rhinecode.hooks.models import (
     Condition,
     Matcher,
 )
-from rhinecode.permission.matching import match_command, match_path, split_commands
+from rhinecode.permission.matching import match_command, match_command_deep, match_path
 
 
 def stringify(value: Any) -> str:
@@ -124,8 +124,7 @@ def _match_command_field(text: str, predicate) -> bool:
 
     ## ⚠ 这一半不能省，真实模型自己就会撞上
 
-    `match_command` 是**整串匹配**，不拆复合命令（它的 docstring 明写「调用方按需
-    先用 `split_commands` 拆段」）。只调它的话，一条
+    `match_command` 是**整串匹配**，不拆复合命令。只调它的话，一条
 
         if: {all: [{tool: run_command}, {command: "git push *"}]}
 
@@ -139,19 +138,17 @@ def _match_command_field(text: str, predicate) -> bool:
     后果比「少拦一次」更糟：`/hooks` 报告里那条规则显示「触发：0 次」，
     用户会据此认定「模型压根没试过 push」，而它其实推了。**规则静默失效**。
 
-    ①黑名单早就是「逐段 + 整条」双重检查的（防 `safe && rm -rf`），
-    这里只是把同一口径补齐。方向偏严——对一个只能拦截/升级、不能放行的系统而言，
-    偏严永远是安全的那一侧。
+    ## 判定形态本身在 `permission/matching.py`，本函数只是调用点
+
+    同一个坑出现过两次（C6 的③规则层、C12 的这里），因此实现收在
+    `match_command_deep` 一处共用。**Hook 侧无条件用它是安全的**：Hook 的结论只有
+    拦截 / 升级为确认 / 不表态三种，没有 allow（见「安全边界」c12 第①条），
+    所以「命中面变大」在这里恒等于「更严」。③规则层就没这么简单——那边 deny 拆、
+    allow 不拆，理由见 `permission/rules.py` 的命令分支。
 
     副作用：无。
     """
-    if predicate(text):
-        return True
-    segments = split_commands(text)
-    # 单段时 `split_commands` 返回的就是它自己（可能去了空白），上面已判过。
-    if len(segments) <= 1:
-        return False
-    return any(predicate(seg) for seg in segments)
+    return match_command_deep(text, predicate)
 
 
 def _match_glob(matcher: Matcher, text: str) -> bool:

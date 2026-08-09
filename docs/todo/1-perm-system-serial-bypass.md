@@ -114,9 +114,9 @@ if tool.system_serial:
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b perm-system-serial-bypass。
 
-读 docs/todo/2-perm-system-serial-bypass.md 与 CLAUDE.md 已知后续工程项第 18 条。
-建议连同 docs/todo/1-perm-compound-command.md 一起做——两者同源（都是③规则层被绕过），
-一起评审比分两次更省事。
+读 docs/todo/1-perm-system-serial-bypass.md 与 CLAUDE.md 已知后续工程项第 18 条。
+建议连同 docs/todo/2-perm-allow-wildcard-spans-separators.md 一起做——两者都在
+③规则层上、都要走安全评审，一起评比分两次更省事。
 
 任务：让 system_serial=True 的工具也过一次 engine.decide，使 permissions.yaml 的
 deny 规则对它们生效。要点：

