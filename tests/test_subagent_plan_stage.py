@@ -15,7 +15,9 @@ Plan Mode 的承诺是「**批准前不动手**」。规划恰恰是最需要把
 
 C13 的 `run_agent` 恰好把它激活了：`system_serial=True` **且** `read_only=False`。
 后果实测过——规划阶段模型硬造一个 `run_agent` 调用，它既没被守卫挡下、
-又因为 `system_serial` 不进权限管线，**直接执行了**。
+又因为当时 `system_serial` 压根不进权限引擎，**直接执行了**。
+（后者已于 perm-system-serial-bypass 修掉，但本守卫仍不可省——
+引擎对 `run_agent` 只会判 ASK，而系统级工具的 ASK 按 ALLOW 处理。）
 
 豁免条件已改成 `plan_safe`：一个工具必须**明确声明**自己规划期安全才被放行。
 本模块的 `PlanGuardTest` 用两个只差这一个标志的假工具把这条钉死。

@@ -22,7 +22,7 @@ python -m unittest discover -s tests
 
 | 层 | 测试文件 | 覆盖要点 | 留作手测的部分 |
 | --- | --- | --- | --- |
-| 权限系统 | `test_perm_*.py`、`test_review_fixes.py` | 命令/路径匹配、危险命令黑名单（复合命令逐段与 fork 炸弹）、deny 优先求值、**③层命令规则的复合命令口径**（deny 逐段命中各种分隔符 / allow **不**被复合命令命中的反证 / 拆段后词边界仍在 / 非复合命令逐字不变）、三层配置加载与容错、工具规范化映射、四层决策管线、被拒不停循环、`grep_content`/`glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地配置不被覆盖 | `test_perm_rules.py::CompoundCommandTest` 里有**两条钉住现状而非期望**的用例（`test_KNOWN_GAP_...` 与 `test_deny_over_strictness_...`），docstring 里写明了它们为什么长这样。⚠ 别把它们当回归修掉——真去修 allow 侧缺口时前者会当场红，那是**设计好的提醒** |
+| 权限系统 | `test_perm_*.py`、`test_review_fixes.py` | 命令/路径匹配、危险命令黑名单（复合命令逐段与 fork 炸弹）、deny 优先求值、**③层命令规则的复合命令口径**（deny「整条 + 任一段」逐个分隔符验过 / allow「每一段都得命中」含跨规则覆盖与未覆盖段的反证 / allow 侧认引号而收紧侧不认 / 引号未闭合退回朴素拆分 / 拆段后词边界仍在 / 非复合命令逐字不变）、**`system_serial` 工具的 deny 生效**（`test_perm_system_serial.py` 遍历七个工具）、三层配置加载与容错、工具规范化映射、四层决策管线、被拒不停循环、`grep_content`/`glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地配置不被覆盖 | `test_perm_rules.py::CompoundCommandTest` 里 `test_deny_over_strictness_...` **钉住的是现状而非期望**（收紧侧朴素拆分带来的偏严），docstring 里写明了它为什么长这样，别把它当回归修掉。⚠ 另有**两个方向的反证**必须都在：allow 侧误用「任一段命中」→ 窄放行被扩成宽放行；deny 侧误用「每一段命中」→ `deny: Bash(git push *)` 拦不住复合命令。少任何一条，把两侧统一掉都能全绿 |
 | Plan Mode | `test_perm_*.py`、`test_plan_stage_guard.py` | 完整计划展示、拒绝计划停止、获批后仍逐项确认；**规划阶段夹带副作用工具被拦**（含放行模式下也挡得住、获批后放行两条反证） | — |
 | MCP 客户端 | `test_mcp_*.py`、`test_mcp_auto_config.py`、`test_perm_other_glob.py` | 两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 三步会话与按 id 配对（起真实子进程）、stderr drain 防阻塞、非法远端名规范化但仍调原名、`CallToolResult→ToolResult` 转换、单 Server 失败隔离、运行时重载、URL/NPM 自动解析、YAML 安全写入、Windows `npx.cmd`、`other` 分支 fnmatch 通配 | HTTP 传输与真实 Server 端到端（`docs/c7/checklist.md`） |
 | 上下文管理 | `test_context_*.py` | 近似估算（无锚点/有锚点/越界兜底）、第一层存盘（挑大先存、user 不动、幂等、写盘失败保留原文）、第二层纯逻辑（边界 snap 到 user 不拆 tool 对、草稿丢弃、重构结构）、编排（摘要成功失效锚点、连续失败熔断与复位、`manual_compact` 无阈值）、**保留区与余量随窗口缩放**（含 64K 零回归与小窗口端到端判据） | 真实 LLM 摘要与 TUI 渲染 5 场景（`docs/c8/checklist.md`） |
@@ -62,11 +62,20 @@ Trace 记录器测试（`tests/test_trace_*.py` + `tests/test_bootstrap.py`，�
   `DETAIL_LIMIT`）。两处都改成「给模型的那份继续裁，完整原文另存只进 trace」。
   三层判据：数据结构填对了 / 裁剪行为本身没变 / **它真的落进了 `tool_execute`**
   （中间隔着 `_trace_tool` 一层，那里漏用同样不报错）。含「没裁剪时不写第二份」的反证。
-- **`test_trace_system_serial.py`（3 条）** —— 七个 `system_serial` 工具此前
+- **`test_trace_system_serial.py`（4 条）** —— 七个 `system_serial` 工具此前
   一条 `permission_decision` 都不产。其中
   `test_every_tool_execution_is_preceded_by_a_decision` 是**改造前根本写不出来**
   的通用不变量（对那七个工具恒假），补埋点之后它才成立。另有「普通工具不得被标成
-  绕过引擎」的反证——没有它的话，把标记写成常量 True 也能让另外两条全绿。
+  `ask_downgraded`」的反证——没有它的话，把标记写成常量 True 也能让其余几条全绿。
+  ⚠ 这组必须跑在**缺省档**而不是放行档：放行档下④层直接判 ALLOW，
+  `ask_downgraded` 恒为假，本组要验的东西就整个落空了。
+- **`test_perm_system_serial.py`（8 条）** —— `deny` 规则对七个 `system_serial`
+  工具**确实生效**（原已知项 #18，那七个工具此前在预扫里直接拿 ALLOW、
+  根本不调引擎）。用的是 `to_request` + `RuleSet` 的**纯判定**路径，因此可以
+  遍历常量表逐个断言、将来新增协作工具自动被覆盖；行为侧（工具执没执行、
+  面板弹没弹）在 `test_team_tools.py::SystemSerialPermissionTest` 里验，
+  两组配合才完整。含「带模式的写法不命中 `other` 类请求」的反证——
+  没有它的话，用例把规则写成 `pattern="*"` 也会「通过」，而用户照着那么配不生效。
 - **`test_e2e_team_scripts.py`（9 条）** —— C15 的端到端场景。分三层：
   ①**设施自证**（`ScopedScriptedProvider` 的分派语义，含并发不串味的栅栏用例）
   ——它不对的话上面所有判据都是假的，因为走兜底也能跑完、也全绿；
@@ -94,7 +103,7 @@ Trace 记录器测试（`tests/test_trace_*.py` + `tests/test_bootstrap.py`，�
 > ### ⚠️ 不要用挂钟时间做判据
 >
 > `test_subagent_e2e.py` 里两条 `assertLess(elapsed, 0.12)` 在全量并发下**偶发失败**、
-> 单跑必过（已登记为 `docs/todo/4-subagent-e2e-timing-flaky.md`）。
+> 单跑必过（已登记为 `docs/todo/2-subagent-e2e-timing-flaky.md`）。
 >
 > 问题不是它红，**是它偶尔红**——那会训练所有人忽略失败，包括忽略它某天开始
 > 报告的真问题。本轮改造期间三次要停下来确认「这条是我改坏的吗」。

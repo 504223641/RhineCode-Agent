@@ -61,7 +61,7 @@ C14 收尾时做的是**止血**：`provision` 在建软链之前先自检落点
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b worktree-link-sandbox。
 
-读 docs/todo/8-worktree-link-sandbox.md 与 docs/c14/acceptance/live-model.md 问题③。
+读 docs/todo/6-worktree-link-sandbox.md 与 docs/c14/acceptance/live-model.md 问题③。
 
 这一条**要走 /spec 技能**：它改的是权限管线第②层的边界判定，
 而第②层是本项目全部隔离论证的落点，不是一次顺手的实现。

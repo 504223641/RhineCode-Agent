@@ -48,11 +48,15 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # 别为了「看起来完整」给它们硬编一个类别——那会让 `deny: Write(...)`
     # 之类的路径规则意外命中一个根本不碰文件系统的工具。
     #
-    # ⚠ **但要知道：登不登记对它们其实都不生效。** 这五个工具与
-    # `run_agent` / `load_skill` 一样是 `system_serial=True`，而那类工具在
-    # `agent/loop.py` 的预扫里**直接拿到一个 ALLOW、根本不调 `engine.decide`**
-    # （c15 验收期实测确认）。收窄它们唯一有效的手段是 Hook 的 `pre_tool_use`。
-    # 见 CLAUDE.md「已知后续工程项」里那条「system_serial 绕过③规则层」。
+    # 不登记的实际后果：它们落 `other` 分支（`rule_name` 取工具自身的 name、
+    # `specifier` 为空），因此只有**整工具规则**（不带括号的 `deny: send_message`）
+    # 命中得了它们。带模式的写法（`deny: send_message(*)`）不命中——`other` 分支
+    # 要求 `rule.pattern == ""`，这是既有语义，不是本次引入的。
+    #
+    # ⚠ 这里一度写着「登不登记对它们都不生效」——因为 `system_serial=True` 的工具
+    # 在 `agent/loop.py` 的预扫里**直接拿 ALLOW、根本不调 `engine.decide`**。
+    # 那个绕过已于 perm-system-serial-bypass 修掉：它们现在照常过一次引擎，
+    # `deny` 规则**确实生效**（只是判 ASK 时按 ALLOW 处理，仍不弹确认面板）。
 }
 
 

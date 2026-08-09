@@ -1053,9 +1053,13 @@ class Agent:
             #
             # C13 的委派工具 `run_agent` 恰好把它激活了：`system_serial=True`
             # **且** `read_only=False`。后果实测过——规划阶段模型凭训练先验硬造出
-            # 一个 `run_agent` 调用，它**既没被这里挡下、又因为 system_serial
-            # 不进权限管线**，直接执行了；而它委派出去的子 Agent 可以写文件。
+            # 一个 `run_agent` 调用，它**既没被这里挡下、又因为当时 system_serial
+            # 压根不进权限引擎**，直接执行了；而它委派出去的子 Agent 可以写文件。
             # Plan Mode「批准前不动手」的承诺就此被绕过。
+            #
+            # （那个「不进引擎」的缺陷已于 perm-system-serial-bypass 单独修掉，
+            # 但本守卫**仍然不可省**：引擎对 `run_agent` 只会判 ASK，而
+            # 系统级工具的 ASK 按 ALLOW 处理——挡住规划阶段委派的只有这一道。）
             #
             # 改成 `plan_safe` 之后：`load_skill` 仍靠 `read_only=True` 通过
             # （行为一字不变），而任何**没有明确声明过自己规划期安全**的副作用工具
@@ -1101,53 +1105,80 @@ class Agent:
 
             # 系统级串行工具**强制走串行、不进只读并发桶**（对齐改造 F8）。
             #
-            # 理由是它现在可能开一整条子对话（`context: fork` 的 Skill 由模型自行
-            # 发起时）。在只读并发桶里跑子对话意味着：子对话自己的确认面板会从
-            # 线程池的工作线程里弹出来，而那正是 C11 加锁不变量那一课的同型场景，
-            # 只是后果更重——那次是状态栏刷新，这次是整条交互链。
+            # 理由是它可能开一整条子对话（`context: fork` 的 Skill 由模型自行发起、
+            # 或 `run_agent` 委派）。在只读并发桶里跑子对话意味着：子对话自己的
+            # 确认面板会从线程池的工作线程里弹出来，而那正是 C11 加锁不变量那一课的
+            # 同型场景，只是后果更重——那次是状态栏刷新，这次是整条交互链。
             #
-            # 给一个 ALLOW 决策直接放行：它与改造前的实际效果相同（`read_only=True`
-            # 会在权限引擎的只读简化分支被直接放行），只是不再经过引擎。
-            # Hook 若判 ASK，这条放行同样会被升级为「问用户」。
+            # ── 它**照常过一次 `engine.decide`**（perm-system-serial-bypass）──
+            #
+            # 这里原本是「直接造一个 ALLOW 塞进串行桶、根本不调引擎」。后果是
+            # `permissions.yaml` 里的 `deny: run_agent` / `deny: send_message`
+            # **一条都不生效**，影响七个工具（`run_agent` / `load_skill` +
+            # C15 的五个协作工具）。危害不在「这些工具很危险」——它们不读写文件、
+            # 不执行命令，副作用限于起一条子对话或改进程内存；危害在于**文档从 C13
+            # 起一直承诺「仍可被 deny 规则整个禁掉」，而那是错的**。用户照着写一条
+            # 规则会以为自己关掉了委派能力，实际没有，且界面上完全看不出来。
+            # **错误的安全承诺比没有承诺更危险。**
+            #
+            # ⚠ **ASK 按 ALLOW 处理，这一条不可省。** 这类工具不弹确认面板是
+            # `system_serial` 存在的理由之一：它可能开一整条子对话，让它在这里
+            # 停下来等一个面板会把交互链拧成死结。而它们全都不在 `_TOOL_MAP` 里、
+            # 走 `other` 分支，因此在缺省档下③层未命中时必然拿到④模式层的 ASK
+            # ——不降级的话，一次普通的 `send_message` 就会弹面板，等于把这次改动
+            # 从「让 deny 生效」变成「给七个工具全加上人在回路」。
+            #
+            # 于是这个分支的净效果**只有一条**：DENY 现在拦得住了。
+            # ALLOW 与 ASK 的观感与改造前逐字一致（都是执行、都不弹面板）。
             if tool.system_serial:
-                system_decision = self._apply_hook_ask(
-                    DecisionResult(Decision.ALLOW, Layer.RULE, "系统级工具，免确认"),
-                    hook_verdict,
-                )
+                request = to_request(tool, tc.arguments, engine.mode, cwd)
+                raw = engine.decide(request)
+                # DENY 原样保留（含①黑名单、②沙箱——虽然 `other` 类请求走不到
+                # 那两层，这里不写特例是为了「引擎说拒就是拒」这条不留缺口）。
+                ask_downgraded = raw.decision == Decision.ASK
+                if raw.decision == Decision.DENY:
+                    system_decision = raw
+                else:
+                    system_decision = DecisionResult(
+                        Decision.ALLOW,
+                        raw.layer,
+                        (
+                            f"系统级工具（system_serial）：{raw.reason}；"
+                            "该结论按放行处理，不弹确认面板"
+                        ) if ask_downgraded else raw.reason,
+                        kind=raw.kind,
+                        host=raw.host,
+                    )
+                # Hook 的 ASK 仍然照常升级为「问用户」——**刻意与④模式层的 ASK
+                # 区别对待**：④是灰色地带的兜底，而 Hook 的 ASK 是用户针对这件事
+                # 写下的一条规则，那是明确的意愿表达，不是兜底。
+                # 这一支的行为与改造前逐字一致。
+                system_decision = self._apply_hook_ask(system_decision, hook_verdict)
                 # ⚠ **这条埋点不可省。**
                 #
-                # 这个分支不调 `engine.decide`，因此在改造之前它也**不产出任何
-                # `permission_decision` 事件**——记录里的表现是「一条 tool_execute
-                # 凭空出现，前面没有任何判定」。受影响的有七个工具：
-                # `run_agent` / `load_skill` + C15 的五个协作工具。
-                #
-                # 后果有两层：
-                # ① 写不了「每一次工具执行前都有一条判定」这种通用护栏
-                #    （它对七个工具恒假，只能整条放弃）；
-                # ② 已知项 #18 记的那个 bypass（`deny: send_message` 不生效）
-                #    **本身无法从 trace 复核**——只能靠「少了一条」去反推，
-                #    而「缺失」永远是最弱的证据。
-                #
-                # 现在如实记一条：`layer` 是 RULE、`reason` 明说「未经引擎」。
-                # **这不改变任何判定行为**，只是让绕过这件事在记录上是可见的。
-                # 真要让 deny 规则对它们生效是另一件事（安全边界变更，见已知项 #18）。
+                # 它原本是为了让「绕过引擎」这件事在记录上可见（此前这七个工具
+                # 一条判定记录都没有，时间线上表现为「一条 tool_execute 凭空出现」）。
+                # 绕过已经修掉，但埋点要留下，理由变成两条：
+                # ① 通用不变量「每一次 tool_execute 前面都有一条同 id 的判定」
+                #    靠它成立（护栏见 `tests/test_trace_system_serial.py`）；
+                # ② **ASK 被降级这件事必须可见**。不记的话时间线上只会看到
+                #    `allow（④模式）`，读的人会以为用户切到了放行档——
+                #    观测设施撒谎且不报错。
                 self._safe_emit(
                     TraceEventType.PERMISSION_DECISION,
                     tool=tc.name,
                     tool_call_id=tc.id,
-                    kind="system_serial",
-                    specifier=full_text(tc.arguments) if tc.arguments is not None else "",
-                    host="",
-                    is_read_only=tool.read_only,
+                    kind=request.kind,
+                    specifier=request.specifier,
+                    host=request.host,
+                    is_read_only=request.is_read_only,
                     decision=system_decision.decision.value,
                     layer=system_decision.layer.value,
-                    reason=(
-                        "系统级工具（system_serial），**未经权限引擎**——"
-                        "③可配置规则层的 deny 规则对它不生效，"
-                        "唯一有效的收窄手段是 Hook 的 pre_tool_use"
-                    ),
-                    bypassed_engine=True,
-                    cwd=str(cwd) if cwd is not None else None,
+                    reason=system_decision.reason,
+                    # 「引擎判了 ASK，但因为是系统级工具而按 ALLOW 执行了」。
+                    # 阅读器据此在时间线上标记，见 `trace/reader.py`。
+                    ask_downgraded=ask_downgraded,
+                    cwd=str(request.cwd) if request.cwd is not None else None,
                 )
                 serial.append((
                     tc,
@@ -1211,7 +1242,10 @@ class Agent:
                 # 记了之后，一条 `scope=subagent:worker` 却 `cwd=<主项目根>`
                 # 的记录本身就是结论。
                 cwd=str(request.cwd) if request.cwd is not None else None,
-                bypassed_engine=False,
+                # 普通工具永远不降级：判 ASK 就是弹面板。
+                # 这个常量 False 是有意义的对照——没有它，把标记写成常量 True
+                # 也能让系统级工具那条护栏通过，标记随即失去意义。
+                ask_downgraded=False,
             )
             # 升级已在埋点之前完成（见上方说明）。这里只做分桶：
             # 升级后的调用必须走串行桶弹面板，不能留在只读并发桶里。
