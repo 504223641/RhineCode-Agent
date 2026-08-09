@@ -395,6 +395,37 @@ class DriverCore:
         # 所以 kind 要单独补
         effective_kind = kind or ("session" if session_active else None)
 
+        # ── 后台活动量（C13/C15）──────────────────────────────────────
+        #
+        # ⚠ **这三个量是「`idle` 不等于系统静止」的解药。**
+        #
+        # 三态只描述**界面**：没有流式 Worker、没有面板挂着就是 `idle`。
+        # 但 C13 起，界面空闲时进程里仍可能有活：后台委派在跑、队员待命、
+        # 队友消息躺在信箱里等主对话自动唤起（`_maybe_auto_wake` 每 0.5 秒
+        # 在空闲时检查一次，符合条件就**自己起一条流**）。
+        #
+        # 于是一个 `wait` 返回 `idle` 之后，会话随时可能又忙起来——
+        # 断言因此是竞态的，而竞态的判据比没有判据更坏（它偶尔通过）。
+        #
+        # 读的都是内存里的整数与布尔，放在主线程这一次调度里一并取，
+        # 与其它界面字段同一时刻、互相自洽。
+        manager = getattr(self.app, "_manager", None)
+        background = {"subagents": 0, "idle_members": 0, "unread_for_main": False}
+        if manager is not None:
+            for key, fn in (
+                ("subagents", "running_subagent_count"),
+                ("idle_members", "team_idle_member_count"),
+                ("unread_for_main", "team_has_unread_for_main"),
+            ):
+                # 逐个 getattr + try：驱动设施要能驱动**旧版本**的产品代码
+                # （宿主与产品是分开演进的），少一个方法不该让 status 整个挂掉。
+                try:
+                    method = getattr(manager, fn, None)
+                    if method is not None:
+                        background[key] = method()
+                except Exception:  # noqa: BLE001 —— 只读快照绝不阻断
+                    pass
+
         panel: Optional[PanelSnapshot] = None
         panel_visible = False
         focused_type = type(self.app.focused).__name__ if self.app.focused is not None else None
@@ -415,7 +446,13 @@ class DriverCore:
             "panel_visible": panel_visible,
             "focused": focused_type,
             "panel": panel,
+            "background": background,
         }
+
+    @staticmethod
+    def _quiescent(background: dict) -> bool:
+        """实例侧的薄封装，便于子类或测试覆盖。见模块级 `_is_quiescent`。"""
+        return _is_quiescent(background)
 
     def _trace_seq(self) -> int:
         """
@@ -462,6 +499,7 @@ class DriverCore:
             state = SessionState.IDLE
 
         panel: Optional[PanelSnapshot] = ui["panel"]
+        background = ui.get("background") or {}
         return {
             "state": state.value,
             "panel": (
@@ -473,6 +511,9 @@ class DriverCore:
             "stream_active": ui["stream_active"],
             "focused": ui["focused"],
             "panel_visible": ui["panel_visible"],
+            "background": background,
+            # 「系统真的停下来了」——见 `_is_quiescent`
+            "quiescent": state is SessionState.IDLE and _is_quiescent(background),
         }
 
     def observe(self, since: int = 0, types: Optional[Iterable[str]] = None) -> dict:
@@ -596,37 +637,65 @@ class DriverCore:
         run_on_main(self.loop, _submit())
         return protocol.ok({"submitted": text})
 
-    def wait(self, timeout: float = 180.0) -> dict:
+    def wait(self, timeout: float = 180.0, until: str = "terminal") -> dict:
         """
-        等到会话进入两个终态之一：`idle`（这一轮跑完了）或 `pending`（需要你应答）。
+        等到会话到达指定的终态。
 
+        :param until: 等什么
+            - `"terminal"`（缺省，**行为与改造前逐字相同**）：
+              `idle`（这一轮跑完了）或 `pending`（需要你应答）。
+            - `"quiescent"`：`pending` **或**「界面空闲**且**后台也没活了」。
         :returns: 成功时 `{"terminal": "idle"|"pending", "state": {...}}`；
             超时走失败响应，`error.data` 是诊断
+
+        ## 为什么需要 `quiescent`
+
+        三态只看界面。C13 起，界面空闲时进程里仍可能有活——后台委派在跑，
+        或者队友消息躺在信箱里等主对话**自动唤起**（那会自己起一条流）。
+        于是 `wait` 返回 `idle` 之后会话随时可能又忙起来，
+        **在此之上做的断言是竞态的**，而竞态的判据比没有判据更坏：它偶尔通过。
+
+        C13 之前不存在这个问题，所以缺省值保持 `terminal`——既有场景一个字不用改。
+        写 C13/C15 的场景时请显式用 `quiescent`。
+
+        判据细节（尤其「待命队员为什么不算」）见模块级 `_is_quiescent`。
 
         **不持驱动锁**（不变量②）：它只轮询只读快照。
 
         轮询间隔从 30 ms 起、退避到 100 ms 封顶：够灵敏，长等待时也不至于
         打出几万次跨线程调度。
         """
+        want_quiescent = until == "quiescent"
         deadline = time.monotonic() + timeout
         interval = POLL_MIN
         state: dict = {}
         while time.monotonic() < deadline:
             state = self.snapshot()
-            if state["state"] in (SessionState.IDLE.value, SessionState.PENDING.value):
+            # `pending` 在两种模式下都是终态：它意味着**要人来应答**，
+            # 而人不应答的话后台那点活也推进不下去，继续等只会白等到超时。
+            if state["state"] == SessionState.PENDING.value:
                 return protocol.ok({"terminal": state["state"], "state": state})
+            if state["state"] == SessionState.IDLE.value:
+                if not want_quiescent or state.get("quiescent"):
+                    return protocol.ok({"terminal": state["state"], "state": state})
             time.sleep(interval)
             interval = min(interval * 1.5, POLL_MAX)
 
-        # 超时诊断：把三个判据分量都摊开，让人一眼看出「卡在哪一步」
+        # 超时诊断：把判据分量都摊开，让人一眼看出「卡在哪一步」。
+        # `background` 必须在里面——`quiescent` 模式下超时时，
+        # 「是子 Agent 还在跑，还是有条消息没人处理」是完全不同的两件事。
         final = state or self.snapshot()
+        target = "idle（且后台静止）或 pending" if want_quiescent else "idle 或 pending"
         return protocol.err(
             "timeout",
-            f"等待 {timeout} 秒后会话仍未进入 idle 或 pending",
+            f"等待 {timeout} 秒后会话仍未进入 {target}",
             {
                 "stream_active": final.get("stream_active"),
                 "pending": final.get("state") == SessionState.PENDING.value,
                 "session_panel": final.get("panel") is not None,
+                "until": until,
+                "quiescent": final.get("quiescent"),
+                "background": final.get("background"),
                 "last_action": self._last_action,
                 "waited": timeout,
                 "state": final.get("state"),
@@ -833,6 +902,46 @@ class DriverCore:
                     thread.join(timeout=30.0)
 
         app.exit()
+
+
+def _is_quiescent(background: dict) -> bool:
+    """
+    这份后台活动量说不说明「系统真的停下来了」。
+
+    :param background: `snapshot()["background"]`，三个键见 `_read_ui_state`
+    :returns: 没有任何还会自己动起来的东西 → True
+
+    ## 判据只有两条，第三条**刻意不算**
+
+    - `subagents > 0`   → 不静止。后台委派还在跑，它随时可能改文件、发消息。
+    - `unread_for_main` → 不静止。主对话的自动唤起（`_maybe_auto_wake`）
+      每 0.5 秒在空闲时检查一次，有未读就**自己起一条流**。
+      也就是说「现在 idle」与「一秒后又忙起来」完全兼容。
+    - `idle_members`    → **不算**。⚠ 这一条不能加。
+
+    ## 为什么 `idle_members` 不能算进去
+
+    C15 有一条明写的不变量：**主对话可以在队员待命时正常收工**
+    （`TeamGate.has_awaited` 恒为假，护栏
+    `test_team_wake.py::test_main_agent_can_finish_while_a_member_idles`）。
+    待命队员就是在那儿等消息，没有任何机制让它自己醒过来——
+    把它算作「系统还在动」，`wait --until quiescent` 会**永远等不到静止**，
+    然后超时，然后下一个人把这个判据整条删掉。
+
+    这与 CLAUDE.md 里那条「绝不要给 TaskStatus 加一个 is_terminal 为假的 IDLE」
+    是**同一个坑**：待命是一种稳定状态，不是一段未完成的工作。
+
+    ## 三条同时成立时为什么可以断定静止
+
+    主对话空闲（调用方已判）+ 0 个在跑的子 Agent + 信箱里没有给 main 的消息
+    → 没有任何正在执行的 Agent，因而没有人能发出新消息；
+    待命队员只能被消息唤醒，而消息只能由正在执行的 Agent 发出。闭环成立。
+    """
+    if background.get("subagents"):
+        return False
+    if background.get("unread_for_main"):
+        return False
+    return True
 
 
 def _safe_default(kind: Optional[str]) -> Any:

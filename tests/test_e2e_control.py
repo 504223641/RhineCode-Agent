@@ -289,6 +289,142 @@ class WaitTest(DriverFixture):
             await core.shutdown_on_main("test")
 
 
+class QuiescentWaitTest(DriverFixture):
+    """
+    `wait --until quiescent`：**「idle」不等于「系统静止」**。
+
+    ## 这组用例在防什么
+
+    三态只描述界面。C13 起，界面空闲时进程里仍可能有活：后台委派在跑，
+    或者队友消息躺在信箱里等主对话**自动唤起**（`_maybe_auto_wake` 每 0.5 秒
+    在空闲时检查一次，符合条件就自己起一条流）。
+
+    于是 `wait` 返回 `idle` 之后会话随时可能又忙起来，**基于它的断言是竞态的**
+    ——而竞态判据比没有判据更坏：它偶尔通过，于是没人相信失败是真的。
+    """
+
+    async def test_terminal_mode_is_unchanged_by_default(self):
+        """
+        **零回归**：缺省 `until="terminal"` 时行为与改造前逐字相同。
+
+        这条排在最前是刻意的——既有的 C2–C11 场景全都不传 `until`，
+        它们的行为一个字都不该变。
+        """
+        app, _ = self.assemble([[text("好的"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            res = await asyncio.to_thread(core.wait, 30.0)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["data"]["terminal"], SessionState.IDLE.value)
+            await core.shutdown_on_main("test")
+
+    async def test_status_reports_background_and_quiescent(self):
+        """
+        没有任何后台活动时：`background` 三个键都在，`quiescent` 为真。
+
+        字段必须**存在**而不只是「值对”——它们是场景的读取契约，
+        少一个键会让断言以 KeyError 的形式失败在一个和判据无关的地方。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            snap = await asyncio.to_thread(core.snapshot)
+            for key in ("subagents", "idle_members", "unread_for_main"):
+                self.assertIn(key, snap["background"], f"background 缺字段 {key}")
+            self.assertTrue(snap["quiescent"], "没有后台活动时应当判为静止")
+            await core.shutdown_on_main("test")
+
+    async def test_quiescent_waits_for_background_subagents(self):
+        """
+        后台还有子 Agent 在跑时，`quiescent` 模式**不得**提前返回。
+
+        用打桩的方式伪造「还有 1 个在跑」——起一个真子 Agent 会把这条用例
+        变成一个依赖模型剧本与线程时序的集成测试，而这里要验的只是
+        **判据本身**：`subagents > 0` 时不算静止。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            manager = app._manager
+            manager.running_subagent_count = lambda: 1
+            try:
+                res = await asyncio.to_thread(core.wait, 0.4, "quiescent")
+                self.assertFalse(res["ok"], "还有子 Agent 在跑就不该判为静止")
+                self.assertEqual(res["error"]["code"], "timeout")
+                data = res["error"]["data"]
+                # 超时诊断必须能区分「子 Agent 还在跑」与「有消息没人处理」
+                self.assertEqual(data["until"], "quiescent")
+                self.assertEqual(data["background"]["subagents"], 1)
+                self.assertEqual(data["state"], SessionState.IDLE.value)
+            finally:
+                del manager.running_subagent_count
+
+            # 恢复之后立刻能等到
+            res = await asyncio.to_thread(core.wait, 5.0, "quiescent")
+            self.assertTrue(res["ok"])
+            await core.shutdown_on_main("test")
+
+    async def test_quiescent_waits_for_pending_auto_wake(self):
+        """
+        信箱里有给 `main` 的未读消息时不算静止——它会自己起一条流。
+
+        这是 C15 特有的形态，也是最容易骗过 `terminal` 模式的那个：
+        界面此刻确实空闲，一秒后却开始跑一整轮。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            manager = app._manager
+            manager.team_has_unread_for_main = lambda: True
+            try:
+                res = await asyncio.to_thread(core.wait, 0.4, "quiescent")
+                self.assertFalse(res["ok"])
+                self.assertIs(res["error"]["data"]["background"]["unread_for_main"], True)
+            finally:
+                del manager.team_has_unread_for_main
+            await core.shutdown_on_main("test")
+
+    async def test_idle_members_alone_do_not_block_quiescence(self):
+        """
+        ⚠ **反证：待命队员不算「还在动」。**
+
+        C15 有一条明写的不变量——主对话可以在队员待命时正常收工
+        （`TeamGate.has_awaited` 恒为假）。把待命人数算进静止判据的话，
+        `wait --until quiescent` 会**永远等不到**，然后超时，
+        然后下一个人把这条判据整条删掉。
+
+        这与 CLAUDE.md 那条「绝不要给 TaskStatus 加 is_terminal 为假的 IDLE」
+        是同一个坑：待命是稳定状态，不是未完成的工作。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            manager = app._manager
+            manager.team_idle_member_count = lambda: 3
+            try:
+                res = await asyncio.to_thread(core.wait, 5.0, "quiescent")
+                self.assertTrue(res["ok"], "有队员待命仍应判为静止")
+                snap = await asyncio.to_thread(core.snapshot)
+                self.assertEqual(snap["background"]["idle_members"], 3)
+                self.assertTrue(snap["quiescent"])
+            finally:
+                del manager.team_idle_member_count
+            await core.shutdown_on_main("test")
+
+
 class CancelTest(DriverFixture):
     """AC20：取消后循环以「用户取消」结束，会话回到空闲且仍可再 send。"""
 

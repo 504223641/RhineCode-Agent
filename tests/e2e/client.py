@@ -161,7 +161,7 @@ def build_request(args: argparse.Namespace) -> dict:
     if cmd == "send":
         return {"cmd": "send", "text": args.text}
     if cmd == "wait":
-        return {"cmd": "wait", "timeout": args.timeout}
+        return {"cmd": "wait", "timeout": args.timeout, "until": args.until}
     if cmd == "answer":
         return {"cmd": "answer", "choice": args.choice, "via": args.via}
     if cmd == "observe":
@@ -227,6 +227,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_wait = sub.add_parser("wait", parents=[common])
     p_wait.add_argument("--timeout", type=float, default=180.0)
+    p_wait.add_argument(
+        "--until",
+        choices=("terminal", "quiescent"),
+        default="terminal",
+        help="terminal=idle 或 pending（缺省）；"
+             "quiescent=还要求后台没活（后台子 Agent 跑完、没有待自动唤起的消息）。"
+             "写 C13/C15 的场景时用后者，否则 idle 之后会话可能又忙起来",
+    )
 
     p_answer = sub.add_parser("answer", parents=[common])
     p_answer.add_argument("choice")

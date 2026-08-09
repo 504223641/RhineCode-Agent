@@ -253,7 +253,11 @@ def dispatch(host_state: HostState, request: dict) -> dict:
             timeout = float(request.get("timeout", 180.0))
         except (TypeError, ValueError):
             return protocol.err("bad_request", "wait 的 timeout 必须是数字")
-        return core.wait(timeout)
+        until = request.get("until", "terminal")
+        bad = protocol.validate_until(until)
+        if bad:
+            return protocol.err("bad_request", bad)
+        return core.wait(timeout, until)
 
     if cmd == "answer":
         choice = request.get("choice")
@@ -295,6 +299,10 @@ def build_status(host_state: HostState) -> dict:
         "trace_seq": ui.get("trace_seq", 0),
         "focused": ui.get("focused"),
         "panel_visible": ui.get("panel_visible"),
+        # 后台活动量与「系统真的停下来了」——C13/C15 的场景靠它们判定，
+        # 因为三态只描述界面（见 control._is_quiescent）
+        "background": ui.get("background", {}),
+        "quiescent": ui.get("quiescent", False),
         "turns": turns,
         "turn_budget": host_state.turn_budget,
         "fingerprint": info.fingerprint if info else "",
