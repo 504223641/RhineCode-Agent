@@ -623,6 +623,20 @@ def run_subagent(
             tools=sorted(toolset.allowed),
             model=(spec.model if spec is not None else None) or runtime.default_model,
             max_turns=spec.max_turns if spec is not None else None,
+            # ⚠ 以下四项都是「这次委派实际在什么条件下跑」，缺了就没法从记录复现。
+            #
+            # `member_name` —— 作用域已经用它了，但作用域是个字符串前缀，
+            #   要把「队员」与「角色」对上还得再猜一次（同一个角色可以派出多个队员）。
+            # `cwd` / `isolated` —— C14 的隔离是**物理的**（第②层按这个目录量边界）。
+            #   不记的话，「隔离到底生效没有」在记录上完全看不出来，
+            #   而 c14 成对维护点里最容易漏的恰恰是「读落到主项目根、写却是对的」。
+            # `permission_mode` —— C13 的核心承诺是「取 min(主对话档, 角色声明档)，
+            #   声明放行档不产生提权」。**实际生效的那个档位此前一处都没记**，
+            #   只能去 `/agents` 报告里看当下状态，事后无从复核。
+            member=member_name or None,
+            cwd=str(handle.path) if handle is not None else str(main_project_root()),
+            isolated=handle is not None,
+            permission_mode=_resolve_mode(runtime, spec).value,
         )
 
         stable, dynamic, history = _build_prompts(

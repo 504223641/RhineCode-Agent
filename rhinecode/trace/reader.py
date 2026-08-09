@@ -129,8 +129,12 @@ _LAYER_NAMES = {
 
 def _s_permission_decision(r: dict) -> str:
     layer = str(r.get("layer"))
+    # `bypassed_engine` 的调用**没进权限引擎**（`system_serial=True` 的七个工具）。
+    # 在时间线上单独标一个记号，否则它们看起来与正常走完五层的判定一模一样，
+    # 而两者的安全含义差得很远（deny 规则对前者不生效，见已知项 #18）。
+    mark = "⚠绕过引擎 " if r.get("bypassed_engine") else ""
     return (
-        f"{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
+        f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"
     )
 
@@ -233,9 +237,16 @@ def _s_subagent_start(r: dict) -> str:
     全文在展开单条（`--seq`）时看得到。
     """
     who = r.get("agent") or "(branch)"
+    # 队员名与角色名可以不同（同一个角色能派出多个队员），有就一并显示
+    member = f"/{r['member']}" if r.get("member") else ""
+    # 隔离与档位直接进摘要行：这两项决定了「它能干什么」，
+    # 排查越权或「为什么它写不进去」时第一眼就要看到，不该等到 --seq
+    iso = " · 隔离" if r.get("isolated") else ""
+    mode = f" · {r['permission_mode']}" if r.get("permission_mode") else ""
     return (
-        f"{r.get('kind')}:{who} [{r.get('task_id')}]"
-        f" · 工具 {r.get('tool_count', 0)} 个 · {_text_of(r.get('task'), 60)}"
+        f"{r.get('kind')}:{who}{member} [{r.get('task_id')}]"
+        f" · 工具 {r.get('tool_count', 0)} 个{iso}{mode}"
+        f" · {_text_of(r.get('task'), 60)}"
     )
 
 
@@ -260,6 +271,7 @@ def _s_worktree_create(r: dict) -> str:
     return (
         f"{tag} {r.get('name')} · 分支 {r.get('branch') or '-'}"
         f" · 基于 {r.get('base_commit') or '-'}"
+        f" · 落点 {r.get('path') or '-'}"
     )
 
 

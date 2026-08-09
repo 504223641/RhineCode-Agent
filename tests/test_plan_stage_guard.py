@@ -191,7 +191,11 @@ class PlanStageTraceTest(unittest.TestCase):
         reg = ToolRegistry()
         reg.register(writer)
         agent = Agent(provider=None, registry=reg)
-        agent._trace_tool = lambda tc, res, outcome: recorded.append(outcome)
+        # `**kw` 而不是逐个列出关键字参数：本用例只关心 `outcome`，
+        # 而 `_trace_tool` 的可选参数会随章节增加（c14 加了 `cwd`）。
+        # 写死签名的话，每加一个字段这条就以一个和判据毫不相干的
+        # TypeError 挂掉——实测撞过一次。
+        agent._trace_tool = lambda tc, res, outcome, **kw: recorded.append(outcome)
 
         _drive(agent, [ToolCall(id="1", name="mutate", arguments={})], planning=True)
         self.assertEqual(recorded, [OUTCOME_PLAN_BLOCKED])
