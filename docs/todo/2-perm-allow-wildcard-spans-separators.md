@@ -34,6 +34,16 @@ allow: Bash(git *)
 两个症状看着相反，**根因是同一个**：allow 侧把复合命令当成一整根字符串在比，
 既可能把不该放的放了，也可能把该放的挡了。
 
+**已有真实模型旁证**（2026-08-09，见 `docs/c12/acceptance.md` 末节）：
+在 `allow: Bash(git *)` 之下，模型自行产出的
+`git commit -m "…" && echo "=====PUSH=====" && git push origin main`
+里那段与 git 无关的 `echo`，正是靠整串命中 `git *` 拿到放行的。
+
+⚠ 同一次验收里有一条**方法论教训**：想让模型现场发出一条
+`git status && echo pwned > owned.txt` 来演示这个缺口时，**模型自己拒绝了**。
+不要把这当成「有防线」——它挡住的那一次，权限层本来是要放行的。
+这个缺口的引擎级事实只能靠确定性探针证明。
+
 ## 为什么上一轮没有一起修
 
 `perm-compound-command` 那一轮只动了 deny：deny 拆段是**收紧**，
