@@ -377,3 +377,22 @@ seq=83  scope=subagent:retry-limit-exp  decision=deny  layer=mode
 trace 字段随之从 `ask_downgraded` 改名 `mode_downgraded`（阅读器标
 ⚠④层已降级）——被降级的不再只有 ASK，**严格档下降级的是 DENY，那更需要
 看得见**：读的人得能分清「引擎放行了」与「引擎拒了但这类工具对该层免疫」。
+
+**真实模型复验**（同一条链路，让 `explorer`——严格档的内置只读角色——
+必须先 `send_message` 再交结论）：
+
+```
+seq=17  subagent_start  agent=explorer  permission_mode=strict
+seq=42  permission_decision  ⚠④层已降级 send_message → allow（④模式）
+        系统级工具（system_serial）：严格模式：无规则放行，默认拒绝；
+        该结论来自权限档兜底，对这类工具不生效，按放行处理
+seq=43  team_message  sender=explorer          ← 消息真的送达了
+        tool_execute send_message → outcome=executed
+```
+
+修复前同一个位置是 `decision=deny layer=mode`，模型白烧一轮还要在结论里
+向用户解释一遍。
+
+⚠ 同一份记录还**坐实了上面第 3 条理由**：同一个 strict 子 Agent 里，
+`grep_content` / `read_file` 走的是 `allow（③规则）· 只读工具默认放行`
+——**根本没进④层**。所以 `strict` 对 `explorer` 确实只管了协作工具那一件事。
