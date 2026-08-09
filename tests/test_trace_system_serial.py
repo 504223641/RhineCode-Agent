@@ -12,14 +12,16 @@
 凭空出现，前面什么判定都没有」。
 
 那个绕过已于 perm-system-serial-bypass 修掉：它们现在照常过引擎，
-只是**判 ASK 时按 ALLOW 处理**（保住「不弹确认面板」这条既有性质，
-那是 `system_serial` 存在的理由之一）。
+只是**对第④层（权限档兜底）整层免疫**——④判 ASK 或 DENY 都按 ALLOW 处理
+（保住「不弹确认面板」这条既有性质，那是 `system_serial` 存在的理由之一；
+而 DENY 也免疫是 `perm-system-serial-mode-immune` 一轮加的，理由见
+`tests/test_team_tools.py::SystemSerialPermissionTest.test_strict_mode_does_not_disable_it`）。
 
 ## 这组用例现在验什么
 
 ① **每一条 `tool_execute` 前面都有一条同 id 的判定**——通用不变量，
    改造前对七个工具恒假、整条写不出来；
-② **ASK 被降级这件事在记录上可见**（`ask_downgraded=True`）。不记的话
+② **④层结论被降级这件事在记录上可见**（`mode_downgraded=True`）。不记的话
    时间线上只剩 `allow（④模式）`，读的人会以为用户切到了放行档——
    观测设施撒谎且不报错，而缺省档下这才是那七个工具的常态。
 
@@ -93,7 +95,7 @@ class SystemSerialDecisionRecordedTest(unittest.TestCase):
         跑一轮循环，返回落盘的全部记录。
 
         ⚠ 用**缺省档**（不是放行档）。放行档下④层直接判 ALLOW，
-        `ask_downgraded` 恒为假——那样就验不到本组要验的东西了，
+        `mode_downgraded` 恒为假——那样就验不到本组要验的东西了，
         而缺省档才是那七个工具的实际常态。
         """
         with tempfile.TemporaryDirectory() as d:
@@ -150,10 +152,10 @@ class SystemSerialDecisionRecordedTest(unittest.TestCase):
         self.assertEqual(d["tool"], "fake_send_message")
         # 缺省档下④模式层判 ASK，被降级为放行执行。
         self.assertEqual(d["decision"], "allow")
-        self.assertIs(d["ask_downgraded"], True)
+        self.assertIs(d["mode_downgraded"], True)
         # reason 要说清「按放行处理、不弹面板」——只写 `allow（④模式）` 的话，
         # 读记录的人会以为用户切到了放行档。
-        self.assertIn("不弹确认面板", d["reason"])
+        self.assertIn("按放行处理", d["reason"])
 
     def test_deny_rule_is_recorded_and_stops_execution(self) -> None:
         """
@@ -172,8 +174,8 @@ class SystemSerialDecisionRecordedTest(unittest.TestCase):
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0]["decision"], "deny")
         self.assertEqual(decisions[0]["layer"], "rule")
-        # DENY 不降级——只有 ASK 降级。
-        self.assertIs(decisions[0]["ask_downgraded"], False)
+        # ③层的 DENY 不降级——免疫只覆盖④层。
+        self.assertIs(decisions[0]["mode_downgraded"], False)
         executed = [
             r for r in records if r["type"] == TraceEventType.TOOL_EXECUTE.value
         ]
@@ -211,15 +213,15 @@ class SystemSerialDecisionRecordedTest(unittest.TestCase):
 
     def test_ordinary_tool_is_not_marked_as_downgraded(self) -> None:
         """
-        **反证**：普通工具必须 `ask_downgraded=False`。
+        **反证**：普通工具必须 `mode_downgraded=False`。
 
         没有这条的话，把标记写成常量 True 也能让上面几条全绿——
-        而那等于给每条判定都盖上「ASK 已降级」的戳，标记随即失去意义。
+        而那等于给每条判定都盖上「④层已降级」的戳，标记随即失去意义。
         """
         records = self._run(_OrdinaryTool())
         decisions = self._decisions(records)
         self.assertEqual(len(decisions), 1)
-        self.assertIs(decisions[0]["ask_downgraded"], False)
+        self.assertIs(decisions[0]["mode_downgraded"], False)
 
 
 if __name__ == "__main__":
