@@ -276,9 +276,10 @@ class CompoundCommandTest(unittest.TestCase):
         对一个只会「多拦」的方向而言，误伤的代价是弹一次面板；反过来漏拦的代价
         是命令直接跑掉。
 
-        ⚠ 想「把拆分做对」（加引号感知）之前先读
-        `docs/todo/2-perm-allow-wildcard-spans-separators.md` 里那一节——
-        那会**同时放宽①黑名单**，是扩大改动面而不是修 bug。
+        ⚠ **allow 侧已经改成认引号了**（`split_commands_quoted`），
+        但收紧侧**刻意没跟着改**——把引号感知搬进 `split_commands`
+        看起来是「把拆分做对」，实际是在放宽①危险命令黑名单。
+        对照见 `test_perm_matching.py::SplitCommandsQuotedTests::test_naive_split_stays_naive`。
         """
         rs = RuleSet([Rule("deny", "Bash", "rm *", "user")])
         result = rs.evaluate(cmd_request('git commit -m "fix: a; rm -rf x"'))

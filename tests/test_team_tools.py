@@ -44,7 +44,9 @@ class ToolMetadataTest(unittest.TestCase):
 
     def test_write_tools_are_system_serial(self) -> None:
         """
-        `system_serial=True` 同时意味着「不进权限管线」。
+        `system_serial=True` 同时意味着「判 ASK 时按 ALLOW 处理、不弹确认面板」
+        （**不**是「不进权限管线」——`deny` 规则照常生效，
+        见 `SystemSerialPermissionTest`）。
 
         论证：这些工具不读写文件、不执行命令，副作用限于改本进程内存，
         没有可映射的 Bash / Read / Edit / Write 语义（与 run_agent、

@@ -1053,9 +1053,13 @@ class Agent:
             #
             # C13 的委派工具 `run_agent` 恰好把它激活了：`system_serial=True`
             # **且** `read_only=False`。后果实测过——规划阶段模型凭训练先验硬造出
-            # 一个 `run_agent` 调用，它**既没被这里挡下、又因为 system_serial
-            # 不进权限管线**，直接执行了；而它委派出去的子 Agent 可以写文件。
+            # 一个 `run_agent` 调用，它**既没被这里挡下、又因为当时 system_serial
+            # 压根不进权限引擎**，直接执行了；而它委派出去的子 Agent 可以写文件。
             # Plan Mode「批准前不动手」的承诺就此被绕过。
+            #
+            # （那个「不进引擎」的缺陷已于 perm-system-serial-bypass 单独修掉，
+            # 但本守卫**仍然不可省**：引擎对 `run_agent` 只会判 ASK，而
+            # 系统级工具的 ASK 按 ALLOW 处理——挡住规划阶段委派的只有这一道。）
             #
             # 改成 `plan_safe` 之后：`load_skill` 仍靠 `read_only=True` 通过
             # （行为一字不变），而任何**没有明确声明过自己规划期安全**的副作用工具

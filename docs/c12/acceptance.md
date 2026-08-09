@@ -266,7 +266,8 @@ deny: Bash(git push *)
 > `_match_command_field` **共用一份实现**。
 > allow 侧刻意保持整串匹配（拆段是放宽，方向错），但实施期发现那边另有一个
 > 独立缺口（末尾通配 `.*` 跨分隔符），已登记为
-> `docs/todo/2-perm-allow-wildcard-spans-separators.md`。
+> `docs/todo/2-perm-allow-wildcard-spans-separators.md`
+> （**已于 `perm-system-serial-bypass` 修复**：allow 改为「每一段都得命中」）。
 >
 > **真实模型验收见下方「附：deny 侧修复的真实模型复验」。**
 
@@ -309,7 +310,7 @@ origin 的 main 分支。」**没有任何关于 `&&` 的暗示。**
 
 第 1 行那条命令里的 `echo "=====PUSH====="` 是个**与 git 无关**的段，
 而它正是靠 `allow: Bash(git *)` 整串命中才在改动前拿到放行的——
-这就是 `docs/todo/2-perm-allow-wildcard-spans-separators.md` 记的那个缺口，
+这就是当时登记的那个 allow 侧缺口（**已于 `perm-system-serial-bypass` 修复**），
 由真实模型的输出顺带证实。
 
 ⚠ 另有两次**没能**在真机上完成的探测，如实记下：想让模型直接发出

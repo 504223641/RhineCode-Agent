@@ -68,7 +68,7 @@ B/C 都要重新论证 C13 的委派契约。
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b subagent-cancel-semantics。
 
-读 docs/todo/3-subagent-cancel-semantics.md，以及 docs/c14/acceptance/live-model.md
+读 docs/todo/1-subagent-cancel-semantics.md，以及 docs/c14/acceptance/live-model.md
 第四节 A（实测现场）。
 
 ⚠ 动手前先问用户要 A / B / C 哪种语义——这一条改的是 C13 的对外契约
