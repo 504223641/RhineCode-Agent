@@ -319,7 +319,7 @@ C11 的全部文档收在 `docs/c11/` 一个目录下，进门先读 **`docs/c11
 
 - **产品能力（Skill 系统）**——顶层 `spec.md` / `plan.md` / `task.md` / `checklist.md` 是 C11 原始设计；`docs/c11/align/` 下同名四份是**对齐 Agent Skills 开放标准的改造**。**两者冲突时以 `align/` 为准**（`allowed-tools` 的语义、命令名来源、执行模式字段、「谁能触发」是否与「在哪执行」正交、白名单笔误是否 fail-fast，这五处都反过来了）。原始那四份**刻意保留**——它们记录「当初为什么那样设计」，删掉等于把这段历史扔了。
 - **跨阶段测试设施**——`docs/c11/testing/`，**不占章节号、不属于 Skill 系统**，服务 C2–C11 与未来所有阶段的验收。`brief.md`（需求交底，同时覆盖两期）+ `p0-trace/`（P0 行为记录器）+ `p1-driver/`（P1a 端到端驱动设施）。两期是**并列**关系不是父子。P1b 尚未开工，范围清单在 `p1-driver/spec.md` 末节。
-- **验收记录**——`docs/c11/acceptance/` 下四份实跑报告：`skills-c11-live.md`（C11 原始设计，10 场景 43/43）、`skills-align-live.md`（对齐改造，7 场景 29/29）、`trace-p0-e2e.md`（用 P1a 验 P0）、`driver-p1a.md`（P1a 自身）。每条判据分「机器判到了什么」与「据此做的判断」两栏。
+- **验收记录**——`docs/c11/acceptance/` 下五份实跑报告：`skills-c11-live.md`（C11 原始设计，10 场景 43/43）、`skills-align-live.md`（对齐改造，7 场景 29/29）、`trace-p0-e2e.md`（用 P1a 验 P0）、`driver-p1a.md`（P1a 自身）、**`trace-driver-live.md`**（2026-08-09 真实模型验两套设施自身，29 条判据全中，真机抓出 2 个单测抓不到的缺口）。每条判据分「机器判到了什么」与「据此做的判断」两栏。
 
 C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C7（MCP 客户端）、C6（五层防御权限系统）、C5（结构化系统提示与缓存策略）、C4（Agent Loop 与 Plan Mode）文档仍保留，用于追溯设计来源。
 
