@@ -58,7 +58,7 @@ from rhinecode.trace import (
     TraceEventType,
     TraceRecorderProtocol,
     agent_event_payload,
-    clip,
+    full_text,
 )
 from rhinecode.tui.widgets import (
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
@@ -358,7 +358,7 @@ class RhineApp(App):
         # 记录里看不出来）。compose_status_text 是纯函数、零副作用，多调一次没成本。
         self._recorder.emit_lazy(
             TraceEventType.STATUS_BAR,
-            lambda: {"text": clip(compose_status_text(**status_args))},
+            lambda: {"text": full_text(compose_status_text(**status_args))},
         )
 
     # ------------------------------------------------------------------ #
@@ -383,7 +383,7 @@ class RhineApp(App):
         """
         self._recorder.emit_lazy(
             TraceEventType.UI_MESSAGE,
-            lambda: {"source": source, "text": clip(text)},
+            lambda: {"source": source, "text": full_text(text)},
         )
 
     def show_user_input(self, text: str) -> None:
@@ -1004,7 +1004,7 @@ class RhineApp(App):
                 text = "".join(response_chunks)
                 self._recorder.emit_lazy(
                     TraceEventType.UI_MESSAGE,
-                    lambda text=text: {"source": "assistant", "text": clip(text)},
+                    lambda text=text: {"source": "assistant", "text": full_text(text)},
                 )
                 # c12 `assistant_message`：与 `ui_message` 埋点**同位置、同产出条件**。
                 # 搭它的车是刻意的——「一段 AI 正文产出完毕」这件事在本文件里只有
@@ -1317,7 +1317,7 @@ class RhineApp(App):
             TraceEventType.INTERACTION,
             lambda: {
                 "kind": kind,
-                "display": clip(display),
+                "display": full_text(display),
                 "source": source,
                 "result": getattr(result, "value", result),
             },

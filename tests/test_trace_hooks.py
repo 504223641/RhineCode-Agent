@@ -166,18 +166,24 @@ class ModelInteractionTest(TraceHookBase):
         self.assertEqual(resp["turn"], 1)
         self.assertGreaterEqual(resp["duration_ms"], 0)
 
-    def test_truncation_records_original_length(self) -> None:
-        """AC17：超长字段被截断但记下原长。"""
-        from rhinecode.trace.models import MAX_FIELD_CHARS
+    def test_long_response_recorded_in_full(self) -> None:
+        """
+        超长模型正文**完整落盘**，不截断。
 
-        long_text = "字" * (MAX_FIELD_CHARS + 500)
+        原判据是 AC17「超长字段被截断但记下原长」，现已推翻——记录器不再有
+        任何字段阈值（理由见 `trace/models.py` 顶部那段注释）。
+        这条从「验截断」翻成「验完整」，是同一个位置上的相反断言。
+
+        取旧阈值（4000）的 10 倍长度，防止有人把阈值「调大」而不是删掉。
+        """
+        long_text = "字" * 40_000
         provider = ScriptedProvider([_text_round(long_text)])
         traced = TracingProvider(provider, self.rec, "model")
         self.run_loop(traced, ToolRegistry())
 
         resp = self.records(T.API_RESPONSE)[0]
-        self.assertIs(resp["text"]["truncated"], True)
-        self.assertEqual(resp["text"]["original_length"], MAX_FIELD_CHARS + 500)
+        self.assertIsInstance(resp["text"], str)
+        self.assertEqual(resp["text"], long_text)
 
 
 class PermissionHookTest(TraceHookBase):

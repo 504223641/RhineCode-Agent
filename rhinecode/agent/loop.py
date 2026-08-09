@@ -59,7 +59,7 @@ from rhinecode.trace import (
     NullRecorder,
     TraceEventType,
     TraceRecorderProtocol,
-    clip,
+    full_text,
 )
 
 # ── 工具执行的结局取值（trace）──
@@ -322,6 +322,7 @@ class Agent:
         outcome: str,
         duration_ms: float = 0,
         is_concurrent: bool = False,
+        cwd: Optional[Path] = None,
     ) -> None:
         """
         记一条 `tool_execute` 事件。八处 `results[tc.id]` 写入点共用本方法。
@@ -337,8 +338,21 @@ class Agent:
             一眼就知道是真的快
         :param is_concurrent: 是否走了只读并发桶
 
+        :param cwd: 本次调用的工作目录（c14）。**隔离子 Agent 与主对话在这里分道**，
+            不记的话「读落到主项目根、写却是对的」这类隔离故障在记录上完全看不出来
+            ——那恰恰是 c14 成对维护点里最容易漏的一条（并发只读桶漏传 `cwd`）。
+            `None` 表示调用点没有工作目录概念
+
+        ## 两个 output 字段的分工
+
+        - `output`：**完整原文**。trace 的职责是完整，主字段就该是完整的那一份。
+        - `model_output`：模型**实际收到**的那一份，**只在与完整原文不同时才出现**。
+          目前唯一会不同的是 `run_command`（它裁掉中间行以省 token）。
+          两者都记是因为它们回答的是两个不同的问题：「命令到底输出了什么」
+          与「模型是据什么做的下一步判断」——排查时经常需要同时知道。
+
         走 `emit_lazy` 是因为负载里的 `output` 可能很大（一次 `read_file` 就是整份文件），
-        关闭记录时不该白 `clip` 一遍（spec N1）。
+        关闭记录时不该白构造一遍（spec N1）。
 
         副作用：产出一条 trace 事件；**任何异常都被吞掉**，不影响循环。
         """
@@ -347,13 +361,22 @@ class Agent:
             lambda: {
                 "tool": tc.name,
                 "tool_call_id": tc.id,
-                "arguments": clip(tc.arguments) if tc.arguments is not None else None,
+                "arguments": full_text(tc.arguments) if tc.arguments is not None else None,
                 "ok": res.ok,
                 "summary": res.summary,
-                "output": clip(res.output),
+                "output": full_text(
+                    res.full_output if res.full_output is not None else res.output
+                ),
+                # 只在真的不同时才写，避免每条事件都存两份一模一样的正文
+                **(
+                    {"model_output": full_text(res.output)}
+                    if res.full_output is not None
+                    else {}
+                ),
                 "duration_ms": duration_ms if outcome == OUTCOME_EXECUTED else 0,
                 "is_concurrent": is_concurrent,
                 "outcome": outcome,
+                "cwd": str(cwd) if cwd is not None else None,
             },
         )
 
@@ -1087,13 +1110,49 @@ class Agent:
             # 会在权限引擎的只读简化分支被直接放行），只是不再经过引擎。
             # Hook 若判 ASK，这条放行同样会被升级为「问用户」。
             if tool.system_serial:
+                system_decision = self._apply_hook_ask(
+                    DecisionResult(Decision.ALLOW, Layer.RULE, "系统级工具，免确认"),
+                    hook_verdict,
+                )
+                # ⚠ **这条埋点不可省。**
+                #
+                # 这个分支不调 `engine.decide`，因此在改造之前它也**不产出任何
+                # `permission_decision` 事件**——记录里的表现是「一条 tool_execute
+                # 凭空出现，前面没有任何判定」。受影响的有七个工具：
+                # `run_agent` / `load_skill` + C15 的五个协作工具。
+                #
+                # 后果有两层：
+                # ① 写不了「每一次工具执行前都有一条判定」这种通用护栏
+                #    （它对七个工具恒假，只能整条放弃）；
+                # ② 已知项 #18 记的那个 bypass（`deny: send_message` 不生效）
+                #    **本身无法从 trace 复核**——只能靠「少了一条」去反推，
+                #    而「缺失」永远是最弱的证据。
+                #
+                # 现在如实记一条：`layer` 是 RULE、`reason` 明说「未经引擎」。
+                # **这不改变任何判定行为**，只是让绕过这件事在记录上是可见的。
+                # 真要让 deny 规则对它们生效是另一件事（安全边界变更，见已知项 #18）。
+                self._safe_emit(
+                    TraceEventType.PERMISSION_DECISION,
+                    tool=tc.name,
+                    tool_call_id=tc.id,
+                    kind="system_serial",
+                    specifier=full_text(tc.arguments) if tc.arguments is not None else "",
+                    host="",
+                    is_read_only=tool.read_only,
+                    decision=system_decision.decision.value,
+                    layer=system_decision.layer.value,
+                    reason=(
+                        "系统级工具（system_serial），**未经权限引擎**——"
+                        "③可配置规则层的 deny 规则对它不生效，"
+                        "唯一有效的收窄手段是 Hook 的 pre_tool_use"
+                    ),
+                    bypassed_engine=True,
+                    cwd=str(cwd) if cwd is not None else None,
+                )
                 serial.append((
                     tc,
                     tool,
-                    self._apply_hook_ask(
-                        DecisionResult(Decision.ALLOW, Layer.RULE, "系统级工具，免确认"),
-                        hook_verdict,
-                    ),
+                    system_decision,
                 ))
                 continue
 
@@ -1140,6 +1199,19 @@ class Agent:
                 decision=decision.decision.value,
                 layer=decision.layer.value,
                 reason=decision.reason,
+                # ⚠ **c14：判定用的那个边界必须记下来。**
+                #
+                # `specifier` 只是模型给的那串路径（常常是相对路径），它单看无法
+                # 回答「这次读写落在哪儿」。而 c14 成对维护点里最容易漏的一条
+                # 恰恰是「并发只读桶漏传 cwd」——漏了之后隔离子 Agent 的**读**
+                # 落到主项目根、**写**却是对的，界面上完全看不出来。
+                #
+                # 不记这个字段的话，那类隔离故障在记录上也看不出来：
+                # 主对话与隔离子 Agent 的 `permission_decision` 长得一模一样。
+                # 记了之后，一条 `scope=subagent:worker` 却 `cwd=<主项目根>`
+                # 的记录本身就是结论。
+                cwd=str(request.cwd) if request.cwd is not None else None,
+                bypassed_engine=False,
             )
             # 升级已在埋点之前完成（见上方说明）。这里只做分桶：
             # 升级后的调用必须走串行桶弹面板，不能留在只读并发桶里。
@@ -1171,7 +1243,7 @@ class Agent:
             # 它既不在 `permission_decision` 里（压根没进引擎），
             # 叠加 F17 的字段白名单后也不在 `agent_event` 里（那里只留工具名与 ok）。
             # 漏埋这一条，本模块就查不出当初立项要查的那个问题。
-            self._trace_tool(tc, res, OUTCOME_OUT_OF_SCOPE)
+            self._trace_tool(tc, res, OUTCOME_OUT_OF_SCOPE, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # Plan Mode 规划阶段夹带的副作用工具：拒绝并指回「先提交计划」。
@@ -1191,7 +1263,7 @@ class Agent:
                 summary="规划阶段不执行副作用工具",
             )
             results[tc.id] = res
-            self._trace_tool(tc, res, OUTCOME_PLAN_BLOCKED)
+            self._trace_tool(tc, res, OUTCOME_PLAN_BLOCKED, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 被 Hook 前置层拦下的：不执行，回灌规则给出的原因（c12 spec F6.3）。
@@ -1207,7 +1279,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = ToolResult(ok=False, output=verdict.reason, summary="Hook 拦截")
             results[tc.id] = res
-            self._trace_tool(tc, res, OUTCOME_BLOCKED_BY_HOOK)
+            self._trace_tool(tc, res, OUTCOME_BLOCKED_BY_HOOK, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         # 只读且放行：并发
@@ -1340,7 +1412,7 @@ class Agent:
             if not isinstance(tc.arguments, dict):
                 res = _invalid_args_result(tc)
                 results[tc.id] = res
-                self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS, is_concurrent=True)
+                self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS, is_concurrent=True, cwd=cwd)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
         valid = [(tc, tool) for tc, tool in items if isinstance(tc.arguments, dict)]
@@ -1407,6 +1479,7 @@ class Agent:
                     OUTCOME_EXECUTED,
                     duration_ms=duration,
                     is_concurrent=True,
+                    cwd=cwd,
                 )
                 # 工具级后置事件（c12）：只挂在「真的执行了」之后（spec AC3）。
                 # 这里跑在生成器所在的 Worker 线程上，不在池线程里。
@@ -1450,7 +1523,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = ToolResult(ok=False, output=f"未知工具: {tc.name}")
             results[tc.id] = res
-            self._trace_tool(tc, res, OUTCOME_UNKNOWN_TOOL)
+            self._trace_tool(tc, res, OUTCOME_UNKNOWN_TOOL, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -1459,7 +1532,7 @@ class Agent:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
             res = _invalid_args_result(tc)
             results[tc.id] = res
-            self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS)
+            self._trace_tool(tc, res, OUTCOME_INVALID_ARGUMENTS, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -1471,7 +1544,7 @@ class Agent:
                 summary="权限拒绝",
             )
             results[tc.id] = res
-            self._trace_tool(tc, res, OUTCOME_DENIED_BY_PERMISSION)
+            self._trace_tool(tc, res, OUTCOME_DENIED_BY_PERMISSION, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -1496,7 +1569,7 @@ class Agent:
             results[tc.id] = res
             # **不置 `ctx.user_denied`**：那个标志会让下一轮 `tools=None`。
             # 子 Agent 应当带着工具继续、改用只读方式达成，见常量注释。
-            self._trace_tool(tc, res, OUTCOME_DENIED_NON_INTERACTIVE)
+            self._trace_tool(tc, res, OUTCOME_DENIED_NON_INTERACTIVE, cwd=cwd)
             yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
             return
 
@@ -1508,7 +1581,7 @@ class Agent:
                 results[tc.id] = res
                 # 置位后主循环下一轮**不发工具**（硬约束，见 DENIED_BY_USER_FEEDBACK 注释）
                 ctx.user_denied = True
-                self._trace_tool(tc, res, OUTCOME_DENIED_BY_USER)
+                self._trace_tool(tc, res, OUTCOME_DENIED_BY_USER, cwd=cwd)
                 yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
                 return
 
@@ -1535,7 +1608,7 @@ class Agent:
             res = ToolResult(ok=False, output=f"工具执行异常: {e}")
         results[tc.id] = res
         duration = round((time.monotonic() - t0) * 1000, 3)
-        self._trace_tool(tc, res, OUTCOME_EXECUTED, duration_ms=duration)
+        self._trace_tool(tc, res, OUTCOME_EXECUTED, duration_ms=duration, cwd=cwd)
         # 工具级后置事件（c12）：只挂在「真的执行了」之后。上面每一条提前 return
         # 的分支（未知工具 / 参数错误 / 权限拒绝 / 用户拒绝）都不挂——它们压根没跑。
         self._dispatch_post_tool(tc, tool, res, duration, cwd)

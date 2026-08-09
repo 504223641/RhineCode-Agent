@@ -59,7 +59,7 @@ from rhinecode.trace import (
     NullRecorder,
     TraceEventType,
     TraceRecorderProtocol,
-    clip,
+    full_text,
     redact_config,
 )
 from rhinecode.trace.tracing_provider import TracingProvider
@@ -465,7 +465,7 @@ def build_app(
             ],
             # Skill 清单快照直接取「实际注入模型的那段清单文本」，而不是另造一份
             # 结构化摘要：读 trace 时最想确认的正是「模型到底看到了哪些 Skill」。
-            "skills_index": clip(skill_manager.index_text()),
+            "skills_index": full_text(skill_manager.index_text()),
             "resume_latest": resume_latest,
         },
     )

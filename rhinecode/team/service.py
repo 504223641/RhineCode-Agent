@@ -41,7 +41,7 @@ from rhinecode.team.models import (
 )
 from rhinecode.team.render import render_board, render_roster
 from rhinecode.team.roster import RegisterResult, Roster
-from rhinecode.trace import TraceEventType, clip
+from rhinecode.trace import TraceEventType, full_text
 
 
 class TeamService:
@@ -196,7 +196,7 @@ class TeamService:
             recipient=recipient,
             ok=result.ok,
             summary=(result.envelope.summary if result.envelope else result.reason),
-            body=clip(body),
+            body=full_text(body),
         )
         return result
 

@@ -10,13 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from rhinecode.trace.models import (
-    MAX_FIELD_CHARS,
     REDACTED,
     SCOPE_MAIN,
     TraceEventType,
     agent_event_payload,
-    clip,
     default_trace_path,
+    full_text,
     isolated_scope,
     redact_config,
 )
@@ -39,36 +38,86 @@ class EventTypeTest(unittest.TestCase):
         # 继承 str 的好处：json.dumps 与 == 都能直接用
         self.assertEqual(TraceEventType.USER_INPUT, "user_input")
 
+    def test_docstring_count_matches_actual_members(self) -> None:
+        """
+        枚举的 docstring 里那个中文数字必须与真实成员数一致。
 
-class ClipTest(unittest.TestCase):
-    def test_within_limit_returns_bare_string(self) -> None:
-        # 未截断返回裸串（不是包了一层的对象）——阅读器与测试都依赖这条约定
-        self.assertEqual(clip("ab", 5), "ab")
-        self.assertEqual(clip("abcde", 5), "abcde")
+        **为什么值得为一句注释写测试**：这个数字漂移过两次——docstring 停在
+        「十九类」、CLAUDE.md 停在「二十三类」，而实际已经是 27。
+        它是纯文字、漏改不报错，于是每一章都往下带一次错。
+        上面那条 `assertEqual(len(members), 27)` 只钉住数量，钉不住**说法**。
 
-    def test_over_limit_returns_three_fields(self) -> None:
-        out = clip("a" * 10, 5)
-        self.assertIsInstance(out, dict)
-        self.assertEqual(out["text"], "aaaaa")
-        self.assertIs(out["truncated"], True)
-        self.assertEqual(out["original_length"], 10)
+        读到这条用例失败时：改 `TraceEventType` 的 docstring，
+        **并且**同步 `CLAUDE.md` 里「二十三类结构化事件」那句
+        （那一处没有护栏，只能靠这里提醒）。
+        """
+        digits = "零一二三四五六七八九"
+        n = len(list(TraceEventType))
+        if n < 10:
+            chinese = digits[n]
+        elif n < 20:
+            chinese = "十" + (digits[n % 10] if n % 10 else "")
+        else:
+            chinese = digits[n // 10] + "十" + (digits[n % 10] if n % 10 else "")
 
-    def test_default_limit_is_max_field_chars(self) -> None:
-        out = clip("x" * (MAX_FIELD_CHARS + 1))
-        self.assertEqual(out["original_length"], MAX_FIELD_CHARS + 1)
-        self.assertEqual(len(out["text"]), MAX_FIELD_CHARS)
+        doc = TraceEventType.__doc__ or ""
+        self.assertIn(
+            chinese,
+            doc,
+            f"枚举现有 {n} 个成员（中文写作「{chinese}」），"
+            f"但 docstring 里没有这个数字——请同步 docstring 与 CLAUDE.md",
+        )
 
-    def test_chinese_truncated_by_character_without_mojibake(self) -> None:
-        # 按字符切分，不会把一个中文字切成半个字节序列
-        out = clip("中文测试内容", 3)
-        self.assertEqual(out["text"], "中文测")
-        self.assertEqual(out["original_length"], 6)
-        # 能正常编解码，证明没有产生非法序列
-        self.assertEqual(out["text"].encode("utf-8").decode("utf-8"), "中文测")
+
+class FullTextTest(unittest.TestCase):
+    """
+    `full_text` 的全部契约：**不截断**。
+
+    这组用例是「trace 不做任何取舍」这条产品承诺在代码里的落点。
+    它替代了原来的 `ClipTest`——那组用例逐条断言了截断行为
+    （超限返回三字段对象、按字符切分不产生乱码……），现在**方向完全相反**。
+    """
+
+    def test_short_string_returned_as_is(self) -> None:
+        self.assertEqual(full_text("ab"), "ab")
+
+    def test_long_string_is_not_truncated_at_any_length(self) -> None:
+        # 旧阈值是 4000。取一个远超它的长度，断言**一个字符都没少**、
+        # 且返回的仍是裸字符串而不是「截断对象」。
+        text = "a" * 100_000
+        out = full_text(text)
+        self.assertIsInstance(out, str)
+        self.assertEqual(len(out), 100_000)
+        self.assertEqual(out, text)
+
+    def test_chinese_is_intact(self) -> None:
+        # 中文一个字符占三字节，是最容易被字节级截断切坏的形态。
+        text = "中文测试内容" * 5000
+        out = full_text(text)
+        self.assertEqual(out, text)
+        # 能原样编解码，证明没有产生非法序列
+        self.assertEqual(out.encode("utf-8").decode("utf-8"), text)
 
     def test_non_string_is_stringified(self) -> None:
-        self.assertEqual(clip({"a": 1}), str({"a": 1}))
-        self.assertEqual(clip(123), "123")
+        self.assertEqual(full_text({"a": 1}), str({"a": 1}))
+        self.assertEqual(full_text(123), "123")
+
+    def test_module_exposes_no_threshold_constants(self) -> None:
+        """
+        **反证**：旧的两个阈值常量必须真的不存在。
+
+        只把 `full_text` 改成不截断、却把 `MAX_FIELD_CHARS` 留在原地，
+        下一个人很容易「顺手」再用起来——而那是静默回归：
+        记录看起来正常，只是又开始丢内容了。
+        """
+        import rhinecode.trace.models as m
+        import rhinecode.trace as pkg
+
+        for name in ("MAX_FIELD_CHARS", "MAX_MESSAGE_ITEMS", "clip"):
+            self.assertFalse(
+                hasattr(m, name), f"models 不应再有 {name}——trace 不做任何截断"
+            )
+            self.assertFalse(hasattr(pkg, name), f"trace 包不应再导出 {name}")
 
 
 class RedactConfigTest(unittest.TestCase):

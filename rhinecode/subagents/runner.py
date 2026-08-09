@@ -47,7 +47,7 @@ from rhinecode.team.gate import TeamGate
 from rhinecode.team.identity import bind_identity
 from rhinecode.team.models import MemberState
 from rhinecode.tools.path_guard import main_project_root
-from rhinecode.trace import NullRecorder, TraceEventType, clip, subagent_scope
+from rhinecode.trace import NullRecorder, TraceEventType, full_text, subagent_scope
 from rhinecode.worktree import (
     WorktreeHandle,
     inspect as worktree_inspect,
@@ -462,7 +462,7 @@ def _emit_end(
             turns=turns,
             usage_tokens=record.usage_tokens,
             stop_reason=stop_reason.value,
-            conclusion=clip(conclusion),
+            conclusion=full_text(conclusion),
         )
     except Exception:  # noqa: BLE001 —— 观测设施绝不能反过来影响被观测的系统
         pass
@@ -618,7 +618,7 @@ def run_subagent(
             kind=kind,
             agent=agent_label,
             task_id=record.task_id,
-            task=clip(task_text),
+            task=full_text(task_text),
             tool_count=len(toolset.allowed),
             tools=sorted(toolset.allowed),
             model=(spec.model if spec is not None else None) or runtime.default_model,

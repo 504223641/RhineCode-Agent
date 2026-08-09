@@ -38,8 +38,16 @@ def _text_of(value: Any, limit: int = 90) -> str:
     """
     把一个字段值渲染成单行短文本。
 
-    落盘时被截断的字段是 `{"text":…, "truncated": True, "original_length": N}`
-    这种对象（见 `models.clip` 的约定），这里统一还原成「文本 +（原长 N 字）」。
+    ⚠️ **`truncated` 分支只为读旧文件而保留。** 记录器已不再产生截断字段
+    （`models.full_text` 完整落盘，理由见那里的注释），但**磁盘上的旧 `.jsonl`
+    仍然是那种形态**——阅读器是只读工具，认不出旧格式等于把历史产物一次性作废。
+    删掉这个分支的唯一时机是「确认不再需要读任何旧文件」，那不是代码能判断的。
+
+    旧格式：`{"text":…, "truncated": True, "original_length": N}`，
+    这里统一还原成「文本 +（原长 N 字）」。
+
+    另外注意：本函数的 `limit` 是**显示宽度**，不是存储阈值。时间线每事件一行，
+    不压成一行就没法扫——展开完整内容请用 `--seq`。
     """
     if isinstance(value, dict) and value.get("truncated"):
         body = str(value.get("text", ""))
@@ -76,6 +84,8 @@ def _s_command_dispatch(r: dict) -> str:
 
 def _s_api_request(r: dict) -> str:
     msgs = r.get("messages")
+    # list 是当前格式（全量落盘）；dict 分支是**旧文件**里被条数上限截断过的形态
+    # （`{"items": [...], "truncated": True, "original_length": N}`），只为读旧产物保留。
     count = len(msgs) if isinstance(msgs, list) else msgs.get("original_length", "?") if isinstance(msgs, dict) else "?"
     return (
         f"turn {r.get('turn')} · {r.get('model')} · 消息 {count} 条 · "
@@ -453,8 +463,12 @@ def render_detail(record: dict) -> list[str]:
     """
     展开模式：人可读地打印单条记录的完整负载。
 
-    被截断的字段**显式标出原长**——只看到 4000 字的正文而不知道它原本有 40 万字，
-    结论会完全不同。
+    这是**唯一会输出完整内容的视图**：时间线为了每事件一行必须压缩，
+    要看某条事件的全文就用 `--seq`。当前格式下这里打出来的就是落盘的全部内容，
+    一个字符都没少。
+
+    `truncated` 分支只为**旧文件**保留（那时字段有 4000 字上限），
+    显式标出原长——只看到 4000 字的正文而不知道它原本有 40 万字，结论会完全不同。
     """
     lines = [
         f"seq   : {record.get('seq')}",

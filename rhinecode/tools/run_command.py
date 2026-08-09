@@ -148,6 +148,20 @@ class RunCommandTool(Tool):
                 parts.append(f"stderr（{err_lines} 行）:\n{_clip(stderr)}")
             output = "\n".join(parts)
 
+            # 同一份内容的**未裁剪**版本，只供行为记录（见 ToolResult.full_output）。
+            # 模型仍然只拿到上面那份裁剪版——token 预算的考量一个字没变；
+            # 变的是「被省掉的中间那些行不再凭空消失」。
+            #
+            # 只在**真的裁剪了**的时候才构造：没超行数时两份完全相同，
+            # 多存一份纯属让记录文件白白翻倍。
+            full_parts = [f"$ {command}", f"退出码: {proc.returncode}"]
+            if stdout:
+                full_parts.append(f"stdout（{out_lines} 行）:\n{stdout}")
+            if stderr:
+                full_parts.append(f"stderr（{err_lines} 行）:\n{stderr}")
+            full = "\n".join(full_parts)
+            full_output = full if full != output else None
+
             ok = proc.returncode == 0
             if ok:
                 summary = f"退出码 0 · 输出 {out_lines} 行"
@@ -156,8 +170,8 @@ class RunCommandTool(Tool):
                 first_err = stderr.splitlines()[0] if stderr else ""
                 summary = f"退出码 {proc.returncode}" + (f" · {first_err}" if first_err else "")
 
-            # 退出码非 0 视为命令失败（ok=False），但仍把完整输出回灌供模型判断
-            return ToolResult(ok=ok, output=output, summary=summary)
+            # 退出码非 0 视为命令失败（ok=False），但仍把输出回灌供模型判断
+            return ToolResult(ok=ok, output=output, summary=summary, full_output=full_output)
 
         except subprocess.TimeoutExpired:
             t = args.get("timeout") or DEFAULT_TIMEOUT
