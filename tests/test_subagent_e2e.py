@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -45,6 +46,15 @@ permission_mode: strict
 # 子 Agent 的 stable 就是角色正文，用它的开头判断「这一轮是谁发的」。
 _ROLE_BODY_HEAD = "你是查找员"
 
+# 子 Agent 闸门的兜底上限（秒）。**不是判据，是防死锁的保险**。
+#
+# 判据是「主对话返回时子 Agent 还没跑完」这个**顺序**，与机器快慢无关。
+# 但如果哪天产品退化成「委派阻塞主对话」，主对话会等子 Agent、子 Agent 会等
+# 这个闸门、而闸门要等主对话返回之后测试才放行——三方互等就是死锁。
+# 有了这个上限，那种情况下子 Agent 会自己走出来，用例**当场红**（而不是挂住）。
+# 挂住的测试比失败的测试难查得多：它没有失败信息，只有一个超时的 CI。
+_SUB_GATE_TIMEOUT = 5.0
+
 
 class _ScriptedProvider(BaseProvider):
     """
@@ -53,7 +63,7 @@ class _ScriptedProvider(BaseProvider):
     记下每一轮的 `system` / `messages` / `tools`，供断言。
     """
 
-    def __init__(self, background: bool = False, sub_delay: float = 0.0) -> None:
+    def __init__(self, background: bool = False, gate_sub: bool = False) -> None:
         self.turns = 0
         self.systems: list[str] = []
         self.bodies: list[str] = []
@@ -66,7 +76,21 @@ class _ScriptedProvider(BaseProvider):
         self.main_bodies: list[str] = []
         self.tool_names: list[list[str]] = []
         self._background = background
-        self._sub_delay = sub_delay
+        # 子 Agent 的**闸门**：它在这里阻塞，直到测试显式放行。
+        #
+        # ⚠ 这里刻意**不用 `time.sleep`**。原写法是让子 Agent 睡 0.15 秒，
+        # 再断言主对话在 0.12 秒内返回——那是拿**挂钟时间**当判据，
+        # 而 0.12 这个数字是在一台空闲机器上量出来的。全量跑（2200+ 项、
+        # 几十个线程 + 真实子进程 + 文件 IO）时一次线程调度延迟就能顶穿它，
+        # 于是用例**偶发**变红。偶发失败比稳定失败更坏：它训练所有人忽略失败。
+        #
+        # 换成事件之后，判据从「主对话在 0.12 秒内返回」变成
+        # 「**子 Agent 还没跑完，主对话就已经返回了**」——那才是这条用例
+        # 真正想说的话，而且与机器快慢完全无关。
+        self._sub_gate = threading.Event()
+        if not gate_sub:
+            # 不需要卡子 Agent 的用例：闸门一开始就是开的，一秒都不等。
+            self._sub_gate.set()
 
     def stream_chat(self, messages, thinking_effort="off", tools=None, system=None):
         self.turns += 1
@@ -80,8 +104,8 @@ class _ScriptedProvider(BaseProvider):
         )
 
         if (system or "").startswith(_ROLE_BODY_HEAD):
-            if self._sub_delay:
-                time.sleep(self._sub_delay)
+            # 卡在闸门上，直到测试放行；`_SUB_GATE_TIMEOUT` 只是防死锁的兜底。
+            self._sub_gate.wait(timeout=_SUB_GATE_TIMEOUT)
             yield StreamChunk(type="text", content="结论：在 a.py 与 b.py 各有一处。")
             yield StreamChunk(type="done")
             return
@@ -107,6 +131,10 @@ class _ScriptedProvider(BaseProvider):
         yield StreamChunk(type="done")
 
     # ---- 便捷查询 ----
+
+    def release_sub(self) -> None:
+        """放行卡在闸门上的子 Agent。对未设闸门的替身是空操作（幂等）。"""
+        self._sub_gate.set()
 
     def sub_turn_index(self) -> int:
         for i, s in enumerate(self.systems):
@@ -134,14 +162,31 @@ class E2EBase(unittest.TestCase):
         self.addCleanup(result.cleanup, "normal_exit")
         return result, root
 
-    @staticmethod
-    def _settle(manager, timeout: float = 5.0) -> None:
+    def _settle(self, manager, timeout: float = 10.0) -> None:
+        """
+        等到全部子 Agent 走到终态。
+
+        ⚠ **超时必须明确失败，绝不能静默返回。** 原写法撞上超时就直接 `return`，
+        于是「子 Agent 压根没跑完」会一路飘到下游，表现成
+        `test_conclusion_delivered_exactly_once` 里一句
+        `AssertionError: 0 != 1`——读的人完全看不出真正发生了什么，
+        只会以为交付逻辑坏了，而实际是这个等待函数提前放弃了。
+
+        这与「观测设施绝不能撒谎」是同一条纪律：一个悄悄放弃的等待函数，
+        等于把「没发生」伪装成「发生了但结果不对」。
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             tasks = manager.subagent_service.tasks.snapshot()
             if tasks and all(t.status.is_terminal for t in tasks):
                 return
             time.sleep(0.01)
+
+        tasks = manager.subagent_service.tasks.snapshot()
+        self.fail(
+            f"等了 {timeout} 秒，子 Agent 仍未走到终态："
+            f"{[(t.label, t.status.value) for t in tasks] or '一个任务都没登记'}"
+        )
 
 
 class ForegroundE2ETest(E2EBase):
@@ -213,6 +258,29 @@ class ForegroundE2ETest(E2EBase):
         # 工具结果回灌进了第 2 轮的请求体
         self.assertIn("a.py", self.provider.main_bodies[-1])
 
+    def test_foreground_waits_for_the_subagent(self) -> None:
+        """
+        **`test_background_does_not_block_main` 的反证。**
+
+        同一个判据（「主对话返回时，子 Agent 跑完了没有」），相反的结论：
+        `background` 缺省为假时是「我要这个结果」，循环准备收工前会停下来等它，
+        因此主对话返回时子 Agent **必然已经终态**。
+
+        为什么必须有这条：少了它，一个「委派之后永远不等」的错误实现
+        照样能让 background 那条通过——那条只断言「没等」，
+        而「永远不等」当然也满足「没等」。两条合起来才说明判据真的分得清。
+
+        ⚠ 这条反证**不需要改产品代码**。用「改坏产品代码看它红不红」来验判据是
+        一次性的手工动作，做完就没了；把反证写成一条常驻用例，
+        判据的分辨力才会被长期钉住。
+        """
+        tasks = self.manager.subagent_service.tasks.snapshot()
+        self.assertEqual(len(tasks), 1)
+        self.assertTrue(
+            tasks[0].status.is_terminal,
+            "前台委派（awaited）时主对话应当等到子 Agent 跑完才收工",
+        )
+
     def test_main_engine_mode_unchanged(self) -> None:
         """AC14b 的端到端侧判据：角色声明 strict，主引擎仍是 default。"""
         self.assertEqual(self.manager.permission_engine.mode.value, "default")
@@ -230,28 +298,50 @@ class BackgroundE2ETest(E2EBase):
     """AC17a / AC19：后台委派 → 通知 → 交付 → 后续几轮仍能引用。"""
 
     def setUp(self) -> None:
-        self.provider = _ScriptedProvider(background=True, sub_delay=0.15)
+        # 子 Agent 卡在闸门上，由每条用例决定什么时候放行——**时序因此是确定的**。
+        self.provider = _ScriptedProvider(background=True, gate_sub=True)
         self.result, _ = self._build(self.provider)
         self.manager = self.result.manager
 
     def test_background_does_not_block_main(self) -> None:
         """
-        `background=true` 时主对话不等那 0.15 秒，且**循环也不为它停留**。
+        `background=true` 时主对话不等子 Agent，且**循环也不为它停留**。
 
         c13 修订注记：这条原本断言回灌文本含「后台」。新语义下委派**永远**
         立即返回（所以「转入后台」这个说法本身没了），`background` 表达的
         是「这次我不要这个结果」——文案随之改成「本轮不会为它停留」。
-        """
-        started = time.monotonic()
-        list(self.manager.submit_user_message("找一下"))
-        elapsed = time.monotonic() - started
 
-        self.assertLess(elapsed, 0.12, "委派不该阻塞主对话")
+        ⚠ **判据是顺序，不是时间。** 原写法让子 Agent 睡 0.15 秒再断言主对话
+        在 0.12 秒内返回，在全量并发下偶发失败（实测 `0.203 not less than 0.12`）。
+        那个数字量自一台空闲机器，一次线程调度延迟就能顶穿它。
+        **不能靠调大阈值解决**：那只降低偶发概率，而且阈值一旦放宽到 1 秒，
+        这条用例就再也验不出「委派阻塞了主对话」——一次真的阻塞往往就是几百毫秒。
+
+        现在的判据是「主对话已经返回，而子 Agent 还卡在闸门上没跑完」，
+        它是一个**顺序**事实，与机器快慢无关。
+
+        反证在 `ForegroundE2ETest.test_foreground_waits_for_the_subagent`：
+        同一个判据、相反的结论。少了它，一个「永远不等」的错误实现
+        也能让本条通过。
+        """
+        list(self.manager.submit_user_message("找一下"))
+
+        # 主对话已经返回了。此刻子 Agent 必然还没跑完——它卡在闸门上，
+        # 而放行动作在下面，还没执行。
+        tasks = self.manager.subagent_service.tasks.snapshot()
+        self.assertEqual(len(tasks), 1, "委派应当已经登记了任务")
+        self.assertFalse(
+            tasks[0].status.is_terminal,
+            "主对话不该等到子 Agent 跑完才返回（background=true）",
+        )
         self.assertIn("不会为它停留", self.provider.main_bodies[-1])
+
+        self.provider.release_sub()
         self._settle(self.manager)
 
     def test_two_consumption_lines_are_independent(self) -> None:
         list(self.manager.submit_user_message("找一下"))
+        self.provider.release_sub()
         self._settle(self.manager)
 
         self.assertEqual(len(self.manager.drain_subagent_notifications()), 1)
@@ -268,6 +358,7 @@ class BackgroundE2ETest(E2EBase):
         但第三轮就会失败。这条断言是「结论必须进历史」这个决策的唯一有效判据。
         """
         list(self.manager.submit_user_message("找一下"))
+        self.provider.release_sub()
         self._settle(self.manager)
 
         list(self.manager.submit_user_message("继续"))
@@ -277,7 +368,21 @@ class BackgroundE2ETest(E2EBase):
         self.assertIn("在 a.py 与 b.py", self.provider.main_bodies[-1], "第三轮仍应含结论")
 
     def test_conclusion_delivered_exactly_once(self) -> None:
+        """
+        结论只该进历史一次。
+
+        ⚠ **这条原本也是偶发红**（`AssertionError: 0 != 1`），而且失败信息
+        极具误导性——看起来像「交付逻辑坏了」，实际是 `_settle` 撞上超时后
+        **静默返回**，子 Agent 压根还没跑完就往下走了。根因已在 `_settle`
+        里修掉（超时改成明确失败），这里再用闸门把时序定死：
+        子 Agent 只在放行之后才结束，因此「该交付」这件事必然已经发生。
+
+        交付有两条路径，共用同一个**消费型**队列（`take_deliverables`）：
+        闸门的迭代级注入、以及跨用户消息的兜底 `_deliver_subagent_results`。
+        「恰好一次」正是靠那个队列取走即置位来保证的。
+        """
         list(self.manager.submit_user_message("找一下"))
+        self.provider.release_sub()
         self._settle(self.manager)
         list(self.manager.submit_user_message("继续"))
         list(self.manager.submit_user_message("再继续"))
