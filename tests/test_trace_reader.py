@@ -16,7 +16,20 @@ from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
 from rhinecode.trace import reader
-from rhinecode.trace.models import MAX_FIELD_CHARS, TraceEventType, clip
+from rhinecode.trace.models import TraceEventType
+
+# 旧记录文件里「被截断的字段」长这样。记录器**已经不再产生**这种形态
+# （trace 现在完整落盘），但阅读器必须继续读得懂——磁盘上的历史产物还是这个样子，
+# 认不出等于把它们一次性作废。
+#
+# 刻意在这里显式手写而不是调用某个函数来生成：它现在是一份**外部格式的样本**，
+# 不再是本项目某个函数的输出。
+_LEGACY_LONG_TEXT = "超长" * 5000
+_LEGACY_CLIPPED = {
+    "text": _LEGACY_LONG_TEXT[:4000],
+    "truncated": True,
+    "original_length": len(_LEGACY_LONG_TEXT),
+}
 
 
 def _line(seq: int, type_: str, scope: str = "main", **payload) -> str:
@@ -41,7 +54,7 @@ class ReaderTestBase(unittest.TestCase):
                           tool_names=[], thinking_effort="off"),
                     _line(5, "tool_execute", tool="read_file", ok=True, outcome="executed",
                           duration_ms=12, is_concurrent=True, summary="读了 30 行",
-                          output=clip("超长" * 5000)),
+                          output=_LEGACY_CLIPPED),
                     _line(6, "brand_new_type", foo=1),
                 ]
             )
@@ -283,11 +296,17 @@ class DetailTest(ReaderTestBase):
         self.assertIn("read_file", out)
         self.assertIn("duration_ms: 12", out)
 
-    def test_truncated_field_shows_original_length(self) -> None:
-        """AC36：被截断的字段必须显式标出原长——否则结论会完全不同。"""
+    def test_legacy_truncated_field_still_readable(self) -> None:
+        """
+        **旧文件兼容**：老记录里被截断的字段仍要能读，且显式标出原长。
+
+        原判据是 AC36「被截断的字段必须显式标出原长」。记录器现在不再截断，
+        所以这条从「当前行为」降级成「向后兼容」——但**不能删**：
+        阅读器是只读工具，它的价值有一半在于能读历史产物。
+        """
         _, out, _ = self.run_reader("--seq", "5")
         self.assertIn("已截断，原长", out)
-        self.assertIn(str(len("超长" * 5000)), out)
+        self.assertIn(str(len(_LEGACY_LONG_TEXT)), out)
 
     def test_missing_seq_returns_error(self) -> None:
         code, _, err = self.run_reader("--seq", "999")

@@ -17,6 +17,8 @@
     {"cmd": "answer",  "choice": "once", "via": "channel"}
     {"cmd": "cancel"}
     {"cmd": "observe", "since": 42, "types": ["tool_execute"]}
+    {"cmd": "keys",    "sequence": ["ctrl+q"]}
+    {"cmd": "screen",  "selector": "#history-messages"}
     {"cmd": "quit"}
 
     # 成功响应
@@ -86,6 +88,16 @@ PANEL_KINDS = frozenset(CHOICE_TABLE.keys())
 # clarify 的选项序号：纯数字字符串
 _CLARIFY_INDEX = re.compile(r"^\d+$")
 
+
+# `wait` 的 `until`：等到什么算数。
+#
+# - terminal ：idle 或 pending。**缺省，与 C13 之前逐字同义**。
+# - quiescent：pending，或「界面空闲**且**后台也没活了」。
+#
+# 加这个取值的原因是「idle 不等于系统静止」——后台委派在跑、或队友消息
+# 躺在信箱里等主对话自动唤起时，界面照样是 idle，一秒后却又忙起来。
+# 判据细节见 `control._is_quiescent`（尤其「待命队员为什么不算」那段）。
+UNTIL_VALUES = frozenset({"terminal", "quiescent"})
 
 # `via` 决定应答走哪条路径：
 # - channel：驱动器直接调产品的结算方法，来源记为应答者的 source（本轮是 `driver`）
@@ -187,6 +199,23 @@ def validate_choice(kind: str, choice: Any) -> Optional[str]:
     allowed = CHOICE_TABLE[kind]
     if choice not in allowed:
         return f"{kind} 的 choice 必须是 {sorted(allowed)} 之一，收到 {choice!r}"
+    return None
+
+
+def validate_until(until: Any) -> Optional[str]:
+    """
+    校验 `wait` 的 `until` 取值。
+
+    :returns: 不合法时返回给人看的错误消息；合法返回 None
+
+    与 `validate_choice` 同样「返回消息而不是抛异常」——调用方要把它包成
+    `bad_request` 响应发回客户端。
+
+    ⚠ 拼错必须报错，不能默默按缺省处理：一个写了 `--until quiescnet` 的场景
+    会静默退化成旧行为，于是它想验的那个竞态问题**照样存在，而判据看起来是绿的**。
+    """
+    if until not in UNTIL_VALUES:
+        return f"until 必须是 {sorted(UNTIL_VALUES)} 之一，收到 {until!r}"
     return None
 
 

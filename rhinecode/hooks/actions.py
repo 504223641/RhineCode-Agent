@@ -52,8 +52,15 @@ from rhinecode.permission.network import check_hard
 from rhinecode.tools.path_guard import main_project_root
 from rhinecode.tools.run_command import decode_subprocess_output
 
-# stdout / stderr 进 `detail` 前的截断长度。Hook 的输出只用于排查，
-# 不进模型上下文，因此这里可以比工具结果宽松，但仍要有上限防止 trace 爆掉。
+# stdout / stderr 进 `detail` 前的截断长度。
+#
+# ⚠️ **它管的是「给模型看的那一份」，不是 trace。** 原注释写着「防止 trace 爆掉」
+# ——那个理由已被推翻：观测设施不该替读它的人决定哪些内容不重要。
+# 完整原文现在走 `ActionOutcome.full_detail` 无损进记录。
+#
+# 这个上限**仍然必要**，但理由变了：失败路径上 `detail` 会经
+# `HOOK_FAILED_REASON` 回灌给模型（见 `manager.py`），一条刷屏的 Hook
+# 没有上限就能把上下文撑爆。
 DETAIL_LIMIT = 2000
 
 # 退出码 2 = 拦截（对齐 Claude Code 的 hooks 约定）。
@@ -246,6 +253,7 @@ def run_command_action(
     code = proc.returncode
 
     def _detail(extra: str = "") -> str:
+        """给模型/报告看的那一份：两路输出各自裁到 `DETAIL_LIMIT`。"""
         parts = [f"退出码 {code}"]
         if extra:
             parts.append(extra)
@@ -255,11 +263,29 @@ def run_command_action(
             parts.append(f"stderr: {_clip(stderr.strip())}")
         return "\n".join(parts)
 
+    def _full_detail(extra: str = "") -> Optional[str]:
+        """
+        同一份内容的完整原文，只进 trace（见 `ActionOutcome.full_detail`）。
+
+        :returns: 与 `_detail` 结果相同时返回 None——两份一模一样时多存一份
+                  纯属让记录文件白白翻倍
+        """
+        parts = [f"退出码 {code}"]
+        if extra:
+            parts.append(extra)
+        if stdout.strip():
+            parts.append(f"stdout: {stdout.strip()}")
+        if stderr.strip():
+            parts.append(f"stderr: {stderr.strip()}")
+        full = "\n".join(parts)
+        return full if full != _detail(extra) else None
+
     # ── 退出码 2：拦截 ──
     if code == EXIT_BLOCK:
         reason = stderr.strip() or stdout.strip() or "Hook 以退出码 2 拦截了这次调用。"
         verdict, detail = _apply_event_scope(payload, HookDecision.DENY, _detail())
-        return _finish(ok=True, verdict=verdict, reason=_clip(reason), detail=detail)
+        return _finish(ok=True, verdict=verdict, reason=_clip(reason), detail=detail,
+                       full_detail=_full_detail())
 
     # ── 退出码 0：通过，可能带决策 JSON ──
     if code == 0:
@@ -267,10 +293,12 @@ def run_command_action(
         verdict, detail = _apply_event_scope(payload, parsed, _detail())
         if verdict != HookDecision.NONE and not reason:
             reason = f"Hook 规则要求{'拦截' if verdict == HookDecision.DENY else '人工确认'}。"
-        return _finish(ok=True, verdict=verdict, reason=_clip(reason), detail=detail)
+        return _finish(ok=True, verdict=verdict, reason=_clip(reason), detail=detail,
+                       full_detail=_full_detail())
 
     # ── 其它非 0：失败 ──
-    return _finish(detail=_detail("Hook 命令以非预期退出码结束"))
+    return _finish(detail=_detail("Hook 命令以非预期退出码结束"),
+                   full_detail=_full_detail("Hook 命令以非预期退出码结束"))
 
 
 def run_http_action(

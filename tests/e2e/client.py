@@ -5,6 +5,8 @@
     python -m tests.e2e.client send "/skills"
     python -m tests.e2e.client wait --timeout 180
     python -m tests.e2e.client answer once [--via keys]
+    python -m tests.e2e.client keys ctrl+q            # 投递任意按键序列
+    python -m tests.e2e.client screen --selector "#history-messages"
     python -m tests.e2e.client observe --since 42 --types tool_execute
     python -m tests.e2e.client cancel
     python -m tests.e2e.client quit
@@ -161,9 +163,13 @@ def build_request(args: argparse.Namespace) -> dict:
     if cmd == "send":
         return {"cmd": "send", "text": args.text}
     if cmd == "wait":
-        return {"cmd": "wait", "timeout": args.timeout}
+        return {"cmd": "wait", "timeout": args.timeout, "until": args.until}
     if cmd == "answer":
         return {"cmd": "answer", "choice": args.choice, "via": args.via}
+    if cmd == "keys":
+        return {"cmd": "keys", "sequence": args.sequence}
+    if cmd == "screen":
+        return {"cmd": "screen", "selector": args.selector}
     if cmd == "observe":
         types = [t.strip() for t in args.types.split(",")] if args.types else None
         return {"cmd": "observe", "since": args.since, "types": types}
@@ -227,10 +233,30 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_wait = sub.add_parser("wait", parents=[common])
     p_wait.add_argument("--timeout", type=float, default=180.0)
+    p_wait.add_argument(
+        "--until",
+        choices=("terminal", "quiescent"),
+        default="terminal",
+        help="terminal=idle 或 pending（缺省）；"
+             "quiescent=还要求后台没活（后台子 Agent 跑完、没有待自动唤起的消息）。"
+             "写 C13/C15 的场景时用后者，否则 idle 之后会话可能又忙起来",
+    )
 
     p_answer = sub.add_parser("answer", parents=[common])
     p_answer.add_argument("choice")
     p_answer.add_argument("--via", choices=("channel", "keys"), default="channel")
+
+    p_keys = sub.add_parser(
+        "keys", parents=[common],
+        help="向界面投递任意按键序列，如 `keys ctrl+q` / `keys slash tab`",
+    )
+    p_keys.add_argument("sequence", nargs="+", help="按键名（Textual 键名），可给多个")
+
+    p_screen = sub.add_parser(
+        "screen", parents=[common],
+        help="导出界面上可见的文本与 markup 原文（补全菜单、聊天区正文等）",
+    )
+    p_screen.add_argument("--selector", default="", help="Textual 选择器，缺省整屏")
 
     p_observe = sub.add_parser("observe", parents=[common])
     p_observe.add_argument("--since", type=int, default=0)

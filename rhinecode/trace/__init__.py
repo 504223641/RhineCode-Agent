@@ -14,8 +14,6 @@ Trace 层：跨阶段的行为记录设施（**测试设施，不是产品功能
 """
 
 from rhinecode.trace.models import (
-    MAX_FIELD_CHARS,
-    MAX_MESSAGE_ITEMS,
     REDACTED,
     SCOPE_MAIN,
     SCOPE_NOTES,
@@ -23,8 +21,8 @@ from rhinecode.trace.models import (
     SCOPE_SUMMARY,
     TraceEventType,
     agent_event_payload,
-    clip,
     default_trace_path,
+    full_text,
     isolated_scope,
     redact_config,
     subagent_scope,
@@ -44,10 +42,8 @@ __all__ = [
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
     "subagent_scope",
-    "MAX_FIELD_CHARS",
-    "MAX_MESSAGE_ITEMS",
     "REDACTED",
-    "clip",
+    "full_text",
     "redact_config",
     "agent_event_payload",
     "default_trace_path",

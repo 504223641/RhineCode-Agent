@@ -54,7 +54,7 @@ from rhinecode.hooks.models import (
     PromptAction,
 )
 from rhinecode.hooks.report import render_project_notice, render_report
-from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol, clip
+from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol, full_text
 
 # 动作类型 → 记录用的短名（trace 与统计里展示）。
 _ACTION_NAMES = {
@@ -445,7 +445,16 @@ class HookManager:
             ok=outcome.ok,
             verdict=outcome.verdict.value,
             duration_ms=outcome.duration_ms,
-            detail=clip(outcome.detail),
+            # 完整原文优先——记录的职责是完整（见 ActionOutcome.full_detail）。
+            detail=full_text(
+                outcome.full_detail if outcome.full_detail is not None else outcome.detail
+            ),
+            # 模型/报告实际看到的那份裁剪版，只在与原文不同时才留一条
+            **(
+                {"model_detail": full_text(outcome.detail)}
+                if outcome.full_detail is not None
+                else {}
+            ),
         )
         return outcome
 

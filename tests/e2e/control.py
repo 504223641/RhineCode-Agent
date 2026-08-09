@@ -1,5 +1,5 @@
 """
-驱动内核：读界面状态、投递输入、应答面板、取消、观察记录、编排退出。
+驱动内核：读界面状态、投递输入与按键、应答面板、导出界面文本、取消、观察记录、编排退出。
 
 宿主进程把控制通道收到的每条指令翻译成本模块 `DriverCore` 的一次方法调用。
 本模块**不认识 socket、不认识 JSON**（那是 `host.py` 与 `protocol.py` 的事），
@@ -69,6 +69,17 @@ DEFAULT_DISPATCH_TIMEOUT = 15.0
 # （长等待时不至于打出几万次跨线程调度）。
 POLL_MIN = 0.03
 POLL_MAX = 0.10
+
+# 一次 `keys` 指令最多投递多少个按键。
+#
+# 上限的作用不是「防滥用」——驱动者是自己人。它防的是**手滑**：
+# 一个写错的循环把上万个按键投进去，Textual 会在主线程上逐个处理，
+# 界面卡死几分钟而调用方只看到一次超时，排查方向完全被带偏。
+MAX_KEY_SEQUENCE = 200
+
+# `screen` 逐行读一个控件时最多读多少行。控件高度理论上可以很大（一个长滚动区），
+# 而导出是给人看的，读满几千行既慢又没人看。
+MAX_PAINTED_LINES = 500
 
 # 不变量③ 的复核重试上限
 SETTLE_RECHECK_TRIES = 40
@@ -395,6 +406,37 @@ class DriverCore:
         # 所以 kind 要单独补
         effective_kind = kind or ("session" if session_active else None)
 
+        # ── 后台活动量（C13/C15）──────────────────────────────────────
+        #
+        # ⚠ **这三个量是「`idle` 不等于系统静止」的解药。**
+        #
+        # 三态只描述**界面**：没有流式 Worker、没有面板挂着就是 `idle`。
+        # 但 C13 起，界面空闲时进程里仍可能有活：后台委派在跑、队员待命、
+        # 队友消息躺在信箱里等主对话自动唤起（`_maybe_auto_wake` 每 0.5 秒
+        # 在空闲时检查一次，符合条件就**自己起一条流**）。
+        #
+        # 于是一个 `wait` 返回 `idle` 之后，会话随时可能又忙起来——
+        # 断言因此是竞态的，而竞态的判据比没有判据更坏（它偶尔通过）。
+        #
+        # 读的都是内存里的整数与布尔，放在主线程这一次调度里一并取，
+        # 与其它界面字段同一时刻、互相自洽。
+        manager = getattr(self.app, "_manager", None)
+        background = {"subagents": 0, "idle_members": 0, "unread_for_main": False}
+        if manager is not None:
+            for key, fn in (
+                ("subagents", "running_subagent_count"),
+                ("idle_members", "team_idle_member_count"),
+                ("unread_for_main", "team_has_unread_for_main"),
+            ):
+                # 逐个 getattr + try：驱动设施要能驱动**旧版本**的产品代码
+                # （宿主与产品是分开演进的），少一个方法不该让 status 整个挂掉。
+                try:
+                    method = getattr(manager, fn, None)
+                    if method is not None:
+                        background[key] = method()
+                except Exception:  # noqa: BLE001 —— 只读快照绝不阻断
+                    pass
+
         panel: Optional[PanelSnapshot] = None
         panel_visible = False
         focused_type = type(self.app.focused).__name__ if self.app.focused is not None else None
@@ -415,7 +457,13 @@ class DriverCore:
             "panel_visible": panel_visible,
             "focused": focused_type,
             "panel": panel,
+            "background": background,
         }
+
+    @staticmethod
+    def _quiescent(background: dict) -> bool:
+        """实例侧的薄封装，便于子类或测试覆盖。见模块级 `_is_quiescent`。"""
+        return _is_quiescent(background)
 
     def _trace_seq(self) -> int:
         """
@@ -462,6 +510,7 @@ class DriverCore:
             state = SessionState.IDLE
 
         panel: Optional[PanelSnapshot] = ui["panel"]
+        background = ui.get("background") or {}
         return {
             "state": state.value,
             "panel": (
@@ -473,6 +522,9 @@ class DriverCore:
             "stream_active": ui["stream_active"],
             "focused": ui["focused"],
             "panel_visible": ui["panel_visible"],
+            "background": background,
+            # 「系统真的停下来了」——见 `_is_quiescent`
+            "quiescent": state is SessionState.IDLE and _is_quiescent(background),
         }
 
     def observe(self, since: int = 0, types: Optional[Iterable[str]] = None) -> dict:
@@ -596,37 +648,65 @@ class DriverCore:
         run_on_main(self.loop, _submit())
         return protocol.ok({"submitted": text})
 
-    def wait(self, timeout: float = 180.0) -> dict:
+    def wait(self, timeout: float = 180.0, until: str = "terminal") -> dict:
         """
-        等到会话进入两个终态之一：`idle`（这一轮跑完了）或 `pending`（需要你应答）。
+        等到会话到达指定的终态。
 
+        :param until: 等什么
+            - `"terminal"`（缺省，**行为与改造前逐字相同**）：
+              `idle`（这一轮跑完了）或 `pending`（需要你应答）。
+            - `"quiescent"`：`pending` **或**「界面空闲**且**后台也没活了」。
         :returns: 成功时 `{"terminal": "idle"|"pending", "state": {...}}`；
             超时走失败响应，`error.data` 是诊断
+
+        ## 为什么需要 `quiescent`
+
+        三态只看界面。C13 起，界面空闲时进程里仍可能有活——后台委派在跑，
+        或者队友消息躺在信箱里等主对话**自动唤起**（那会自己起一条流）。
+        于是 `wait` 返回 `idle` 之后会话随时可能又忙起来，
+        **在此之上做的断言是竞态的**，而竞态的判据比没有判据更坏：它偶尔通过。
+
+        C13 之前不存在这个问题，所以缺省值保持 `terminal`——既有场景一个字不用改。
+        写 C13/C15 的场景时请显式用 `quiescent`。
+
+        判据细节（尤其「待命队员为什么不算」）见模块级 `_is_quiescent`。
 
         **不持驱动锁**（不变量②）：它只轮询只读快照。
 
         轮询间隔从 30 ms 起、退避到 100 ms 封顶：够灵敏，长等待时也不至于
         打出几万次跨线程调度。
         """
+        want_quiescent = until == "quiescent"
         deadline = time.monotonic() + timeout
         interval = POLL_MIN
         state: dict = {}
         while time.monotonic() < deadline:
             state = self.snapshot()
-            if state["state"] in (SessionState.IDLE.value, SessionState.PENDING.value):
+            # `pending` 在两种模式下都是终态：它意味着**要人来应答**，
+            # 而人不应答的话后台那点活也推进不下去，继续等只会白等到超时。
+            if state["state"] == SessionState.PENDING.value:
                 return protocol.ok({"terminal": state["state"], "state": state})
+            if state["state"] == SessionState.IDLE.value:
+                if not want_quiescent or state.get("quiescent"):
+                    return protocol.ok({"terminal": state["state"], "state": state})
             time.sleep(interval)
             interval = min(interval * 1.5, POLL_MAX)
 
-        # 超时诊断：把三个判据分量都摊开，让人一眼看出「卡在哪一步」
+        # 超时诊断：把判据分量都摊开，让人一眼看出「卡在哪一步」。
+        # `background` 必须在里面——`quiescent` 模式下超时时，
+        # 「是子 Agent 还在跑，还是有条消息没人处理」是完全不同的两件事。
         final = state or self.snapshot()
+        target = "idle（且后台静止）或 pending" if want_quiescent else "idle 或 pending"
         return protocol.err(
             "timeout",
-            f"等待 {timeout} 秒后会话仍未进入 idle 或 pending",
+            f"等待 {timeout} 秒后会话仍未进入 {target}",
             {
                 "stream_active": final.get("stream_active"),
                 "pending": final.get("state") == SessionState.PENDING.value,
                 "session_panel": final.get("panel") is not None,
+                "until": until,
+                "quiescent": final.get("quiescent"),
+                "background": final.get("background"),
                 "last_action": self._last_action,
                 "waited": timeout,
                 "state": final.get("state"),
@@ -768,6 +848,152 @@ class DriverCore:
         run_on_main(self.loop, _press())
         return protocol.ok({"kind": kind, "choice": choice, "via": "keys", "source": "human"})
 
+    def keys(self, sequence: list) -> dict:
+        """
+        向界面投递**任意按键序列**（P1b 缺口①）。
+
+        :param sequence: 按键名列表，用 Textual 的键名
+            （`ctrl+q` / `escape` / `tab` / `down` / `a` …）
+        :returns: `{"pressed": [...]}`
+        :raises: 不抛；非法输入走 `bad_request`
+
+        ## 为什么需要一条通用指令，而不是继续加专用指令
+
+        `answer --via keys` 只能应答**面板**，它把「目标选项」换算成「按几次方向键」。
+        但有一整类判据根本不在面板上：
+        - C2 AC9 的 `Ctrl+Q` / `Ctrl+C` 退出；
+        - C4 场景 11 的澄清面板键盘导航（`answer` 明确拒绝 `clarify`+`keys`，
+          因为候选项之间夹着 disabled 详情行、按键次数推不出来——
+          但**逐键投递**没有这个问题，调用方自己决定按几次）；
+        - C10 的 Tab 补全（要先按 `/`、再按 `tab`，看候选菜单怎么变）。
+
+        `docs/e2e-sweep/summary.md` 把这 4 条列为「P1a 设施限制」，
+        指向的就是这一个缺口。
+
+        ## 与 `answer --via keys` 的分工
+
+        本指令是**低层原语**：它不知道面板是什么，只管把键按下去。
+        `answer --via keys` 是**语义化封装**，替调用方算移动次数。
+        两者都保留——用原语写面板应答要自己数按键次数，
+        那正是 `answer` 当初存在的理由。
+
+        副作用：真实地在界面上按键，可能触发任何绑定（包括退出应用）。
+        """
+        if not isinstance(sequence, list) or not sequence:
+            return protocol.err("bad_request", "keys 需要非空的按键名列表")
+        if len(sequence) > MAX_KEY_SEQUENCE:
+            return protocol.err(
+                "bad_request",
+                f"一次最多投递 {MAX_KEY_SEQUENCE} 个按键，收到 {len(sequence)} 个",
+            )
+        for item in sequence:
+            if not isinstance(item, str) or not item:
+                return protocol.err("bad_request", f"按键名必须是非空字符串，收到 {item!r}")
+
+        with self._lock:
+            self._last_action = f"keys:{','.join(sequence)}"
+
+        pilot = self.pilot
+
+        async def _press() -> None:
+            for key in sequence:
+                await pilot.press(key)
+
+        # ⚠ 这里**刻意不复核任何前置状态**（不像 answer 要先确认面板就绪）。
+        # 按键是最低层的输入，「现在能不能按」本身常常就是判据的一部分——
+        # 加了前置校验，「面板没弹出来时按回车会怎样」这类场景就没法验了。
+        run_on_main(self.loop, _press())
+        return protocol.ok({"pressed": list(sequence)})
+
+    def screen(self, selector: str = "") -> dict:
+        """
+        导出界面上**可见的文本**（P1b 缺口②）。
+
+        :param selector: Textual 选择器，缺省 `""` 表示整屏
+        :returns: `{"text", "content", "lines", "widgets"}`
+
+        ## ⚠ `text` 与 `content` 是两份，别用错
+
+        - `text` —— **屏幕上真的画出来的**（逐行读 `render_line`）。
+          长句会按控件宽度折行；菜单候选、输入框内容、布局判据用它。
+        - `content` —— 逻辑内容（`render()`），不折行。
+          `assertIn("一句很长的话")` 这类**内容断言用它**，
+          否则会失败在折行位置这种与判据无关的地方。
+
+        每个 widget 条目里也各有一份（`text` / `painted` / `content`）。
+
+        ## 为什么控制通道需要它
+
+        既有的观察面只有两个：`status`（面板与三态）与 `observe`（trace 事件）。
+        两者都读不到**聊天区正文与补全菜单**，于是这些判据一条都验不了：
+        - C10 E03 补全与高亮（候选菜单里有哪些项、命令字段有没有高亮）；
+        - 「界面上真的出现了那句话」这类内容判据——
+          `ui_message` 事件只能证明**产品打算显示它**，
+          证明不了它真的渲染进了组件树（两者不同：markup 异常会让渲染失败
+          而事件照常落盘，那正是 CLAUDE.md 里 `MarkupError` 那条坑的形态）。
+
+        ## 样式怎么带出来
+
+        每个控件除了纯文本，还给出它的**类名**与（若有）markup 原文。
+        样式判据（如「命令字段以青色加粗高亮」）靠 markup 原文断言——
+        导出渲染后的 ANSI 序列既难读又依赖终端能力，
+        而 markup 原文就是产品自己写下的那份意图。
+
+        副作用：无（纯读组件树）。
+        """
+        async def _read() -> dict:
+            widgets: list[dict] = []
+            try:
+                nodes = self.app.query(selector) if selector else self.app.query("*")
+            except Exception as e:  # noqa: BLE001 —— 选择器语法错误
+                return {"error": f"选择器无效：{e}"}
+
+            for node in nodes:
+                if not getattr(node, "display", True):
+                    continue
+                entry = {
+                    "class": type(node).__name__,
+                    "text": "",       # 屏幕上真的画出来的（可能折行）
+                    "content": "",    # 逻辑内容（不折行），做内容断言用
+                    "markup": None,
+                }
+                try:
+                    entry["content"] = _plain_text_of(node.render())
+                except Exception:  # noqa: BLE001 —— 容器没有 render / 渲染抛异常
+                    entry["content"] = ""
+                entry["painted"] = _painted_text_of(node)
+                # **画出来的那份优先**——`screen` 承诺的是「界面上可见的文本」。
+                # 见 `_painted_text_of` 的 docstring：`Input` / `OptionList` 的
+                # `render()` 返回的是 Panel 外壳（只有边框），内容只在逐行绘制里。
+                entry["text"] = entry["painted"] or entry["content"]
+                # markup 原文：Textual 8.x 的 `Content` 有个 `.markup` 属性，
+                # 给出的正是产品自己写下的那串带标记的文本（如 `[dim]…[/dim]`）。
+                # 取不到就留 None——样式判据自行判断能不能用。
+                try:
+                    markup = getattr(node.render(), "markup", None)
+                    if isinstance(markup, str):
+                        entry["markup"] = markup
+                except Exception:  # noqa: BLE001
+                    pass
+                if entry["text"] or entry["markup"]:
+                    widgets.append(entry)
+
+            lines = [w["text"] for w in widgets if w["text"]]
+            return {
+                "text": "\n".join(lines),
+                "lines": lines,
+                # 逻辑内容单独给一份：`text` 是屏幕上画出来的，长句会**按控件宽度折行**，
+                # 而 `assertIn("一句很长的话")` 会因此失败在一个与判据无关的地方。
+                # 内容断言用这份，布局 / 菜单 / 输入框判据用 `text`。
+                "content": "\n".join(w["content"] for w in widgets if w["content"]),
+                "widgets": widgets,
+            }
+
+        data = run_on_main(self.loop, _read())
+        if "error" in data:
+            return protocol.err("bad_request", data["error"])
+        return protocol.ok(data)
+
     def cancel(self) -> dict:
         """请求取消当前的 Agent 循环（等价于真人按 Esc）。"""
         with self._lock:
@@ -833,6 +1059,148 @@ class DriverCore:
                     thread.join(timeout=30.0)
 
         app.exit()
+
+
+def _plain_text_of(rendered: Any) -> str:
+    """
+    把一个控件的渲染产物压成纯文本。
+
+    :param rendered: `widget.render()` 的返回值
+    :returns: 可见文本；实在取不出来时返回空串（**绝不返回 `repr`**）
+
+    ## 为什么不能只写 `getattr(rendered, "plain", str(rendered))`
+
+    最初就是那么写的，然后第一次真跑就撞上了：聊天区的 AI 正文控件渲染出的是一个
+    包在 `RichVisual` 里的 `rich.console.Group`，它没有 `.plain`，于是
+    `str()` 兜底给出的是 `RichVisual(Static(), <rich.console.Group object at 0x…>)`
+    ——**一个看起来像内容的字符串**。断言「界面上出现了那句话」于是失败在
+    「导出实现不完整」上，而报错完全不指向这个原因。
+
+    比失败更坏的是它的另一面：如果判据恰好是 `assertNotIn`，
+    这个 repr 会让它**通过**。观测设施返回 repr 比返回空串危险得多。
+
+    三级取值：
+    1. `.plain`（`rich.text.Text` 这类，最常见）；
+    2. Rich console 捕获（`Group` / 表格 / 任何组合渲染）；
+    3. 都不行就空串——**宁可少一行，也不要把 repr 冒充成内容**。
+    """
+    # ① `textual.content.Content`（Textual 8.x 里 Static 之类的渲染产物）直接有 .plain
+    plain = getattr(rendered, "plain", None)
+    if isinstance(plain, str):
+        return plain
+
+    # ② 先拆包再捕获。**顺序不能反**——`RichVisual` 是 Textual 的 Visual，
+    #    **不是** Rich 可渲染对象，把它丢给 `console.print` 不会报错，
+    #    Rich 会用 `Pretty` 打出它的 repr，于是「捕获成功」而内容是
+    #    `RichVisual(Static(), <rich.console.Group object at 0x…>)`。
+    #    先捕获后拆包的话，第一步就「成功」了，拆包分支永远走不到（实测踩过）。
+    inner = getattr(rendered, "_renderable", None)
+    if inner is not None and inner is not rendered:
+        nested = _plain_text_of(inner)
+        if nested:
+            return nested
+
+    # ③ 真正的 Rich 可渲染对象才走捕获。宽度取一个足够宽的固定值：
+    #    太窄会折行、把一句话拆成两行，内容断言就得考虑折行位置。
+    if hasattr(rendered, "__rich_console__") or hasattr(rendered, "__rich__") or isinstance(rendered, str):
+        try:
+            import io
+
+            from rich.console import Console
+
+            console = Console(file=io.StringIO(), width=400, no_color=True, legacy_windows=False)
+            with console.capture() as capture:
+                console.print(rendered, end="")
+            return capture.get()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ④ 取不出来就空串。**宁可少一行，也不要把 repr 冒充成内容**
+    return ""
+
+
+def _painted_text_of(widget: Any) -> str:
+    """
+    逐行读一个控件**实际画在屏幕上**的字符。
+
+    :param widget: 任意 Textual 控件
+    :returns: 逐行拼接的可见文本；读不出来返回空串
+
+    ## 为什么必须有这条路径（真实模型验收当场发现的）
+
+    `render()` 只覆盖「一次性产出整块可渲染对象」的控件（`Static` 那一类）。
+    另一类控件**按行绘制**——`Input` 与 `OptionList` 都是，它们实现的是
+    `render_line(y)` 而不是 `render()`。对这类控件调 `render()` 拿到的是空白，
+    于是导出结果里只有边框，内容一个字都没有。
+
+    实测现场：`keys / t a s k s` 之后补全菜单确实弹出来了（`CommandPanel` 可见
+    本身就是证据——只有 `/` 开头才弹），但 `screen` 导出的 `CommandPanel`
+    只有一串 `╭───────`。**而 C10 E03「补全菜单里有哪些候选」正是这个缺口
+    要解决的判据之一**——补不上的话，`screen` 对那条判据依然无能为力。
+
+    `Strip.text` 给的是这一行所有 segment 的文本拼接，也就是**真的被画出来的
+    那些字符**——比任何「去问控件要内容」的写法都更接近「用户看到了什么」。
+
+    副作用：无（只读；`render_line` 在 Textual 里是纯函数式的绘制）。
+    """
+    try:
+        height = widget.size.height
+    except Exception:  # noqa: BLE001 —— 尚未布局的控件没有 size
+        return ""
+    if not height:
+        return ""
+
+    lines: list[str] = []
+    for y in range(min(height, MAX_PAINTED_LINES)):
+        try:
+            strip = widget.render_line(y)
+        except Exception:  # noqa: BLE001 —— 不支持逐行绘制 / 越界
+            break
+        text = getattr(strip, "text", None)
+        if isinstance(text, str):
+            lines.append(text.rstrip())
+    # 全是空白就当作「没内容」返回空串，避免把一堆空行塞进导出结果
+    return "\n".join(lines) if any(l.strip() for l in lines) else ""
+
+
+def _is_quiescent(background: dict) -> bool:
+    """
+    这份后台活动量说不说明「系统真的停下来了」。
+
+    :param background: `snapshot()["background"]`，三个键见 `_read_ui_state`
+    :returns: 没有任何还会自己动起来的东西 → True
+
+    ## 判据只有两条，第三条**刻意不算**
+
+    - `subagents > 0`   → 不静止。后台委派还在跑，它随时可能改文件、发消息。
+    - `unread_for_main` → 不静止。主对话的自动唤起（`_maybe_auto_wake`）
+      每 0.5 秒在空闲时检查一次，有未读就**自己起一条流**。
+      也就是说「现在 idle」与「一秒后又忙起来」完全兼容。
+    - `idle_members`    → **不算**。⚠ 这一条不能加。
+
+    ## 为什么 `idle_members` 不能算进去
+
+    C15 有一条明写的不变量：**主对话可以在队员待命时正常收工**
+    （`TeamGate.has_awaited` 恒为假，护栏
+    `test_team_wake.py::test_main_agent_can_finish_while_a_member_idles`）。
+    待命队员就是在那儿等消息，没有任何机制让它自己醒过来——
+    把它算作「系统还在动」，`wait --until quiescent` 会**永远等不到静止**，
+    然后超时，然后下一个人把这个判据整条删掉。
+
+    这与 CLAUDE.md 里那条「绝不要给 TaskStatus 加一个 is_terminal 为假的 IDLE」
+    是**同一个坑**：待命是一种稳定状态，不是一段未完成的工作。
+
+    ## 三条同时成立时为什么可以断定静止
+
+    主对话空闲（调用方已判）+ 0 个在跑的子 Agent + 信箱里没有给 main 的消息
+    → 没有任何正在执行的 Agent，因而没有人能发出新消息；
+    待命队员只能被消息唤醒，而消息只能由正在执行的 Agent 发出。闭环成立。
+    """
+    if background.get("subagents"):
+        return False
+    if background.get("unread_for_main"):
+        return False
+    return True
 
 
 def _safe_default(kind: Optional[str]) -> Any:

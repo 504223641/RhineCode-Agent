@@ -457,7 +457,15 @@ class ActionOutcome:
                一个成功跑完并明确判 DENY 的 Hook，`ok` 是 True、`verdict` 是 DENY
     :param verdict: 该动作产出的结论；非 `pre_tool_use` 事件上恒为 NONE
     :param reason: 结论原因（`verdict` 非 NONE 时有意义）
-    :param detail: stdout / stderr / 响应状态的摘要，进 trace 供排查
+    :param detail: stdout / stderr / 响应状态的摘要。**这一份可能被裁剪**，
+                   因为失败路径上它会经 `HOOK_FAILED_REASON` 回灌给模型
+                   （见 `manager.py`），无上限会让一条刷屏的 Hook 撑爆上下文
+    :param full_detail: 同一份内容的**完整原文，只进行为记录（trace）**。
+                   缺省 None 表示「`detail` 就是全部」。
+                   ⚠️ 与 `ToolResult.full_output` 同一个约定、同一个坑：
+                   **裁剪 `detail` 与填 `full_detail` 必须成对**，漏填不报错，
+                   只是那段输出永久消失。Hook 的 stdout 恰恰是排查
+                   「我的自动化到底跑出了什么」唯一的证据
     :param duration_ms: 执行耗时（毫秒，保留三位小数）
     :param injected_text: `prompt` 动作的产物，其余动作为空串
 
@@ -470,6 +478,7 @@ class ActionOutcome:
     verdict: HookDecision = HookDecision.NONE
     reason: str = ""
     detail: str = ""
+    full_detail: Optional[str] = None
     duration_ms: float = 0.0
     injected_text: str = ""
 

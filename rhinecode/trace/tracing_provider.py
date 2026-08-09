@@ -25,9 +25,8 @@ from typing import Any, Iterator, Optional
 
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk
 from rhinecode.trace.models import (
-    MAX_MESSAGE_ITEMS,
     TraceEventType,
-    clip,
+    full_text,
 )
 from rhinecode.trace.recorder import TraceRecorderProtocol
 
@@ -83,20 +82,22 @@ class TracingProvider(BaseProvider):
         turn = self._recorder.next_turn(scope)
         t0 = time.monotonic()
 
-        # 走 emit_lazy 而不是 emit：这个负载要遍历整份消息历史并逐条 clip，
+        # 走 emit_lazy 而不是 emit：这个负载要遍历整份消息历史并逐条渲染，
         # 是典型的「昂贵负载」，关闭记录时不应该白构造一遍（spec N1）。
+        # 去掉条数上限之后它更贵了，emit_lazy 也因此更重要——不开 `--trace` 时
+        # 这个 lambda 一次都不会被调用，产品运行的开销仍然是零。
         self._recorder.emit_lazy(
             TraceEventType.API_REQUEST,
             lambda: {
                 "turn": turn,
                 "model": self._model,
                 "thinking_effort": thinking_effort,
-                "system": clip(system) if system else None,
+                "system": full_text(system) if system else None,
                 "tool_names": _tool_names(tools),
                 # 完整 schema 也记：AC1 要固化「工具 schema 的黄金基线」，
                 # 只记名字的话「某个参数描述被改坏了」这类回归查不出来。
                 "tools": tools,
-                "messages": _clip_messages(messages),
+                "messages": _render_messages(messages),
             },
         )
 
@@ -144,7 +145,7 @@ class TracingProvider(BaseProvider):
                             {
                                 "id": chunk.tool_call.id,
                                 "name": chunk.tool_call.name,
-                                "arguments": clip(chunk.tool_call.arguments)
+                                "arguments": full_text(chunk.tool_call.arguments)
                                 if chunk.tool_call.arguments is not None
                                 else None,
                             }
@@ -161,8 +162,8 @@ class TracingProvider(BaseProvider):
                 lambda: {
                     "turn": turn,
                     "model": self._model,
-                    "text": clip("".join(text_parts)),
-                    "thinking": clip("".join(thinking_parts)),
+                    "text": full_text("".join(text_parts)),
+                    "thinking": full_text("".join(thinking_parts)),
                     "tool_calls": tool_calls,
                     "usage": _usage_payload(usage),
                     "duration_ms": int((time.monotonic() - t0) * 1000),
@@ -198,39 +199,44 @@ def _tool_names(tools: Optional[list[dict]]) -> list[str]:
     return names
 
 
-def _clip_messages(messages: list[Message]) -> Any:
+def _render_messages(messages: list[Message]) -> list[dict]:
     """
-    把消息历史转成可落盘的形态：逐条取角色与内容、内容经 `clip`、工具调用只留摘要。
+    把消息历史转成可落盘的形态：逐条取角色、完整内容与工具调用。
 
-    超过 `MAX_MESSAGE_ITEMS` 条时只保留**头部**并额外返回原条数。为什么保留头部
-    而不是尾部：越靠前的消息越可能是被 c8 压缩改写过的摘要与边界提示，
-    而「压缩到底把什么留下了」正是排查上下文问题时最要看的部分。
+    :param messages: 本次请求实际发给模型的全部消息
+    :returns: 与入参**等长**的字典列表
+
+    ## 为什么这里不再有条数上限
+
+    旧实现在超过 400 条时只保留头部并记一个 `original_length`。它与 trace 的
+    立项目的直接冲突：读记录的人问的是「模型这一轮到底看到了什么」，
+    而一个被砍掉尾部的历史**恰好丢掉了离当前最近、最可能解释当前行为的那一段**。
+    （旧注释给的理由是「头部是 c8 压缩后的摘要，最该看」——那只在排查压缩本身时成立，
+    排查其它任何问题时都反了。）
+
+    现在**逐条全记、内容不截断**。代价是长会话下单行 JSON 很大——`api_request`
+    每轮都携带完整历史，一次几百轮的会话可以产出数十 MB 的记录文件。
+    这是刻意接受的：JSONL 是逐行独立的，阅读器按行处理不必整份读进内存，
+    而「证据不完整」的代价没有上限。
+
+    副作用：无（纯函数）。
     """
-    total = len(messages)
-    items = messages[:MAX_MESSAGE_ITEMS]
     rendered = []
-    for m in items:
+    for m in messages:
         entry: dict = {
             "role": getattr(m, "role", None),
-            "content": clip(getattr(m, "content", "") or ""),
+            "content": full_text(getattr(m, "content", "") or ""),
         }
         calls = getattr(m, "tool_calls", None)
         if calls:
             entry["tool_calls"] = [
-                {"id": c.id, "name": c.name, "arguments": clip(c.arguments)}
+                {"id": c.id, "name": c.name, "arguments": full_text(c.arguments)}
                 for c in calls
             ]
         tcid = getattr(m, "tool_call_id", None)
         if tcid:
             entry["tool_call_id"] = tcid
         rendered.append(entry)
-
-    if total > MAX_MESSAGE_ITEMS:
-        return {
-            "items": rendered,
-            "truncated": True,
-            "original_length": total,
-        }
     return rendered
 
 

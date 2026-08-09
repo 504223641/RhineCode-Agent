@@ -219,25 +219,62 @@ class TracingProviderTest(unittest.TestCase):
         self.assertIs(call["tools"], tools)
         self.assertEqual(call["system"], "SYS")
 
-    def test_messages_clipped_and_counted(self) -> None:
-        from rhinecode.trace.models import MAX_FIELD_CHARS, MAX_MESSAGE_ITEMS
+    def test_messages_recorded_in_full(self) -> None:
+        """
+        消息历史**全量**落盘：既不裁内容，也不裁条数。
 
-        long_msg = Message(role="user", content="x" * (MAX_FIELD_CHARS + 10))
+        这条替代了原来的 `test_messages_clipped_and_counted`——它当时逐条断言
+        「超过 4000 字符包成截断对象」「超过 400 条只留头部」，两条现在都已作废。
+
+        用的长度刻意远超旧阈值（10 倍字符 / 4 倍条数），这样万一有人把阈值
+        「调大一点」而不是删掉，这条依然红。
+        """
+        long_msg = Message(role="user", content="x" * 40_000)
         inner = FakeProvider([StreamChunk(type="done")])
         p = TracingProvider(inner, self.rec, model="m")
         list(p.stream_chat([long_msg]))
 
         content = self.records()[0]["messages"][0]["content"]
-        self.assertIs(content["truncated"], True)
-        self.assertEqual(content["original_length"], MAX_FIELD_CHARS + 10)
+        # 裸字符串、原样等长——不是那个 {"text":…, "truncated":…} 对象
+        self.assertIsInstance(content, str)
+        self.assertEqual(len(content), 40_000)
 
-        # 超条数上限时只留头部并记原条数
-        many = [Message(role="user", content=str(i)) for i in range(MAX_MESSAGE_ITEMS + 5)]
+        # 条数同样不设上限：1600 条全都在，且顺序与内容都对得上
+        many = [Message(role="user", content=str(i)) for i in range(1600)]
         list(p.stream_chat(many))
         msgs_field = self.records()[2]["messages"]
-        self.assertIs(msgs_field["truncated"], True)
-        self.assertEqual(msgs_field["original_length"], MAX_MESSAGE_ITEMS + 5)
-        self.assertEqual(len(msgs_field["items"]), MAX_MESSAGE_ITEMS)
+        self.assertIsInstance(msgs_field, list)
+        self.assertEqual(len(msgs_field), 1600)
+        # **尾部必须在**：旧实现保留头部丢尾部，而离当前最近的那几条
+        # 恰恰是最可能解释当前行为的（这正是删掉上限的直接理由）
+        self.assertEqual(msgs_field[-1]["content"], "1599")
+
+    def test_system_prompt_recorded_in_full(self) -> None:
+        """
+        系统提示不截断——**这是删掉阈值的头号动因**。
+
+        实测：结构化系统提示在最小配置下已有 3886 字符，贴着旧的 4000 线；
+        而稳定通道按「越稳定越靠前」排序，尾部依次是 134 组队协作 /
+        135 角色清单 / 140 Skill 清单。旧阈值下，任何一份真实的 RHINE.md
+        一进来，被切掉的**正好是 C15 / C13 / C11 那三段清单**——
+        也就是「模型到底看没看到这个能力」唯一的证据。
+
+        用一段带尾部哨兵的长提示钉住：哨兵在 4000 之后，能读到它
+        就说明尾部没被切。
+        """
+        sentinel = "【尾部哨兵·组队协作清单】"
+        system = "S" * 9000 + sentinel
+        inner = FakeProvider([StreamChunk(type="done")])
+        p = TracingProvider(inner, self.rec, model="m")
+        list(p.stream_chat([Message(role="user", content="hi")], system=system))
+
+        recorded = self.records()[0]["system"]
+        self.assertIsInstance(recorded, str)
+        self.assertTrue(
+            recorded.endswith(sentinel),
+            "系统提示的尾部被切掉了——三个清单槽位恰好排在那里",
+        )
+        self.assertEqual(len(recorded), len(system))
 
 
 if __name__ == "__main__":

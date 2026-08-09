@@ -685,3 +685,198 @@ def seed_team_readonly(workspace: Path, user_dir: Path) -> None:
     """
     seed_team_project(workspace, user_dir)
     seeding.seed_permissions(workspace / ".rhinecode", allow=["Read"])
+
+
+# ---------------------------------------------------------------------------
+# C15：子 Agent 协作（`ScopedScriptedProvider` 专用）
+# ---------------------------------------------------------------------------
+# ⚠️ **这几份剧本是 dict 而不是 list**，必须配 `ScopedScriptedProvider`。
+#
+# 原因见那个类的 docstring：`ScriptedProvider` 按全局调用序号取轮次，
+# 而队员是并发跑的——主对话的第 2 轮与 worker 的第 1 轮谁先调模型取决于
+# 线程调度，同一份 list 剧本每次跑都可能对应到不同的 Agent 身上。
+#
+# 键是 trace 作用域：主对话是 `main`，队员是 `subagent:<队员名>`
+# （**队员名不是角色名**——`run_agent` 的 `name` 参数决定它，
+# 同一个角色可以派出多个队员；漏了这一点会写出一个永远走兜底的剧本）。
+
+# 场景 A：派两个队员并行干活，各自做完给 main 发消息。
+# 验：共享清单的认领、点对点消息的送达、主对话收工前会等队员。
+TEAM_PARALLEL = {
+    "main": [
+        [
+            text("这两件事互不相干，我组个队并行做。"),
+            tool("task_create", {
+                "subject": "把 greet 改成中文",
+                "description": "src/app.py 里的 greet 返回中文问候。",
+            }, call_id="t-create-1"),
+            tool("task_create", {
+                "subject": "给 shout 加一行注释",
+                "description": "src/util.py 的 shout 函数补一句 docstring。",
+            }, call_id="t-create-2"),
+            done(),
+        ],
+        [
+            text("清单建好了，派人。"),
+            tool("run_agent", {
+                "type": "role", "agent": "worker", "name": "impl-a",
+                "task": "认领「把 greet 改成中文」那条，改完把状态改成 completed，然后告诉 main。",
+            }, call_id="t-run-a"),
+            tool("run_agent", {
+                "type": "role", "agent": "worker", "name": "impl-b",
+                "task": "认领「给 shout 加一行注释」那条，改完把状态改成 completed，然后告诉 main。",
+            }, call_id="t-run-b"),
+            done(),
+        ],
+        [text("两条都完成了，收工。"), done()],
+        # ⚠ 还要再写一轮：子 Agent 的结论是在**收工前**注入主历史的，
+        # 循环会因此多跑一轮让模型看过结论再收。少写这一轮不会报错，
+        # 只会让最后一句变成 `[e2e-fallback]`——判据看起来仍然全绿。
+        [text("两位队员的结论都收到了，任务完成。"), done()],
+    ],
+    "subagent:impl-a": [
+        [
+            text("我来做第一条。"),
+            tool("edit_file", {
+                "path": "src/app.py",
+                "old_string": 'return "hi " + name',
+                "new_string": 'return "你好，" + name',
+            }, call_id="a-edit"),
+            done(),
+        ],
+        [
+            text("改完了，报一声。"),
+            tool("send_message", {
+                "to": "main", "message": "greet 已改成中文。", "summary": "greet 改好了",
+            }, call_id="a-msg"),
+            done(),
+        ],
+        [text("已完成：src/app.py 的 greet 现在返回中文问候。"), done()],
+    ],
+    "subagent:impl-b": [
+        [
+            text("我来做第二条。"),
+            tool("edit_file", {
+                "path": "src/util.py",
+                "old_string": '"""工具函数。"""',
+                # ⚠ 换行必须写成转义的 \n 而不是真换行：这是要塞进
+                # `edit_file` 参数里的**文件内容**，剧本里断行会让替换目标
+                # 与文件里的实际文本对不上，edit_file 报「未找到匹配」。
+                "new_string": '"""工具函数。\n\nshout：把文本转成大写。\n"""',
+            }, call_id="b-edit"),
+            done(),
+        ],
+        [
+            text("改完了，报一声。"),
+            tool("send_message", {
+                "to": "main", "message": "shout 的说明补好了。", "summary": "注释补好了",
+            }, call_id="b-msg"),
+            done(),
+        ],
+        [text("已完成：src/util.py 的模块说明补上了 shout 的一句话。"), done()],
+    ],
+}
+
+
+# 场景 B：唤醒续跑。队员做完第一件事后待命，reviewer 给它发消息，它被叫醒接着干。
+# 验：待命 → 被消息唤醒 → **原上下文还在**（它记得自己刚改过哪个文件）。
+TEAM_WAKE = {
+    "main": [
+        [
+            text("先让 worker 改，再让 reviewer 看。"),
+            tool("run_agent", {
+                "type": "role", "agent": "worker", "name": "impl",
+                "task": "把 src/app.py 的 greet 改成返回中文。改完待命，reviewer 可能会找你。",
+            }, call_id="w-run"),
+            done(),
+        ],
+        [
+            text("再派个审阅。"),
+            tool("run_agent", {
+                "type": "role", "agent": "reviewer", "name": "checker",
+                "task": "看看 src/app.py 的 greet 改得对不对，有问题直接告诉 impl。",
+            }, call_id="w-review"),
+            done(),
+        ],
+        [text("都处理完了。"), done()],
+        [text("改动与复核都完成了。"), done()],
+    ],
+    "subagent:impl": [
+        [
+            text("先改。"),
+            tool("edit_file", {
+                "path": "src/app.py",
+                "old_string": 'return "hi " + name',
+                "new_string": 'return "你好" + name',
+            }, call_id="i-edit"),
+            done(),
+        ],
+        [text("改完了，我待命等反馈。"), done()],
+        # ↓ 被 reviewer 的消息唤醒之后的这一轮。它能引用「刚才那次修改」
+        #   正是「原上下文还在」的判据——历史丢了的话它只能重新读一遍文件。
+        [
+            text("收到反馈，补上逗号。"),
+            tool("edit_file", {
+                "path": "src/app.py",
+                "old_string": 'return "你好" + name',
+                "new_string": 'return "你好，" + name',
+            }, call_id="i-fix"),
+            done(),
+        ],
+        [text("已修正：greet 现在返回「你好，<名字>」。"), done()],
+    ],
+    "subagent:checker": [
+        [
+            text("我看看。"),
+            tool("read_file", {"path": "src/app.py"}, call_id="c-read"),
+            done(),
+        ],
+        [
+            text("少个逗号，找 impl 改。"),
+            tool("send_message", {
+                "to": "impl",
+                "message": "你刚改的那处 greet 少了个逗号，中文里应该是「你好，」。",
+                "summary": "greet 少个逗号",
+            }, call_id="c-msg"),
+            done(),
+        ],
+        [text("已复核：提出一处标点问题，已通知 impl。"), done()],
+    ],
+}
+
+
+# 场景 C：队员给 main 发消息触发**自动唤起**。
+# 验：主对话空闲时被队友消息叫起来自己跑一轮（F17/F21），
+# 且那一轮判 ASK 一律自动拒绝、一个面板都不弹（F18）。
+TEAM_AUTO_WAKE = {
+    "main": [
+        [
+            text("派一个人去看看。"),
+            tool("run_agent", {
+                "type": "role", "agent": "reviewer", "name": "scout",
+                "task": "读一下 src/app.py，把 greet 的现状告诉 main。",
+            }, call_id="aw-run"),
+            done(),
+        ],
+        [text("知道了。"), done()],
+        # ↓ 这一轮是**自动唤起**跑的：没有用户输入，由 scout 的消息触发
+        [text("收到 scout 的消息了，我记下来。"), done()],
+    ],
+    "subagent:scout": [
+        [
+            text("我看看。"),
+            tool("read_file", {"path": "src/app.py"}, call_id="aw-read"),
+            done(),
+        ],
+        [
+            text("看完了，报给 main。"),
+            tool("send_message", {
+                "to": "main",
+                "message": "src/app.py 的 greet 目前返回英文 'hi <name>'。",
+                "summary": "greet 现状",
+            }, call_id="aw-msg"),
+            done(),
+        ],
+        [text("已调研：greet 返回英文问候。"), done()],
+    ],
+}

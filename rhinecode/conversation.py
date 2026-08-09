@@ -1664,6 +1664,22 @@ class ConversationManager:
             return False
         return self.team_service.has_unread_for_main()
 
+    def team_idle_member_count(self) -> int:
+        """
+        当前处于待命状态的队员数（**只读**）。
+
+        :returns: 待命人数；协作未启用时为 0
+
+        用途是回答「这个进程还有没有活着的后台线程」——待命队员各占一条
+        daemon 线程阻塞等消息。它**不表示系统还在忙**：C15 的一条不变量正是
+        「主对话可以在队员待命时正常收工」（`TeamGate.has_awaited` 恒为假），
+        所以判断「系统静止了没有」时**不能**把它算进去，
+        否则永远等不到静止。见 `tests/e2e/control.py` 的 `_is_quiescent`。
+        """
+        if self.team_service is None:
+            return 0
+        return self.team_service.roster.idle_count()
+
     def team_can_auto_wake(self) -> bool:
         """自动唤起连锁计数还没到上限吗（TUI 轮询用；**只读**）。"""
         if self.team_service is None:

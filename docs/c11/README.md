@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 顶层四份 + `align/` | **产品能力**：Skill 系统 | 是（C11） |
 | `testing/` | **跨阶段测试设施**：Trace 记录器与端到端驱动器 | **否** |
-| `acceptance/` | 上面两块的**实跑验收记录** | — |
+| `acceptance/` | 上面两块的**实跑验收记录**（五份） | — |
 
 ```
 docs/c11/
@@ -23,11 +23,12 @@ docs/c11/
 │   └── p1-driver/                  ← P1a：端到端驱动设施（`tests/e2e/`）
 │       └── spec.md  plan.md  task.md  checklist.md
 │
-└── acceptance/                     ← 四份实跑验收记录
+└── acceptance/                     ← 五份实跑验收记录
     ├── skills-c11-live.md          ← C11 原始设计的真实模型验收（10 场景 43/43）
     ├── skills-align-live.md        ← 对齐改造的真实模型验收（7 场景 29/29）
     ├── trace-p0-e2e.md             ← 用 P1a 驱动设施验收 P0（6 场景）
-    └── driver-p1a.md               ← P1a 自身的验收
+    ├── driver-p1a.md               ← P1a 自身的验收
+    └── trace-driver-live.md        ← **两套设施自身**的真实模型验收（29 条判据，2026-08-09）
 ```
 
 ---
@@ -89,9 +90,10 @@ P0 解决「看清实际发生了什么」，P1a 解决「让 Claude 自己把�
 | Skill 系统现在是什么行为 | `align/spec.md` |
 | 怎么写一个 Skill / 怎么从 CC 搬一个过来 | 仓库根 [`README.md` 的「Skill 系统」一节](../../README.md#skill-系统) |
 | 某条设计当初为什么那么定 | `spec.md`（原始）→ `align/spec.md`（改造理由） |
-| 实跑时到底发现了什么问题 | `acceptance/` 下四份，每条判据都分「机器判到了什么」与「据此做的判断」 |
+| 实跑时到底发现了什么问题 | `acceptance/` 下五份，每条判据都分「机器判到了什么」与「据此做的判断」 |
+| **设施自身可不可信** | `acceptance/trace-driver-live.md` —— 验的不是产品，是 trace 与驱动器本身。依据不可信的话，上面所有验收结论都要打折 |
 | 怎么用 `--trace` 排查行为问题 | `testing/p0-trace/spec.md` + 根 `CLAUDE.md` 的「常用命令」 |
 | 怎么让 Claude 自己驱动界面跑场景 | `testing/p1-driver/spec.md` + 根 `CLAUDE.md` 的「常用命令」 |
 
-> 验收记录尤其值得读：四份加起来找出的十几个缺陷里，**绝大多数逃过了全部单测**，
+> 验收记录尤其值得读：五份加起来找出的十几个缺陷里，**绝大多数逃过了全部单测**，
 > 共同点是落在两个模块的**接缝处**——单测各自验一侧，交界处没人验。

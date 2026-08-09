@@ -31,6 +31,7 @@ from unittest import mock
 from rhinecode.bootstrap import build_app
 from rhinecode.config import Config
 from rhinecode.tools import path_guard
+from rhinecode.tui.widgets import InputBar
 from rhinecode.trace.recorder import TraceRecorder
 from tests.e2e import sandbox
 from tests.e2e.assertions import TraceView
@@ -286,6 +287,142 @@ class WaitTest(DriverFixture):
 
             slow.set()  # 放行，让它自然结束
             await asyncio.to_thread(core.wait, 30.0)
+            await core.shutdown_on_main("test")
+
+
+class QuiescentWaitTest(DriverFixture):
+    """
+    `wait --until quiescent`：**「idle」不等于「系统静止」**。
+
+    ## 这组用例在防什么
+
+    三态只描述界面。C13 起，界面空闲时进程里仍可能有活：后台委派在跑，
+    或者队友消息躺在信箱里等主对话**自动唤起**（`_maybe_auto_wake` 每 0.5 秒
+    在空闲时检查一次，符合条件就自己起一条流）。
+
+    于是 `wait` 返回 `idle` 之后会话随时可能又忙起来，**基于它的断言是竞态的**
+    ——而竞态判据比没有判据更坏：它偶尔通过，于是没人相信失败是真的。
+    """
+
+    async def test_terminal_mode_is_unchanged_by_default(self):
+        """
+        **零回归**：缺省 `until="terminal"` 时行为与改造前逐字相同。
+
+        这条排在最前是刻意的——既有的 C2–C11 场景全都不传 `until`，
+        它们的行为一个字都不该变。
+        """
+        app, _ = self.assemble([[text("好的"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            res = await asyncio.to_thread(core.wait, 30.0)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["data"]["terminal"], SessionState.IDLE.value)
+            await core.shutdown_on_main("test")
+
+    async def test_status_reports_background_and_quiescent(self):
+        """
+        没有任何后台活动时：`background` 三个键都在，`quiescent` 为真。
+
+        字段必须**存在**而不只是「值对”——它们是场景的读取契约，
+        少一个键会让断言以 KeyError 的形式失败在一个和判据无关的地方。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            snap = await asyncio.to_thread(core.snapshot)
+            for key in ("subagents", "idle_members", "unread_for_main"):
+                self.assertIn(key, snap["background"], f"background 缺字段 {key}")
+            self.assertTrue(snap["quiescent"], "没有后台活动时应当判为静止")
+            await core.shutdown_on_main("test")
+
+    async def test_quiescent_waits_for_background_subagents(self):
+        """
+        后台还有子 Agent 在跑时，`quiescent` 模式**不得**提前返回。
+
+        用打桩的方式伪造「还有 1 个在跑」——起一个真子 Agent 会把这条用例
+        变成一个依赖模型剧本与线程时序的集成测试，而这里要验的只是
+        **判据本身**：`subagents > 0` 时不算静止。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            manager = app._manager
+            manager.running_subagent_count = lambda: 1
+            try:
+                res = await asyncio.to_thread(core.wait, 0.4, "quiescent")
+                self.assertFalse(res["ok"], "还有子 Agent 在跑就不该判为静止")
+                self.assertEqual(res["error"]["code"], "timeout")
+                data = res["error"]["data"]
+                # 超时诊断必须能区分「子 Agent 还在跑」与「有消息没人处理」
+                self.assertEqual(data["until"], "quiescent")
+                self.assertEqual(data["background"]["subagents"], 1)
+                self.assertEqual(data["state"], SessionState.IDLE.value)
+            finally:
+                del manager.running_subagent_count
+
+            # 恢复之后立刻能等到
+            res = await asyncio.to_thread(core.wait, 5.0, "quiescent")
+            self.assertTrue(res["ok"])
+            await core.shutdown_on_main("test")
+
+    async def test_quiescent_waits_for_pending_auto_wake(self):
+        """
+        信箱里有给 `main` 的未读消息时不算静止——它会自己起一条流。
+
+        这是 C15 特有的形态，也是最容易骗过 `terminal` 模式的那个：
+        界面此刻确实空闲，一秒后却开始跑一整轮。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            manager = app._manager
+            manager.team_has_unread_for_main = lambda: True
+            try:
+                res = await asyncio.to_thread(core.wait, 0.4, "quiescent")
+                self.assertFalse(res["ok"])
+                self.assertIs(res["error"]["data"]["background"]["unread_for_main"], True)
+            finally:
+                del manager.team_has_unread_for_main
+            await core.shutdown_on_main("test")
+
+    async def test_idle_members_alone_do_not_block_quiescence(self):
+        """
+        ⚠ **反证：待命队员不算「还在动」。**
+
+        C15 有一条明写的不变量——主对话可以在队员待命时正常收工
+        （`TeamGate.has_awaited` 恒为假）。把待命人数算进静止判据的话，
+        `wait --until quiescent` 会**永远等不到**，然后超时，
+        然后下一个人把这条判据整条删掉。
+
+        这与 CLAUDE.md 那条「绝不要给 TaskStatus 加 is_terminal 为假的 IDLE」
+        是同一个坑：待命是稳定状态，不是未完成的工作。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "你好")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            manager = app._manager
+            manager.team_idle_member_count = lambda: 3
+            try:
+                res = await asyncio.to_thread(core.wait, 5.0, "quiescent")
+                self.assertTrue(res["ok"], "有队员待命仍应判为静止")
+                snap = await asyncio.to_thread(core.snapshot)
+                self.assertEqual(snap["background"]["idle_members"], 3)
+                self.assertTrue(snap["quiescent"])
+            finally:
+                del manager.team_idle_member_count
             await core.shutdown_on_main("test")
 
 
@@ -894,3 +1031,124 @@ class ObserveTest(DriverFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeysAndScreenTest(DriverFixture):
+    """
+    P1b 的两个设施缺口：**任意按键投递**与**可见文本导出**。
+
+    `docs/e2e-sweep/summary.md` 把 6 条「未覆盖」归到这两个缺口上：
+    C2 AC9 的 Ctrl+Q / Ctrl+C、C4 场景 11 的澄清面板键盘导航、
+    C10 E03 的补全与高亮、C10 E05 的配色可辨性。补上之后它们都能自动判定。
+    """
+
+    async def test_keys_reaches_the_input_bar(self):
+        """
+        最基本的一条：投递的按键真的到了界面上。
+
+        用输入框而不是某个绑定动作来验，是因为输入框的 `value` 是**可读的状态**
+        ——「按键有没有生效」有一个确定的观测点。验绑定动作（比如 Ctrl+Q 退出）
+        的话，成功的表现是应用没了，反而不好从同一个进程里断言。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+
+            # ⚠ 这里**直接调**而不是走 `run_on_main`：测试体本身就跑在事件循环
+            # 线程上，`run_on_main` 会把协程投给同一个循环再同步等结果——
+            # 自己等自己，确定性死锁（实测：15 秒后以 TimeoutError 收场，
+            # 而报错完全不指向「你在主线程上调了它」）。
+            # `run_on_main` 是给**别的线程**用的，见它的 docstring。
+            app.query_one(InputBar).focus()
+            await pilot.pause()
+
+            res = await asyncio.to_thread(core.keys, ["a", "b", "c"])
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["data"]["pressed"], ["a", "b", "c"])
+
+            await pilot.pause()
+            self.assertEqual(app.query_one(InputBar).value, "abc")
+            await core.shutdown_on_main("test")
+
+    async def test_keys_rejects_bad_input(self):
+        """
+        非法输入走 `bad_request`，不抛。
+
+        ⚠ 上限那条不是防滥用（驱动者是自己人），是防手滑：一个写错的循环
+        把上万个按键投进去，Textual 会在主线程逐个处理，界面卡死几分钟
+        而调用方只看到一次超时——排查方向会被完全带偏。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            for bad in ([], "ctrl+q", [""], [1, 2], ["a"] * 500):
+                res = await asyncio.to_thread(core.keys, bad)
+                self.assertFalse(res["ok"], f"{bad!r} 应当被拒")
+                self.assertEqual(res["error"]["code"], "bad_request")
+            await core.shutdown_on_main("test")
+
+    async def test_screen_exports_visible_history_text(self):
+        """
+        导出的文本里能找到界面上真的出现过的那句话。
+
+        ⚠ 这与 `ui_message` 事件**不等价**：事件只能证明产品**打算**显示它，
+        证明不了它真的渲染进了组件树。两者会分叉——markup 异常会让渲染失败
+        而事件照常落盘，那正是 CLAUDE.md 里 `MarkupError` 那条坑的形态。
+        """
+        app, _ = self.assemble([[text("界面上要出现的这句话"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "说句话")
+            await asyncio.to_thread(core.wait, 30.0)
+            await pilot.pause()
+
+            res = await asyncio.to_thread(core.screen, "")
+            self.assertTrue(res["ok"], res)
+            self.assertIn("界面上要出现的这句话", res["data"]["text"])
+            self.assertTrue(res["data"]["widgets"], "widgets 不该为空")
+            await core.shutdown_on_main("test")
+
+    async def test_screen_selector_narrows_and_reports_bad_selector(self):
+        """选择器能收窄范围；语法错误走 `bad_request` 而不是抛。"""
+        app, _ = self.assemble([[text("正文在这里"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "说句话")
+            await asyncio.to_thread(core.wait, 30.0)
+            await pilot.pause()
+
+            narrowed = await asyncio.to_thread(core.screen, "#history-messages > *")
+            self.assertTrue(narrowed["ok"], narrowed)
+            self.assertIn("正文在这里", narrowed["data"]["text"])
+            # 收窄之后不该再包含状态栏那些内容
+            whole = await asyncio.to_thread(core.screen, "")
+            self.assertGreater(
+                len(whole["data"]["widgets"]),
+                len(narrowed["data"]["widgets"]),
+                "整屏导出应当比收窄后的多",
+            )
+
+            bad = await asyncio.to_thread(core.screen, "#!!!not a selector")
+            self.assertFalse(bad["ok"])
+            self.assertEqual(bad["error"]["code"], "bad_request")
+            await core.shutdown_on_main("test")
+
+    async def test_screen_exposes_markup_for_style_assertions(self):
+        """
+        样式判据靠 **markup 原文**，不靠渲染后的 ANSI。
+
+        导出 ANSI 既难读又依赖终端能力；而 markup 原文就是产品自己写下的
+        那份意图（比如状态栏里的 `[dim]…[/dim]`），断言它才稳。
+        """
+        app, _ = self.assemble([[text("好"), done()]])
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await pilot.pause()
+            res = await asyncio.to_thread(core.screen, "")
+            self.assertTrue(res["ok"], res)
+            markups = [w["markup"] for w in res["data"]["widgets"] if w["markup"]]
+            self.assertTrue(
+                any("[" in m for m in markups),
+                "至少应当有一个控件带 markup 原文（状态栏就有 [dim]）",
+            )
+            await core.shutdown_on_main("test")

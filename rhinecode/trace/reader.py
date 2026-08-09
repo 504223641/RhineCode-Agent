@@ -38,8 +38,16 @@ def _text_of(value: Any, limit: int = 90) -> str:
     """
     把一个字段值渲染成单行短文本。
 
-    落盘时被截断的字段是 `{"text":…, "truncated": True, "original_length": N}`
-    这种对象（见 `models.clip` 的约定），这里统一还原成「文本 +（原长 N 字）」。
+    ⚠️ **`truncated` 分支只为读旧文件而保留。** 记录器已不再产生截断字段
+    （`models.full_text` 完整落盘，理由见那里的注释），但**磁盘上的旧 `.jsonl`
+    仍然是那种形态**——阅读器是只读工具，认不出旧格式等于把历史产物一次性作废。
+    删掉这个分支的唯一时机是「确认不再需要读任何旧文件」，那不是代码能判断的。
+
+    旧格式：`{"text":…, "truncated": True, "original_length": N}`，
+    这里统一还原成「文本 +（原长 N 字）」。
+
+    另外注意：本函数的 `limit` 是**显示宽度**，不是存储阈值。时间线每事件一行，
+    不压成一行就没法扫——展开完整内容请用 `--seq`。
     """
     if isinstance(value, dict) and value.get("truncated"):
         body = str(value.get("text", ""))
@@ -76,6 +84,8 @@ def _s_command_dispatch(r: dict) -> str:
 
 def _s_api_request(r: dict) -> str:
     msgs = r.get("messages")
+    # list 是当前格式（全量落盘）；dict 分支是**旧文件**里被条数上限截断过的形态
+    # （`{"items": [...], "truncated": True, "original_length": N}`），只为读旧产物保留。
     count = len(msgs) if isinstance(msgs, list) else msgs.get("original_length", "?") if isinstance(msgs, dict) else "?"
     return (
         f"turn {r.get('turn')} · {r.get('model')} · 消息 {count} 条 · "
@@ -119,8 +129,12 @@ _LAYER_NAMES = {
 
 def _s_permission_decision(r: dict) -> str:
     layer = str(r.get("layer"))
+    # `bypassed_engine` 的调用**没进权限引擎**（`system_serial=True` 的七个工具）。
+    # 在时间线上单独标一个记号，否则它们看起来与正常走完五层的判定一模一样，
+    # 而两者的安全含义差得很远（deny 规则对前者不生效，见已知项 #18）。
+    mark = "⚠绕过引擎 " if r.get("bypassed_engine") else ""
     return (
-        f"{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
+        f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"
     )
 
@@ -223,9 +237,16 @@ def _s_subagent_start(r: dict) -> str:
     全文在展开单条（`--seq`）时看得到。
     """
     who = r.get("agent") or "(branch)"
+    # 队员名与角色名可以不同（同一个角色能派出多个队员），有就一并显示
+    member = f"/{r['member']}" if r.get("member") else ""
+    # 隔离与档位直接进摘要行：这两项决定了「它能干什么」，
+    # 排查越权或「为什么它写不进去」时第一眼就要看到，不该等到 --seq
+    iso = " · 隔离" if r.get("isolated") else ""
+    mode = f" · {r['permission_mode']}" if r.get("permission_mode") else ""
     return (
-        f"{r.get('kind')}:{who} [{r.get('task_id')}]"
-        f" · 工具 {r.get('tool_count', 0)} 个 · {_text_of(r.get('task'), 60)}"
+        f"{r.get('kind')}:{who}{member} [{r.get('task_id')}]"
+        f" · 工具 {r.get('tool_count', 0)} 个{iso}{mode}"
+        f" · {_text_of(r.get('task'), 60)}"
     )
 
 
@@ -250,6 +271,7 @@ def _s_worktree_create(r: dict) -> str:
     return (
         f"{tag} {r.get('name')} · 分支 {r.get('branch') or '-'}"
         f" · 基于 {r.get('base_commit') or '-'}"
+        f" · 落点 {r.get('path') or '-'}"
     )
 
 
@@ -453,8 +475,12 @@ def render_detail(record: dict) -> list[str]:
     """
     展开模式：人可读地打印单条记录的完整负载。
 
-    被截断的字段**显式标出原长**——只看到 4000 字的正文而不知道它原本有 40 万字，
-    结论会完全不同。
+    这是**唯一会输出完整内容的视图**：时间线为了每事件一行必须压缩，
+    要看某条事件的全文就用 `--seq`。当前格式下这里打出来的就是落盘的全部内容，
+    一个字符都没少。
+
+    `truncated` 分支只为**旧文件**保留（那时字段有 4000 字上限），
+    显式标出原长——只看到 4000 字的正文而不知道它原本有 40 万字，结论会完全不同。
     """
     lines = [
         f"seq   : {record.get('seq')}",

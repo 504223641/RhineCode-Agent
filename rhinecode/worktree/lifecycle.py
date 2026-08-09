@@ -267,6 +267,10 @@ def create(
             recorder,
             TraceEventType.WORKTREE_CREATE,
             name=final_name,
+            # ⚠ 路径必须记：它是「隔离到底有没有真的发生」唯一的锚点。
+            # 没有它的话，`permission_decision.cwd` 记下来的那个目录
+            # 与「本次委派用的工作区」对不上号——读记录的人只能靠名字猜。
+            path=str(target),
             branch="",
             base_commit="",
             recovered=True,
@@ -313,6 +317,7 @@ def create(
         recorder,
         TraceEventType.WORKTREE_CREATE,
         name=final_name,
+        path=str(target),
         branch=branch,
         base_commit=base,
         recovered=False,

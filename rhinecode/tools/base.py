@@ -49,11 +49,26 @@ class ToolResult:
     :param diff: 可选的结构化差异。改文件类工具（edit_file/write_file）填充它，
                  TUI 据此在状态行下方渲染彩色 diff 块；其它工具留空（None）。
                  与 output/summary 解耦：diff 是「结构化数据」，渲染样式由 TUI 决定。
+    :param full_output: **完整原文，只进行为记录（trace），不进模型上下文、不进界面。**
+                 缺省 None 表示「`output` 就是全部」——绝大多数工具都是这样，不必填。
+
+                 只有**主动裁剪过 `output`** 的工具才填它。目前唯一的填写方
+                 是 `run_command`：它的 `_clip` 只保留前 30 行 + 后 10 行，
+                 一次 200 行的测试输出有 160 行**在任何地方都不存在**——
+                 模型看不到是对的（省 token），但连 trace 里也没有就不对了，
+                 那正是排查「测试到底为什么失败」时唯一有用的部分。
+
+                 ⚠️ **裁剪 `output` 与填 `full_output` 必须成对。** 漏填不报错，
+                 只是那段内容永久丢失且无人察觉——记录看起来是完整的，
+                 因为被裁掉的地方连痕迹都没有（`_clip` 的省略提示是给模型看的，
+                 它不告诉你被省掉的**内容**是什么）。
+                 护栏见 `tests/test_trace_full_output.py`。
     """
     ok: bool
     output: str
     summary: str = ""
     diff: Optional[DiffView] = None
+    full_output: Optional[str] = None
 
 
 class Tool(ABC):

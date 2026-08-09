@@ -57,7 +57,7 @@ from rhinecode.trace.recorder import create_recorder
 from tests.e2e import discovery, fingerprint, protocol, sandbox
 from tests.e2e.control import DriverCore, ExternalResponder, SessionState
 from tests.e2e.discovery import HostInfo
-from tests.e2e.scripted import ScriptedProvider
+from tests.e2e.scripted import ScopedScriptedProvider, ScriptedProvider
 from tests.e2e.webstub import stub_client_factory, stub_resolver
 
 
@@ -253,7 +253,23 @@ def dispatch(host_state: HostState, request: dict) -> dict:
             timeout = float(request.get("timeout", 180.0))
         except (TypeError, ValueError):
             return protocol.err("bad_request", "wait 的 timeout 必须是数字")
-        return core.wait(timeout)
+        until = request.get("until", "terminal")
+        bad = protocol.validate_until(until)
+        if bad:
+            return protocol.err("bad_request", bad)
+        return core.wait(timeout, until)
+
+    if cmd == "keys":
+        sequence = request.get("sequence")
+        if not isinstance(sequence, list):
+            return protocol.err("bad_request", "keys 需要 sequence 数组")
+        return core.keys(sequence)
+
+    if cmd == "screen":
+        selector = request.get("selector", "")
+        if not isinstance(selector, str):
+            return protocol.err("bad_request", "screen 的 selector 必须是字符串")
+        return core.screen(selector)
 
     if cmd == "answer":
         choice = request.get("choice")
@@ -295,6 +311,10 @@ def build_status(host_state: HostState) -> dict:
         "trace_seq": ui.get("trace_seq", 0),
         "focused": ui.get("focused"),
         "panel_visible": ui.get("panel_visible"),
+        # 后台活动量与「系统真的停下来了」——C13/C15 的场景靠它们判定，
+        # 因为三态只描述界面（见 control._is_quiescent）
+        "background": ui.get("background", {}),
+        "quiescent": ui.get("quiescent", False),
         "turns": turns,
         "turn_budget": host_state.turn_budget,
         "fingerprint": info.fingerprint if info else "",
@@ -441,8 +461,22 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
 
     provider_factory = None
     if args.mode == "scripted":
-        turns = load_attr(args.script) if args.script else []
-        provider = ScriptedProvider(turns)
+        script = load_attr(args.script) if args.script else []
+        # 剧本有两种形态，按类型自动分派：
+        #
+        # - **list**（`[[chunk, ...], ...]`）→ `ScriptedProvider`，按全局调用序取轮次。
+        #   单条对话的场景用它，C2–C12 全部如此。
+        # - **dict**（`{作用域: [[chunk, ...], ...]}`）→ `ScopedScriptedProvider`，
+        #   **按线程本地的 trace 作用域**分派。多 Agent 并发（C13/C15）**必须**用它——
+        #   队员与主对话谁先调模型取决于线程调度，全局序号在那里是不确定的。
+        #
+        # 自动分派而不是加一个 `--script-kind` 参数：形态从剧本本身就能看出来，
+        # 多一个参数只会多一处「写错了但不报错」的地方（写 list 剧本却传
+        # `--script-kind scoped` 会静默走兜底，现象是「模型什么都不说」）。
+        if isinstance(script, dict):
+            provider = ScopedScriptedProvider(script)
+        else:
+            provider = ScriptedProvider(script)
         provider_factory = lambda cfg: provider  # noqa: E731
 
     try:

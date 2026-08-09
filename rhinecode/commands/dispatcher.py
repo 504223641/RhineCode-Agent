@@ -21,7 +21,7 @@ from rhinecode.commands.models import (
 )
 from rhinecode.commands.parser import parse_input
 from rhinecode.commands.registry import CommandRegistry
-from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol, clip
+from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol, full_text
 
 # 调试日志：命令处理异常时记录上下文（用户界面不输出堆栈，plan 8.6）。
 _logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ class CommandDispatcher:
         # 用户每敲一次回车都会在记录里留下一条空事件。
         self._recorder.emit(
             TraceEventType.USER_INPUT,
-            text=clip(parsed.raw_text),
+            text=full_text(parsed.raw_text),
             kind=parsed.kind.value,
         )
 
@@ -98,7 +98,7 @@ class CommandDispatcher:
             self._recorder.emit(
                 TraceEventType.COMMAND_DISPATCH,
                 command_token=parsed.command_token,
-                arguments=clip(parsed.arguments),
+                arguments=full_text(parsed.arguments),
                 is_unknown=True,
             )
             message = f"未知命令：{parsed.command_token}。输入 /help 查看可用命令。"
@@ -128,7 +128,7 @@ class CommandDispatcher:
             command=spec.name,
             typed_name=invocation.typed_name,
             matched_name=matched_name,
-            arguments=clip(invocation.arguments),
+            arguments=full_text(invocation.arguments),
             command_type=spec.command_type.value,
             is_unknown=False,
         )

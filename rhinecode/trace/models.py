@@ -19,12 +19,20 @@ from __future__ import annotations
 import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 
 
 class TraceEventType(str, Enum):
     """
-    行为记录的事件种类，共十九类（spec F11–F16 十五类 + c12 Hook 两类 + c13 子 Agent 两类）。
+    行为记录的事件种类，共**二十七类**。
+
+    构成（每一批都对应一个章节，新增时请一并更新这个计数与 CLAUDE.md 的能力表）：
+    spec F11–F16 十五类 + c12 Hook 两类 + c13 子 Agent 两类 + c14 worktree 四类
+    + c15 协作四类。
+
+    ⚠️ 这个数字长期是错的（曾停在「十九类」，CLAUDE.md 停在「二十三类」），
+    因为它是**纯注释、漏改不报错**。`tests/test_trace_models.py` 现在有一条
+    用例把「枚举成员数」与这段文字里的数字钉在一起，漏改当场红。
 
     继承 `str` 是为了让枚举成员可以直接当字符串用（`json.dumps` 能原样序列化、
     与阅读器的 `--type` 过滤参数可直接比较），与项目里 `AgentEventType`、
@@ -120,53 +128,57 @@ def subagent_scope(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 截断与脱敏（spec F6 / F5）
+# 字段值的落盘形态与脱敏（spec F6 / F5）
 # ---------------------------------------------------------------------------
-# MAX_FIELD_CHARS：单个字段的字符上限。超过就截断并记原长——「全量记录 + 字段阀值截断」
-# 策略的落点：既不丢事件，也不让一次 10MB 的文件读取把记录文件撑爆。
-MAX_FIELD_CHARS = 4000
-# MAX_MESSAGE_ITEMS：一次请求里最多记多少条历史消息。长会话的历史可能有上千条，
-# 每条都记会让单行 JSON 极其庞大；超限只留头部并记原条数。
-MAX_MESSAGE_ITEMS = 400
+# ⚠️ **本层不做任何截断。**
+#
+# 这里原先有两个阈值：`MAX_FIELD_CHARS = 4000`（单字段字符上限）与
+# `MAX_MESSAGE_ITEMS = 400`（一次请求最多记多少条历史消息）。两者都已删除，
+# 理由是它们与 trace 的立项目的直接冲突：
+#
+# **观测设施一旦自作主张地丢内容，它就不再是可信证据。** 截断的坏处不是「少了一段」，
+# 而是「读的人无法判断自己看到的够不够」——排查一个行为问题时，你永远不知道
+# 被切掉的那 4001 字里有没有答案，于是每一条从 trace 得出的结论都要打个折扣。
+#
+# 实测过的具体代价（这就是删掉它们的直接动因）：结构化系统提示在**最小配置**下
+# （无 RHINE.md、无记忆索引、无 Skill 清单，只有三个内置角色 + 组队说明）
+# 已经有 3886 字符，贴着 4000 线；而稳定通道按「越稳定越靠前」排序，
+# 尾部依次是 134 组队协作 / 135 角色清单 / 140 Skill 清单。也就是说
+# **任何一份真实的 RHINE.md 一进来，被切掉的正好是 C15 / C13 / C11 那三段清单**
+# ——恰恰是「模型到底看没看到这个能力」这类问题唯一的证据。
+#
+# 代价是记录文件更大（`api_request` 每条都含完整历史，长会话下可达数十 MB）。
+# 这是**刻意付的**：磁盘便宜，而一次查不出根因的排查很贵。文件体积与敏感性
+# 见 CLAUDE.md「安全边界」里 trace 那条——产物勿提交、勿外传。
+#
 # REDACTED：脱敏占位符。固定字面量，便于阅读器与测试直接比对。
+# **脱敏与截断是两回事**：前者是安全要求（不记密钥），后者是容量妥协（已删除）。
 REDACTED = "***REDACTED***"
 
 
-def clip(value: Any, limit: int = MAX_FIELD_CHARS) -> Union[str, dict]:
+def full_text(value: Any) -> str:
     """
-    把任意值转成「可安全落盘的字段值」，超长则截断并保留原长信息。
+    把任意值转成可落盘的字段值——**完整，不截断**。
 
-    这是**全项目唯一的截断入口**。所有埋点里可能很长的字段（消息正文、工具输出、
-    系统提示、状态栏文本）都必须经过它，好处是阀值只有一处、行为只有一种，
-    阅读器也只需要认识一种截断表示。
+    这是全项目埋点的统一入口。它现在只剩一件事：把非字符串安全地转成字符串
+    （工具参数里可能是 dict、用量里可能是 int）。
 
-    返回值的约定（重要，阅读器与测试都依赖它）：
-    - **未截断 → 返回裸字符串**。绝大多数字段都不超限，保持裸串让落盘的 JSON 可读，
-      不会到处是 `{"text": ..., "truncated": false}` 这种噪音。
-    - **截断 → 返回一个三字段对象**：`text`（前 limit 个字符）、`truncated`（恒为 True）、
-      `original_length`（截断前的字符数）。
+    ## 为什么保留这个函数而不是让调用点直接写 `str(x)`
 
-    为什么必须记 `original_length`：spec F6 要求「能看出这里原本有多长」。只留前 4000 字
-    而不记原长的话，读 trace 的人无法判断「模型看到的到底是 4KB 还是 4MB」，
-    而这恰好是排查上下文相关问题时最关键的信息。
+    ① 它是一个**语义标记**：出现 `full_text(...)` 的地方就是「这里是一段可能很长的
+    自由文本」，读代码的人一眼能看出哪些字段是重量级的；
+    ② 将来若要对某类字段做统一处理（比如把二进制安全地转义），只有一处要改；
+    ③ 它取代了旧的 `clip()`，**改名是刻意的**——留着旧名字做别名的话，
+    漏改的调用点会静默继续按旧语义工作；改名让每一个调用点在导入时就报 `ImportError`，
+    强制被访问一遍。这与本项目「路径判定不给默认值、让遗漏在开发期变成 TypeError」
+    是同一套思路。
 
-    :param value: 任意值；非字符串先经 `str()` 转换（工具参数里可能有 dict / int）
-    :param limit: 字符上限，缺省 MAX_FIELD_CHARS
-    :returns: 未截断时是原字符串；截断时是含三个键的字典
+    :param value: 任意值；非字符串经 `str()` 转换
+    :returns: 完整字符串，**任何长度都原样返回**
 
     副作用：无（纯函数）。
-
-    注意截断按**字符**而不是字节切分，因此中文不会被切成半个字导致乱码
-    （落盘时统一 UTF-8 编码，字符边界天然安全）。
     """
-    text = value if isinstance(value, str) else str(value)
-    if len(text) <= limit:
-        return text
-    return {
-        "text": text[:limit],
-        "truncated": True,
-        "original_length": len(text),
-    }
+    return value if isinstance(value, str) else str(value)
 
 
 def redact_config(cfg: Any) -> dict:
@@ -280,10 +292,8 @@ __all__ = [
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
     "subagent_scope",
-    "MAX_FIELD_CHARS",
-    "MAX_MESSAGE_ITEMS",
     "REDACTED",
-    "clip",
+    "full_text",
     "redact_config",
     "agent_event_payload",
     "default_trace_path",
