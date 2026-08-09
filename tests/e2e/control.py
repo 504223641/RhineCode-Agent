@@ -77,6 +77,10 @@ POLL_MAX = 0.10
 # 界面卡死几分钟而调用方只看到一次超时，排查方向完全被带偏。
 MAX_KEY_SEQUENCE = 200
 
+# `screen` 逐行读一个控件时最多读多少行。控件高度理论上可以很大（一个长滚动区），
+# 而导出是给人看的，读满几千行既慢又没人看。
+MAX_PAINTED_LINES = 500
+
 # 不变量③ 的复核重试上限
 SETTLE_RECHECK_TRIES = 40
 SETTLE_RECHECK_INTERVAL = 0.03
@@ -906,7 +910,17 @@ class DriverCore:
         导出界面上**可见的文本**（P1b 缺口②）。
 
         :param selector: Textual 选择器，缺省 `""` 表示整屏
-        :returns: `{"text": 拼接后的全文, "lines": [...], "widgets": [...]}`
+        :returns: `{"text", "content", "lines", "widgets"}`
+
+        ## ⚠ `text` 与 `content` 是两份，别用错
+
+        - `text` —— **屏幕上真的画出来的**（逐行读 `render_line`）。
+          长句会按控件宽度折行；菜单候选、输入框内容、布局判据用它。
+        - `content` —— 逻辑内容（`render()`），不折行。
+          `assertIn("一句很长的话")` 这类**内容断言用它**，
+          否则会失败在折行位置这种与判据无关的地方。
+
+        每个 widget 条目里也各有一份（`text` / `painted` / `content`）。
 
         ## 为什么控制通道需要它
 
@@ -937,11 +951,21 @@ class DriverCore:
             for node in nodes:
                 if not getattr(node, "display", True):
                     continue
-                entry = {"class": type(node).__name__, "text": "", "markup": None}
+                entry = {
+                    "class": type(node).__name__,
+                    "text": "",       # 屏幕上真的画出来的（可能折行）
+                    "content": "",    # 逻辑内容（不折行），做内容断言用
+                    "markup": None,
+                }
                 try:
-                    entry["text"] = _plain_text_of(node.render())
+                    entry["content"] = _plain_text_of(node.render())
                 except Exception:  # noqa: BLE001 —— 容器没有 render / 渲染抛异常
-                    continue
+                    entry["content"] = ""
+                entry["painted"] = _painted_text_of(node)
+                # **画出来的那份优先**——`screen` 承诺的是「界面上可见的文本」。
+                # 见 `_painted_text_of` 的 docstring：`Input` / `OptionList` 的
+                # `render()` 返回的是 Panel 外壳（只有边框），内容只在逐行绘制里。
+                entry["text"] = entry["painted"] or entry["content"]
                 # markup 原文：Textual 8.x 的 `Content` 有个 `.markup` 属性，
                 # 给出的正是产品自己写下的那串带标记的文本（如 `[dim]…[/dim]`）。
                 # 取不到就留 None——样式判据自行判断能不能用。
@@ -955,7 +979,15 @@ class DriverCore:
                     widgets.append(entry)
 
             lines = [w["text"] for w in widgets if w["text"]]
-            return {"text": "\n".join(lines), "lines": lines, "widgets": widgets}
+            return {
+                "text": "\n".join(lines),
+                "lines": lines,
+                # 逻辑内容单独给一份：`text` 是屏幕上画出来的，长句会**按控件宽度折行**，
+                # 而 `assertIn("一句很长的话")` 会因此失败在一个与判据无关的地方。
+                # 内容断言用这份，布局 / 菜单 / 输入框判据用 `text`。
+                "content": "\n".join(w["content"] for w in widgets if w["content"]),
+                "widgets": widgets,
+            }
 
         data = run_on_main(self.loop, _read())
         if "error" in data:
@@ -1085,6 +1117,50 @@ def _plain_text_of(rendered: Any) -> str:
 
     # ④ 取不出来就空串。**宁可少一行，也不要把 repr 冒充成内容**
     return ""
+
+
+def _painted_text_of(widget: Any) -> str:
+    """
+    逐行读一个控件**实际画在屏幕上**的字符。
+
+    :param widget: 任意 Textual 控件
+    :returns: 逐行拼接的可见文本；读不出来返回空串
+
+    ## 为什么必须有这条路径（真实模型验收当场发现的）
+
+    `render()` 只覆盖「一次性产出整块可渲染对象」的控件（`Static` 那一类）。
+    另一类控件**按行绘制**——`Input` 与 `OptionList` 都是，它们实现的是
+    `render_line(y)` 而不是 `render()`。对这类控件调 `render()` 拿到的是空白，
+    于是导出结果里只有边框，内容一个字都没有。
+
+    实测现场：`keys / t a s k s` 之后补全菜单确实弹出来了（`CommandPanel` 可见
+    本身就是证据——只有 `/` 开头才弹），但 `screen` 导出的 `CommandPanel`
+    只有一串 `╭───────`。**而 C10 E03「补全菜单里有哪些候选」正是这个缺口
+    要解决的判据之一**——补不上的话，`screen` 对那条判据依然无能为力。
+
+    `Strip.text` 给的是这一行所有 segment 的文本拼接，也就是**真的被画出来的
+    那些字符**——比任何「去问控件要内容」的写法都更接近「用户看到了什么」。
+
+    副作用：无（只读；`render_line` 在 Textual 里是纯函数式的绘制）。
+    """
+    try:
+        height = widget.size.height
+    except Exception:  # noqa: BLE001 —— 尚未布局的控件没有 size
+        return ""
+    if not height:
+        return ""
+
+    lines: list[str] = []
+    for y in range(min(height, MAX_PAINTED_LINES)):
+        try:
+            strip = widget.render_line(y)
+        except Exception:  # noqa: BLE001 —— 不支持逐行绘制 / 越界
+            break
+        text = getattr(strip, "text", None)
+        if isinstance(text, str):
+            lines.append(text.rstrip())
+    # 全是空白就当作「没内容」返回空串，避免把一堆空行塞进导出结果
+    return "\n".join(lines) if any(l.strip() for l in lines) else ""
 
 
 def _is_quiescent(background: dict) -> bool:

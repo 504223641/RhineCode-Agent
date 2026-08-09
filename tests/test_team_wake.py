@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 import unittest
@@ -351,3 +352,108 @@ class ZeroRegressionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WakeTraceTest(unittest.TestCase):
+    """
+    唤醒续跑也要留下 `subagent_start`（真实模型验收当场发现的缺口）。
+
+    ## 现场
+
+    alice 被唤醒两次，时间线上是 **1 条 start 配 3 条 end**。读记录的人
+    对不上号——`_next_round_record` 每轮都发新的 `task_id`，那两条 end
+    看起来像凭空出现的。更要紧的是**续跑轮的运行条件一处都没记**：
+    工具集、权限档、工作目录全都只在首轮那条 start 里，
+    「它被叫醒之后还是那套能力吗」无从复核。
+    """
+
+    def _run_with_wake(self):
+        """跑一个会待命一次、被唤醒一次的队员，返回落盘的记录。"""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import shutil
+
+        from rhinecode.trace import TraceRecorder
+
+        # ⚠ 用 mkdtemp + 容错清理，而不是 `with TemporaryDirectory()`：
+        # 记录器持着文件句柄，`TemporaryDirectory` 的清理在 Windows 上会撞
+        # `PermissionError: 另一个程序正在使用此文件`——而那个报错与判据毫无关系，
+        # 排查时会先怀疑产品代码（实测踩过）。
+        #
+        # 这里用 `ignore_errors=True` 是安全的，与 CLAUDE.md 里
+        # 「测试删沙箱目录一律走 force_rmtree」那条不冲突：那条针对的是
+        # **含 git 仓库的 e2e 沙箱**（只读的 .git/objects 会「删一半」留残骸）。
+        # 本目录只有一个我们自己写的 jsonl，没有那个问题；
+        # 而 `force_rmtree` 要求可丢弃标记文件，本目录没有、也不该为它伪造一个。
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        try:
+            path = Path(d) / "t.jsonl"
+            rec = TraceRecorder(path)
+            team = TeamService()
+            provider = _ScriptedProvider(["第一轮做完了", "被叫醒之后做完了"])
+            runtime = _runtime(provider, team)
+            runtime = dataclasses.replace(runtime, recorder=rec)
+            tasks = TaskManager()
+
+            record, thread = _start(runtime, team, tasks, "alice")
+            # 等它进入待命
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                entry = next((e for e in team.members() if e.name == "alice"), None)
+                if entry is not None and entry.state is MemberState.IDLE:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(entry)
+            self.assertIs(entry.state, MemberState.IDLE, "队员应当进入待命")
+
+            team.send(MAIN_NAME, "alice", "接着干")
+            thread.join(timeout=10)
+        finally:
+            # 无论判据成不成立都要放开句柄，否则清理必然失败
+            try:
+                rec.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return [
+            json.loads(l)
+            for l in path.read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+
+    def test_wake_round_emits_its_own_start(self) -> None:
+        records = self._run_with_wake()
+        starts = [r for r in records if r["type"] == "subagent_start"]
+        ends = [r for r in records if r["type"] == "subagent_end"]
+
+        self.assertEqual(
+            len(starts), len(ends),
+            f"start 与 end 必须配对，实际 {len(starts)} vs {len(ends)}"
+            "——续跑轮漏了 start 的话，读记录的人对不上号",
+        )
+        self.assertEqual({s["task_id"] for s in starts}, {e["task_id"] for e in ends},
+                         "每条 end 都要有同 task_id 的 start")
+
+        # 续跑那条要能一眼认出「不是新委派」
+        kinds = [s["kind"] for s in starts]
+        self.assertIn("wake", kinds, "续跑轮的 kind 应当是 wake")
+
+    def test_wake_start_carries_the_same_run_conditions(self) -> None:
+        """
+        ⚠ 续跑轮的 start 必须带齐运行条件——这才是补这条埋点的**主要理由**。
+
+        只补一条空壳事件（让计数配平）而不带这些字段的话，
+        「它被叫醒之后还是那套能力吗」依然无从复核，而计数看起来是对的。
+        """
+        records = self._run_with_wake()
+        wake = [
+            r for r in records
+            if r["type"] == "subagent_start" and r["kind"] == "wake"
+        ]
+        self.assertTrue(wake, "没有 kind=wake 的 start")
+        for s in wake:
+            for field in ("member", "cwd", "isolated", "permission_mode", "tools"):
+                self.assertIn(field, s, f"续跑轮的 start 缺字段 {field}")
+            self.assertEqual(s["member"], "alice")

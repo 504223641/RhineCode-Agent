@@ -441,6 +441,65 @@ def _extract_conclusion(
     return "子 Agent 自然结束，但没有产出任何正文。", False
 
 
+def _emit_start(
+    recorder,
+    *,
+    kind: str,
+    agent_label: str,
+    record: TaskRecord,
+    task_text: str,
+    toolset: ToolsetResult,
+    spec: Optional[AgentSpec],
+    runtime: SubAgentRuntime,
+    member_name: str,
+    handle: "Optional[WorktreeHandle]",
+) -> None:
+    """
+    记一条 `subagent_start`（c13 起；c15 唤醒续跑起**两个调用点共用本函数**）。
+
+    :param kind: `role` / `branch`（首轮）或 `wake`（被消息唤醒的续跑轮）
+    :param record: 本轮的任务记录——`task_id` 取自它，续跑轮每次都是新的
+
+    ## 为什么抽成函数而不是各写一份
+
+    真实模型验收撞到过：唤醒续跑的那两轮**只有 `subagent_end`、没有 `start`**，
+    时间线上 1 条 start 配 3 条 end，读的人对不上号（`_next_round_record`
+    每次发新 `task_id`）。更要紧的是**续跑轮的运行条件一处都没记**——
+    工具集、权限档、工作目录全都只在首轮那条 start 里。
+
+    抽成一份是为了防同一个坑的下一次：两处各拼一次负载的话，
+    将来给 start 加字段必然只加到一处，而**漏的那一处不报错**，
+    只是某一类运行的条件从记录里消失了。
+
+    副作用：产出一条 trace 事件。异常由调用方的 `recorder.emit` 自行吞掉。
+    """
+    recorder.emit(
+        TraceEventType.SUBAGENT_START,
+        kind=kind,
+        agent=agent_label,
+        task_id=record.task_id,
+        task=full_text(task_text),
+        tool_count=len(toolset.allowed),
+        tools=sorted(toolset.allowed),
+        model=(spec.model if spec is not None else None) or runtime.default_model,
+        max_turns=spec.max_turns if spec is not None else None,
+        # ⚠ 以下四项都是「这次运行实际在什么条件下跑」，缺了就没法从记录复现。
+        #
+        # `member` —— 作用域已经用它了，但作用域是个字符串前缀，要把「队员」
+        #   与「角色」对上还得再猜一次（同一个角色可以派出多个队员）。
+        # `cwd` / `isolated` —— C14 的隔离是**物理的**（第②层按这个目录量边界）。
+        #   不记的话，「隔离到底生效没有」在记录上完全看不出来，
+        #   而 c14 成对维护点里最容易漏的恰恰是「读落到主项目根、写却是对的」。
+        # `permission_mode` —— C13 的核心承诺是「取 min(主对话档, 角色声明档)，
+        #   声明放行档不产生提权」。**实际生效的那个档位此前一处都没记**，
+        #   只能去 `/agents` 报告里看当下状态，事后无从复核。
+        member=member_name or None,
+        cwd=str(handle.path) if handle is not None else str(main_project_root()),
+        isolated=handle is not None,
+        permission_mode=_resolve_mode(runtime, spec).value,
+    )
+
+
 def _emit_end(
     recorder, record, agent_label: str, status, turns: int, stop_reason, conclusion: str
 ) -> None:
@@ -613,30 +672,17 @@ def run_subagent(
         # 排查「这一步是谁做的」只能靠时间戳和内容猜。
         recorder.bind_scope(subagent_scope(member_name or agent_label))
 
-        recorder.emit(
-            TraceEventType.SUBAGENT_START,
+        _emit_start(
+            recorder,
             kind=kind,
-            agent=agent_label,
-            task_id=record.task_id,
-            task=full_text(task_text),
-            tool_count=len(toolset.allowed),
-            tools=sorted(toolset.allowed),
-            model=(spec.model if spec is not None else None) or runtime.default_model,
-            max_turns=spec.max_turns if spec is not None else None,
-            # ⚠ 以下四项都是「这次委派实际在什么条件下跑」，缺了就没法从记录复现。
-            #
-            # `member_name` —— 作用域已经用它了，但作用域是个字符串前缀，
-            #   要把「队员」与「角色」对上还得再猜一次（同一个角色可以派出多个队员）。
-            # `cwd` / `isolated` —— C14 的隔离是**物理的**（第②层按这个目录量边界）。
-            #   不记的话，「隔离到底生效没有」在记录上完全看不出来，
-            #   而 c14 成对维护点里最容易漏的恰恰是「读落到主项目根、写却是对的」。
-            # `permission_mode` —— C13 的核心承诺是「取 min(主对话档, 角色声明档)，
-            #   声明放行档不产生提权」。**实际生效的那个档位此前一处都没记**，
-            #   只能去 `/agents` 报告里看当下状态，事后无从复核。
-            member=member_name or None,
-            cwd=str(handle.path) if handle is not None else str(main_project_root()),
-            isolated=handle is not None,
-            permission_mode=_resolve_mode(runtime, spec).value,
+            agent_label=agent_label,
+            record=record,
+            task_text=task_text,
+            toolset=toolset,
+            spec=spec,
+            runtime=runtime,
+            member_name=member_name,
+            handle=handle,
         )
 
         stable, dynamic, history = _build_prompts(
@@ -771,6 +817,32 @@ def run_subagent(
             record = _next_round_record(tasks, kind, agent_label, member_name)
             stop_reason = StopReason.COMPLETED
             status = TaskStatus.COMPLETED
+
+            # ⚠ **续跑轮同样要记一条 `subagent_start`。**
+            #
+            # 漏了不报错，只是记录里出现「一条 subagent_end 找不到对应的 start」
+            # ——真实模型验收当场撞到：alice 被唤醒两次，时间线上 1 条 start
+            # 配 3 条 end，读的人无法判断那两条 end 是从哪儿冒出来的
+            # （`_next_round_record` 每次都发新的 task_id，对不上号）。
+            #
+            # 更要紧的是**续跑轮的运行条件一处都没记**：工具集、权限档、
+            # 工作目录全都只在首轮的那条 start 里。要复核「它被叫醒之后
+            # 还是那套能力吗」，除了这条埋点没有别的依据。
+            #
+            # `kind` 用 `wake` 而不是原来的 role/branch：读时间线的人第一眼
+            # 就该看出「这一条不是新委派，是把人叫醒接着干」。
+            _emit_start(
+                recorder,
+                kind="wake",
+                agent_label=agent_label,
+                record=record,
+                task_text=_WOKEN_TASK_TEXT,
+                toolset=toolset,
+                spec=spec,
+                runtime=runtime,
+                member_name=member_name,
+                handle=handle,
+            )
 
     except BaseException as exc:  # noqa: BLE001
         # 后台线程的异常无人接管。逃逸出去 = 任务永远「运行中」+ 等待方永远阻塞。
