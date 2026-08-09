@@ -3,6 +3,7 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 
 组件职责：
 - HistoryView：对话历史展示区，支持流式逐块更新和滚动
+- UserMessageWidget：历史区里的用户消息行（整行灰底，与其它消息视觉区分）
 - CommandPanel：斜杠命令提示面板，输入 "/" 时弹出，支持键盘上下选择
 - InputBar：用户输入框，拦截回车事件并发出自定义消息
 - StatusBar：底部状态栏，展示当前 Provider、模型和思考模式状态
@@ -16,7 +17,7 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 
 import re
 from time import monotonic
-from typing import Optional
+from typing import Optional, TypeVar
 
 from rich.cells import cell_len
 from rich.console import Group as RichGroup
@@ -431,6 +432,45 @@ class ToolCallWidget(Static):
             self.update(RichGroup(RichText.from_markup(header), branch))
 
 
+# `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
+_WidgetT = TypeVar("_WidgetT", bound=Static)
+
+
+class UserMessageWidget(Static):
+    """
+    用户消息行：**整行铺满灰底**（对齐 Claude Code 的呈现方式）。
+
+    ## 为什么单独开一个类而不是在 markup 里写 `[on grey23]`
+
+    markup 的背景色只覆盖**字符所在的格子**——一句 5 个字的消息就只有 5 格变灰，
+    右边一大片仍是底色，看起来像「选中了几个字」而不是「这是一条用户消息」。
+    要让灰底铺满整行（包括换行后的每一行），背景必须落在 **widget 的区域**上，
+    也就是必须走 CSS。故把它抽成独立组件，用 `DEFAULT_CSS` 把样式与组件放在一起
+    （而不是塞进 `app.py` 的全局 CSS——那份是布局，这份是某个组件自己的外观）。
+
+    ## 样式取值的理由
+
+    - `width: 1fr`：占满父容器宽度，短消息也铺满整行。
+    - `background: $panel`：主题里比正文底色略亮的一档中性灰，跟随主题走
+      （硬编码 `#2A2A2A` 之类在浅色主题下会变成一块黑疤）。
+    - `padding: 0 1`：文字与灰块边缘留一格，不然字贴着色块边显得脏。
+    - `margin: 1 0`：上下各空一行，把这条消息与前后的 AI 回复/工具行分开——
+      灰块紧贴着别的内容时，视觉上会被读成「这一段属于上一条」。
+
+    ⚠️ 与本文件其它组件同理：传进来的文本必须先经本模块的 `escape`，
+    绝不能换成 `rich.markup.escape`（理由见文件头那段注释）。
+    """
+
+    DEFAULT_CSS = """
+    UserMessageWidget {
+        width: 1fr;
+        background: $panel;
+        padding: 0 1;
+        margin: 1 0;
+    }
+    """
+
+
 class HistoryView(ScrollableContainer):
     """
     对话历史展示区。
@@ -447,6 +487,64 @@ class HistoryView(ScrollableContainer):
         # 内层 Vertical 作为消息列表容器，便于统一清空（remove_children）
         yield Vertical(id="history-messages")
 
+    def on_mount(self) -> None:
+        """
+        打开 Textual 的**滚动锚点**（anchor），让历史区默认「粘」在底部。
+
+        ## 为什么必须用它，而不是自己调 scroll_end
+
+        `mount()` 只是把组件放进 DOM，**它的高度要等下一次布局才算得出来**。
+        而 `scroll_end()` 取的是**当前**的 `max_scroll_y`——也就是加新组件之前的值，
+        于是每次都停在「差最后一条消息」的位置，消息占几行就差几行。
+
+        实测（80×24 终端、历史已铺满时）：
+
+            append_user 之前   scroll_y=38  max=38
+            append_user 之后   scroll_y=38  max=41   ← 新消息整条在视口外
+
+        用户看到的症状正是「发完消息还得自己拨滚轮才看得到最新内容」。
+        试过「多等一帧再滚」，但那是在赌布局刚好在第几帧落定，不可靠。
+
+        anchor 是 Textual 为这件事内置的机制：被 anchor 的可滚动组件，
+        **由合成器（compositor）在每次排布时把它按到底部**——与新组件的高度
+        在同一次布局里算出，因此不存在「用了过期的 max_scroll_y」这回事。
+
+        用户手动往上翻时 Textual 会自动松开锚点（不会把正在看历史的人硬拽回底部），
+        松开后由 `_scroll_to_latest()` 在有新消息时重新按住。
+        """
+        self.anchor()
+
+    def _scroll_to_latest(self) -> None:
+        """
+        有新内容时把视口带回底部。
+
+        与 `on_mount` 里的 anchor 是**一对**：anchor 负责「粘住」，这里负责
+        「用户翻上去之后，新消息把他带回来」——Textual 在用户手动滚动时会把锚点
+        标记为已松开（`_anchor_released`），而 `scroll_end` 会重新按住它。
+
+        `immediate=True` 只是省掉 Textual 内部那次 `call_after_refresh`：
+        这一下滚到的位置可能仍是旧的 `max_scroll_y`（原因见 `on_mount`），
+        真正滚到底由锚点在紧接着的那次布局里完成。
+        """
+        self.scroll_end(animate=False, immediate=True)
+
+    def _mount_widget(self, widget: _WidgetT) -> _WidgetT:
+        """
+        把一个已构造好的组件挂到历史区末尾并滚到底。
+
+        用 TypeVar 而不是写死 `-> Static`：`add_tool_widget` 对外承诺返回
+        `ToolCallWidget`（调用方要拿它调 `begin_running` / `finish`），
+        写死父类会让那个承诺在类型上退化成「某个 Static」。
+
+        :param widget: 任意 Static 子类实例（普通消息行 / 用户消息行 / 工具行）
+        :returns: 原样返回该组件（流式场景下供后续 update_widget 使用）
+        """
+        container = self.query_one("#history-messages", Vertical)
+        container.mount(widget)
+        # 每次新增消息后自动滚动到底部，保持用户视角始终看到最新内容
+        self._scroll_to_latest()
+        return widget
+
     def _add_widget(self, markup: str) -> Static:
         """
         在历史区末尾添加一个新的 Static 消息组件并自动滚动到底部。
@@ -454,16 +552,24 @@ class HistoryView(ScrollableContainer):
         :param markup: Rich markup 格式的显示内容
         :returns: 新建的 Static 组件引用（流式场景下供后续 update_widget 使用）
         """
-        container = self.query_one("#history-messages", Vertical)
-        widget = Static(markup, markup=True)
-        container.mount(widget)
-        # 每次新增消息后自动滚动到底部，保持用户视角始终看到最新内容
-        self.scroll_end(animate=False)
-        return widget
+        return self._mount_widget(Static(markup, markup=True))
+
+    @staticmethod
+    def _build_user_widget(text: str) -> "UserMessageWidget":
+        """
+        构造一条用户消息行（灰底整行 + 青色粗体 "◈" 前缀）。
+
+        ⚠️ **成对维护点**：实时回显（`append_user`）与会话回放（`render_history`）
+        必须共用这一处构造。各拼一次的话，`/resume` 回放出来的用户消息会与刚发的那条
+        长得不一样（改了样式只改一处不报错，只是历史区里两种样式混着出现）。
+        """
+        return UserMessageWidget(
+            f"[bold #99FFFF]◈[/bold #99FFFF] {escape(text)}", markup=True
+        )
 
     def append_user(self, text: str) -> None:
-        """追加一条用户消息，以青色粗体 "◈" 为前缀。"""
-        self._add_widget(f"[bold #99FFFF]◈[/bold #99FFFF] {escape(text)}")
+        """追加一条用户消息：整行灰底，以青色粗体 "◈" 为前缀。"""
+        self._mount_widget(self._build_user_widget(text))
 
     def begin_assistant_turn(self) -> Static:
         """
@@ -498,7 +604,7 @@ class HistoryView(ScrollableContainer):
         :param markup: 新的 Rich markup 内容（完整替换，非追加）
         """
         widget.update(markup)
-        self.scroll_end(animate=False)
+        self._scroll_to_latest()
 
     def update_ai_widget(self, widget: Static, content: str) -> None:
         """
@@ -518,7 +624,7 @@ class HistoryView(ScrollableContainer):
         body = RichMarkdown(content)
         # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable
         widget.update(RichGroup(label, body))
-        self.scroll_end(animate=False)
+        self._scroll_to_latest()
 
     def add_tool_widget(self, tool_call, pending: bool = False) -> "ToolCallWidget":
         """
@@ -532,11 +638,7 @@ class HistoryView(ScrollableContainer):
         :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
         :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
         """
-        container = self.query_one("#history-messages", Vertical)
-        widget = ToolCallWidget(tool_call, pending=pending)
-        container.mount(widget)
-        self.scroll_end(animate=False)
-        return widget
+        return self._mount_widget(ToolCallWidget(tool_call, pending=pending))
 
     def append_system(self, text: str) -> None:
         """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
@@ -626,16 +728,15 @@ class HistoryView(ScrollableContainer):
         for item in build_replay_items(messages):
             kind = item[0]
             if kind == "user":
-                widgets.append(
-                    Static(f"[bold #99FFFF]◈[/bold #99FFFF] {escape(item[1])}", markup=True)
-                )
+                # 与实时回显共用同一处构造，样式不会分叉（见 _build_user_widget）
+                widgets.append(self._build_user_widget(item[1]))
             elif kind == "assistant":
                 widgets.append(self._build_assistant_widget(item[1]))
             elif kind == "tool":
                 widgets.append(self._build_tool_record_widget(item[1], item[2]))
         if widgets:
             container.mount(*widgets)
-        self.scroll_end(animate=False)
+        self._scroll_to_latest()
 
 
 class CommandHighlighter(Highlighter):
