@@ -118,6 +118,11 @@ class TaskRecord:
     stop_reason: str = ""
     delivered: bool = False
     notified: bool = False
+    # 创建时所属的会话代。会话切换（`/clear` / `/resume`）后自增，
+    # 而交付只认**当前代**——上一段对话的结论不得流进新对话。
+    # 缺省 0 使直接构造 `TaskRecord` 的既有测试与调用点一字不用改
+    # （它们不经 `TaskManager.create`，天然落在第 0 代）。见 `begin_session`。
+    epoch: int = 0
     worktree_path: str = ""
     worktree_branch: str = ""
     worktree_removed: bool = False
@@ -160,6 +165,9 @@ class TaskManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._tasks: dict[str, TaskRecord] = {}
+        # 当前会话代。每次会话切换（`/clear` / `/resume`）自增，新建的记录盖上
+        # 当时的代号；交付只认**当前代**。见 `begin_session` 的完整理由。
+        self._epoch = 0
 
     # ------------------------------------------------------------------ #
     # 创建与更新
@@ -190,9 +198,46 @@ class TaskManager:
                 kind=kind,
                 agent_name=agent_name,
                 task_text=task_text,
+                epoch=self._epoch,
             )
             self._tasks[task_id] = record
             return record
+
+    def begin_session(self) -> None:
+        """
+        开启新的一代（会话切换时调，`/clear` 与 `/resume` 都要）。
+
+        自此之后，**上一代的结论再也不会被 `take_deliverables` 取走**。
+
+        ## 为什么需要它
+
+        `/clear` 清空 `history`，但任务记录留在本表里。而 `take_deliverables`
+        的判据是「终态且未交付」，**不区分这条任务属于哪一段对话**——于是
+        清空之后的第一次请求会把上一段对话的结论追加进本该空白的历史。
+
+        真实模型验收撞到过：`/clear` 之后模型坚称「explorer 已经回来了、
+        auditor 还在跑」，一次委派都没发起。trace 上的物证是清空后第一轮请求
+        「消息 3 条」（本该只有用户那 1 条）。
+
+        ⚠ C15 的待命队员让这条路径**更容易**被走到：会话切换会唤醒待命队员
+        让它们的线程退出，那恰好把它们从「待命」变成「终态且未交付」。
+
+        ## 为什么是「代」，而不是在切换时把当前任务标成已交付
+
+        **取消是异步的。** `cancel_all()` 只置信号，被取消的子 Agent 完全可能
+        在切换返回**之后**才真正走到终态；那一刻它是「终态且未交付」，
+        「切换时标记一遍」的写法压根覆盖不到它。代号盖在**创建**那一刻，
+        因此判据与「它什么时候跑完」无关——这正是这里需要的性质。
+
+        ## 为什么不直接把记录删掉
+
+        `/agents` 要能继续展示这次运行都派过谁、结局如何；trace 的
+        `subagent_end` 也还会来找它们。**丢弃的是「交付资格」，不是记录本身。**
+
+        副作用：只改自身内存状态（纯内存自增，符合本类的加锁不变量）。
+        """
+        with self._lock:
+            self._epoch += 1
 
     def bump(
         self,
@@ -319,12 +364,16 @@ class TaskManager:
         **取走即置位**，因此重复调用是幂等的——第二次返回空。
         由主对话在**组装请求之前**调用，不能在一次正在运行的循环中途调
         （那会破坏消息协议顺序）。
+
+        ⚠ **只交付当前会话代的任务。** 上一段对话（`/clear` / `/resume` 之前）
+        遗留的结论一律不取——它们属于一段已经不存在的对话，追加进新历史就是
+        「凭空多出一段来路不明的内容」。理由与时序细节见 `begin_session`。
         """
         with self._lock:
             taken = tuple(
                 r
                 for r in self._tasks.values()
-                if r.status.is_terminal and not r.delivered
+                if r.status.is_terminal and not r.delivered and r.epoch == self._epoch
             )
             for r in taken:
                 r.delivered = True
