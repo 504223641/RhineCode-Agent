@@ -209,7 +209,9 @@ class ForegroundE2ETest(E2EBase):
         `build_default_prompt` 的产物、更证明不了它进了 `system` 参数。
         """
         self.assertIn("finder", self.provider.systems[0])
-        self.assertIn("而不是自己动手做", self.provider.systems[0])
+        # 表头的标志句。2026-08-10 触发口径反转后由「而不是自己动手做」改成本句，
+        # 理由见 `test_subagent_tool.py::SameVoiceTest` 的类 docstring。
+        self.assertIn("默认不要委派", self.provider.systems[0])
 
     def test_subagent_stable_is_the_role_body_only(self) -> None:
         """AC7a：子 Agent 的 stable 是角色正文，不含主对话的八模块。"""
