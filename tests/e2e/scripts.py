@@ -292,6 +292,34 @@ def seed_subagents(workspace: Path, user_dir: Path) -> None:
     )
 
 
+def seed_subagents_with_deny(workspace: Path, user_dir: Path) -> None:
+    """
+    `seed_subagents` 再加一条**项目级 deny 规则**，用于验「④层免疫」的分界线。
+
+    ## 它验的是什么
+
+    `system_serial` 的七个工具对权限管线**第④层（权限档兜底）整层免疫**，
+    但**③层用户写下的规则照常生效**。这两句话必须同时为真——只做前半句
+    就是「一律放行」，而那正是 `perm-system-serial-bypass` 修掉的那个缺陷
+    （`deny: send_message` 一条都不生效）。
+
+    ⚠ **判据要在同一次运行里同时看到两种结论才有分辨力**，所以这里只 deny
+    `task_create` 一个：同一个严格档子 Agent 里，
+    `send_message` 应当 **allow（④层免疫）**，`task_create` 应当
+    **deny（③规则）**。少了任何一半，「免疫」与「一律放行」都看不出区别。
+
+    ⚠ 规则必须写成**不带括号**的整工具形式：这些工具落 `other` 分支，
+    那个分支只认空模式，`deny: task_create(*)` 不命中（c7 起的既有语义）。
+
+    ⚠ 写的是**项目级**（`<workspace>/.rhinecode/`）而不是用户级——
+    `seed_permissions` 的 `target_dir` 要的是最终目录，传错位置会让规则落到
+    产品根本不读的地方，然后表现为「规则没生效」，而那与本用例要验的失败
+    形态**长得一模一样**。
+    """
+    seed_subagents(workspace, user_dir)
+    seeding.seed_permissions(workspace / ".rhinecode", deny=["task_create"])
+
+
 def seed_isolated_skill(workspace: Path, user_dir: Path) -> None:
     """
     预置一个**独立模式**且**指定了模型**的 Skill（AC30）。
