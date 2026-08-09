@@ -3,7 +3,7 @@
 > 建议分支：`team-adoption` · 复杂度：中（**先做测量，再决定改不改**）
 > 来源：C15 真实模型验收（2026-08-09）
 > 对应 `CLAUDE.md`「已知后续工程项」第 17 条
-> ⚠ 与 [`3-skill-recall-eval.md`](3-skill-recall-eval.md) **同源**（都是「模型欠触发」的评测问题），
+> ⚠ 与 [`2-skill-recall-eval.md`](2-skill-recall-eval.md) **同源**（都是「模型欠触发」的评测问题），
 > 那份的评测闭环建好之后，这份可以直接复用
 
 ## 问题
@@ -77,15 +77,15 @@ C15 验收全程用的是 `deepseek-v4-flash`——**快速小模型，指令遵
 3. **接受现状，改文档。** 在 README 里明说「需要时请直接说『组个队』」。
    这不丢人——Claude Code 自己的 subagent 也常要用户点名。
 
-## 评测该怎么做（复用 `3-skill-recall-eval.md` 的闸门）
+## 评测该怎么做（复用 `2-skill-recall-eval.md` 的闸门）
 
-「触发率」这种东西**不能靠感觉判断**，那正是第 3 条 todo 要建的闭环：
+「触发率」这种东西**不能靠感觉判断**，那正是第 2 条 todo 要建的闭环：
 
 - 一批**真实**的任务描述（不是为了触发而编的），标注「该不该组队」；
 - 用 e2e 驱动设施批量跑，从 trace 里数 `team_task` / `team_member` 事件；
 - 出一个「该组队时组了几次 / 不该组队时误组了几次」的两栏统计。
 
-⚠ **取样方法比实现更重要**——第 6 条 todo（P1b）记着同一条教训：
+⚠ **取样方法比实现更重要**——第 4 条 todo（P1b）记着同一条教训：
 别用自己写的 fixture 验自己的 spec。任务描述应当来自真实使用记录。
 
 ## 开工 Prompt
@@ -93,7 +93,7 @@ C15 验收全程用的是 `deepseek-v4-flash`——**快速小模型，指令遵
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b team-adoption。
 
-读 docs/todo/4-team-adoption.md 与 CLAUDE.md 已知后续工程项第 17 条，
+读 docs/todo/3-team-adoption.md 与 CLAUDE.md 已知后续工程项第 17 条，
 以及 docs/c15/acceptance/live-model.md（真实模型验收记录，含完整证据）。
 
 ⚠ 第一步不是改代码，是**换强模型跑对照**：
