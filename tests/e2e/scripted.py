@@ -130,6 +130,10 @@ class RecordedCall:
     :param tools: 本轮实际发出的工具 schema 列表（None 表示本轮禁用了工具，
                   如上下文摘要与自动笔记的调用）
     :param thinking_effort: 思考强度
+    :param scope: 发出这次调用的**对话**（trace 作用域：`main` / `subagent:worker-a` /
+                  `summary` …）。`ScriptedProvider` 不填（恒 `main`），
+                  `ScopedScriptedProvider` 按线程本地作用域填真值。
+                  多 Agent 场景里「这一轮是谁跑的」全靠它区分
     """
 
     index: int
@@ -137,6 +141,7 @@ class RecordedCall:
     system: Optional[str]
     tools: Optional[list[dict]]
     thinking_effort: str
+    scope: str = "main"
 
     @property
     def tool_names(self) -> set[str]:
@@ -289,3 +294,138 @@ class CountingProviderFactory:
         with self._lock:
             self.created.append(model)
         return self._per_model.get(model, self._provider)
+
+
+class ScopedScriptedProvider(BaseProvider):
+    """
+    **按作用域分派**的假 Provider——多 Agent 协作剧本（C13/C15）的必需品。
+
+    ## 为什么 `ScriptedProvider` 不够用
+
+    它按「第几次被调用」取轮次，而那个计数是**全进程共享**的。
+    单条对话时这没问题；一旦有子 Agent 并发跑，主对话的第 2 轮与
+    worker 的第 1 轮谁先调模型完全取决于线程调度——同一份剧本每次跑
+    都可能对应到不同的 Agent 身上。**剧本一旦不确定，判据就不可信**，
+    而这正是 C15 至今没有脚本化场景的直接原因。
+
+    ## 分派依据：trace 的线程本地作用域
+
+    `subagents/runner.py` 在子 Agent 线程启动时会
+    `recorder.bind_scope(subagent_scope(队员名或角色名))`，主对话则是 `main`。
+    它存在 `threading.local` 里，因此**在 `stream_chat` 里读到的一定是
+    当前这条对话自己的作用域**——天然的分派键，不必自己再传一遍上下文。
+
+    用法::
+
+        ScopedScriptedProvider({
+            "main": [
+                [text("我派两个人去。"), tool("run_agent", {...}), done()],
+                [text("都回来了。"), done()],
+            ],
+            "subagent:worker-a": [
+                [text("我做完了 A。"), tool("send_message", {...}), done()],
+            ],
+        })
+
+    键写 `"*"` 表示「其余全部作用域」，用于不关心是谁的兜底剧本。
+
+    ## 与 `ScriptedProvider` 的关系
+
+    刻意**不做成子类**：两者的取轮语义完全相反（全局序 vs 每作用域序），
+    继承会让「我用的是哪种」在调用点看不出来。断言用的 `calls` 与
+    `call_count` 两个属性保持同名同义，场景代码切换成本很低。
+    """
+
+    def __init__(
+        self,
+        scripts: dict[str, list[list[StreamChunk]]],
+        fallback: Optional[list[StreamChunk]] = None,
+    ):
+        """
+        :param scripts: 作用域名 → 该作用域的逐轮剧本。键 `"*"` 是兜底剧本
+        :param fallback: 剧本耗尽后的块序列；缺省一条含 `FALLBACK_MARKER` 的文本 + done
+        """
+        self._scripts = {k: list(v) for k, v in scripts.items()}
+        self._fallback = list(fallback) if fallback is not None else [text(FALLBACK_MARKER), done()]
+        self._log = _CallLog()
+        # 每个作用域各自的轮次游标。**必须与 `_log.lock` 同一把锁保护**——
+        # 取游标与记调用是同一件事的两半，分两把锁会让两者错位。
+        self._cursor: dict[str, int] = {}
+
+    @property
+    def calls(self) -> list[RecordedCall]:
+        """留存的全部调用（副本）。与 `ScriptedProvider` 同义。"""
+        with self._log.lock:
+            return list(self._log.items)
+
+    @property
+    def call_count(self) -> int:
+        with self._log.lock:
+            return len(self._log.items)
+
+    def calls_in(self, scope: str) -> list[RecordedCall]:
+        """
+        某个作用域下的调用（按发生顺序）。
+
+        断言「worker-a 一共只跑了 2 轮」这类判据要用它——`calls` 是全部
+        作用域混在一起的，数出来的轮次没有意义。
+        """
+        with self._log.lock:
+            return [c for c in self._log.items if c.scope == scope]
+
+    def stream_chat(
+        self,
+        messages: list[Message],
+        thinking_effort: str = "off",
+        tools: Optional[list[dict]] = None,
+        system: Optional[str] = None,
+    ) -> Iterator[StreamChunk]:
+        """
+        按**本线程所属作用域**的轮次游标产出数据块。
+
+        :returns: StreamChunk 迭代器
+        副作用：往 `calls` 追加一条 `RecordedCall`；推进该作用域的游标。
+        """
+        scope = _current_scope()
+
+        # ① 临界区：取游标 + 记调用，只做纯内存操作，不做任何调度
+        with self._log.lock:
+            index = len(self._log.items)
+            turn_index = self._cursor.get(scope, 0)
+            self._cursor[scope] = turn_index + 1
+            self._log.items.append(
+                RecordedCall(
+                    index=index,
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    thinking_effort=thinking_effort,
+                    scope=scope,
+                )
+            )
+
+        # ② 出锁之后再产出（生成器的消费方会跑很久，绝不能在锁内）
+        script = self._scripts.get(scope)
+        if script is None:
+            script = self._scripts.get("*")
+        chunks = (
+            script[turn_index] if script is not None and turn_index < len(script) else self._fallback
+        )
+        for chunk in chunks:
+            yield chunk
+
+
+def _current_scope() -> str:
+    """
+    当前线程的 trace 作用域；取不到就当主对话。
+
+    延迟导入是刻意的：`scripted.py` 的其余部分只依赖 `provider.base`
+    （一个零副作用的纯抽象模块），把 trace 的导入放在函数里，
+    可以让不使用 `ScopedScriptedProvider` 的场景保持原有的依赖面。
+    """
+    try:
+        from rhinecode.trace.recorder import current_scope
+
+        return current_scope()
+    except Exception:  # noqa: BLE001 —— 测试设施，取不到就退回主对话
+        return "main"

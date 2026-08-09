@@ -57,7 +57,7 @@ from rhinecode.trace.recorder import create_recorder
 from tests.e2e import discovery, fingerprint, protocol, sandbox
 from tests.e2e.control import DriverCore, ExternalResponder, SessionState
 from tests.e2e.discovery import HostInfo
-from tests.e2e.scripted import ScriptedProvider
+from tests.e2e.scripted import ScopedScriptedProvider, ScriptedProvider
 from tests.e2e.webstub import stub_client_factory, stub_resolver
 
 
@@ -449,8 +449,22 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
 
     provider_factory = None
     if args.mode == "scripted":
-        turns = load_attr(args.script) if args.script else []
-        provider = ScriptedProvider(turns)
+        script = load_attr(args.script) if args.script else []
+        # 剧本有两种形态，按类型自动分派：
+        #
+        # - **list**（`[[chunk, ...], ...]`）→ `ScriptedProvider`，按全局调用序取轮次。
+        #   单条对话的场景用它，C2–C12 全部如此。
+        # - **dict**（`{作用域: [[chunk, ...], ...]}`）→ `ScopedScriptedProvider`，
+        #   **按线程本地的 trace 作用域**分派。多 Agent 并发（C13/C15）**必须**用它——
+        #   队员与主对话谁先调模型取决于线程调度，全局序号在那里是不确定的。
+        #
+        # 自动分派而不是加一个 `--script-kind` 参数：形态从剧本本身就能看出来，
+        # 多一个参数只会多一处「写错了但不报错」的地方（写 list 剧本却传
+        # `--script-kind scoped` 会静默走兜底，现象是「模型什么都不说」）。
+        if isinstance(script, dict):
+            provider = ScopedScriptedProvider(script)
+        else:
+            provider = ScriptedProvider(script)
         provider_factory = lambda cfg: provider  # noqa: E731
 
     try:
