@@ -11,16 +11,19 @@ C13 把委派做成一个工具带 `type` 参数，理由是「不论加载了�
 `task_get` 只有一个），模型少犯参数错误。这也与 Claude Code 的
 `TaskCreate` / `TaskList` / `TaskGet` / `TaskUpdate` 四件套一致。
 
-## 都不进权限管线（`system_serial=True`）
+## 都不弹确认面板（写入的两个是 `system_serial=True`）
 
 与 `run_agent`、`load_skill` 同先例。论证：这四个工具**不读写文件、
 不执行命令**，副作用限于「在本进程内存里改一份清单」，没有可映射的
 Bash / Read / Edit / Write 语义。
 
-⚠ **`deny` 规则对它们无效**（实测确认，见下）。`system_serial=True` 的工具在
-`agent/loop.py` 的预扫里被**直接给一个 ALLOW 决策**，**根本不调 `engine.decide`**
-——③可配置规则层因此完全不参与。收窄它们唯一有效的手段是
-**Hook 的 `pre_tool_use` 拦截**（那一层排在更前面，实测拦得住）。
+`system_serial=True` 的含义是「**判 ASK 时按 ALLOW 处理**」——不是「不进管线」。
+它们**照常过一次 `engine.decide`**，因此 `deny: task_create` / `deny: task_update`
+（不带括号的整工具规则）**确实拦得住**；只是③层未命中时直接放行而不弹面板。
+
+⚠ 这里一度写着「`deny` 规则对它们无效」，那是 C15 验收期实测确认的**真实缺陷**
+（预扫直接给 ALLOW、根本不调引擎），已于 perm-system-serial-bypass 修掉。
+Hook 的 `pre_tool_use` 依然是另一条独立且更早的收窄手段。
 
 ## `plan_safe` 的兑现
 

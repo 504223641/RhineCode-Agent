@@ -33,9 +33,10 @@ class RunAgentTool(Tool):
     1. **它会开一整条子对话**。放进只读并发桶意味着子 Agent 的执行会从
        线程池的工作线程里发生，而本工具的前台路径要阻塞等待——
        占着并发桶的槽位干等，会把同轮其它只读工具一起堵住。
-    2. 该标志同时意味着**这次工具调用本身不进权限管线**。
+    2. 该标志同时意味着**这次工具调用不弹确认面板**：引擎判 ASK 时按 ALLOW 处理。
+       （它**仍然过引擎**，`deny` 规则照常生效——见下文。）
 
-    ## 不进权限管线的安全论证
+    ## 不弹确认面板的安全论证
 
     委派这个动作**本身不产生任何副作用**：它只是起一条子对话。
     副作用全部来自子 Agent 调用的工具，而那些调用**逐个**过完整的五层
@@ -50,13 +51,18 @@ class RunAgentTool(Tool):
     因此「模型能不能委派」不需要单独设一道闸——它委派出去也做不了
     自己直接做不了的事。
 
-    另：本工具**有意不在 `permission/adapter.py` 的 `_TOOL_MAP` 中登记**，
+    ## 想整个关掉委派能力：写 `deny: run_agent`
+
+    本工具**有意不在 `permission/adapter.py` 的 `_TOOL_MAP` 中登记**，
     理由与 `load_skill` 相同——它既不读文件也不执行命令，没有可映射的
-    Bash/Read/Edit/Write 语义。未登记的工具落进 `other` 分支，
-    ⚠ **但 `deny: run_agent` 其实拦不住它**（c15 验收期实测发现的既有错误）：
-    `system_serial=True` 的工具在预扫里直接拿到 ALLOW、**根本不调
-    `engine.decide`**，③规则层完全不参与。唯一有效的收窄手段是 Hook 的
-    `pre_tool_use`。见 CLAUDE.md「已知后续工程项」。
+    Bash/Read/Edit/Write 语义。未登记的工具落进 `other` 分支，只被
+    **整工具规则**（不带括号的 `deny: run_agent`）命中，那一条确实生效。
+
+    ⚠ **这里一度写着「`deny: run_agent` 其实拦不住它」，那是从 C13 起就存在的
+    真实缺陷**：`system_serial=True` 的工具在预扫里直接拿 ALLOW、根本不调
+    `engine.decide`。已于 perm-system-serial-bypass 修掉——现在照常过引擎，
+    只是判 ASK 时按 ALLOW 处理（保住「不弹面板」这条性质）。
+    Hook 的 `pre_tool_use` 依然是另一条独立且更早的收窄手段。
     """
 
     name = "run_agent"

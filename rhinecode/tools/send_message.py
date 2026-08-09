@@ -18,7 +18,7 @@
 委派工具描述」。前三次都是真实模型实测才发现的。
 护栏见 `tests/test_team_tools.py::SameVoiceTest`。
 
-## 不进权限管线（`system_serial=True`）
+## 不弹确认面板（`system_serial=True`）
 
 与 `run_agent`、`load_skill`、四个任务工具同先例：本工具不读写文件、
 不执行命令，副作用限于「把一段文本放进另一个 Agent 的信箱」。
@@ -27,10 +27,14 @@
 仍逐个过完整的五层权限管线 + Hook 前置层，且它的工具集与权限档
 在委派时就已按 C13 的规则收窄过。本工具不引入任何绕过管线的通路。
 
-⚠ **`deny` 规则对它们无效**（实测确认，见下）。`system_serial=True` 的工具在
-`agent/loop.py` 的预扫里被**直接给一个 ALLOW 决策**，**根本不调 `engine.decide`**
-——③可配置规则层因此完全不参与。收窄它们唯一有效的手段是
-**Hook 的 `pre_tool_use` 拦截**（那一层排在更前面，实测拦得住）。
+`system_serial=True` 的含义是「**判 ASK 时按 ALLOW 处理**」——不是「不进管线」。
+它**照常过一次 `engine.decide`**，因此 `deny: send_message`（不带括号的
+整工具规则）**确实拦得住它**；只是缺省档下③层未命中时不会像普通工具那样
+弹面板，而是直接放行（它可能开一整条子对话，在那里停下来等面板会拧死交互链）。
+
+⚠ 这里一度写着「`deny` 规则对它们无效」，那是 C15 验收期实测确认的**真实缺陷**
+（预扫直接给 ALLOW、根本不调引擎），已于 perm-system-serial-bypass 修掉。
+Hook 的 `pre_tool_use` 依然是另一条独立且更早的收窄手段。
 """
 
 from __future__ import annotations

@@ -10,8 +10,9 @@
 - **第二阶段**（按需，本工具）：模型判断该用某个 Skill 时调本工具，
   完整 SOP 才被拉进上下文。
 
-**本工具是系统级的**：`system_serial = True` 使它直接放行并强制串行执行，
-既不进权限管线也不进只读并发桶。理由见下方类文档。
+**本工具是系统级的**：`system_serial = True` 使它强制串行执行（不进只读并发桶），
+并让权限引擎判 ASK 时按 ALLOW 处理（**不弹确认面板**）。它**仍然过引擎**——
+`deny: load_skill` 这条整工具规则拦得住它。理由见下方类文档。
 
 依赖方向：`tools/load_skill.py → skills/manager.py`。本模块**不由
 `tools/registry.py` 导入**（`ToolRegistry.default()` 里没有它），而是由
