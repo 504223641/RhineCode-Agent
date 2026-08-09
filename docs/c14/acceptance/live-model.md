@@ -167,7 +167,31 @@ glob_files('vendor/bigdep/*')       → 同上
 
 ## 四、未修，如实列出
 
-### A. `Esc` 不会取消正在跑的隔离子 Agent
+### A. `Esc` 不会取消正在跑的隔离子 Agent（**语义保留，2026-08-10 补上提示并复验**）
+
+> **后续处置（2026-08-10，PR #27）**：语义**保持不动**（用户拍板方案 A）——
+> `Esc` 仍然只停主对话，C13「委派永不阻塞」的契约原样成立。改的是**把话说清**：
+> 按下时若还有子 Agent 在跑，界面明确告知还剩几个、怎么停。
+>
+> **真实模型复验（`deepseek-v4-flash`，`seed_subagents`，走 `keys escape` 真人按键路径）**：
+>
+> ```
+> （按 Esc 前 status：background.subagents = 2，state = busy）
+> seq 31  ui_message [system] 已请求取消当前回合。⚠ 仍有 2 个子 Agent 在后台运行
+>                             ——Esc 只停主对话，不会停它们。要一并停止请用 /agents cancel all。
+> seq 46  agent_event finished → stop_reason=user_cancelled      ← 主对话确实停了
+> seq 50+ subagent:explore_retry / audit_hardcode 继续跑          ← 子 Agent 确实没停
+>         Esc 之后它们又产生 44 条事件（15 条 tool_execute、2 条 subagent_end，各 4 轮跑完）
+> ```
+>
+> 四条判据全中：**条数照实**（2 = 按下那一刻的真值）、**主对话真停**、
+> **子 Agent 真没停**（这正是当初那 7 轮的同一现象，只是现在用户被告知了）、
+> 以及**反证**——另一轮在**空闲态**误按 `Esc`，界面一个字都没多出来。
+>
+> ⚠ **界面截图在这里是弱证据**：`screen` 只抓可见区域，那条提示一秒内就被子 Agent
+> 的后续输出顶出了屏幕，按截图判会得出「没出现」的错误结论。判据取自 trace。
+>
+> 下面是当初的原始记录，保留不动。
 
 实测：委派一个大活，25 秒后按 `Esc`（走真人取消入口）。主循环停了，**子 Agent 继续跑完
 7 轮、写文件、提交、留下工作区与分支**。`request_cancel` 只置主循环的取消信号，
