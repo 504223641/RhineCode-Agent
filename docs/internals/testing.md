@@ -22,7 +22,7 @@ python -m unittest discover -s tests
 
 | 层 | 测试文件 | 覆盖要点 | 留作手测的部分 |
 | --- | --- | --- | --- |
-| 权限系统 | `test_perm_*.py`、`test_review_fixes.py` | 命令/路径匹配、危险命令黑名单（复合命令逐段与 fork 炸弹）、deny 优先求值、三层配置加载与容错、工具规范化映射、四层决策管线、被拒不停循环、`grep_content`/`glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地配置不被覆盖 | — |
+| 权限系统 | `test_perm_*.py`、`test_review_fixes.py` | 命令/路径匹配、危险命令黑名单（复合命令逐段与 fork 炸弹）、deny 优先求值、**③层命令规则的复合命令口径**（deny 逐段命中各种分隔符 / allow **不**被复合命令命中的反证 / 拆段后词边界仍在 / 非复合命令逐字不变）、三层配置加载与容错、工具规范化映射、四层决策管线、被拒不停循环、`grep_content`/`glob_files` 遵守 `Read(...)` deny、大文件范围读取、损坏本地配置不被覆盖 | `test_perm_rules.py::CompoundCommandTest` 里有**两条钉住现状而非期望**的用例（`test_KNOWN_GAP_...` 与 `test_deny_over_strictness_...`），docstring 里写明了它们为什么长这样。⚠ 别把它们当回归修掉——真去修 allow 侧缺口时前者会当场红，那是**设计好的提醒** |
 | Plan Mode | `test_perm_*.py`、`test_plan_stage_guard.py` | 完整计划展示、拒绝计划停止、获批后仍逐项确认；**规划阶段夹带副作用工具被拦**（含放行模式下也挡得住、获批后放行两条反证） | — |
 | MCP 客户端 | `test_mcp_*.py`、`test_mcp_auto_config.py`、`test_perm_other_glob.py` | 两层配置合并与 `${VAR}` 展开、JSON-RPC 消息构造与响应分类、stdio 三步会话与按 id 配对（起真实子进程）、stderr drain 防阻塞、非法远端名规范化但仍调原名、`CallToolResult→ToolResult` 转换、单 Server 失败隔离、运行时重载、URL/NPM 自动解析、YAML 安全写入、Windows `npx.cmd`、`other` 分支 fnmatch 通配 | HTTP 传输与真实 Server 端到端（`docs/c7/checklist.md`） |
 | 上下文管理 | `test_context_*.py` | 近似估算（无锚点/有锚点/越界兜底）、第一层存盘（挑大先存、user 不动、幂等、写盘失败保留原文）、第二层纯逻辑（边界 snap 到 user 不拆 tool 对、草稿丢弃、重构结构）、编排（摘要成功失效锚点、连续失败熔断与复位、`manual_compact` 无阈值）、**保留区与余量随窗口缩放**（含 64K 零回归与小窗口端到端判据） | 真实 LLM 摘要与 TUI 渲染 5 场景（`docs/c8/checklist.md`） |

@@ -93,7 +93,7 @@ C15 验收全程用的是 `deepseek-v4-flash`——**快速小模型，指令遵
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b team-adoption。
 
-读 docs/todo/5-team-adoption.md 与 CLAUDE.md 已知后续工程项第 17 条，
+读 docs/todo/6-team-adoption.md 与 CLAUDE.md 已知后续工程项第 17 条，
 以及 docs/c15/acceptance/live-model.md（真实模型验收记录，含完整证据）。
 
 ⚠ 第一步不是改代码，是**换强模型跑对照**：

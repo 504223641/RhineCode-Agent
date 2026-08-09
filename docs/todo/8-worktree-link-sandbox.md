@@ -39,7 +39,7 @@ C14 收尾时做的是**止血**：`provision` 在建软链之前先自检落点
   （并发下互相干扰），要么把它做成 per-call 参数（那就是改判定函数签名）。
 
 也就是说这是**第②层沙箱的行为变更**——本项目全部隔离论证的落点。
-按惯例（同 `docs/todo/1` 里权限层那条）应当单独立项、走完整 `/spec`，
+按惯例（同 `docs/todo/2` 里权限层那条）应当单独立项、走完整 `/spec`，
 不是一次顺手的实现。
 
 ## 立项时至少要回答的四个问题
@@ -61,7 +61,7 @@ C14 收尾时做的是**止血**：`provision` 在建软链之前先自检落点
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b worktree-link-sandbox。
 
-读 docs/todo/5-worktree-link-sandbox.md 与 docs/c14/acceptance/live-model.md 问题③。
+读 docs/todo/8-worktree-link-sandbox.md 与 docs/c14/acceptance/live-model.md 问题③。
 
 这一条**要走 /spec 技能**：它改的是权限管线第②层的边界判定，
 而第②层是本项目全部隔离论证的落点，不是一次顺手的实现。

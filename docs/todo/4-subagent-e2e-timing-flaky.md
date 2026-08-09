@@ -70,7 +70,7 @@ CLAUDE.md 的测试章已经记过同型教训：
 ```
 先 `git branch --show-current`，在 main 上就 `git checkout -b subagent-e2e-timing-flaky`。
 
-读 `docs/todo/9-subagent-e2e-timing-flaky.md`，然后修
+读 `docs/todo/4-subagent-e2e-timing-flaky.md`，然后修
 `tests/test_subagent_e2e.py` 里两条用挂钟时间做判据的用例
 （`test_background_does_not_block_main` 与 `test_conclusion_delivered_exactly_once`）。
 
