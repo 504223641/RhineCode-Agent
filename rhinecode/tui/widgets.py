@@ -38,6 +38,7 @@ from textual.message import Message as TextualMessage
 from rhinecode.agent.events import ClarifyOption
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
+from rhinecode.subagents.tasks import BRANCH_AGENT_NAME
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 
 
@@ -378,18 +379,122 @@ def classify_report(text: str) -> "tuple[tuple[ReportLineKind, str], ...]":
     return tuple(out)
 
 
-# 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签，
-# 与改文件工具的 "Update"/"Write" 风格统一。这里是「展示层」的映射：
+# 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签。
+# 这里是「展示层」的映射：
 # - 真实工具名仍是各工具的 name（API 用、注册中心用），此表只决定 UI 标题怎么写；
 # - 未登记的工具回退到原始名，保证新增工具即便忘了登记也不会显示异常。
+#
+# 取值对齐 **Claude Code 的工具命名**（tui-display 扩展 F11）。用户在两边看到的
+# 是同一套词汇，不必在脑子里做一次翻译。`run_command` 由 `Run` 改成 `Bash`
+# 也是这个理由——`Run` 是本项目自造的词。
+#
+# ⚠ **无对应工具的刻意不登记**，别顺手补上：
+# - `mcp_add_server` / `mcp_resolve_server`：Claude Code 那边**根本没有对应物**，
+#   硬套一个标签等于凭空造出一条假的对应关系；
+# - `ask_user` / `present_plan`：那边叫 `AskUserQuestion` / `ExitPlanMode`。
+#   前者只是名字长，后者直译过来是「退出计划模式」，与本项目「提交计划**等待
+#   审批**」的语义不符——批准与否还没发生，说「退出」是错的。
+# - `run_agent`：走 `resolve_call_title` 的委派特例分支（标签取角色名），
+#   登记在这里只会变成一个永远用不到的死项。
+#
+# 判据是一句话：**宁可显示内部名，也不要一个会误导人的假标签。**
 _TOOL_LABELS = {
+    # 文件与检索
     "read_file": "Read",
+    "write_file": "Write",
+    "edit_file": "Update",
     "glob_files": "Glob",
     "grep_content": "Grep",
-    "run_command": "Run",
-    "edit_file": "Update",
-    "write_file": "Write",
+    # 命令与网络
+    "run_command": "Bash",
+    "web_fetch": "WebFetch",
+    # Skill（c11）
+    "load_skill": "Skill",
+    # 协作（c15）
+    "send_message": "SendMessage",
+    "task_create": "TaskCreate",
+    "task_list": "TaskList",
+    "task_get": "TaskGet",
+    "task_update": "TaskUpdate",
 }
+
+
+# 主参数值的展示上限。比 `summarize_args` 的整体上限（60）宽松一档：那边要塞
+# 「键=值, 键=值」好几组，这里只有一个值，且这个值正是用户唯一要看的东西。
+_PRIMARY_ARG_MAX_CHARS = 72
+
+# 委派工具的特例（spec F12 第 2 条）。这三个字符串必须与 `tools/run_agent.py`
+# 的 `parameters` 对得上：`agent` 是角色名、`task` 是任务陈述。
+_DELEGATE_TOOL = "run_agent"
+_DELEGATE_LABEL_KEY = "agent"
+_DELEGATE_VALUE_KEY = "task"
+
+
+def _clip_value(value: object, max_chars: int = _PRIMARY_ARG_MAX_CHARS) -> str:
+    """把一个参数值压成单行并按上限截断（换行折成空格，与 `summarize_args` 同口径）。"""
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return text
+
+
+def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tuple[str, str]":
+    """
+    解析一次工具调用在界面上的标题：`标签(括号内文本)`。
+
+    ## 为什么不再显示「键=值」列表（spec F12）
+
+    改造前是 `Task(name=explorer, task=调研权限层…)`。`name=` `task=` 这些**键名**
+    对用户零信息量——它们是给模型看的参数结构；而真正有用的那个值被键名挤占了
+    本就不多的横向空间，往往正好在关键处被截断。改成只显示一个主参数的值之后，
+    同样的宽度里能看清「在对什么东西做什么」。
+
+    ## 三条分支，顺序固定
+
+    1. **委派特例**：`run_agent` 的标签取**角色名**、括号里放**任务描述**，
+       于是委派的工具行与活动区那条终态留痕行**天然同形**——用户在两个时刻
+       看到的是同一个东西，不用在脑子里做一次对应（这也是 Claude Code 的做法：
+       把 agent 类型当标签）。角色名缺席（分支式委派）时用占位名。
+    2. **已声明主参数**：`primary_args` 里登记了该工具、且本次调用真的带了那个键
+       且值非空 → 括号里放该值。
+    3. **兜底**：回退到既有的 `summarize_args` 键值对摘要。
+       这是**安全兜底**——新增工具忘了声明 `primary_arg` 时显示形态退回改造前，
+       而不是显示成 `Read()` 这种「看起来像无参调用」的异常形态。
+
+    :param tool_call: `provider.base.ToolCall`，提供 `name` 与 `arguments`
+    :param primary_args: `{工具名: 主参数键名}`，由 `app.on_mount` 从工具注册中心
+        建一次（工具集启动后不变）。为 None / 空字典时**全部走分支 3**，
+        因此非 DeepSeek Provider（拿不到注册中心）下行为与改造前逐字一致
+    :returns: `(标签, 括号内文本)`，**两者都已经过本模块的 `escape`**，可直接拼进
+        markup。括号内文本可能为空串（调用方据此决定写不写括号）
+
+    副作用：无（纯函数）。
+
+    ⚠ **转义在这里做，不能推给调用方。** F12 让**主参数的原始值**直接进入标题
+    （不再被 `键=值` 的格式包裹），而路径、命令、URL、任务描述全是可能含字面
+    `[` 的自由文本。漏一次转义就是布局阶段 `MarkupError`、整个应用退出，
+    没有任何 try/except 兜得住。
+    """
+    name = str(getattr(tool_call, "name", "") or "")
+    raw = getattr(tool_call, "arguments", None)
+    args = raw if isinstance(raw, dict) else {}
+
+    # ── 分支 1：委派特例 ──
+    if name == _DELEGATE_TOOL:
+        role = str(args.get(_DELEGATE_LABEL_KEY) or "").strip() or BRANCH_AGENT_NAME
+        return escape(role), escape(_clip_value(args.get(_DELEGATE_VALUE_KEY) or ""))
+
+    label = escape(_TOOL_LABELS.get(name, name))
+
+    # ── 分支 2：已声明主参数 ──
+    key = (primary_args or {}).get(name)
+    if key:
+        value = args.get(key)
+        if value is not None and str(value).strip():
+            return label, escape(_clip_value(value))
+
+    # ── 分支 3：兜底（summarize_args 内部已 escape）──
+    return label, summarize_args(raw)
 
 
 class ToolCallWidget(Static):
