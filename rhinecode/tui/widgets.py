@@ -997,6 +997,46 @@ class HistoryView(ScrollableContainer):
         """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
         self._add_widget(f"[dim]◆ {escape(text)}[/dim]")
 
+    def append_report(self, text: str) -> None:
+        """
+        追加一段**分级渲染**的命令报告（tui-display 扩展 F15/F16/F17）。
+
+        改造前 `/agents` `/skills` 这类多行报告整段走 `append_system` 的 `[dim]`
+        通道——段落标题、条目、次级信息在视觉上完全等价，读起来是一堵均匀的
+        暗色墙。这里按 `classify_report` 判出的层级分别施加亮度与强调。
+
+        四级的样式取值理由：
+
+        - **首行**：加粗 + 强调色。它承担「这是一次命令的结果，不是 AI 说的话」
+          这个判断（F17）。⚠ **刻意不发前缀符号**——按 F29 收敛后的词汇表，
+          `●` 专属于工具行与活动行，为报告再造一个图形会让符号表重新变杂；
+        - **段落标题**：正常亮度 + 加粗；
+        - **条目**：正常亮度；
+        - **次级信息**：暗色（与工具行的分支、活动区的子行同一个
+          `SECONDARY_COLOR`，三处单一来源）。
+
+        :param text: 报告全文（多行，纯文本）
+
+        ⚠ 报告里嵌着路径、错误消息、任务标题与模型产出的结论——全是可能含
+        字面 `[` 的自由文本，必须逐行经本模块的 `escape`。
+
+        副作用：往历史区挂一个组件并滚到底。
+        """
+        rendered: list[str] = []
+        for kind, line in classify_report(text):
+            safe = escape(line)
+            if kind is ReportLineKind.TITLE:
+                rendered.append(f"[bold #7AEEFF]{safe}[/bold #7AEEFF]")
+            elif kind is ReportLineKind.SECTION:
+                rendered.append(f"[bold]{safe}[/bold]")
+            elif kind is ReportLineKind.DETAIL:
+                rendered.append(f"[{SECONDARY_COLOR}]{safe}[/{SECONDARY_COLOR}]")
+            else:
+                # ITEM 与 BLANK 都用正常亮度原样输出——条目行本身就是主干内容，
+                # 加任何强调都会与段落标题打架。
+                rendered.append(safe)
+        self._add_widget("\n".join(rendered))
+
     def append_error(self, text: str) -> None:
         """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
         self._add_widget(f"[bold red]● 错误：{escape(text)}[/bold red]")

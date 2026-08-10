@@ -192,5 +192,68 @@ class SingleSourceTest(unittest.TestCase):
         self.assertNotIn('f"  ⎿  ', source)
 
 
+class RenderReportTest(unittest.IsolatedAsyncioTestCase):
+    """
+    AC13a：`/agents` 那类报告呈现出分级，整段不再是同一个暗色。
+
+    判据取 **markup 原文**而不是渲染出来的纯文本：分级的全部内容就是样式，
+    看纯文本的话四种级别长得一模一样，用例会在「分级完全失效」时照样通过。
+    """
+
+    async def _render(self, text: str) -> str:
+        from textual.app import App, ComposeResult
+
+        from rhinecode.tui.widgets import HistoryView
+
+        class _Harness(App):
+            def compose(self) -> ComposeResult:
+                yield HistoryView()
+
+        app = _Harness()
+        async with app.run_test() as pilot:
+            view = app.query_one(HistoryView)
+            view.append_report(text)
+            await pilot.pause()
+            child = list(view.query_one("#history-messages").children)[-1]
+            content = child.content
+            return content if isinstance(content, str) else str(content)
+
+    async def test_at_least_three_distinct_styles(self) -> None:
+        markup = await self._render(AGENTS_REPORT)
+        self.assertIn("bold #7AEEFF", markup, "首行要加粗 + 强调色")
+        self.assertIn("[bold]", markup, "段落标题要加粗")
+        self.assertIn(SECONDARY_COLOR, markup, "次级信息要暗")
+
+    async def test_no_bullet_symbol_on_the_title(self) -> None:
+        """
+        F17：首行**不发前缀符号**。
+
+        按 F29 收敛后的词汇表，`●` 专属于工具行与活动行；为报告再造一个图形
+        会让符号表重新变杂，而符号一多每个的语义就都记不住了。
+        """
+        markup = await self._render(AGENTS_REPORT)
+        self.assertNotIn("● 子 Agent 角色与任务", markup)
+
+    async def test_report_text_is_escaped(self) -> None:
+        """
+        报告里嵌着路径、错误消息、任务标题与模型产出的结论——全是可能含字面
+        `[` 的自由文本。
+        """
+        markup = await self._render("标题\n  • 任务 [未闭合括号")
+        self.assertIn("\\[未闭合", markup)
+
+    async def test_whole_report_is_not_one_dim_block(self) -> None:
+        """
+        **反证**：改造前整段被包进一个 `[dim]`。
+
+        没有这条，把 `append_report` 写成 `append_system` 的别名也能让上面
+        那些「有某某样式」的断言部分通过。
+        """
+        markup = await self._render(AGENTS_REPORT)
+        self.assertFalse(
+            markup.startswith("[dim]"), f"整段不该再是一个暗色块：{markup[:60]}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

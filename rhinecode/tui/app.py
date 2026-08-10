@@ -496,6 +496,20 @@ class RhineApp(App):
         self._trace_ui_message("system", text)
         self.query_one(HistoryView).append_system(text)
 
+    def show_report(self, text: str) -> None:
+        """
+        显示一段**分级渲染**的命令报告（tui-display 扩展 F15）。
+
+        埋点仍记 `source="system"`——**刻意不新增一种 source 取值**，
+        与 `show_warning` 同口径：trace 那边的 source 词汇是断言与阅读器共用的
+        契约，为一个样式差异扩充它不划算，而「界面上出现过这段文本」才是这条
+        埋点的价值所在。
+
+        副作用：产出一条 `ui_message` 埋点；往历史区挂一个组件。
+        """
+        self._trace_ui_message("system", text)
+        self.query_one(HistoryView).append_report(text)
+
     def show_warning(self, text: str) -> None:
         """
         显示一条**醒目**的警告（橙色粗体，c12）。
