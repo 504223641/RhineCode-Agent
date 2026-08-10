@@ -215,7 +215,7 @@ def render_project_notice(project_rules: list[HookRule]) -> Optional[str]:
         return None
 
     lines = [
-        f"⚠ 发现 {len(project_rules)} 条项目级 Hook 规则"
+        f"发现 {len(project_rules)} 条项目级 Hook 规则"
         f"（来自 .rhinecode/hooks.yaml，随仓库分发）。",
         "它们会在对应时刻【直接执行】，不经模型、也不经确认面板。请当作代码来评审：",
         "",

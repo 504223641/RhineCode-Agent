@@ -344,6 +344,14 @@ EXPAND_HINT = "（Ctrl+O 展开）"
 # 这样「统一来源」这件事本身不改变任何一处的既有观感。
 SECONDARY_COLOR = "#808080"
 
+# 系统行分级里两个高档位的**文字**前缀（tui-display 扩展 F19/F21）。
+#
+# 用文字而不是图形，是为了让它们**脱离颜色也能辨认**：截图、配色异常的终端、
+# 端到端驱动抓到的纯文本里，颜色都可能丢失，而这三个字不会。
+# 提示级与事件级刻意**没有**前缀——误读那两者的代价为零，见 `append_event`。
+WARNING_PREFIX = "警告："
+ERROR_PREFIX = "错误："
+
 
 class ReportLineKind(Enum):
     """
@@ -994,8 +1002,33 @@ class HistoryView(ScrollableContainer):
         )
 
     def append_system(self, text: str) -> None:
-        """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
-        self._add_widget(f"[dim]◆ {escape(text)}[/dim]")
+        """
+        追加一条**提示级**系统行：暗色、**无前缀**（tui-display 扩展 F19）。
+
+        四级里最低的一档，用于「记忆已更新」「上下文已压缩」「Skill 已激活」
+        这类**误读代价为零**的消息。
+
+        ⚠ 改造前它带一个 `◆` 前缀，本轮去掉，两个理由：
+        ① `◆` 不在 F29 收敛后的符号白名单里；
+        ② F21 明确要求**提示级与事件级之间只差亮度**——留着前缀的话两者会
+        差两样东西（亮度 + 有没有符号），而那个符号本身不表达任何用户能用上的
+        信息（每条系统行都有它，等于没有）。
+        """
+        self._add_widget(f"[dim]{escape(text)}[/dim]")
+
+    def append_event(self, text: str) -> None:
+        """
+        追加一条**事件级**系统行：正常亮度、无前缀（tui-display 扩展 F19）。
+
+        用于「子 Agent 完成」「自动唤起」「会话已恢复」这类**真的发生了一件事**
+        的消息。改造前它们与「记忆已更新」走同一条 `[dim]` 通道，于是一屏里
+        最要紧的那条和最可忽略的那条长得一模一样。
+
+        与提示级只差亮度是**刻意的**（F21）：误读这两者的代价为零——把一条
+        「记忆已更新」当成事件，不会导致任何错误决策。真正会让人做错决定的是
+        漏看警告与错误，而那两级由**文字前缀**承担，脱离颜色也认得出。
+        """
+        self._add_widget(escape(text))
 
     def append_report(self, text: str) -> None:
         """
@@ -1038,29 +1071,40 @@ class HistoryView(ScrollableContainer):
         self._add_widget("\n".join(rendered))
 
     def append_error(self, text: str) -> None:
-        """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
-        self._add_widget(f"[bold red]● 错误：{escape(text)}[/bold red]")
+        """
+        追加一条**错误级**系统行：红色粗体 + 文字前缀「错误：」（F19/F21）。
+
+        ⚠ 改造前它带一个 `●`，本轮去掉——按 F29 收敛后的词汇表，
+        `●` 专属于工具行与活动行，让它同时表示「一条错误」会稀释掉那个语义。
+        """
+        self._add_widget(f"[bold red]{ERROR_PREFIX}{escape(text)}[/bold red]")
 
     def append_warning(self, text: str) -> None:
         """
-        追加一条**醒目**的警告消息（橙色粗体，与确认面板同色系，c12）。
-
-        与 `append_system` 的差别只有一个：那条是 `[dim]`（比正文更暗），这条是
-        `[bold #FFA500]`。
+        追加一条**警告级**系统行：橙色粗体 + 文字前缀「警告：」（F19/F21）。
 
         ## 为什么需要它
 
-        今天唯一的用户是**项目级 Hook 的启动提示**——那是本项目里唯一一段
+        最早的用户是**项目级 Hook 的启动提示**——那是本项目里唯一一段
         「可能来自别人的仓库、且会被直接执行」的内容，它的可读性就是那道防线的强度。
         用 `append_system` 渲染的话，这条警告会比普通提示**更不显眼**（dim），
         方向正好反了（人眼评审时发现）。
 
-        **不加前缀符号**：调用方传进来的文本自带 `⚠`，widget 再加一个会重复。
+        ## 为什么前缀是**文字**而不是一个图形（F21）
+
+        这一条曾设计成「每级各发一个前缀符号（`·` / `◆` / `▲` / `×`）」，
+        **已推翻**。Claude Code 不给严重级别发图形，它靠颜色 + 文字本身
+        （`Error:`）；自创四个图形是「符号越加越杂」的来源，而符号一多，
+        每个的语义就都记不住了。
+
+        文字前缀还兑现了一件图形做不到的事：**脱离颜色也能辨认**。
+        截图、配色异常的终端、端到端驱动抓到的纯文本里，颜色都可能丢失，
+        而「警告：」三个字不会。
 
         ⚠ 与本类其它方法同理，文本必须经 `escape` —— 那是 `tui/widgets.py` 自己的
         版本，绝不能换成 `rich.markup.escape`（落单的 `[` 会被它放过并在布局阶段崩）。
         """
-        self._add_widget(f"[bold #FFA500]{escape(text)}[/bold #FFA500]")
+        self._add_widget(f"[bold #FFA500]{WARNING_PREFIX}{escape(text)}[/bold #FFA500]")
 
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""

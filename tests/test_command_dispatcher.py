@@ -33,6 +33,9 @@ class FakeController:
     def show_message(self, text: str) -> None:
         self.calls.append(("show_message", text))
 
+    def show_event(self, text: str) -> None:
+        self.calls.append(("show_event", text))
+
     def show_report(self, text: str) -> None:
         """
         报告专用通道（tui-display 扩展 F15）。

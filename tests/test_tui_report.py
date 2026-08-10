@@ -17,6 +17,8 @@ import unittest
 
 from rhinecode.tui.widgets import (
     BRANCH_MARK,
+    ERROR_PREFIX,
+    WARNING_PREFIX,
     BRANCH_PREFIX,
     SECONDARY_COLOR,
     ReportLineKind,
@@ -253,6 +255,83 @@ class RenderReportTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             markup.startswith("[dim]"), f"整段不该再是一个暗色块：{markup[:60]}"
         )
+
+
+class SystemLevelTest(unittest.IsolatedAsyncioTestCase):
+    """
+    D 组：四条系统行通道各不相同（tui-display 扩展 F19/F21，AC14/AC15）。
+
+    改造前「子 Agent 完成」与「记忆已更新」走同一条 `[dim]` 通道，
+    于是一屏里最要紧的那条和最可忽略的那条长得一模一样。
+    """
+
+    async def _markups(self) -> dict:
+        from textual.app import App, ComposeResult
+
+        from rhinecode.tui.widgets import HistoryView
+
+        class _Harness(App):
+            def compose(self) -> ComposeResult:
+                yield HistoryView()
+
+        out = {}
+        app = _Harness()
+        async with app.run_test() as pilot:
+            view = app.query_one(HistoryView)
+            view.append_system("记忆已更新（3 条）")
+            view.append_event("explorer 已完成")
+            view.append_warning("仍有 2 个子 Agent 在后台运行")
+            view.append_error("连接超时，已重试 2 次")
+            await pilot.pause()
+            children = list(view.query_one("#history-messages").children)
+            for name, child in zip(("notice", "event", "warning", "error"), children):
+                content = child.content
+                out[name] = content if isinstance(content, str) else str(content)
+        return out
+
+    async def test_four_channels_are_all_different(self) -> None:
+        markups = await self._markups()
+        self.assertEqual(
+            len(set(m.split("]")[0] for m in markups.values())),
+            4,
+            f"四条通道的样式必须互不相同：{markups}",
+        )
+
+    async def test_warning_and_error_carry_text_prefixes(self) -> None:
+        """
+        AC15：去掉颜色之后**警告与错误**仍可辨认。
+
+        这是 F21 推翻「每级各发一个图形」之后剩下的那道保证——
+        截图、配色异常的终端、端到端驱动抓到的纯文本里颜色都可能丢失。
+        """
+        markups = await self._markups()
+        self.assertIn(WARNING_PREFIX, markups["warning"])
+        self.assertIn(ERROR_PREFIX, markups["error"])
+
+    async def test_notice_and_event_differ_only_in_brightness(self) -> None:
+        """
+        F21：提示级与事件级之间**只差亮度**，这是刻意的。
+
+        误读这两者的代价为零——把一条「记忆已更新」当成事件，不会导致任何
+        错误决策。真正会让人做错决定的是漏看警告与错误，那两级由文字承担。
+        """
+        markups = await self._markups()
+        self.assertTrue(markups["notice"].startswith("[dim]"))
+        self.assertFalse(markups["event"].startswith("["), "事件级不该带任何样式包裹")
+
+    async def test_no_invented_level_glyphs(self) -> None:
+        """
+        F21/F29：不存在为分级发明的专属图形。
+
+        本条曾设计成 `·` / `◆` / `▲` / `×` 四个前缀符号，已推翻——
+        Claude Code 不给严重级别发图形，自创图形是「符号越加越杂」的来源。
+        `●` 也不行：它专属于工具行与活动行。
+        """
+        markups = await self._markups()
+        for name, markup in markups.items():
+            for glyph in ("◆", "▲", "×", "●"):
+                with self.subTest(channel=name, glyph=glyph):
+                    self.assertNotIn(glyph, markup)
 
 
 if __name__ == "__main__":

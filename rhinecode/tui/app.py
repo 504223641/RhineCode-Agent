@@ -496,6 +496,22 @@ class RhineApp(App):
         self._trace_ui_message("system", text)
         self.query_one(HistoryView).append_system(text)
 
+    def show_event(self, text: str) -> None:
+        """
+        显示一条**事件级**系统行（tui-display 扩展 F19）。
+
+        与 `show_message` 的唯一差别是亮度：那条 `[dim]`，这条正常亮度。
+        用于「真的发生了一件事」的消息（子 Agent 完成、自动唤起、会话已恢复），
+        与「记忆已更新」这类可忽略的提示分开。
+
+        埋点仍记 `source="system"`——**刻意不新增 source 取值**，
+        与 `show_warning` / `show_report` 同口径。
+
+        副作用：产出一条 `ui_message` 埋点；往历史区挂一个组件。
+        """
+        self._trace_ui_message("system", text)
+        self.query_one(HistoryView).append_event(text)
+
     def show_report(self, text: str) -> None:
         """
         显示一段**分级渲染**的命令报告（tui-display 扩展 F15）。
