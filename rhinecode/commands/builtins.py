@@ -372,7 +372,7 @@ def build_builtin_registry() -> CommandRegistry:
             CommandSpec(
                 name="/memory",
                 aliases=(),
-                description="查看记忆系统状态（RHINE.md / 笔记 / 会话存档 / 锁）",
+                description="查看记忆系统状态（RHINE.md / 记忆 / 会话存档 / 锁）",
                 usage="/memory",
                 command_type=CommandType.LOCAL,
                 handler=_handle_memory,

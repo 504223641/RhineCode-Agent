@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk
-from rhinecode.memory.manager import MemoryManager, NOTE_LOCK_STALE, INDEX_FILENAME
+from rhinecode.memory.manager import MemoryManager, MEMORY_LOCK_STALE, INDEX_FILENAME
 from rhinecode.memory.memory_updater import parse_memory_response
 from rhinecode.memory.memories import INDEX_MAX_LINES
 from rhinecode.memory import lockfile
@@ -132,7 +132,7 @@ class NotesFlowTest(ManagerTestBase):
         mgr = self._manager(provider)
         target = self.project / ".rhinecode" / "memory"
         target.mkdir(parents=True)
-        lockfile.try_acquire(target / ".lock", NOTE_LOCK_STALE)  # 模拟另一实例持锁
+        lockfile.try_acquire(target / ".lock", MEMORY_LOCK_STALE)  # 模拟另一实例持锁
 
         mgr._update_memories([Message(role="user", content="x")])  # 同步调用便于断言
         self.assertFalse((target / "arch-note.md").exists())
@@ -290,7 +290,7 @@ class ObservabilityTest(ManagerTestBase):
         report = mgr.memory_report()
         self.assertIn("RHINE.md 项目指令", report)
         self.assertIn("项目根", report)
-        self.assertIn("自动笔记", report)
+        self.assertIn("自动记忆", report)
         self.assertIn("当前会话", report)
         self.assertIn("写锁", report)
         self.assertIn("最近一次自动更新", report)

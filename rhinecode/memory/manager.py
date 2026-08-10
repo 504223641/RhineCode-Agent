@@ -44,7 +44,7 @@ from rhinecode.memory.memory_updater import (
 )
 
 # 笔记锁过期阈值（秒）：笔记写入是秒级临界区，10 分钟没释放必是崩溃残留（F22/F24）。
-NOTE_LOCK_STALE = 600.0
+MEMORY_LOCK_STALE = 600.0
 
 # 时间跨度提醒阈值（小时）：恢复会话时距最后一条消息超过该值则注入提醒（F11④）。
 TIME_GAP_HOURS = 24
@@ -220,7 +220,7 @@ class MemoryManager:
             if not raw.strip():
                 continue
             parts.append(
-                f"### {label}记忆索引（笔记全文位于 {self._memory_dirs[scope]}，"
+                f"### {label}记忆索引（全文位于 {self._memory_dirs[scope]}，"
                 f"需要细节时用读文件工具按文件名读取）\n{truncate_index(raw)}"
             )
         if not parts:
@@ -262,7 +262,7 @@ class MemoryManager:
         if not self.memories_enabled:
             return
         if self._memory_inflight.is_set():
-            self._last_memory_result = "上一轮笔记更新仍在进行，本轮跳过。"
+            self._last_memory_result = "上一轮记忆更新仍在进行，本轮跳过。"
             return
         new_msgs = list(history[self._memory_watermark:])
         if not new_msgs:
@@ -298,9 +298,9 @@ class MemoryManager:
                 return
             applied, skipped_locked = self._apply_actions(actions)
             if applied:
-                self._last_memory_result = f"已更新 {applied} 条笔记。"
+                self._last_memory_result = f"已更新 {applied} 条记忆。"
                 if self.notify is not None:
-                    self.notify(f"🧠 已更新记忆（{applied} 条笔记）")
+                    self.notify(f"🧠 已更新记忆（{applied} 条）")
             elif skipped_locked:
                 self._last_memory_result = "目标记忆目录正被其它实例写入，本轮跳过。"
             else:
@@ -321,7 +321,7 @@ class MemoryManager:
         # 强制 tools=None：笔记模型在此阶段没有任何工具可用（F15/N6④）。
         for chunk in self._provider.stream_chat(req, thinking_effort="off", tools=None, system=system):
             if chunk.type == "error":
-                raise RuntimeError(chunk.content or "笔记流出错")
+                raise RuntimeError(chunk.content or "记忆流出错")
             if chunk.type == "text":
                 parts.append(chunk.content)
         return parse_memory_response("".join(parts))
@@ -355,7 +355,7 @@ class MemoryManager:
             except OSError:
                 continue
             lock = target_dir / ".lock"
-            if not lockfile.try_acquire(lock, NOTE_LOCK_STALE):
+            if not lockfile.try_acquire(lock, MEMORY_LOCK_STALE):
                 skipped_locked += len(group)
                 continue
             try:
@@ -507,18 +507,18 @@ class MemoryManager:
                 lines.append(f"    ⚠ {err}")
 
         lines.append("")
-        lines.append("自动笔记：" + ("启用" if self.memories_enabled else "未启用（仅 DeepSeek 工具模式）"))
+        lines.append("自动记忆：" + ("启用" if self.memories_enabled else "未启用（仅 DeepSeek 工具模式）"))
         for scope, label in (("user", "用户级"), ("project", "项目级")):
             target_dir = self._memory_dirs[scope]
             counts = self._count_memories(target_dir)
             total = sum(counts.values())
             detail = "、".join(
                 f"{CATEGORY_LABELS[c]} {counts[c]}" for c in CATEGORIES if counts[c]
-            ) or "无笔记"
+            ) or "无记忆"
             index_path = target_dir / INDEX_FILENAME
             over = self._index_over_limit(index_path)
             index_state = ("存在" + ("，超出注入上限（已截断）" if over else "")) if index_path.is_file() else "不存在"
-            locked = "占用中" if lockfile.is_fresh(target_dir / ".lock", NOTE_LOCK_STALE) else "空闲"
+            locked = "占用中" if lockfile.is_fresh(target_dir / ".lock", MEMORY_LOCK_STALE) else "空闲"
             lines.append(f"  [{label}] {target_dir} — {total} 条（{detail}）· 索引{index_state} · 写锁{locked}")
         lines.append(f"  最近一次自动更新：{self._last_memory_result}")
 

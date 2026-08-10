@@ -31,12 +31,12 @@ _TOOL_RESULT_PREVIEW_CHARS = 500
 _VALID_OPS = ("add", "update", "delete")
 _VALID_SCOPES = ("user", "project")
 
-# 笔记更新的系统提示：定义四类分类、归属标准、去重要求与输出格式。
+# 记忆更新的系统提示：定义四类分类、归属标准、去重要求与输出格式。
 MEMORY_SYSTEM_PROMPT = """\
 你是一个编程助手的记忆管理器。你会看到两份「现有记忆索引」和一段「最近的对话」，\
-任务是判断这段对话里有没有**将来的会话仍然有用**的信息值得记成笔记。
+任务是判断这段对话里有没有**将来的会话仍然有用**的信息值得记成记忆。
 
-## 四类笔记（category）
+## 四类记忆（category）
 - preference（用户偏好）：用户的个人习惯与口味，如「注释用中文」「不要用缩写」。
 - feedback（纠正反馈）：用户对助手行为的纠正与确认，应记录原因和以后怎么做。
 - project（项目知识）：这个项目特有的、代码里看不出来的知识，如架构决策背景、坑。
@@ -48,15 +48,15 @@ MEMORY_SYSTEM_PROMPT = """\
 
 ## 判断标准
 - 只记「将来会再用到」的信息；一次性的问答、闲聊、代码本身能看出来的内容不记。
-- **对照现有索引去重**：已有等价笔记就不要新增；信息有更新就输出 update（沿用原 filename）；
+- **对照现有索引去重**：已有等价记忆就不要新增；信息有更新就输出 update（沿用原 filename）；
   已明确失效的可输出 delete。
 - 没有值得记的内容时输出空数组 []。这是常态，不要为了输出而编造。
 
 ## 输出格式（严格遵守）
 你没有任何工具可用，也不要输出解释文字。只输出一个 JSON 数组，每个元素形如：
 {"op": "add|update|delete", "scope": "user|project", "filename": "kebab-case-name.md",
- "name": "笔记标识", "summary": "一行摘要（索引钩子）", "category": "preference|feedback|project|reference",
- "body": "笔记正文，写清楚事实、原因和怎么应用"}
+ "name": "记忆标识", "summary": "一行摘要（索引钩子）", "category": "preference|feedback|project|reference",
+ "body": "记忆正文，写清楚事实、原因和怎么应用"}
 - filename 只能用小写字母/数字/连字符/下划线加 .md 后缀，不含任何目录。
 - delete 时只需 op/scope/filename 三个字段。
 """
