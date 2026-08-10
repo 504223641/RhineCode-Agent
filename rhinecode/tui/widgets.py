@@ -16,6 +16,7 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 """
 
 import re
+from enum import Enum
 from time import monotonic
 from typing import Optional, TypeVar
 
@@ -249,7 +250,7 @@ class _DiffBlock:
         # 先收集每行的 (文本, 样式, 是否整行铺背景)
         rows_out: list[tuple[str, Style, bool]] = []
         # 概要分支行（灰色，无背景）
-        rows_out.append((f"  ⎿  {_count_phrase(view.added, view.removed)}", dim, False))
+        rows_out.append((f"{BRANCH_PREFIX}{_count_phrase(view.added, view.removed)}", dim, False))
         for row in view.rows:
             if row.marker == MARK_GAP:
                 # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
@@ -288,6 +289,95 @@ def render_diff_block(view) -> "_DiffBlock":
     return _DiffBlock(view)
 
 
+# ---------------------------------------------------------------------------
+# 分支符号与次级信息配色：**全界面单一来源**（tui-display 扩展 F14 / AC12）
+# ---------------------------------------------------------------------------
+# 三处会画「从属于上一行」的次级信息：工具行的结果分支、活动区展开后的子调用行、
+# 命令报告里缩进的详情行。它们**必须取自同一处定义**——各写一份的话，改了一处
+# 另外两处不会跟着变，而这**不报错**：界面照常渲染，只是三处的灰度慢慢分叉，
+# 最后没人说得清哪个才是「对的灰」。
+#
+# `⎿` 与 `·` `↑` `●` `>` `✻` 一起构成本项目的**符号白名单**（F29）。
+# 不在白名单里的符号一律不用，新增要先进 CLAUDE.md 里那张表。
+BRANCH_MARK = "⎿"
+# 分支行的完整前缀：两格缩进体现层级，符号后两个空格与正文拉开距离。
+BRANCH_PREFIX = f"  {BRANCH_MARK}  "
+# 次级信息的灰色前景。取值沿用改造前 `ToolCallWidget._COLOR_BRANCH` 的 #808080，
+# 这样「统一来源」这件事本身不改变任何一处的既有观感。
+SECONDARY_COLOR = "#808080"
+
+
+class ReportLineKind(Enum):
+    """
+    命令报告里一行的层级（tui-display 扩展 F16）。
+
+    改造前所有报告整段走 `append_system` 的 `[dim]` 通道——段落标题、条目、
+    次级信息在视觉上完全等价，一份 `/agents` 报告读起来是一堵均匀的暗色墙。
+    本枚举让展示层能按行施加不同的亮度与强调。
+    """
+
+    TITLE = "title"      # 首行：加粗 + 强调色，一眼看出「这是一次命令的结果」
+    SECTION = "section"  # 段落标题（无缩进的非条目行）：正常亮度 + 加粗
+    ITEM = "item"        # 条目行（• / - / · 开头）：正常亮度
+    DETAIL = "detail"    # 缩进 ≥4 的次级信息：暗色
+    BLANK = "blank"      # 空行
+
+
+# 条目行的项目符号。`·` 也算，因为部分报告用它做次级列表。
+_ITEM_BULLETS = ("•", "-", "·")
+# 判定为「次级信息」的最小缩进。取 4 是因为各报告的产出函数一律用
+# 「2 空格 = 条目、4 空格 = 该条目的细节」这套缩进（见 subagents/report.py 的
+# `_agent_block`：`  • 名字` 配 `    说明：…`）。
+_DETAIL_INDENT = 4
+
+
+def classify_report(text: str) -> "tuple[tuple[ReportLineKind, str], ...]":
+    """
+    把一段命令报告逐行判定层级。
+
+    ## 为什么只看「行的形状」，不认识任何一个具体报告
+
+    spec F16 要求**各报告的文本产出函数一字不改**——它们是纯函数，且有大量
+    逐字断言的护栏钉着（`subagents/report.py` / `team/render.py` /
+    `skills/render.py` / `hooks/report.py` …）。为某个报告的具体措辞写判定，
+    等于把展示层与那些函数的内容绑死，改一句话就要改这里。
+
+    所以判据只有缩进与首字符。代价是判错时无非是某一行的亮度不对，
+    不会出任何功能问题——这是刻意选的、**失败代价极小**的方向。
+
+    判定顺序（**顺序即优先级，不可调换**）：
+    1. 第一行且非空 → TITLE；
+    2. 空行（或纯空白）→ BLANK；
+    3. 去掉前导空格后以 `•` / `-` / `·` 开头 → ITEM
+       （**排在缩进判定之前**：一个缩进 6 格的条目仍是条目，不是详情）；
+    4. 前导空格 ≥ 4 → DETAIL；
+    5. 其余 → SECTION。
+
+    :param text: 报告全文（多行）
+    :returns: `((级别, 原始行), …)`，行文本**未转义**——转义由渲染方按 markup
+              需要施加，在这里做会让本函数没法被别的渲染方式复用
+
+    副作用：无（纯函数）。
+    """
+    out: list[tuple[ReportLineKind, str]] = []
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if index == 0 and stripped:
+            out.append((ReportLineKind.TITLE, line))
+            continue
+        if not stripped:
+            out.append((ReportLineKind.BLANK, line))
+            continue
+        if stripped[0] in _ITEM_BULLETS:
+            out.append((ReportLineKind.ITEM, line))
+            continue
+        if len(line) - len(line.lstrip(" ")) >= _DETAIL_INDENT:
+            out.append((ReportLineKind.DETAIL, line))
+            continue
+        out.append((ReportLineKind.SECTION, line))
+    return tuple(out)
+
+
 # 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签，
 # 与改文件工具的 "Update"/"Write" 风格统一。这里是「展示层」的映射：
 # - 真实工具名仍是各工具的 name（API 用、注册中心用），此表只决定 UI 标题怎么写；
@@ -323,11 +413,14 @@ class ToolCallWidget(Static):
     因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
     """
 
-    # 执行中橘色 / 成功绿色 / 失败红色 / "⎿ 摘要" 分支行灰色（次级信息）
+    # 执行中橘色 / 成功绿色 / 失败红色
     _COLOR_RUNNING = "#FFA500"
     _COLOR_OK = "#5FD75F"
     _COLOR_FAIL = "#FF5F5F"
-    _COLOR_BRANCH = "#808080"
+    # 分支行的灰色**不在这里定义**：它与活动区、命令报告共用模块级的
+    # `SECONDARY_COLOR`（F14 / AC12）。此处保留同名别名只是为了不改动既有调用点，
+    # 取值必须继续指向那一处，别改回字面量。
+    _COLOR_BRANCH = SECONDARY_COLOR
 
     def __init__(self, tool_call, pending: bool = False) -> None:
         """
@@ -427,7 +520,7 @@ class ToolCallWidget(Static):
             # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
             title = self._label if self._pending else f"{self._label}({self._args_summary})"
             header = f"[{color}]● {title} {result} ({elapsed}s)[/]"
-            branch = RichText("  ⎿  ", style=self._COLOR_BRANCH)
+            branch = RichText(BRANCH_PREFIX, style=self._COLOR_BRANCH)
             branch.append(summary, style=self._COLOR_BRANCH)
             self.update(RichGroup(RichText.from_markup(header), branch))
 
@@ -706,7 +799,7 @@ class HistoryView(ScrollableContainer):
         # 分支行用 RichText 纯文本拼接——结果摘要来自工具输出原文，可能含 "["，
         # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
         header = f"[{ToolCallWidget._COLOR_OK}]● {label}({summarize_args(tool_call.arguments)})[/]"
-        branch = RichText(f"  ⎿  {result_summary}", style=ToolCallWidget._COLOR_BRANCH)
+        branch = RichText(f"{BRANCH_PREFIX}{result_summary}", style=ToolCallWidget._COLOR_BRANCH)
         return Static(RichGroup(RichText.from_markup(header), branch))
 
     def render_history(self, messages) -> None:
