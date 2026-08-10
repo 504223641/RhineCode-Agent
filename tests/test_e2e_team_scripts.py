@@ -321,7 +321,7 @@ class TeamRunTest(unittest.IsolatedAsyncioTestCase):
             exclude_tools=frozenset({"mcp_add_server", "mcp_resolve_server"}),
         )
         # 自动笔记是不确定性来源（它另起一条对话、另调一次模型），关掉
-        self.result.manager.memory_manager.notes_enabled = False
+        self.result.manager.memory_manager.memories_enabled = False
 
         app = self.result.app
         async with app.run_test(size=(120, 40)) as pilot:

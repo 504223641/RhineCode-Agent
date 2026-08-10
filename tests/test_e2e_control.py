@@ -136,7 +136,7 @@ class DriverFixture(unittest.IsolatedAsyncioTestCase):
             provider_factory=lambda cfg: self.provider,
             exclude_tools=EXCLUDED,
         )
-        self.result.manager.memory_manager.notes_enabled = False
+        self.result.manager.memory_manager.memories_enabled = False
         if plan_mode:
             self.result.manager.plan_mode = True
         self.turn_budget = turn_budget

@@ -300,7 +300,7 @@ class ConversationManager:
             )
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
-        # 工具能力；自动笔记由 notes_enabled 门控（仅工具模式，F21）。
+        # 工具能力；自动笔记由 memories_enabled 门控（仅工具模式，F21）。
         # user_dir 已在构造函数开头解析成 self._user_dir（权限层要先用），此处直接复用
         user_dir = self._user_dir
         self.memory_manager = MemoryManager(
@@ -308,7 +308,7 @@ class ConversationManager:
             config.model,
             main_project_root(),
             user_dir,
-            notes_enabled=self._tools_enabled,
+            memories_enabled=self._tools_enabled,
             recorder=self._recorder,
         )
         # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。

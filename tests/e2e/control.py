@@ -1066,7 +1066,7 @@ class DriverCore:
             # 顺序天然安全：笔记钩子在产出结束事件之前触发，而忙碌态在事件流耗尽后
             # 才转假，故「先等忙碌态转假、再 join」不存在「线程还没起就以为收敛了」的竞态。
             for thread in threading.enumerate():
-                if thread.name == "rhine-notes":
+                if thread.name == "rhine-memory":
                     thread.join(timeout=30.0)
 
         app.exit()

@@ -40,7 +40,7 @@ INDEX_MAX_BYTES = 25 * 1024
 
 
 @dataclass
-class Note:
+class Memory:
     """
     一条笔记的内存形态。
 
@@ -58,7 +58,7 @@ class Note:
     body: str = ""
 
 
-def parse_note(text: str, filename: str = "") -> Optional[Note]:
+def parse_memory(text: str, filename: str = "") -> Optional[Memory]:
     """
     宽松解析一个笔记文件的文本。
 
@@ -69,7 +69,7 @@ def parse_note(text: str, filename: str = "") -> Optional[Note]:
     4. 其余内容为正文。
 
     :param text: 文件全文
-    :param filename: 文件名（回填到 Note.filename，便于索引渲染）
+    :param filename: 文件名（回填到 Memory.filename，便于索引渲染）
     :returns: Note；格式坏 / 缺必填字段 / 非法分类 → None（调用方跳过该文件）
 
     副作用：无。
@@ -103,27 +103,27 @@ def parse_note(text: str, filename: str = "") -> Optional[Note]:
         return None
 
     body = "\n".join(lines[end + 1:]).strip()
-    return Note(filename=filename, name=name, summary=summary, category=category, body=body)
+    return Memory(filename=filename, name=name, summary=summary, category=category, body=body)
 
 
-def render_note(note: Note) -> str:
+def render_memory(memory: Memory) -> str:
     """
-    把 Note 渲染为磁盘文本（与 parse_note 往返一致）。
+    把 Memory 渲染为磁盘文本（与 parse_memory 往返一致）。
 
     副作用：无。
     """
     return (
         "---\n"
-        f"name: {note.name}\n"
-        f"summary: {note.summary}\n"
-        f"category: {note.category}\n"
+        f"name: {memory.name}\n"
+        f"summary: {memory.summary}\n"
+        f"category: {memory.category}\n"
         "---\n"
         "\n"
-        f"{note.body.strip()}\n"
+        f"{memory.body.strip()}\n"
     )
 
 
-def rebuild_index(notes: list[Note]) -> str:
+def rebuild_index(memories: list[Memory]) -> str:
     """
     由笔记列表全量重建索引文本：首行标题 + 每条一行。
 
@@ -133,7 +133,7 @@ def rebuild_index(notes: list[Note]) -> str:
     副作用：无。
     """
     lines = ["# 记忆索引", ""]
-    for n in notes:
+    for n in memories:
         label = CATEGORY_LABELS.get(n.category, n.category)
         lines.append(f"- {n.name}（{n.filename}）[{label}] — {n.summary}")
     return "\n".join(lines) + "\n"

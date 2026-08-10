@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from rhinecode.provider.base import Message
-from rhinecode.memory.memories import CATEGORIES, Note
+from rhinecode.memory.memories import CATEGORIES, Memory
 
 # 笔记文件名白名单：小写字母/数字/连字符/下划线 + .md 后缀，禁止任何路径分隔符。
 _FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.md$")
@@ -32,7 +32,7 @@ _VALID_OPS = ("add", "update", "delete")
 _VALID_SCOPES = ("user", "project")
 
 # 笔记更新的系统提示：定义四类分类、归属标准、去重要求与输出格式。
-NOTE_SYSTEM_PROMPT = """\
+MEMORY_SYSTEM_PROMPT = """\
 你是一个编程助手的记忆管理器。你会看到两份「现有记忆索引」和一段「最近的对话」，\
 任务是判断这段对话里有没有**将来的会话仍然有用**的信息值得记成笔记。
 
@@ -63,23 +63,23 @@ NOTE_SYSTEM_PROMPT = """\
 
 
 @dataclass
-class NoteAction:
+class MemoryAction:
     """
     LLM 决定的一个笔记动作（只是意图，不含 IO）。
 
     :param op: "add" | "update" | "delete"
     :param scope: "user"（用户级目录）| "project"（项目级目录）
     :param filename: 目标文件名（已过白名单校验，不含目录）
-    :param note: 要写入的笔记内容；op="delete" 时为 None
+    :param memory: 要写入的笔记内容；op="delete" 时为 None
     """
 
     op: str
     scope: str
     filename: str
-    note: Optional[Note] = None
+    memory: Optional[Memory] = None
 
 
-def build_note_request(
+def build_memory_request(
     new_messages: list[Message],
     user_index: str,
     project_index: str,
@@ -120,10 +120,10 @@ def build_note_request(
             if len(content) > _TOOL_RESULT_PREVIEW_CHARS:
                 content = content[:_TOOL_RESULT_PREVIEW_CHARS] + "…（已截断）"
             lines.append(f"【工具结果】{content}")
-    return NOTE_SYSTEM_PROMPT, [Message(role="user", content="\n\n".join(lines))]
+    return MEMORY_SYSTEM_PROMPT, [Message(role="user", content="\n\n".join(lines))]
 
 
-def parse_note_response(text: str) -> list[NoteAction]:
+def parse_memory_response(text: str) -> list[MemoryAction]:
     """
     把笔记 LLM 的输出解析为动作列表（宽松容错，F17）。
 
@@ -134,7 +134,7 @@ def parse_note_response(text: str) -> list[NoteAction]:
        add/update 还须有非空 name 与 summary；坏项**逐个跳过**，不连坐。
 
     :param text: LLM 输出全文
-    :returns: 合法的 NoteAction 列表（可能为空）
+    :returns: 合法的 MemoryAction 列表（可能为空）
 
     副作用：无。
     """
@@ -150,7 +150,7 @@ def parse_note_response(text: str) -> list[NoteAction]:
     if not isinstance(data, list):
         return []
 
-    actions: list[NoteAction] = []
+    actions: list[MemoryAction] = []
     for item in data:
         if not isinstance(item, dict):
             continue
@@ -162,7 +162,7 @@ def parse_note_response(text: str) -> list[NoteAction]:
         if not isinstance(filename, str) or not _FILENAME_RE.match(filename):
             continue  # 防注入：非法文件名（含路径分隔符/大写/怪字符）直接丢弃
         if op == "delete":
-            actions.append(NoteAction(op=op, scope=scope, filename=filename))
+            actions.append(MemoryAction(op=op, scope=scope, filename=filename))
             continue
         name = item.get("name")
         summary = item.get("summary")
@@ -174,12 +174,12 @@ def parse_note_response(text: str) -> list[NoteAction]:
         if category not in CATEGORIES:
             continue
         body = item.get("body")
-        note = Note(
+        memory = Memory(
             filename=filename,
             name=name.strip(),
             summary=summary.strip(),
             category=category,
             body=body.strip() if isinstance(body, str) else "",
         )
-        actions.append(NoteAction(op=op, scope=scope, filename=filename, note=note))
+        actions.append(MemoryAction(op=op, scope=scope, filename=filename, memory=memory))
     return actions
