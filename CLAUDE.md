@@ -123,7 +123,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 | 层 | 路径 | 职责 | ⚠ 致命不变量 |
 | --- | --- | --- | --- |
-| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现 `CommandController` 协议 | **markup 转义必须用 `tui/widgets.py` 的 `escape`**，绝不用 rich 那版——落单的 `[` 会在布局阶段主线程抛 `MarkupError`，**没有 try/except 兜得住，整个 app 退出** |
+| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现 `CommandController` 协议。**子 Agent 活动区**（主线程轮询，`ActivityView`）、**系统行四级分级**、**命令报告分级渲染**、面板序号与数字键直选、连按两次 `Ctrl+C` 退出（tui-display 扩展） | **markup 转义必须用 `tui/widgets.py` 的 `escape`**，绝不用 rich 那版——落单的 `[` 会在布局阶段主线程抛 `MarkupError`，**没有 try/except 兜得住，整个 app 退出**。**另一条**：活动区的数据一律**主线程轮询**，绝不新增从子 Agent 线程到界面的推送——本项目已因「加锁临界区内做跨线程调度」死锁四次 |
 | Commands | `commands/` | 斜杠命令注册与分发（纯逻辑，不依赖 Textual） | `_specs` 是两个列表的只读拼接，**写入必须直接操作其中之一**——对属性 append 不报错也不生效 |
 | 协调层 | `conversation.py` | TUI 与 Agent/Provider 的中转；历史、权限引擎、四类回调、上下文/记忆/Skill 接线 | 预授权**先取令牌再授予**；`clear()` 与 `_resume_stream` 两处必须清空 Skill 激活态 |
 | Agent | `agent/` | ReAct 循环、事件类型、流式收集、结构化系统提示 | `dynamic` 是**每轮求值**的 callable，改回取值型会让两阶段加载失效；trace 埋点一律走 `_safe_emit` 漏斗 |
@@ -190,6 +190,26 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
 - 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+- **活动区终态行与历史区完成通知的成本数字必须同源（tui-display）** → 两处都经
+  `subagents/tasks.py` 的 `TaskManager.row_of` 取快照、再交给
+  `tui/widgets.py` 的 `format_activity_cost` 渲染。**各自从 `TaskRecord` 上取字段
+  拼一遍不报错**，只是同一个任务的成本在两处对不上——而那种不一致最难解释
+  （两个数字都「看起来对」，只是不相等）。⚠ 连带一条：**F6 的「历史永久痕」与
+  F7 的「完成通知」是同一行**，产出点只有 `tui/app.py` 的 `_subagent_finish_text`
+  一处；写成两行同样不报错，只是每个子 Agent 在历史区留下重复的两条，
+  用户会以为它跑了两次。护栏见 `tests/test_e2e_activity.py::FinishTraceTest`
+  （断言该任务名在历史区**恰好出现一次**）
+- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 六个：
+  `●`（发生了一件事——工具行、活动行，状态靠**颜色**区分）、`⎿`（从属于上一行）、
+  `>`（你，或当前选中——用户消息前缀与面板高亮指示符**刻意合一**）、
+  `·`（行内分隔，不作行首前缀）、`↑`（token 计数）、`✻`（思考块）。
+  **不在表内的一律不用**，包括为消息分级发明的图形——警告与错误靠**文字前缀**
+  （「警告：」「错误：」），那是它们脱离颜色也能辨认的唯一依靠。
+  改动要同步三处：本表、`tests/test_tui_symbols.py` 的 `WHITELIST`、
+  以及那份扫描覆盖的模块清单。⚠ 扫描**刻意不管注释与发给模型的提示词**
+  （`skills/render.py` / `subagents/render.py` / `team/render.py` 的
+  `render_team_brief` 等）——那些是 prompt 不是界面，措辞是真实模型验收
+  反复调过的，为一条排版约束去动它们是拿行为回归换看不见的整洁
 - **工具行的「建行 / 定色」必须成对**，且 `_do_stream` 的 `tool_widgets` 表**只装还没定色的行**：`TOOL_PENDING` 建行、`TOOL_START` 复用（`get` 后 `begin_running`）、`TOOL_RESULT` **必须 `pop`**、`finally` 里 `_settle_unfinished_tools` 收尾剩下的。**把 `pop` 写成 `get` 不报错**：已经定成绿色「完成」的行会在收尾时被再收一次、覆写成「失败 · 未执行」——用户看到的是「明明写成功了却显示没执行」，而调用栈上什么线索都没有。护栏见 `tests/test_tui_tool_pending.py::DoStreamWiringTest`（含这条覆写的反证）
 - **`ToolCallWidget` 的 `(Ns)` 语义是「工具执行耗时」** → `begin_running` 必须重置 `_start`。漏了不报错，只是把「模型生成参数」与「用户盯着确认面板发呆」的时间一并算进去，一次 2 毫秒的写盘可能显示成 `(600s)`
 - 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
@@ -295,6 +315,16 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 补全与高亮（c10）：输入 `/` 前缀实时弹候选（只显示规范名，别名不参与补全——仍可直接输入执行、完整命中仍高亮、`/help` 可见；隐藏命令不出现）；Tab 单候选直补（有参数提示的命令末尾留一个空格）、多候选弹稳定排序菜单；菜单可见时回车执行当前高亮项；光标进入参数区后 Tab 不拦截。输入框只在命令字段完整命中规范名或别名时以青色加粗高亮该字段，参数与未完成前缀保持普通样式。无参命令忽略多余参数（`/clear now` 仍清空）。
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
+
+`Ctrl+O` 在「折叠 / 展开」之间切换**一个全局开关**——同时管子 Agent 活动区
+（展开后列出每个队员最近的工具调用）与历史区里被折叠的长工具结果 / diff 块。
+它**不改变焦点**（tui-display 扩展 F5/F41）。
+
+**退出是连按两次 `Ctrl+C`**（tui-display 扩展 F31）：第一次只给一行提示，
+两秒内没有第二下就自动复位。⚠ **屏幕上有选中文本时 `Ctrl+C` 是复制，且不计数**
+——连续复制多少次都不会靠近退出，这是 c2 AC9「`Ctrl+C` 用于复制场景」在新键位
+下的落点。`Ctrl+Q` **已不再退出**（绑到一个空动作上吃掉 Textual 自带的绑定），
+`/exit` 不受影响。
 
 ⚠️ **`Esc` 的语义是「我不等了」，不是「全停」**：它只停主对话，**不会取消正在跑的子 Agent**
 （那是 C13「委派永不阻塞」的契约——`background=true` 那些是模型明说过不等的）。
