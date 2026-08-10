@@ -28,8 +28,9 @@ import unittest
 
 from textual.app import App, ComposeResult
 
+from rhinecode.provider.base import ToolCall
 from rhinecode.tui.app import RhineApp
-from rhinecode.tui.widgets import HistoryView
+from rhinecode.tui.widgets import BRANCH_LINE_LIMIT, HistoryView
 
 
 class _LayoutHarness(App):
@@ -179,6 +180,154 @@ class FollowLatestTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 view.scroll_offset.y, 0, "正在看历史时不得被布局强行拽回底部"
             )
+
+
+class _ToolHarness(App):
+    """只挂历史区的最小应用，用于让工具行真的经历挂载与渲染。"""
+
+    def compose(self) -> ComposeResult:
+        yield HistoryView()
+
+
+def _text_of(widget) -> str:
+    """
+    取出工具行当前展示的纯文本。
+
+    终态传给 `Static.update` 的是 `RichGroup`，直接 `str()` 只会得到对象表示，
+    必须逐个取子元素的 `.plain`。与 `test_tui_tool_pending.py` 里那份同口径
+    ——那边验的是「建行/定色」的时序，这边验的是折叠，共用一个辅助函数会让
+    两个文件互相牵制，故各留一份（十行的辅助函数，不值得抽公共模块）。
+    """
+    content = widget.content
+    if isinstance(content, str):
+        return content
+    renderables = getattr(content, "renderables", None) or [content]
+    parts = []
+    for item in renderables:
+        plain = getattr(item, "plain", None)
+        parts.append(plain if plain is not None else str(item))
+    return "\n".join(parts)
+
+
+class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
+    """
+    AC31a/AC31b：长结果被折叠并标出剩余行数，展开后能看到全文。
+
+    ## 这条测试在防什么
+
+    改造前工具结果**只取首行、截到 80 字符**。一次 `grep` 命中 23 处，
+    用户只看得到第一处，而且**没有任何迹象表明还有别的**——既不知道被省了
+    什么，也没法展开。「还有 N 行」这个数字本身就是那个迹象。
+    """
+
+    async def test_folded_shows_limit_lines_and_the_remainder(self) -> None:
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="grep_content", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"命中第 {i} 处" for i in range(20)))
+            await pilot.pause()
+
+            text = _text_of(widget)
+            self.assertIn("命中第 0 处", text)
+            self.assertIn(f"命中第 {BRANCH_LINE_LIMIT - 1} 处", text)
+            self.assertNotIn(f"命中第 {BRANCH_LINE_LIMIT} 处", text, "超限的行不该出现")
+            self.assertIn(f"+{20 - BRANCH_LINE_LIMIT} 行", text)
+            self.assertIn("Ctrl+O", text, "必须写明怎么展开，否则用户只知道被省了")
+
+    async def test_expanded_shows_everything(self) -> None:
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="grep_content", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"命中第 {i} 处" for i in range(20)))
+            widget.set_expanded(True)
+            await pilot.pause()
+
+            text = _text_of(widget)
+            for i in range(20):
+                self.assertIn(f"命中第 {i} 处", text)
+            self.assertNotIn("+15 行", text, "展开后不该还留着折叠提示")
+
+    async def test_collapse_again(self) -> None:
+        """再按一次收回——展开是可逆的。"""
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="grep_content", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"第 {i} 行" for i in range(20)))
+            widget.set_expanded(True)
+            widget.set_expanded(False)
+            await pilot.pause()
+
+            self.assertIn("+15 行", _text_of(widget))
+
+    async def test_short_result_has_no_fold_hint(self) -> None:
+        """
+        不超限时**不得**出现折叠提示。
+
+        绝大多数工具结果只有一行；无条件挂一句「+0 行」是纯噪音，
+        且会让用户以为有东西被藏起来了。
+        """
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="read_file", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "读取 412 行")
+            await pilot.pause()
+
+            text = _text_of(widget)
+            self.assertIn("读取 412 行", text)
+            self.assertNotIn("Ctrl+O", text)
+
+    async def test_exactly_at_the_limit_is_not_folded(self) -> None:
+        """边界值：恰好等于上限时不折叠（折了只会多一行「+0 行」）。"""
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="run_command", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"第 {i} 行" for i in range(BRANCH_LINE_LIMIT)))
+            await pilot.pause()
+
+            self.assertNotIn("Ctrl+O", _text_of(widget))
+
+    async def test_trailing_blank_lines_do_not_eat_the_budget(self) -> None:
+        """
+        命令输出几乎都以换行结尾。尾部空行留着会白占折叠额度，
+        让一个三行的结果显示成「+1 行」。
+        """
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="run_command", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "a\nb\nc\n\n\n")
+            await pilot.pause()
+
+            self.assertNotIn("Ctrl+O", _text_of(widget))
+
+    async def test_full_text_is_kept_not_truncated_at_finish(self) -> None:
+        """
+        **组件保留全文**：折叠只发生在渲染那一刻。
+
+        存半截的话展开就没得展了——而那正是改造前「只取首行截到 80 字符」
+        的问题所在。这条比「展开后能看到 20 行」更靠前一层：即使
+        `set_expanded` 写错了，只要全文还在就救得回来。
+        """
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="grep_content", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"第 {i} 行" for i in range(20)))
+            await pilot.pause()
+
+            self.assertEqual(len(widget._summary.split("\n")), 20)
 
 
 if __name__ == "__main__":

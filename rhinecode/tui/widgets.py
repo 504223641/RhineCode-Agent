@@ -230,9 +230,14 @@ class _DiffBlock:
     与 DiffView.to_text() 的取值规则一致，保证人看到的与回灌给模型的对得上。
     """
 
-    def __init__(self, view) -> None:
-        """:param view: tools.diff.DiffView"""
+    def __init__(self, view, expanded: bool = False) -> None:
+        """
+        :param view: tools.diff.DiffView
+        :param expanded: 全局展开开关（`Ctrl+O`）。为假时 diff 行数受
+                         `DIFF_ROW_LIMIT` 约束（F41）
+        """
         self._view = view
+        self._expanded = expanded
 
     def __rich_console__(self, console, options):
         """
@@ -280,14 +285,15 @@ class _DiffBlock:
                 yield Segment.line()
 
 
-def render_diff_block(view) -> "_DiffBlock":
+def render_diff_block(view, expanded: bool = False) -> "_DiffBlock":
     """
     构造 diff 块的可渲染对象（见 _DiffBlock）。保留函数形式，调用方无需感知具体类型。
 
     :param view: tools.diff.DiffView
+    :param expanded: 全局展开开关；为假时行数受 `DIFF_ROW_LIMIT` 约束
     :returns: 一个 Rich 可渲染对象，删除/新增行整行背景高亮、自适应宽度
     """
-    return _DiffBlock(view)
+    return _DiffBlock(view, expanded=expanded)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +309,24 @@ def render_diff_block(view) -> "_DiffBlock":
 BRANCH_MARK = "⎿"
 # 分支行的完整前缀：两格缩进体现层级，符号后两个空格与正文拉开距离。
 BRANCH_PREFIX = f"  {BRANCH_MARK}  "
+# 分支块**续行**的缩进：与首行正文左缘对齐，让多行结果读起来是一块而不是几条。
+# 宽度由 `cell_len` 算而不是写死——`⎿` 是 East Asian Width「模糊」字符，
+# 在 CJK 终端里占两格，写死 5 会让续行在中文环境下错位一格。
+BRANCH_CONT_INDENT = " " * cell_len(BRANCH_PREFIX)
+
+# 折叠上限（tui-display 扩展 F41 / N5「一切展示都有界」）。
+#
+# 改造前工具结果**只取首行、截到 80 字符**：一次 `grep` 命中 23 处，用户只看得到
+# 第一处，而且**没有任何迹象表明还有别的**——既不知道被省了什么，也没法展开。
+# 现在改成保留全文、折叠展示，并在末行如实写出还有多少行。
+BRANCH_LINE_LIMIT = 5
+# diff 块的行数上限。改造前**完全没有上限**，一次大改动会把整块差异铺进历史区。
+# 取 12 而不是 5：diff 的每一行信息量比结果行低（大半是上下文行），
+# 5 行往往连一个 hunk 都放不下。
+DIFF_ROW_LIMIT = 12
+# 折叠提示里给出的展开方式。**与 A 组共用同一个快捷键**，不为工具行另立一个
+# （F41：对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套）。
+EXPAND_HINT = "（Ctrl+O 展开）"
 # 次级信息的灰色前景。取值沿用改造前 `ToolCallWidget._COLOR_BRANCH` 的 #808080，
 # 这样「统一来源」这件事本身不改变任何一处的既有观感。
 SECONDARY_COLOR = "#808080"
@@ -585,6 +609,16 @@ class ToolCallWidget(Static):
         self._args_summary = summarize_args(tool_call.arguments)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
+        # ── 终态的完整素材（F41）──
+        # 组件**保留全文**，折叠只发生在渲染那一刻。存半截的话展开就没得展了，
+        # 而那正是改造前「只取首行截到 80 字符」的问题所在。
+        self._finished = False
+        self._ok = True
+        self._summary = ""
+        self._diff = None
+        self._final_elapsed = 0
+        # 全局展开开关的本地副本，由 `set_expanded` 广播进来（见 app.action_toggle_expand）
+        self._expanded = False
 
     def on_mount(self) -> None:
         """挂载后记录起始时刻、立即渲染 0s，并启动每秒刷新的主线程定时器。"""
@@ -644,8 +678,12 @@ class ToolCallWidget(Static):
 
         由 TUI 的 Worker 通过 call_from_thread 在主线程调用，线程安全。
 
-        :param ok: 工具是否成功（决定绿/红与图标）
-        :param summary: 结果摘要文本（已由调用方取首行/截断）
+        本方法只**记下终态素材**，画由 `_render_finished` 负责——两者分开是为了
+        让 `set_expanded` 能在任何时候重画同一行（F41 的展开/收回）。
+
+        :param ok: 工具是否成功（决定绿/红）
+        :param summary: 结果摘要文本，**可以是多行全文**（折叠交给渲染，见
+                        `BRANCH_LINE_LIMIT`）
         :param diff: 可选的 tools.diff.DiffView。改文件类工具会带上它，
                      此时在状态行下方追加渲染一个彩色 diff 块；其它工具留空。
 
@@ -653,24 +691,92 @@ class ToolCallWidget(Static):
         """
         if self._timer is not None:
             self._timer.stop()
-        elapsed = self._elapsed()
-        color = self._COLOR_OK if ok else self._COLOR_FAIL
-        result = "完成" if ok else "失败"
-        # 统一为两行式：第一行 "● 标题 完成/失败 (Ns)"，第二行起为 "⎿ ..." 分支。
+        self._final_elapsed = self._elapsed()
+        self._finished = True
+        self._ok = ok
+        self._summary = summary or ""
+        self._diff = diff
+        self._render_finished()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        接收全局展开开关的广播（`Ctrl+O`，见 `app.action_toggle_expand`）。
+
+        只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下状态即可，
+        等它 `finish` 时自然按新状态渲染。
+
+        :param expanded: 展开为真、折叠为假
+
+        副作用：可能原地重绘本行。
+        """
+        if self._expanded == expanded:
+            return
+        self._expanded = expanded
+        if self._finished:
+            self._render_finished()
+
+    def _branch_block(self) -> RichText:
+        """
+        把结果摘要渲染成分支块：首行带 `⎿`，续行缩进对齐，超限时折叠。
+
+        折叠时**保留前 `BRANCH_LINE_LIMIT` 行**并在末尾追加「… +N 行（Ctrl+O 展开）」。
+        为什么写出确切的 N 而不是一个「更多」：改造前只取首行、且**没有任何迹象
+        表明还有别的**——用户既不知道被省了什么，也没法展开。数字本身就是那个迹象。
+
+        用 `RichText` 纯文本而不是 markup：结果摘要来自工具输出原文，
+        含 `[` 是常态，纯文本渲染天然免转义（与本类既有做法一致）。
+        """
+        lines = self._summary.split("\n")
+        # 去掉尾部空行：命令输出几乎都以换行结尾，留着会白占一行折叠额度
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            lines = [""]
+
+        hidden = 0
+        if not self._expanded and len(lines) > BRANCH_LINE_LIMIT:
+            hidden = len(lines) - BRANCH_LINE_LIMIT
+            lines = lines[:BRANCH_LINE_LIMIT]
+
+        rendered = [BRANCH_PREFIX + lines[0]]
+        rendered.extend(BRANCH_CONT_INDENT + line for line in lines[1:])
+        if hidden:
+            rendered.append(f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}")
+        return RichText("\n".join(rendered), style=self._COLOR_BRANCH)
+
+    def _render_finished(self) -> None:
+        """
+        画终态（成功/失败）。`finish` 与 `set_expanded` 共用这一处。
+
+        统一为两段式：第一行 `● 标题 完成/失败 [(Ns)]`，其下是 `⎿` 分支块。
+        """
+        color = self._COLOR_OK if self._ok else self._COLOR_FAIL
+        result = "完成" if self._ok else "失败"
+        diff = self._diff
         if diff is not None and diff.rows:
-            # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要更贴近改动语义），
-            # 分支由 render_diff_block 产出（首行 "⎿ Added.../removed..." 概要 + 彩色 diff 行）。
-            header = f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) {result} ({elapsed}s)[/]"
-            self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
-        else:
-            # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
-            # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
-            # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
-            title = self._label if self._pending else f"{self._label}({self._args_summary})"
-            header = f"[{color}]● {title} {result} ({elapsed}s)[/]"
-            branch = RichText(BRANCH_PREFIX, style=self._COLOR_BRANCH)
-            branch.append(summary, style=self._COLOR_BRANCH)
-            self.update(RichGroup(RichText.from_markup(header), branch))
+            # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要
+            # 更贴近改动语义），分支由 render_diff_block 产出。
+            header = (
+                f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) "
+                f"{result}{self._elapsed_suffix()}[/]"
+            )
+            self.update(
+                RichGroup(
+                    RichText.from_markup(header),
+                    render_diff_block(diff, expanded=self._expanded),
+                )
+            )
+            return
+        # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"。
+        # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
+        # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
+        title = self._label if self._pending else f"{self._label}({self._args_summary})"
+        header = f"[{color}]● {title} {result}{self._elapsed_suffix()}[/]"
+        self.update(RichGroup(RichText.from_markup(header), self._branch_block()))
+
+    def _elapsed_suffix(self) -> str:
+        """终态耗时后缀。占位实现，T18 会给它加上「不足一秒不显示」的规则。"""
+        return f" ({self._final_elapsed}s)"
 
 
 # `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
