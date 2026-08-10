@@ -2,7 +2,7 @@
 TUI 结构回归测试（键位 + c10 命令接线的静态断言）。
 
 对 app.py / widgets.py 源码做结构检查：不启动真实终端，验证
-- Ctrl+C 未绑定退出（历史回归）
+- 单次 Ctrl+C 不导致退出（历史回归，判据形态已随 tui-display 扩展改写）
 - 提交入口只走 CommandDispatcher 单入口（c10 T51）
 - 旧的命令字符串状态刷新白名单与静态 COMMANDS 列表已删除
 - 运行中 Esc 取消、确认/会话面板优先级守卫仍在
@@ -19,7 +19,27 @@ WIDGETS_SOURCE = Path(__file__).resolve().parents[1] / "rhinecode" / "tui" / "wi
 
 
 class TuiKeybindingTests(unittest.TestCase):
-    def test_ctrl_c_is_not_bound_to_quit(self):
+    """
+    `Ctrl+C` 的历史约束（c2 AC9）——**判据形态改写，意图原样继承**。
+
+    原判据是「`ctrl+c` 不得绑定到退出动作」，理由记在 `docs/c2/spec.md`：
+    **「`Ctrl+C` 用于复制场景，不应触发退出」**。
+
+    tui-display 扩展把退出改成**连按两次** `Ctrl+C`。这不是推翻那条约束，
+    而是兑现它的本意——单次按下依然不退出（复制场景安全），两次连按才退。
+    因此这里的判据由「不得绑定」改成「**不得直接绑到 `quit`**」，
+    行为侧的「单次按下后应用仍在运行」由 `tests/test_tui_quit.py` 承担
+    （空闲 / 流式运行中 / 面板挂起中各验一次）。
+    """
+
+    def test_single_ctrl_c_never_quits(self):
+        """
+        `ctrl+c` 不得直接绑到 Textual 的 `quit` 动作。
+
+        它必须走本项目的 `request_quit`——那里面才有「第一次只提示、
+        有选中文本就复制且不计数」这几条。直接绑 `quit` 等于一按就退，
+        正是 c2 AC9 当年要挡的。
+        """
         tree = ast.parse(APP_SOURCE.read_text(encoding="utf-8"))
 
         ctrl_c_quit_bindings = []
@@ -37,11 +57,18 @@ class TuiKeybindingTests(unittest.TestCase):
 
         self.assertEqual(ctrl_c_quit_bindings, [])
 
-    def test_placeholder_points_to_ctrl_q_for_quit(self):
+    def test_placeholder_points_to_double_ctrl_c_for_quit(self):
+        """
+        输入框占位符必须写「连按两次 Ctrl+C 退出」，且不得再提 `Ctrl+Q 退出`。
+
+        占位符是用户唯一会读到「怎么退出」的地方。留着旧文案的后果是用户按
+        `Ctrl+Q` 什么都不发生（那个键已被 `action_noop` 吃掉），却完全不知道
+        该按什么。
+        """
         source = APP_SOURCE.read_text(encoding="utf-8")
 
-        self.assertIn("Ctrl+Q 退出", source)
-        self.assertNotIn("Ctrl+C 退出", source)
+        self.assertIn("连按两次 Ctrl+C 退出", source)
+        self.assertNotIn("Ctrl+Q 退出", source)
 
 
 class CommandWiringStructureTests(unittest.TestCase):

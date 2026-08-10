@@ -19,9 +19,11 @@ RhineApp 是 TUI 层的核心，负责：
 """
 
 import threading
+from time import monotonic
 from typing import Optional
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.events import Key
 from textual.widgets import Static, Input
 
@@ -75,6 +77,7 @@ from rhinecode.trace import (
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
+    ToolCallWidget,
     SessionPanel, compose_status_text,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
@@ -141,6 +144,30 @@ class RhineApp(App):
     - InputBar：固定 3 行高（含边框），用户在此输入
     - StatusBar：固定 1 行，展示 Provider / 模型 / 思考模式 / 计划模式
     """
+
+    # ---------------------------------------------------------------- #
+    # 键位（tui-display 扩展 F31/F32/F5）
+    # ---------------------------------------------------------------- #
+    # ⚠ **两条 `priority=True` 是实测确认必需的，别去掉。**
+    #
+    # - `ctrl+q`：退出行为**来自 Textual 自己**（`App` 内置一条
+    #   `ctrl+q → quit` 的 priority 绑定），不是本项目的代码。要取消它，
+    #   覆盖的那条也必须是 priority，否则内置那条先赢。
+    # - `ctrl+c`：`Input` 自带 `ctrl+c → copy`，不用 priority 的话输入框聚焦时
+    #   我们的动作根本不触发——而输入框聚焦正是绝大多数时间的状态。
+    #
+    # `ctrl+o` 不需要 priority：没有任何组件占用它。
+    BINDINGS = [
+        Binding("ctrl+q", "noop", "", show=False, priority=True),
+        Binding("ctrl+c", "request_quit", "", show=False, priority=True),
+        Binding("ctrl+o", "toggle_expand", "", show=False),
+    ]
+
+    # 两次 `Ctrl+C` 之间的最长间隔（秒）。超过就当成「第一次」重新计数。
+    #
+    # 取 2 秒：短到不会让「几分钟前误按过一次」在此刻突然生效，
+    # 长到够人看清提示再按第二下。
+    QUIT_CONFIRM_SECONDS = 2.0
 
     CSS = """
     Screen {
@@ -301,6 +328,9 @@ class RhineApp(App):
         # **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
         # verbose 语义，两个键会让用户记两套。
         self._expanded = False
+        # 上一次按下 `Ctrl+C` 的时刻（`time.monotonic`）。
+        # 初值取一个足够久远的负数，保证第一次按下必然走「提示」那一支。
+        self._last_quit_request = -1e9
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
@@ -316,7 +346,7 @@ class RhineApp(App):
         yield SessionPanel()
         yield InputBar(
             self._command_registry,
-            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，Ctrl+Q 退出",
+            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，连按两次 Ctrl+C 退出",
         )
         yield StatusBar()
 
@@ -937,6 +967,102 @@ class RhineApp(App):
             panel.hide()
             return
         panel.show_for(event.prefix)
+
+    # ------------------------------------------------------------------ #
+    # 键位动作（tui-display 扩展 F31/F32/F5）
+    # ------------------------------------------------------------------ #
+
+    def action_noop(self) -> None:
+        """
+        什么都不做——用来**吃掉** `Ctrl+Q`（F31）。
+
+        退出行为来自 Textual 自带的 priority 绑定，不覆盖是去不掉的。
+        绑到一个空动作上，按下去就真的什么都不发生。
+        """
+
+    def action_toggle_expand(self) -> None:
+        """
+        全局展开开关（`Ctrl+O`，F5/F41）。
+
+        **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
+        verbose 语义。两个键会让用户记两套，而这两处展开的是同一类东西
+        （「刚才具体做了什么」）。
+
+        ⚠ **不引入焦点切换**：本动作只重绘，不 `focus()` 任何组件。
+        活动区任何时候都不抢焦点，输入框与四个面板的键位体系一字不动（F5）。
+
+        副作用：重绘活动区与当前挂着的工具行。
+        """
+        self._expanded = not self._expanded
+        self._refresh_activity()
+        for widget in self.query(ToolCallWidget):
+            widget.set_expanded(self._expanded)
+
+    def action_request_quit(self) -> None:
+        """
+        `Ctrl+C`：**连按两次**才退出（F31/F32）。
+
+        ## 三条分支，顺序固定
+
+        1. **屏幕上有选中文本 → 复制，且不计数**；
+        2. 距上次按下 ≤ `QUIT_CONFIRM_SECONDS` → 退出；
+        3. 否则记下时间戳并提示「再按一次 Ctrl+C 退出」。
+
+        ## 为什么复制这一支必须存在
+
+        C2 那条护栏（`Ctrl+C` 不得绑定退出）的理由是「**`Ctrl+C` 用于复制场景**」。
+        而 Textual 里 `Screen` 与 `Input` **各有一条** `ctrl+c → copy` 绑定，
+        两条都是 `priority=False`——**都会被我们上面那条 priority 绑定盖掉**。
+        不做分流的话，「Ctrl+C 复制」这个今天真实可用的功能会整个消失，
+        而那正是当年写下那条护栏时指的东西。
+
+        两处选中来源**缺一不可**（实测确认是两套独立机制）：
+        鼠标在历史区拖选走 `screen.get_selected_text()`，
+        输入框内 Shift+方向键选中走焦点组件的 `selected_text`。
+
+        ## 「不计数」是这条设计的要害
+
+        连续复制五次，一次都不会靠近退出。反过来（复制也计入双击）会让
+        「连按两次复制」意外退出程序——那个方向更糟。
+
+        **已知代价（接受）**：屏幕上有选中内容时按两次得到的是「复制两次」，
+        不会退出；想退出需先清掉选中。相比「复制两次就退出」，这个方向更安全。
+
+        副作用：可能复制到剪贴板、可能显示一行提示、可能退出应用。
+        """
+        if self._copy_selection_if_any():
+            return
+
+        now = monotonic()
+        if now - self._last_quit_request <= self.QUIT_CONFIRM_SECONDS:
+            self.exit()
+            return
+
+        self._last_quit_request = now
+        # ⚠ 文案必须写明是**退出**而不是取消——`Esc` 才是取消当前回合，
+        # 两者不能让用户混淆。
+        self.show_message("再按一次 Ctrl+C 退出")
+
+    def _copy_selection_if_any(self) -> bool:
+        """
+        屏幕上有选中文本就复制它，返回是否复制过。
+
+        :returns: True 表示本次 `Ctrl+C` 是一次复制，**不该计入双击**
+
+        整段 try/except：剪贴板在某些终端里不可用，而复制失败不该妨碍
+        「再按一次就退出」这条主路径。
+        """
+        try:
+            focused = self.focused
+            selected = getattr(focused, "selected_text", "") if focused else ""
+            if not selected:
+                selected = self.screen.get_selected_text() or ""
+            if not selected:
+                return False
+            self.copy_to_clipboard(selected)
+            return True
+        except Exception:  # noqa: BLE001 —— 见上：复制失败不阻断退出路径
+            return False
 
     def _handle_digit_choice(self, event: Key) -> bool:
         """
