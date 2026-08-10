@@ -8,8 +8,8 @@ from pathlib import Path
 
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk
 from rhinecode.memory.manager import MemoryManager, NOTE_LOCK_STALE, INDEX_FILENAME
-from rhinecode.memory.note_updater import parse_note_response
-from rhinecode.memory.notes import INDEX_MAX_LINES
+from rhinecode.memory.memory_updater import parse_note_response
+from rhinecode.memory.memories import INDEX_MAX_LINES
 from rhinecode.memory import lockfile
 
 

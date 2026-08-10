@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from rhinecode.provider.base import Message
-from rhinecode.memory.notes import CATEGORIES, Note
+from rhinecode.memory.memories import CATEGORIES, Note
 
 # 笔记文件名白名单：小写字母/数字/连字符/下划线 + .md 后缀，禁止任何路径分隔符。
 _FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.md$")

@@ -2,7 +2,7 @@
 
 import unittest
 
-from rhinecode.memory.notes import (
+from rhinecode.memory.memories import (
     Note,
     parse_note,
     render_note,

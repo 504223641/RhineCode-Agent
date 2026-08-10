@@ -27,7 +27,7 @@ from rhinecode.trace import SCOPE_NOTES, NullRecorder, TraceRecorderProtocol
 from rhinecode.memory import lockfile
 from rhinecode.memory.instructions import LoadedInstructions, load_instructions
 from rhinecode.memory.session import SessionStore, SessionInfo
-from rhinecode.memory.notes import (
+from rhinecode.memory.memories import (
     CATEGORIES,
     CATEGORY_LABELS,
     parse_note,
@@ -37,7 +37,7 @@ from rhinecode.memory.notes import (
     INDEX_MAX_LINES,
     INDEX_MAX_BYTES,
 )
-from rhinecode.memory.note_updater import (
+from rhinecode.memory.memory_updater import (
     NoteAction,
     build_note_request,
     parse_note_response,
