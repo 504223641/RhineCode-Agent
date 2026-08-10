@@ -684,9 +684,18 @@ class RhineApp(App):
         self._refresh_status()
 
     def clear_conversation(self) -> None:
-        """清空对话：领域侧清历史/开新档 + 界面侧清聊天区（确认文本由命令层显示）。"""
+        """
+        清空对话：领域侧清历史/开新档 + 界面侧清聊天区（确认文本由命令层显示）。
+
+        活动区一并清空（tui-display 扩展 F8）。⚠ 这不是「顺手也清一下」：
+        `/clear` 会取消还在跑的子 Agent 并开新的会话代，那些任务的行留在活动区里
+        就是**在展示一段已经不存在的对话的状态**。领域侧下一轮轮询也会把它们
+        滤掉（它们随即转终态、再过几秒淡出），但那中间有半秒到几秒的窗口，
+        用户会在一个刚清空的界面上看到上一段对话的残影。
+        """
         self._manager.clear()
         self.query_one(HistoryView).clear_all()
+        self.query_one(ActivityView).update_rows(())
 
     def compact_context(self) -> None:
         """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
@@ -1273,6 +1282,12 @@ class RhineApp(App):
                     reset_text_widgets()
                     tool_widgets.clear()
                     self.call_from_thread(history_view.render_history, event.messages)
+                    # 活动区同样属于「上一段对话的状态」（tui-display 扩展 F8）。
+                    # `/resume` 与 `/clear` 是同一类切换：`cancel_all_for_session_switch`
+                    # 会取消在跑的子 Agent 并开新会话代，那些行不该跨到新对话里。
+                    self.call_from_thread(
+                        self.query_one(ActivityView).update_rows, ()
+                    )
         finally:
             # **作用域泄漏的唯一可靠防护**，必须是 finally 的第一行（trace T42）。
             #

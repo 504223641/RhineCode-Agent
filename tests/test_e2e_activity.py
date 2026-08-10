@@ -298,6 +298,33 @@ class FinishTraceTest(ActivityFixture):
             self.assertIn("次调用", _history_text(app))
 
 
+class SessionSwitchTest(ActivityFixture):
+    """AC8：`/clear` 之后活动区为空。"""
+
+    async def test_clear_empties_the_activity_area(self) -> None:
+        """
+        清空之后活动区必须立刻空掉，**不能等下一轮轮询**。
+
+        领域侧确实也会把它们滤掉（`/clear` 取消在跑的子 Agent，它们随即转终态、
+        再过几秒淡出），但那中间有半秒到几秒的窗口——用户会在一个刚清空的
+        界面上看到上一段对话的残影。
+        """
+        app = self.result.app
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await self._send(app, pilot, "找人复核一下")
+            await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
+            view = app.query_one(ActivityView)
+            await _wait_for(lambda: view.display, pilot, 10.0)
+
+            self.gate.set()
+            await self._send(app, pilot, "/clear")
+            await pilot.pause()
+
+            self.assertFalse(view.display, "清空之后活动区必须立刻隐藏")
+            self.assertEqual(_activity_text(view), "")
+
+
 def _history_text(app) -> str:
     """把历史区所有组件的文本拍平成一段，用于「出现过 / 出现几次」这类判据。"""
     view = app.query_one(HistoryView)
