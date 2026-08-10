@@ -1245,6 +1245,26 @@ class ConversationManager:
             return ()
         return self.subagent_service.tasks.drain_notifications()
 
+    def subagent_activity(self) -> tuple:
+        """
+        取活动区要画的那几行（tui-display 扩展 F1/F4）。
+
+        :returns: `ActivityRow` 元组；服务未启用时为**空元组**——界面据此把整块
+            隐藏且不占布局空间，于是不使用子 Agent 的用户界面表现与改造前
+            逐字一致（F9 零回归）
+
+        由 TUI 在**主线程**调用，与 `drain_subagent_notifications` 同一个
+        0.5 秒节拍（F4 明确要求**不新增定时器**：空闲会话的开销必须与改造前
+        一致）。**只读，不取走任何东西**——与上面那条「取走即置位」的消费线
+        刻意不同，活动区每一轮都要重新看到同样的行。
+
+        ⚠ **不新增任何从子 Agent 线程到界面的推送通道**（N1）。本项目已因
+        「加锁临界区内做跨线程调度」死锁四次，轮询从结构上消掉这一整类问题。
+        """
+        if self.subagent_service is None:
+            return ()
+        return self.subagent_service.tasks.activity_rows()
+
     def _run_forked_skill(
         self, spec: SkillSpec, arguments: str, display: str, record: bool = True
     ) -> Iterator[AgentEvent]:

@@ -370,6 +370,9 @@ class ZeroRegressionTest(IntegrationBase):
         self.assertEqual(manager._agent_index_text(), "")
         self.assertEqual(manager.running_subagent_count(), 0)
         self.assertEqual(manager.drain_subagent_notifications(), ())
+        # tui-display 扩展 F9/AC1：未启用时活动区拿到空元组 → 整块隐藏、
+        # 不占布局空间，界面表现与改造前逐字一致
+        self.assertEqual(manager.subagent_activity(), ())
         self.assertIn("未启用", manager.agents_report())
         self.assertIn("未启用", manager.cancel_subagents(None))
         # 交付是空操作，历史不变
@@ -379,6 +382,32 @@ class ZeroRegressionTest(IntegrationBase):
 
     def test_clear_unaffected(self) -> None:
         self.assertEqual(self._manager(with_service=False).clear(), "对话历史已清空")
+
+
+class ActivityPassthroughTest(IntegrationBase):
+    """
+    活动区的领域通路（tui-display 扩展 T22，F1/F4）。
+
+    ⚠ 它与 `drain_subagent_notifications` **语义刻意不同**：那条是「取走即置位」
+    的消费线，这条是**纯只读**——活动区每一轮都要重新看到同样的行。
+    写成消费线的话，第二次轮询（0.5 秒后）活动区就空了，那一行会闪一下就没。
+    """
+
+    def test_running_task_reaches_the_activity_snapshot(self) -> None:
+        manager = self._manager()
+        manager.subagent_service.tasks.create(KIND_ROLE, "explorer", "去查点东西")
+
+        rows = manager.subagent_activity()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].display_name, "explorer")
+
+    def test_reading_it_twice_gives_the_same_rows(self) -> None:
+        """**反证**：只读、不取走。"""
+        manager = self._manager()
+        manager.subagent_service.tasks.create(KIND_ROLE, "explorer", "t")
+
+        self.assertEqual(len(manager.subagent_activity()), 1)
+        self.assertEqual(len(manager.subagent_activity()), 1)
 
 
 class ParentSnapshotTest(IntegrationBase):
