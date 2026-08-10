@@ -53,12 +53,12 @@ package.json）、构建与测试命令、代码风格约定、关键架构分�
 # ---------------------------------------------------------------------- #
 def _handle_mcp(invocation: CommandInvocation, controller: CommandController) -> None:
     """/mcp：查询 MCP 连接状态报告并展示（纯只读，不改状态）。"""
-    controller.show_message(controller.query_report(ReportTarget.MCP))
+    controller.show_report(controller.query_report(ReportTarget.MCP))
 
 
 def _handle_hooks(invocation: CommandInvocation, controller: CommandController) -> None:
     """/hooks：查看已加载的 Hook 规则、加载警告与本次运行的触发统计（纯只读，c12）。"""
-    controller.show_message(controller.query_report(ReportTarget.HOOKS))
+    controller.show_report(controller.query_report(ReportTarget.HOOKS))
 
 
 # `/agents` 的用法串，多个分支要用，抽出来避免各处写得不一致（照 `_SKILLS_USAGE` 先例）。
@@ -79,7 +79,7 @@ def _handle_tasks(
 
     副作用：向聊天区输出一段文本。
     """
-    controller.show_message(controller.query_report(ReportTarget.TASKS))
+    controller.show_report(controller.query_report(ReportTarget.TASKS))
 
 
 def _handle_agents(invocation: CommandInvocation, controller: CommandController) -> None:
@@ -101,7 +101,7 @@ def _handle_agents(invocation: CommandInvocation, controller: CommandController)
     raw = invocation.arguments.strip()
 
     if not raw:
-        controller.show_message(controller.query_report(ReportTarget.AGENTS))
+        controller.show_report(controller.query_report(ReportTarget.AGENTS))
         return
 
     parts = raw.split(maxsplit=1)
@@ -122,12 +122,12 @@ def _handle_agents(invocation: CommandInvocation, controller: CommandController)
 
 def _handle_context(invocation: CommandInvocation, controller: CommandController) -> None:
     """/context：查询上下文用量报告并展示（纯只读）。"""
-    controller.show_message(controller.query_report(ReportTarget.CONTEXT))
+    controller.show_report(controller.query_report(ReportTarget.CONTEXT))
 
 
 def _handle_memory(invocation: CommandInvocation, controller: CommandController) -> None:
     """/memory：查询记忆系统状态报告并展示（纯只读）。"""
-    controller.show_message(controller.query_report(ReportTarget.MEMORY))
+    controller.show_report(controller.query_report(ReportTarget.MEMORY))
 
 
 # `/skills` 的用法串，多个分支要用，抽出来避免各处写得不一致。
@@ -154,7 +154,7 @@ def _handle_skills(invocation: CommandInvocation, controller: CommandController)
     raw = invocation.arguments.strip()
 
     if not raw:
-        controller.show_message(controller.query_report(ReportTarget.SKILLS))
+        controller.show_report(controller.query_report(ReportTarget.SKILLS))
         return
 
     parts = raw.split(maxsplit=1)
@@ -162,7 +162,7 @@ def _handle_skills(invocation: CommandInvocation, controller: CommandController)
     rest = parts[1] if len(parts) > 1 else ""
 
     if sub == "prompt":
-        controller.show_message(controller.query_report(ReportTarget.SKILLS_PROMPT))
+        controller.show_report(controller.query_report(ReportTarget.SKILLS_PROMPT))
         return
 
     if sub == "reload":
@@ -285,7 +285,7 @@ def build_builtin_registry() -> CommandRegistry:
 
     def handle_help(invocation: CommandInvocation, controller: CommandController) -> None:
         """/help：展示可见命令的帮助（闭包捕获本注册表实例，plan 第 7 节）。"""
-        controller.show_message(registry.render_help())
+        controller.show_report(registry.render_help())
 
     registry.register_many(
         [

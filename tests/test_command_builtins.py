@@ -120,8 +120,10 @@ class BuiltinBehaviorTests(unittest.TestCase):
         self.controller = FakeController()
 
     def test_help_shows_registry_content_with_aliases(self) -> None:
+        # `/help` 是多行报告，走 `show_report`（tui-display 扩展 F15），
+        # 不是 `show_message`
         self.dispatcher.dispatch("/help", self.controller)
-        shown = [c[1] for c in self.controller.calls if c[0] == "show_message"]
+        shown = [c[1] for c in self.controller.calls if c[0] == "show_report"]
         self.assertEqual(len(shown), 1)
         self.assertIn("/resume", shown[0])
         self.assertIn("/continue", shown[0])
@@ -140,7 +142,10 @@ class BuiltinBehaviorTests(unittest.TestCase):
             controller = FakeController()
             self.dispatcher.dispatch(text, controller)
             self.assertIn(("query_report", target), controller.calls)
-            self.assertIn(("show_message", f"report:{target.value}"), controller.calls)
+            # 报告走专用通道（tui-display 扩展 F15/T28）。⚠ 这里断言的是
+            # `show_report` 而不是 `show_message`——两者刻意分开记，
+            # 某条报告被误改回普通通道时这条当场红。
+            self.assertIn(("show_report", f"report:{target.value}"), controller.calls)
 
     def test_mode_commands_show_result_and_refresh(self) -> None:
         cases = {"/think": ModeTarget.THINKING, "/plan": ModeTarget.PLAN, "/perm": ModeTarget.PERMISSION}
