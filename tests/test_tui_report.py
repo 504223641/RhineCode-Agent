@@ -1,11 +1,12 @@
 """
 命令报告分级的纯函数单测（tui-display 扩展 T7/T9，spec F16/F17/AC13）。
 
-本文件覆盖报告分级的纯函数：
+本文件覆盖两个纯函数：
 
 - `classify_report`：把一段报告逐行判定层级。它是 C 组的全部判定逻辑——
   spec F16 要求**报告的产出函数一字不改**，因此分级只能在展示层靠「行的形状」
   推断。判错的代价只是某一行的亮度不对，不会出功能问题。
+- `numbered_prompt`：面板选项的「序号 + 高亮指示符」拼装（E 组 F23/F24）。
 
 ⚠ 判定顺序是本文件最要紧的部分：**条目判定必须排在缩进判定之前**。
 反过来的话，一个缩进 6 格的条目会被判成 DETAIL、整段条目变暗，
@@ -21,6 +22,7 @@ from rhinecode.tui.widgets import (
     ReportLineKind,
     ToolCallWidget,
     classify_report,
+    numbered_prompt,
 )
 
 
@@ -124,6 +126,38 @@ class ClassifyReportTest(unittest.TestCase):
     def test_single_line_report(self) -> None:
         """只有一行的报告，那一行就是标题。"""
         self.assertEqual(kinds_of("未启用协作。"), [ReportLineKind.TITLE])
+
+
+class NumberedPromptTest(unittest.TestCase):
+    """E 组 F23/F24：序号 + 非颜色的高亮指示符。"""
+
+    def test_selected_uses_arrow(self) -> None:
+        self.assertTrue(numbered_prompt(1, "本次放行", True).startswith("> 1. "))
+
+    def test_unselected_uses_spaces(self) -> None:
+        self.assertTrue(numbered_prompt(2, "本会话放行", False).startswith("  2. "))
+
+    def test_prefix_width_is_equal(self) -> None:
+        """
+        选中与未选中的前缀**必须等宽**，否则高亮在选项间移动时整列文字会左右抖。
+
+        这是 `>` 加一个空格、对上两个空格的全部理由。
+        """
+        selected = numbered_prompt(1, "文本", True)
+        plain = numbered_prompt(1, "文本", False)
+        self.assertEqual(len(selected), len(plain))
+
+    def test_text_is_preserved(self) -> None:
+        self.assertIn("本会话放行", numbered_prompt(2, "本会话放行", False))
+
+    def test_does_not_escape(self) -> None:
+        """
+        与 `classify_report` 同口径：转义留给调用方。
+
+        三个面板传进来的文本有的已是 markup（含 `[dim]…[/dim]`），
+        在这里转义会把那些样式标签打成字面量。
+        """
+        self.assertIn("[dim]说明[/dim]", numbered_prompt(1, "放行 [dim]说明[/dim]", False))
 
 
 class SingleSourceTest(unittest.TestCase):
