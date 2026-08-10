@@ -77,7 +77,6 @@ from rhinecode.trace import (
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
-    ToolCallWidget,
     SessionPanel, compose_status_text,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
@@ -995,8 +994,9 @@ class RhineApp(App):
         """
         self._expanded = not self._expanded
         self._refresh_activity()
-        for widget in self.query(ToolCallWidget):
-            widget.set_expanded(self._expanded)
+        # 历史区自己记下展开态并广播给已挂载的行——**不要在这里直接遍历组件**：
+        # 那样只覆盖「此刻挂着的」，展开之后新产生的行又会是折叠的。
+        self.query_one(HistoryView).set_expanded(self._expanded)
 
     def action_request_quit(self) -> None:
         """

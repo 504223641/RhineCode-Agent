@@ -835,6 +835,25 @@ class HistoryView(ScrollableContainer):
     # 与改造前逐字一致。
     _primary_args: dict = {}
 
+    # 全局展开开关的本地副本（`Ctrl+O`，F5/F41）。
+    #
+    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：展开之后新产生的
+    # 每一行都要按展开态画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
+    # 又是折叠的——现象是「这个开关时灵时不灵」，而那比没有开关更让人困惑。
+    _expanded: bool = False
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        接收全局展开开关，**记下来并广播给已挂载的工具行**（F5/F41）。
+
+        :param expanded: 展开为真、折叠为假
+
+        副作用：改自身状态；重绘全部已定色的工具行。
+        """
+        self._expanded = expanded
+        for widget in self.query(ToolCallWidget):
+            widget.set_expanded(expanded)
+
     def set_primary_args(self, mapping: dict) -> None:
         """
         接收「工具名 → 主参数键名」映射（F12）。
@@ -1001,9 +1020,12 @@ class HistoryView(ScrollableContainer):
         :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
         :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
         """
-        return self._mount_widget(
-            ToolCallWidget(tool_call, pending=pending, primary_args=self._primary_args)
+        widget = ToolCallWidget(
+            tool_call, pending=pending, primary_args=self._primary_args
         )
+        # 新行也要跟上当前的展开态（见 `set_expanded` 里那条注释）。
+        widget.set_expanded(self._expanded)
+        return self._mount_widget(widget)
 
     def append_system(self, text: str) -> None:
         """
@@ -1779,6 +1801,25 @@ class ConfirmPanel(NumberedPanel):
     # 工具行标题用的主参数映射（F12），由 `app.on_mount` 灌进来。
     # 缺省空字典 → 退回键值对摘要，与改造前逐字一致。
     _primary_args: dict = {}
+
+    # 全局展开开关的本地副本（`Ctrl+O`，F5/F41）。
+    #
+    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：展开之后新产生的
+    # 每一行都要按展开态画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
+    # 又是折叠的——现象是「这个开关时灵时不灵」，而那比没有开关更让人困惑。
+    _expanded: bool = False
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        接收全局展开开关，**记下来并广播给已挂载的工具行**（F5/F41）。
+
+        :param expanded: 展开为真、折叠为假
+
+        副作用：改自身状态；重绘全部已定色的工具行。
+        """
+        self._expanded = expanded
+        for widget in self.query(ToolCallWidget):
+            widget.set_expanded(expanded)
 
     def set_primary_args(self, mapping: dict) -> None:
         """接收「工具名 → 主参数键名」映射（F12），与 `HistoryView` 同一份。"""

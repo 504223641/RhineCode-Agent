@@ -298,6 +298,61 @@ class FinishTraceTest(ActivityFixture):
             self.assertIn("次调用", _history_text(app))
 
 
+class ExpandToggleTest(ActivityFixture):
+    """AC5：`Ctrl+O` 在折叠与展开之间切换，且**不动焦点**。"""
+
+    async def test_ctrl_o_reveals_recent_calls_and_folds_back(self) -> None:
+        app = self.result.app
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await self._send(app, pilot, "找人复核一下")
+            await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
+            view = app.query_one(ActivityView)
+            await _wait_for(lambda: view.display, pilot, 10.0)
+
+            # 直接往任务表里塞一次调用记录：本用例验的是**展开开关**，
+            # 让子 Agent 真的去调工具会把判据搅进权限与工具执行里。
+            tasks = self.result.manager.subagent_service.tasks
+            tasks.note_tool(tasks.snapshot()[0].task_id, "Read(src/app.py)")
+            await _wait_for(lambda: "Ctrl+O 展开" in _activity_text(view), pilot, 10.0)
+            self.assertNotIn("Read(src/app.py)", _activity_text(view))
+
+            await pilot.press("ctrl+o")
+            await _wait_for(lambda: "Read(src/app.py)" in _activity_text(view), pilot, 10.0)
+            self.assertIn("Ctrl+O 收回", _activity_text(view))
+
+            await pilot.press("ctrl+o")
+            await _wait_for(lambda: "Ctrl+O 展开" in _activity_text(view), pilot, 10.0)
+            self.assertNotIn("Read(src/app.py)", _activity_text(view))
+
+            self.gate.set()
+
+    async def test_focus_stays_in_the_input(self) -> None:
+        """
+        AC5b：切换展开**不引入焦点切换**。
+
+        活动区任何时候都不抢焦点——抢了的话用户按 `Ctrl+O` 看一眼之后
+        就打不了字了，而这在只看「子行出没出现」的用例里完全测不出来。
+        """
+        from rhinecode.tui.widgets import InputBar
+
+        app = self.result.app
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            bar = app.query_one(InputBar)
+            bar.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+
+            self.assertIs(app.focused, bar, "焦点必须仍在输入框")
+            # 再打一个字，确认输入框真的还能用（焦点对了但被禁用也算坏）
+            await pilot.press("a")
+            await pilot.pause()
+            self.assertEqual(bar.value, "a")
+
+
 class SessionSwitchTest(ActivityFixture):
     """AC8：`/clear` 之后活动区为空。"""
 

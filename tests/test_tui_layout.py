@@ -495,5 +495,57 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Ctrl+O", expanded)
 
 
+class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
+    """
+    T39：`Ctrl+O` 是**一个**全局开关，同时管活动区与历史区的工具行。
+
+    对齐 Claude Code 的全局 verbose 语义。两个键会让用户记两套，而这两处
+    展开的是同一类东西（「刚才具体做了什么」）。
+    """
+
+    async def test_toggle_broadcasts_to_mounted_tool_rows(self) -> None:
+        from tests.test_command_tui import _make_app
+
+        app, _ = _make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="grep_content", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"第 {i} 行" for i in range(20)))
+            await pilot.pause()
+            self.assertIn("+15 行", _text_of(widget))
+
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            self.assertNotIn("+15 行", _text_of(widget), "工具行也该跟着展开")
+            self.assertIn("第 19 行", _text_of(widget))
+
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            self.assertIn("+15 行", _text_of(widget), "再按一次要收回")
+
+    async def test_rows_finished_after_the_toggle_respect_it(self) -> None:
+        """
+        **顺序反证**：先按 `Ctrl+O`、后定色的行，也要按展开态画。
+
+        只广播给「当前挂着的行」而不记下全局状态的话，展开之后新产生的每一行
+        又会是折叠的——用户会以为开关时灵时不灵。
+        """
+        from tests.test_command_tui import _make_app
+
+        app, _ = _make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="grep_content", arguments={}))
+            await pilot.pause()
+            widget.finish(True, "\n".join(f"第 {i} 行" for i in range(20)))
+            await pilot.pause()
+
+            self.assertIn("第 19 行", _text_of(widget))
+
+
 if __name__ == "__main__":
     unittest.main()
