@@ -194,13 +194,28 @@ BINDINGS = [
 `ctrl+c → copy`，不用 priority 的话输入框聚焦时我们的动作根本不触发。
 
 **`action_request_quit`（双击）**
-1. 焦点组件有**选中文本** → 交给它的复制动作，**不计数、不提示**；
+1. **有选中文本** → 执行复制，**不计数、不提示**；
 2. 否则：距上次按下 ≤ `QUIT_CONFIRM_SECONDS`（2 秒）→ `self.exit()`；
 3. 否则 → 记时间戳 + 显示一行提示级消息「再按一次 Ctrl+C 退出」。
 
-⚠ **第 1 条是对 C2 那条护栏本意的兑现**：Textual 8.x 里 `Ctrl+C` 在输入框中用于
-复制选中文本，直接夺走它就是重新踩回「Ctrl+C 用于复制场景」那个坑。
-有选中文本时优先复制，两种用途各归各位。
+⚠ **「有选中文本」必须同时查两处，缺一不可**（实测确认是两套独立机制）：
+
+| 用户操作 | 判定来源 | 现有绑定 |
+| --- | --- | --- |
+| 鼠标在历史区拖选一段（抄报错 / 路径） | `screen.get_selected_text()` | `Screen.BINDINGS`: `ctrl+c → screen.copy_text` |
+| 输入框内 Shift+方向键选中自己打的字 | 焦点组件的 `selected_text` | `Input.BINDINGS`: `ctrl+c → copy` |
+
+两条都是 `priority=False`，因此**都会被我们的 `priority=True` 绑定盖掉**——
+不做分流的话，「Ctrl+C 复制」这个今天真实可用的功能会整个消失，
+而那正是 C2 护栏当年写下「Ctrl+C 用于复制场景」时指的东西。
+
+⚠ **「不计数」是这条设计的要害**：连续复制五次一次都不会靠近退出。
+反过来（复制也计入双击）会让「连按两次复制」意外退出程序，那个更糟。
+
+**已知代价（接受）**：屏幕上有选中内容时按两次 `Ctrl+C` 得到的是「复制两次」，
+不会退出；想退出需先清掉选中。相比「复制两次就退出」，这个方向更安全。
+另：第一次按下的提示文案必须写明是**退出**而不是取消——`Esc` 才是取消当前回合，
+两者不能让用户混淆。
 
 **护栏改写**（`tests/test_tui_keybindings.py`）
 - `test_ctrl_c_is_not_bound_to_quit` → `test_single_ctrl_c_never_quits`：
@@ -309,7 +324,7 @@ rhinecode/
 | 报告分级放哪 | 展示层纯函数，只看行的形状 | spec F16 要求报告产出函数一字不改（它们有大量逐字断言的护栏） |
 | 分级新增几个方法 | **一个** `show_event` | 提示（`show_message`）、警告（`show_warning`）、错误（`append_error`）都已存在，只缺中间一级 |
 | 面板高亮指示符怎么跟随 | `watch_highlighted` + `replace_option_prompt_at_index` | Textual 原生 API（已验证存在）；该方法不改 `highlighted`，不会自激 |
-| `Ctrl+C` 与复制的冲突 | 有选中文本时**先复制、不计数** | Textual 8.x 里 `Input` 自带 `ctrl+c → copy`；直接夺走就是重新踩回 C2 护栏那个坑 |
+| `Ctrl+C` 与复制的冲突 | 有选中文本时**先复制、不计数**；选中来源查 `Screen` 与焦点组件**两处** | Textual 8.x 里 `Screen` 与 `Input` 各有一条 `ctrl+c → copy`（都是 priority=False，会被我们盖掉）；直接夺走就是重新踩回 C2 护栏那个坑 |
 | `Ctrl+Q` 怎么取消 | `priority=True` 覆盖成空动作 | **实测**：退出行为来自 Textual 自带的 priority 绑定，不覆盖去不掉 |
 | 改名怎么做 | 词边界精确匹配，分两步提交 | 裸替换会打中 `notetaker`（C11 验收夹具），让验收记录与代码对不上号 |
 
