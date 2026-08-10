@@ -937,9 +937,58 @@ class RhineApp(App):
             return
         panel.show_for(event.prefix)
 
+    def _handle_digit_choice(self, event: Key) -> bool:
+        """
+        面板挂起时，把 `1`–`9` 当成「选中第 N 项」（tui-display 扩展 F23）。
+
+        :param event: 按键事件
+        :returns: 是否已消化本次按键。False 表示按原有路径继续处理
+
+        ## 三条不生效的情形，每一条都不能少
+
+        1. **没有面板挂起** —— 数字照常落进输入框（AC18c）。这是最要紧的一条：
+           拦错了的话用户再也打不出带数字的消息；
+        2. **可见的面板不是那三个之一** —— 命令补全面板从不取得焦点，
+           它的候选也不该被数字键选中；
+        3. **序号越界** —— 面板只有四项时按 `7` 什么都不该发生，
+           尤其不能环绕到第 1 项（那会让人误选）。
+
+        ⚠ **不新增结算路径**：命中后把高亮移过去，再调 OptionList 原生的
+        `action_select()`，走回车那条既有路径。另造一条的话，「按 2」与
+        「移过去按回车」会慢慢分叉，而分叉出来的那条没有护栏。
+
+        副作用：命中时移动面板高亮并触发一次选择结算。
+        """
+        if not (len(event.key) == 1 and event.key.isdigit() and event.key != "0"):
+            return False
+        panel = self._active_choice_panel()
+        if panel is None:
+            return False
+        index = panel.choice_index(int(event.key))
+        if index is None:
+            return False
+        event.stop()
+        panel.highlighted = index
+        panel.action_select()
+        return True
+
+    def _active_choice_panel(self):
+        """
+        当前挂着的可选面板（确认 / 澄清 / 会话），没有则 None。
+
+        ⚠ 判据用 `display` 而不是「有没有待决交互」：会话面板走的是另一条路径
+        （主线程发起、无 Worker 阻塞等待，见 `_settle_session`），
+        用 `_pending_interaction` 判会把它整个漏掉。
+        """
+        for panel_type in (ConfirmPanel, ClarifyPanel, SessionPanel):
+            panel = self.query_one(panel_type)
+            if panel.display:
+                return panel
+        return None
+
     def on_key(self, event: Key) -> None:
         """
-        处理特殊按键：运行中取消、命令面板导航。
+        处理特殊按键：面板数字键直选、运行中取消、命令面板导航。
 
         优先级：
         1. 有交互待决（确认/澄清/审批）或会话选择面板展示中 → 交给被聚焦的面板自身的
@@ -947,6 +996,20 @@ class RhineApp(App):
         2. 流式运行中 → Esc 触发取消当前 Agent 循环（spec F9）。
         3. 命令面板可见 → Up/Down 移动高亮、Esc 隐藏（焦点始终保持在 InputBar）。
         """
+        # 0. 数字键直选（tui-display 扩展 F23）。
+        #
+        # ⚠ **必须排在下面那条「交互待决 → return」守卫之前**，否则永远走不到
+        # ——面板挂起正是它唯一该生效的时候。
+        #
+        # 它**不新增任何结算路径**：把高亮移过去，再调 OptionList 原生的
+        # `action_select()`，走的仍是回车那条既有的
+        # `on_option_list_option_selected`。另造一条结算路径的话，
+        # 「按 2」与「移过去按回车」会慢慢分叉，而分叉出来的那条没有护栏。
+        #
+        # 无面板时不拦截（AC18c）：数字照常落进输入框。
+        if self._handle_digit_choice(event):
+            return
+
         # 1. 交互待决 / 会话选择面板展示中：让面板自己处理（它们各有 escape 绑定，
         #    上下键与回车由获得焦点的 OptionList 原生消化），不在此拦截
         if self._pending_interaction is not None or self._session_panel_active:

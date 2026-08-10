@@ -20,6 +20,7 @@ AC16/AC17/AC19）。
 
 from __future__ import annotations
 
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -319,6 +320,114 @@ class ContractUnchangedTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual([o.id for o in panel._options if o.id is not None], [])
+
+
+class DigitKeyTest(unittest.IsolatedAsyncioTestCase):
+    """
+    AC16b / AC18c：面板挂起时数字键直选；没有面板时数字照常进输入框。
+
+    ⚠ 用**真实的 App**（`test_command_tui` 那套桩件装出来的）而不是裸面板：
+    数字键的全部逻辑在 `RhineApp.on_key` 里，脱开它验的就只是 `choice_index`
+    ——那个已经由上面的 `NumberingTest` 钉过了。
+    """
+
+    def _app(self):
+        from tests.test_command_tui import _make_app
+
+        app, _manager = _make_app()
+        return app
+
+    @staticmethod
+    def _pending(kind: str = "confirm") -> dict:
+        """造一个形态与 `_interact` 一致的待决盒（结算方会读它的 kind）。"""
+        return {
+            "event": threading.Event(),
+            "result": None,
+            "kind": kind,
+            "source": "human",
+        }
+
+    async def test_digit_selects_the_matching_option(self) -> None:
+        app = self._app()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            box = self._pending()
+            app._pending_interaction = box
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "a.txt"}),
+                None,
+                _decision(),
+            )
+            # 与真实路径一致：面板弹出时 App 会把焦点移过去（见 `_interact`）。
+            # 不移的话按键被输入框吃掉，压根到不了 `App.on_key`——那验的是
+            # 另一件事（而且恰好是下面那条「无面板时数字进输入框」的机制）。
+            panel.focus()
+            await pilot.pause()
+
+            await pilot.press("2")
+            await pilot.pause()
+
+            from rhinecode.agent.events import ConfirmDecision
+
+            self.assertIsNone(app._pending_interaction, "结算之后待决盒应已清空")
+            self.assertIs(
+                box["result"],
+                ConfirmDecision.ALLOW_SESSION,
+                "按 `2` 必须结算成第二项「本会话放行」",
+            )
+
+    async def test_out_of_range_digit_does_nothing(self) -> None:
+        """
+        面板只有四项时按 `7` 什么都不该发生——**尤其不能环绕到第 1 项**，
+        那会让人误选。
+        """
+        app = self._app()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            app._pending_interaction = self._pending()
+            panel.show_for(ToolCall(id="c1", name="write_file", arguments={}), None, _decision())
+            panel.focus()
+            await pilot.pause()
+            highlighted = panel.highlighted
+
+            await pilot.press("7")
+            await pilot.pause()
+
+            self.assertIsNotNone(app._pending_interaction, "越界不该结算")
+            self.assertEqual(panel.highlighted, highlighted, "越界不该移动高亮")
+
+    async def test_digit_goes_to_the_input_when_no_panel(self) -> None:
+        """
+        **最要紧的一条反证**：没有面板时数字必须照常落进输入框。
+
+        拦错了的话用户再也打不出带数字的消息，而这在有面板的用例里完全测不出来。
+        """
+        from rhinecode.tui.widgets import InputBar
+
+        app = self._app()
+        async with app.run_test() as pilot:
+            bar = app.query_one(InputBar)
+            bar.focus()
+            await pilot.press("2")
+            await pilot.pause()
+
+            self.assertEqual(bar.value, "2")
+
+    async def test_zero_is_never_a_choice(self) -> None:
+        """`0` 不是任何一项的序号，它该照常进输入框。"""
+        from rhinecode.tui.widgets import InputBar
+
+        app = self._app()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(ToolCall(id="c1", name="write_file", arguments={}), None, _decision())
+            bar = app.query_one(InputBar)
+            bar.focus()
+            await pilot.pause()
+
+            await pilot.press("0")
+            await pilot.pause()
+            self.assertEqual(bar.value, "0")
 
 
 if __name__ == "__main__":
