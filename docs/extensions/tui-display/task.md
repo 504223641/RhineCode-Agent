@@ -43,6 +43,28 @@
 
 **验证：** 产出一份明确结论（有/无），写进本任务的执行记录。**结论未得出前不做 T20。**
 
+> ⚠ 上一行的「T20」是笔误，阻塞的是 **T15**（删「第 N 轮」）——T20 是活动区的
+> `ActivityRow`，与本任务无关。执行时按 T15 理解。
+
+**执行结论（2026-08-11）：无依赖，T15 可做。** 逐项证据：
+>
+> - `tests/` 与 `tests/e2e/` 中全部「第 N 轮」字样，均为**注释**或**测试自造的
+>   剧本文本**，无一条判据去读界面上那一行。
+> - `test_trace_reader.py::NonUtf8ConsoleTest` 出现 `"🔄 第 2 轮"`，但它是该用例
+>   **自己写进 JSONL 的夹具字符串**（验 GBK 控制台能否读完一份含 emoji 的记录），
+>   与产品是否产出这行无关。⚠ 该用例的 docstring 说「`ui_message` 正文天然带
+>   emoji」，本轮之后不再成立，T15 顺手改写那段说明、**保留用例**
+>   （trace 正文仍可能从别处带进 emoji，例如被读过的文件内容）。
+> - `test_e2e_control.py` 的三条 `ui_message` 护栏分别过滤
+>   `source == "assistant"` 或匹配「已更新记忆」；轮次行是另一条
+>   `source="system"`，删掉不影响。其中
+>   `test_no_duplicate_ui_message_when_tool_runs` 断言 assistant 正文**恰好两条**
+>   ——轮次行本就不在这个计数里。
+> - `tests/e2e/assertions.py::check_ui_contains` 的全部调用点只查
+>   `"review"` / `"seed.txt"` / `"三个函数"` 等具体内容，无一条查轮次。
+> - `test_e2e_host.py:378` 只断言 `ui_message` **这个类型存在**
+>   （user_echo 与 AI 正文都会产出），不看轮次。
+
 ---
 
 ## P1 · G 组：「笔记 → 记忆」改名（独立、机械，先做完以免后续任务在两套命名间摇摆）
