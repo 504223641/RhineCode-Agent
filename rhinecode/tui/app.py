@@ -254,6 +254,15 @@ class RhineApp(App):
         self._manager.clarify_callback = self._clarify
         self._manager.approve_plan_callback = self._approve_plan
 
+        # 工具行标题的主参数映射（tui-display 扩展 F12）。
+        #
+        # **只建一次**：工具集在启动装配完成之后不再变化（MCP 运行期重载只增删
+        # 远端工具，而远端工具一律没有 `primary_arg`，映射里本来就没有它们）。
+        # 必须排在 `render_history` **之前**——`--continue` 恢复出来的历史里
+        # 有工具行，晚一步的话首屏那批会用空映射画成键值对形态，与其后新产生的
+        # 行长得不一样，而这在界面上只表现为「上下两截风格不同」。
+        self.query_one(HistoryView).set_primary_args(self._manager.primary_arg_map())
+
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
         # 2. 记忆通知回调：记忆线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；

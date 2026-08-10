@@ -563,7 +563,12 @@ def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tup
     args = raw if isinstance(raw, dict) else {}
 
     # ── 分支 1：委派特例 ──
-    if name == _DELEGATE_TOOL:
+    #
+    # ⚠ 附加条件 `and args`：参数**还没到**（`tool_pending` 阶段 `arguments` 是
+    # None）时不走这一支。否则「角色名缺席 → 用分支占位名」那条规则会把一次
+    # 普通的角色委派在参数生成期显示成 `(branch)`——那是**错的信息**，
+    # 比显示内部名更糟。等 `tool_start` 带着参数到达时它自然转成角色名。
+    if name == _DELEGATE_TOOL and args:
         role = str(args.get(_DELEGATE_LABEL_KEY) or "").strip() or BRANCH_AGENT_NAME
         return escape(role), escape(_clip_value(args.get(_DELEGATE_VALUE_KEY) or ""))
 
@@ -610,19 +615,20 @@ class ToolCallWidget(Static):
     # 取值必须继续指向那一处，别改回字面量。
     _COLOR_BRANCH = SECONDARY_COLOR
 
-    def __init__(self, tool_call, pending: bool = False) -> None:
+    def __init__(self, tool_call, pending: bool = False, primary_args: "Optional[dict]" = None) -> None:
         """
         :param tool_call: provider.base.ToolCall，提供工具名与参数用于展示
         :param pending: True 表示「模型还在生成调用参数」，此时 tool_call.arguments
                         通常为 None，本行先只显示工具名；等 TOOL_START 到达时由
                         begin_running() 补上参数摘要并转入执行态
+        :param primary_args: `{工具名: 主参数键名}`（F12）。由 `HistoryView` 透传，
+                             缺省 None → 标题全部走键值对摘要，形态与改造前一致
         """
         super().__init__(markup=True)
         self._pending = pending
         self._name = tool_call.name
-        # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
-        self._label = escape(_TOOL_LABELS.get(self._name, self._name))
-        self._args_summary = summarize_args(tool_call.arguments)
+        self._primary_args = primary_args or {}
+        self._label, self._args_summary = resolve_call_title(tool_call, self._primary_args)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
         # ── 终态的完整素材（F41）──
@@ -668,7 +674,9 @@ class ToolCallWidget(Static):
         :param tool_call: 参数已完整的同一次调用（id 与本行一致）
         """
         self._pending = False
-        self._args_summary = summarize_args(tool_call.arguments)
+        # 标签也要重算：委派工具在 pending 阶段还不知道派给哪个角色，
+        # 参数到齐后标签才从内部名转成角色名（F12 分支 1）。
+        self._label, self._args_summary = resolve_call_title(tool_call, self._primary_args)
         self._start = monotonic()
         self._render_running()
 
@@ -846,6 +854,25 @@ class HistoryView(ScrollableContainer):
     update_widget() 原地更新该组件内容，实现逐字显示效果。
     """
 
+    # `{工具名: 主参数键名}`（F12）。由 `app.on_mount` 从工具注册中心建一次并调
+    # `set_primary_args` 灌进来——工具集在启动之后不再变化，故只建一份。
+    #
+    # 缺省空字典是**零回归的关键**：拿不到注册中心时（非 DeepSeek Provider）
+    # 它一直是空的，`resolve_call_title` 全部走键值对摘要兜底，工具行的形态
+    # 与改造前逐字一致。
+    _primary_args: dict = {}
+
+    def set_primary_args(self, mapping: dict) -> None:
+        """
+        接收「工具名 → 主参数键名」映射（F12）。
+
+        :param mapping: 由工具注册中心导出的一次性快照
+
+        副作用：只影响**此后**新建的工具行；已经画好的行不重绘
+        （启动时机决定了它总是在第一条消息之前被调用，实际不会出现半新半旧）。
+        """
+        self._primary_args = dict(mapping or {})
+
     def compose(self) -> ComposeResult:
         # 内层 Vertical 作为消息列表容器，便于统一清空（remove_children）
         yield Vertical(id="history-messages")
@@ -1001,7 +1028,9 @@ class HistoryView(ScrollableContainer):
         :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
         :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
         """
-        return self._mount_widget(ToolCallWidget(tool_call, pending=pending))
+        return self._mount_widget(
+            ToolCallWidget(tool_call, pending=pending, primary_args=self._primary_args)
+        )
 
     def append_system(self, text: str) -> None:
         """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
@@ -1052,23 +1081,30 @@ class HistoryView(ScrollableContainer):
         return Static(RichGroup(label, RichMarkdown(content)))
 
     @staticmethod
-    def _build_tool_record_widget(tool_call, result_summary: str) -> Static:
+    def _build_tool_record_widget(
+        tool_call, result_summary: str, primary_args: "Optional[dict]" = None
+    ) -> Static:
         """
         构造一条「历史工具调用记录」的简化静态行（回放场景）。
 
-        两行式：绿色 "● 标签(参数摘要)" + 灰色 "⎿ 结果首行摘要"。
+        两行式：绿色 "● 标签(主参数)" + 灰色 "⎿ 结果首行摘要"。
         刻意**不复用 ToolCallWidget**：它的 on_mount 会启动每秒计时器并重绘「执行中」
         状态——回放时 finish() 与挂载的时序无保证，终态会被 on_mount 覆盖且定时器
         永不停止（泄漏）。历史记录也没有耗时数据，简化行语义更贴切。
 
+        ⚠ **标题必须与实时工具行同口径**（都走 `resolve_call_title`）。
+        各拼一次的话，`/resume` 回放出来的工具行会与刚跑过的那条长得不一样——
+        与 `_build_user_widget` 那个成对维护点是同一类问题。
+
         :param tool_call: provider.base.ToolCall（提供工具名与参数）
         :param result_summary: 已截断的结果摘要（build_replay_items 产出）
+        :param primary_args: `{工具名: 主参数键名}`（F12）
         """
-        label = escape(_TOOL_LABELS.get(tool_call.name, tool_call.name))
-        # 标题行走 markup（label 与 summarize_args 的产出都已 escape，安全）；
+        label, inner = resolve_call_title(tool_call, primary_args)
+        # 标题行走 markup（resolve_call_title 的两个产出都已 escape，安全）；
         # 分支行用 RichText 纯文本拼接——结果摘要来自工具输出原文，可能含 "["，
         # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
-        header = f"[{ToolCallWidget._COLOR_OK}]● {label}({summarize_args(tool_call.arguments)})[/]"
+        header = f"[{ToolCallWidget._COLOR_OK}]● {label}({inner})[/]"
         branch = RichText(f"{BRANCH_PREFIX}{result_summary}", style=ToolCallWidget._COLOR_BRANCH)
         return Static(RichGroup(RichText.from_markup(header), branch))
 
@@ -1096,7 +1132,9 @@ class HistoryView(ScrollableContainer):
             elif kind == "assistant":
                 widgets.append(self._build_assistant_widget(item[1]))
             elif kind == "tool":
-                widgets.append(self._build_tool_record_widget(item[1], item[2]))
+                widgets.append(
+                    self._build_tool_record_widget(item[1], item[2], self._primary_args)
+                )
         if widgets:
             container.mount(*widgets)
         self._scroll_to_latest()

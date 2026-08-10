@@ -196,6 +196,16 @@ class FakeManager:
     def memory_report(self) -> str:
         return "记忆报告"
 
+    def primary_arg_map(self) -> dict:
+        """
+        工具行主参数映射（tui-display 扩展 F12）。
+
+        返回空字典 = **未启用工具能力**那一支，工具行全部走键值对摘要兜底
+        ——与本桩件其余部分（`subagent_service = None` 等）保持同一个前提：
+        这里模拟的是最小配置下的 App。
+        """
+        return {}
+
     # ---- c11 Skill 相关 ----
 
     def skill_status_segment(self):

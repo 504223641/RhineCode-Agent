@@ -819,6 +819,33 @@ class ConversationManager:
         registered = self._registry.names() if self._registry else frozenset()
         return self.skill_manager.prompt_report(registered)
 
+    def primary_arg_map(self) -> dict:
+        """
+        导出「工具名 → 主参数键名」映射，供工具行决定括号里显示什么
+        （tui-display 扩展 F12）。
+
+        :returns: `{工具名: 主参数键名}`；只收**声明过**的工具。
+            未启用工具能力（非 DeepSeek Provider）时返回空字典——展示层据此
+            全部走键值对摘要兜底，形态与改造前逐字一致
+
+        由 `RhineApp.on_mount` **只调一次**：工具集在启动装配完成之后不再变化
+        （MCP 运行期重载只增删远端工具，而远端工具一律没有 `primary_arg`）。
+
+        为什么走协调层而不是让 TUI 直接摸 `ToolRegistry`：依赖方向是
+        TUI → conversation → tools，反过来会让展示层认识工具注册中心。
+
+        副作用：无（只读快照）。
+        """
+        if self._registry is None:
+            return {}
+        mapping: dict = {}
+        for name in self._registry.names():
+            tool = self._registry.get(name)
+            key = getattr(tool, "primary_arg", "") if tool is not None else ""
+            if key:
+                mapping[name] = key
+        return mapping
+
     def skill_status_segment(self) -> Optional[str]:
         """状态栏的 Skill 段（形如 `Skill:2`）；无激活时 None，状态栏随之隐藏该段。"""
         return self.skill_manager.status_segment()
