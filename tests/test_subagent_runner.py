@@ -50,6 +50,9 @@ class _Reader(Tool):
     description = "fake"
     parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
     read_only = True
+    # 与真实 ReadFileTool 同口径：活动区的最近调用要显示成 `Read(a.py)`
+    # 而不是 `Read(path=a.py)`（tui-display 扩展 F12）
+    primary_arg = "path"
 
     def execute(self, args: dict) -> ToolResult:
         return ToolResult(ok=True, output="文件内容", summary="read")
@@ -237,6 +240,76 @@ class HappyPathTest(RunnerBase):
         )
         record = self._run(provider)
         self.assertGreaterEqual(record.turns, 1)
+
+
+class ToolCallCountTest(RunnerBase):
+    """
+    活动区那三个数字里的第三个（tui-display 扩展 F3/F5，AC3）。
+
+    运行器消费事件流时顺带数一下工具调用。它**不破坏**「子 Agent 的过程不渲染」
+    这条既有约束（spec F23）：只往任务表里记一个计数与几个短字符串，
+    没有任何事件被转发到主界面。
+    """
+
+    def test_counts_completed_calls(self) -> None:
+        provider = _SayProvider(
+            [
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.py"}),
+                ToolCall(id="c2", name="read_file", arguments={"path": "b.py"}),
+                "读完了。",
+            ]
+        )
+        record = self._run(provider)
+        self.assertEqual(record.tool_calls, 2)
+
+    def test_recent_tools_use_the_display_form(self) -> None:
+        """
+        最近列表存的是**已渲染的短文本**，形态与主对话工具行一致
+        （标签 + 主参数，不是 `键=值`）。
+
+        两处形态不一致的话，用户在活动区看到 `read_file(path=a.py)`、
+        在历史区看到 `Read(a.py)`，会以为是两回事。
+        """
+        provider = _SayProvider(
+            [ToolCall(id="c1", name="read_file", arguments={"path": "a.py"}), "好了"]
+        )
+        record = self._run(provider)
+
+        self.assertEqual(record.recent_tools, ("Read(a.py)",))
+
+    def test_stores_plain_text_not_escaped_markup(self) -> None:
+        """
+        ⚠ 存进去的必须是**纯文本**，转义留给渲染方（`ActivityView`）。
+
+        在这里转的话，那条路径会被转**两次**——用户看到字面的 `\\[`。
+        这也是「标签与主参数的判定下沉到 `tools/display.py`（纯文本）、
+        `tui/widgets.py` 只加一层转义」那次拆分的直接理由。
+        """
+        provider = _SayProvider(
+            [ToolCall(id="c1", name="read_file", arguments={"path": "src/[wip.py"}), "好了"]
+        )
+        record = self._run(provider)
+
+        self.assertEqual(record.recent_tools, ("Read(src/[wip.py)",))
+        self.assertNotIn("\\[", record.recent_tools[0])
+
+    def test_denied_call_is_still_counted(self) -> None:
+        """
+        **口径反证**：被权限拒绝的调用也要计入。
+
+        它压根走不到 `TOOL_START`（只产 `TOOL_RESULT`），但它同样烧掉了一轮
+        迭代与一次模型请求。取 `TOOL_START` 计数会让「跑了 15 轮却显示 0 次
+        调用」——而那正是最需要看清成本的场合。
+
+        `write_file` 是非只读工具，子 Agent 全程非交互、判 ASK 一律自动拒绝。
+        """
+        provider = _SayProvider(
+            [ToolCall(id="c1", name="write_file", arguments={"path": "a.py"}), "被拒了。"]
+        )
+        record = self._run(provider)
+
+        self.assertEqual(self.writer.executed, 0, "这次调用必须真的被拒了，用例才有效")
+        self.assertEqual(record.tool_calls, 1)
 
 
 class SystemPromptTest(RunnerBase):

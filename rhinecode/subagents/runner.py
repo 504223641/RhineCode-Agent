@@ -46,6 +46,7 @@ from rhinecode.subagents.toolset import ToolsetResult
 from rhinecode.team.gate import TeamGate
 from rhinecode.team.identity import bind_identity
 from rhinecode.team.models import MemberState
+from rhinecode.tools.display import primary_arg_map, resolve_call_parts
 from rhinecode.tools.path_guard import main_project_root
 from rhinecode.trace import NullRecorder, TraceEventType, full_text, subagent_scope
 from rhinecode.worktree import (
@@ -634,6 +635,9 @@ def run_subagent(
     recorder = runtime.recorder or NullRecorder()
     agent_label = spec.name if spec is not None else BRANCH_AGENT_NAME
     kind = KIND_ROLE if spec is not None else KIND_BRANCH
+    # 活动区展开时要画的「最近调用」用的映射（tui-display 扩展 F5）。
+    # **建一次**：本次运行期间工具集不变，每条 TOOL_RESULT 重建一遍纯属浪费。
+    primary_args = primary_arg_map(runtime.registry)
     turns = 0
     stop_reason = StopReason.COMPLETED
     status = TaskStatus.COMPLETED
@@ -769,6 +773,22 @@ def run_subagent(
                     tasks.bump(
                         record.task_id, tokens=getattr(event.usage, "total_tokens", 0)
                     )
+                elif event.type == AgentEventType.TOOL_RESULT:
+                    # 活动区那三个数字里的第三个（tui-display 扩展 F3）。
+                    #
+                    # ⚠ **取 TOOL_RESULT 而不是 TOOL_START**，两个理由：
+                    # ① 口径是「**已完成**的调用」——正在跑的那一次还没产生成本；
+                    # ② 被权限拒绝的调用**只产 TOOL_RESULT**（它压根走不到
+                    #    TOOL_START），而那些同样烧掉了一轮迭代，该计入。
+                    #
+                    # 渲染在**这里**做、传字符串进去，不是把 ToolCall 递给任务表
+                    # ——后者的加锁临界区只做纯内存读写（见 TaskManager 的不变量）。
+                    #
+                    # 这一支**不破坏**「子 Agent 的过程不渲染」那条既有约束
+                    # （spec F23）：它只往任务表里记一个计数与几个短字符串，
+                    # 没有任何事件被转发到主界面。
+                    label, inner = resolve_call_parts(event.tool_call, primary_args)
+                    tasks.note_tool(record.task_id, f"{label}({inner})")
                 elif event.type == AgentEventType.FINISHED:
                     stop_reason = event.stop_reason or StopReason.COMPLETED
 

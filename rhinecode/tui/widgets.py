@@ -40,6 +40,12 @@ from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
 from rhinecode.subagents.tasks import BRANCH_AGENT_NAME
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
+from rhinecode.tools.display import (
+    TOOL_LABELS,
+    clip_value,
+    resolve_call_parts,
+    summarize_args_plain,
+)
 
 
 # 「把一段纯文本安全地嵌进 markup 字符串」的转义正则：匹配任意 `[` 及其前导反斜杠。
@@ -97,24 +103,15 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     取每个参数 "键=值" 拼接，值过长则截断，整体再做长度上限截断，
     目的是让用户一眼看清工具将操作什么（如 path=...），而非展示完整内容。
 
+    判定本身在 `tools/display.py`（那份是纯文本、无转义，子 Agent 侧也要用它）；
+    这里只加一层**转义**。⚠ 转义必须留在这一侧且只做一次：产出会被拼进 markup
+    字符串，而参数值里的 `[` 全是字面量。
+
     :param arguments: 解析后的参数字典；None（解析失败）时返回占位提示
     :param max_len: 摘要最大长度，超出截断
-    :returns: 单行参数摘要字符串
+    :returns: 单行参数摘要字符串，**已转义**
     """
-    if arguments is None:
-        return "<参数解析失败>"
-    if not isinstance(arguments, dict):
-        return "<参数格式错误>"
-    parts = []
-    for key, value in arguments.items():
-        text = str(value).replace("\n", " ")
-        if len(text) > 30:
-            text = text[:30] + "…"
-        parts.append(f"{key}={text}")
-    summary = ", ".join(parts)
-    if len(summary) > max_len:
-        summary = summary[:max_len] + "…"
-    return escape(summary)
+    return escape(summarize_args_plain(arguments, max_len))
 
 
 # 回放时工具结果摘要的最大展示长度（取首行再截断，避免长结果撑爆历史区）
@@ -462,63 +459,23 @@ def numbered_prompt(index: int, text: str, selected: bool) -> str:
     return f"{mark}{index}. {text}"
 
 
-# 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签。
-# 这里是「展示层」的映射：
-# - 真实工具名仍是各工具的 name（API 用、注册中心用），此表只决定 UI 标题怎么写；
-# - 未登记的工具回退到原始名，保证新增工具即便忘了登记也不会显示异常。
+# 工具名 → 标题展示标签。**定义在 `tools/display.py`**，这里只是别名。
 #
-# 取值对齐 **Claude Code 的工具命名**（tui-display 扩展 F11）。用户在两边看到的
-# 是同一套词汇，不必在脑子里做一次翻译。`run_command` 由 `Run` 改成 `Bash`
-# 也是这个理由——`Run` 是本项目自造的词。
-#
-# ⚠ **无对应工具的刻意不登记**，别顺手补上：
-# - `mcp_add_server` / `mcp_resolve_server`：Claude Code 那边**根本没有对应物**，
-#   硬套一个标签等于凭空造出一条假的对应关系；
-# - `ask_user` / `present_plan`：那边叫 `AskUserQuestion` / `ExitPlanMode`。
-#   前者只是名字长，后者直译过来是「退出计划模式」，与本项目「提交计划**等待
-#   审批**」的语义不符——批准与否还没发生，说「退出」是错的。
-# - `run_agent`：走 `resolve_call_title` 的委派特例分支（标签取角色名），
-#   登记在这里只会变成一个永远用不到的死项。
-#
-# 判据是一句话：**宁可显示内部名，也不要一个会误导人的假标签。**
-_TOOL_LABELS = {
-    # 文件与检索
-    "read_file": "Read",
-    "write_file": "Write",
-    "edit_file": "Update",
-    "glob_files": "Glob",
-    "grep_content": "Grep",
-    # 命令与网络
-    "run_command": "Bash",
-    "web_fetch": "WebFetch",
-    # Skill（c11）
-    "load_skill": "Skill",
-    # 协作（c15）
-    "send_message": "SendMessage",
-    "task_create": "TaskCreate",
-    "task_list": "TaskList",
-    "task_get": "TaskGet",
-    "task_update": "TaskUpdate",
-}
+# 单一来源是必须的：`subagents/runner.py` 给活动区渲染子 Agent 的最近调用时
+# 用的是同一张表，而它**不能** import 本模块（会撞循环导入，见 display.py 的
+# docstring）。两处各写一份的话，同一个工具会在主对话与活动区显示成两个名字。
+_TOOL_LABELS = TOOL_LABELS
 
-
-# 主参数值的展示上限。比 `summarize_args` 的整体上限（60）宽松一档：那边要塞
-# 「键=值, 键=值」好几组，这里只有一个值，且这个值正是用户唯一要看的东西。
-_PRIMARY_ARG_MAX_CHARS = 72
 
 # 委派工具的特例（spec F12 第 2 条）。这三个字符串必须与 `tools/run_agent.py`
 # 的 `parameters` 对得上：`agent` 是角色名、`task` 是任务陈述。
+#
+# ⚠ **这一支刻意留在本模块、不下沉到 `tools/display.py`**：它要用到
+# `BRANCH_AGENT_NAME`，而 display.py import `subagents.tasks` 会成环。
+# 子 Agent 侧不受影响——`run_agent` 在 `GLOBAL_DENIED_TOOLS` 里，它调不到。
 _DELEGATE_TOOL = "run_agent"
 _DELEGATE_LABEL_KEY = "agent"
 _DELEGATE_VALUE_KEY = "task"
-
-
-def _clip_value(value: object, max_chars: int = _PRIMARY_ARG_MAX_CHARS) -> str:
-    """把一个参数值压成单行并按上限截断（换行折成空格，与 `summarize_args` 同口径）。"""
-    text = str(value).replace("\n", " ").replace("\r", " ").strip()
-    if len(text) > max_chars:
-        text = text[:max_chars] + "…"
-    return text
 
 
 def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tuple[str, str]":
@@ -534,22 +491,21 @@ def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tup
 
     ## 三条分支，顺序固定
 
-    1. **委派特例**：`run_agent` 的标签取**角色名**、括号里放**任务描述**，
-       于是委派的工具行与活动区那条终态留痕行**天然同形**——用户在两个时刻
-       看到的是同一个东西，不用在脑子里做一次对应（这也是 Claude Code 的做法：
-       把 agent 类型当标签）。角色名缺席（分支式委派）时用占位名。
-    2. **已声明主参数**：`primary_args` 里登记了该工具、且本次调用真的带了那个键
-       且值非空 → 括号里放该值。
-    3. **兜底**：回退到既有的 `summarize_args` 键值对摘要。
-       这是**安全兜底**——新增工具忘了声明 `primary_arg` 时显示形态退回改造前，
-       而不是显示成 `Read()` 这种「看起来像无参调用」的异常形态。
+    1. **委派特例**（本函数自己处理）：`run_agent` 的标签取**角色名**、括号里放
+       **任务描述**，于是委派的工具行与活动区那条终态留痕行**天然同形**——
+       用户在两个时刻看到的是同一个东西，不用在脑子里做一次对应（这也是
+       Claude Code 的做法：把 agent 类型当标签）。角色名缺席（分支式委派）
+       时用占位名。
+    2 与 3（已声明主参数 / 回退键值对摘要）由 `tools/display.resolve_call_parts`
+    判定——那份是**纯文本**内核，`subagents/runner.py` 给活动区渲染时用的是
+    同一份。本函数只在它外面加一层**转义**。
 
     :param tool_call: `provider.base.ToolCall`，提供 `name` 与 `arguments`
     :param primary_args: `{工具名: 主参数键名}`，由 `app.on_mount` 从工具注册中心
-        建一次（工具集启动后不变）。为 None / 空字典时**全部走分支 3**，
+        建一次（工具集启动后不变）。为 None / 空字典时**全部走兜底分支**，
         因此非 DeepSeek Provider（拿不到注册中心）下行为与改造前逐字一致
     :returns: `(标签, 括号内文本)`，**两者都已经过本模块的 `escape`**，可直接拼进
-        markup。括号内文本可能为空串（调用方据此决定写不写括号）
+        markup
 
     副作用：无（纯函数）。
 
@@ -570,19 +526,10 @@ def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tup
     # 比显示内部名更糟。等 `tool_start` 带着参数到达时它自然转成角色名。
     if name == _DELEGATE_TOOL and args:
         role = str(args.get(_DELEGATE_LABEL_KEY) or "").strip() or BRANCH_AGENT_NAME
-        return escape(role), escape(_clip_value(args.get(_DELEGATE_VALUE_KEY) or ""))
+        return escape(role), escape(clip_value(args.get(_DELEGATE_VALUE_KEY) or ""))
 
-    label = escape(_TOOL_LABELS.get(name, name))
-
-    # ── 分支 2：已声明主参数 ──
-    key = (primary_args or {}).get(name)
-    if key:
-        value = args.get(key)
-        if value is not None and str(value).strip():
-            return label, escape(_clip_value(value))
-
-    # ── 分支 3：兜底（summarize_args 内部已 escape）──
-    return label, summarize_args(raw)
+    label, inner = resolve_call_parts(tool_call, primary_args)
+    return escape(label), escape(inner)
 
 
 class ToolCallWidget(Static):

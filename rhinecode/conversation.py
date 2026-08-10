@@ -34,6 +34,7 @@ from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
+from rhinecode.tools.display import primary_arg_map
 from rhinecode.tools.registry import ToolRegistry
 # c14：协调层定位存盘/存档/角色目录与环境信息，一律是主项目根——
 # 主对话的工作目录是不变量（spec F4），隔离只发生在子 Agent 那一侧。
@@ -836,15 +837,7 @@ class ConversationManager:
 
         副作用：无（只读快照）。
         """
-        if self._registry is None:
-            return {}
-        mapping: dict = {}
-        for name in self._registry.names():
-            tool = self._registry.get(name)
-            key = getattr(tool, "primary_arg", "") if tool is not None else ""
-            if key:
-                mapping[name] = key
-        return mapping
+        return primary_arg_map(self._registry)
 
     def skill_status_segment(self) -> Optional[str]:
         """状态栏的 Skill 段（形如 `Skill:2`）；无激活时 None，状态栏随之隐藏该段。"""
