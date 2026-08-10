@@ -1009,7 +1009,7 @@ class RhineApp(App):
         本方法运行在独立线程，所有 UI 操作通过 call_from_thread() 调度到主线程。
 
         渲染策略：
-        - PROGRESS：进入新一轮——重置正文/思考占位组件，使新一轮文本另起新块；第 2 轮起追加一行提示
+        - PROGRESS：进入新一轮——重置正文/思考占位组件，使新一轮文本另起新块
         - THINKING / TEXT：增量更新对应占位组件（思考灰色斜体、正文 Markdown）
         - TOOL_PENDING：模型刚开始生成该调用的参数（可能持续几十秒）——立刻建一行
           橘色「参数生成中… Ns」，这是那段时间里界面上唯一的活体信号
@@ -1085,12 +1085,19 @@ class RhineApp(App):
                     )
 
                 if etype == AgentEventType.PROGRESS:
+                    # ⚠ `reset_text_widgets()` **必须保留**：它负责让新一轮的正文
+                    # 另起一块。删掉会让相邻两轮的正文粘在一起，看起来像一段话。
+                    #
+                    # 这里原本还追加一行「🔄 第 N 轮」（tui-display 扩展 F42 已删除）。
+                    # 那是 Agent Loop 的**内部结构**，对用户没有任何可操作信息，
+                    # 而一次十几轮的运行会因此多出十几行，把真正有内容的工具行挤下去。
+                    # Claude Code 没有对应物。「循环仍在推进」这件事由工具行本身
+                    # 与子 Agent 活动区表达，都比一个轮次序号具体。
+                    #
+                    # 删之前查过 trace 与 e2e 判据有无依赖它产出的那条 `ui_message`
+                    # （task.md 的 T1）：结论是**无依赖**——全部「第 N 轮」字样要么是
+                    # 注释，要么是测试自造的剧本文本或 JSONL 夹具。
                     reset_text_widgets()
-                    # 第 2 轮起显示一行进度提示，标示循环在自主推进
-                    if event.iteration >= 2:
-                        line = f"🔄 第 {event.iteration} 轮"
-                        self._trace_ui_message("system", line)
-                        self.call_from_thread(history_view.append_system, line)
 
                 elif etype == AgentEventType.THINKING:
                     if thinking_widget is None:
