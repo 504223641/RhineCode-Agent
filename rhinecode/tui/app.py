@@ -61,6 +61,7 @@ from rhinecode.trace import (
     full_text,
 )
 from rhinecode.tui.widgets import (
+    ActivityView,
     HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
     SessionPanel, compose_status_text,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
@@ -129,6 +130,24 @@ class RhineApp(App):
     HistoryView > Vertical {
         height: auto;
         min-height: 100%;
+    }
+    /*
+     * 子 Agent 活动区（tui-display 扩展 F1）。
+     *
+     * `display: none` 是缺省态——不使用子 Agent 的用户永远看不到它，
+     * 布局与改造前逐字一致（F9 零回归）。可见性由 `ActivityView.update_rows`
+     * 按「有没有行」切换。
+     *
+     * 顶部分隔线用灰色而不是主题青：它是**观测区**不是交互区，
+     * 与下面那几个等着人应答的面板必须在视觉上分得开。
+     */
+    ActivityView {
+        height: auto;
+        max-height: 12;
+        display: none;
+        border: none;
+        border-top: tall #808080 60%;
+        padding: 0 1;
     }
     CommandPanel {
         height: auto;
@@ -228,10 +247,19 @@ class RhineApp(App):
         # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
         # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
         self._last_subagent_count = 0
+        # 全局展开开关（tui-display 扩展 F5/F41，`Ctrl+O`）。
+        # **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
+        # verbose 语义，两个键会让用户记两套。
+        self._expanded = False
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
         yield HistoryView()
+        # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
+        #
+        # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
+        # 放历史区上方的话，它空转时会白占两行，而且位置会随历史区滚动跳动。
+        yield ActivityView()
         yield CommandPanel(self._command_registry)
         yield ConfirmPanel()
         yield ClarifyPanel()
@@ -548,10 +576,29 @@ class RhineApp(App):
             # （spec N6 的落实方式，见 spec 里那段措辞修订）。
             for notice in self._manager.team_drain_notices():
                 self.show_message(notice)
+            # tui-display 扩展 F4：活动区的数据也搭这趟车。
+            # **不新增定时器**——空闲会话的开销必须与改造前一致。
+            self._refresh_activity()
             self._maybe_auto_wake()
         except Exception:
             # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断定时器。
             pass
+
+    def _refresh_activity(self) -> None:
+        """
+        把子 Agent 活动区刷成任务表当前的样子（tui-display 扩展 F4/N7）。
+
+        由 `_poll_subagents` 在**主线程**调用，与完成通知共用同一个 0.5 秒节拍。
+
+        ⚠ **本方法只做纯内存读取与组件更新**（N7）：不做 IO、不发请求、
+        不调 `call_from_thread`。它跑在每 0.5 秒都会执行的路径上，
+        往里加任何一件慢事都会让整个界面卡顿。
+
+        副作用：重绘活动区组件。
+        """
+        self.query_one(ActivityView).update_rows(
+            self._manager.subagent_activity(), self._expanded
+        )
 
     def _maybe_auto_wake(self) -> None:
         """
