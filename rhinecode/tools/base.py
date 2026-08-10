@@ -141,6 +141,29 @@ class Tool(ABC):
 
                  之所以做成工具自己声明的标志、而不是在循环里按名字判断：
                  循环不该认识任何具体工具的名字，那会让 agent 层反向依赖 skills 层。
+
+    - primary_arg：**界面上要显示哪一个参数的值**。缺省空串 = 未声明
+                 （tui-display 扩展 F12）。
+
+                 取值必须是 `parameters` 里真实存在的属性名。工具行的标题会写成
+                 `标签(该参数的值)`——例如 `read_file` 声明 `"path"` 之后显示成
+                 `Read(rhinecode/tui/app.py)`，而不是改造前那种
+                 `Read(path=rhinecode/tui/app.py, offset=10)`。
+
+                 **怎么选**：挑「用户扫一眼就知道这次调用在动什么」的那一个。
+                 通常是路径、模式、命令、地址、收件人——**不是**内容、不是选项。
+                 一个反例：`write_file` 选 `path` 而不是 `content`，
+                 后者可能是整份文件。
+
+                 **不声明是安全的**：界面会回退到既有的键值对摘要
+                 （`tui/widgets.py` 的 `summarize_args`），形态与改造前一致。
+                 之所以留这条兜底，是因为「新增工具忘了声明」必然会发生，
+                 而它的后果应该是「显示得没那么好看」，不该是
+                 `Read()` 这种看起来像无参调用的异常形态。
+
+                 与 `_TOOL_LABELS`（内部名 → 展示标签）的分工：那张表在展示层，
+                 因为它是纯粹的用词选择；这个字段在工具本体，因为**只有工具自己
+                 知道哪个参数最重要**，而且改参数时它就在眼前、不容易漏。
     """
 
     name: str = ""
@@ -150,6 +173,7 @@ class Tool(ABC):
     system_serial: bool = False
     plan_safe: bool = False
     workspace_aware: bool = False
+    primary_arg: str = ""
 
     @abstractmethod
     def execute(self, args: dict) -> ToolResult:

@@ -56,6 +56,8 @@ class SendMessageTool(Tool):
     system_serial = True
     # 规划阶段仍开放，但**收件人受限**——见 `execute` 的 `plan_stage` 分支。
     plan_safe = True
+    # 显示收件人：一屏里同时躺着好几条消息时，「发给谁」是唯一分得开它们的东西
+    primary_arg = "to"
 
     # ## ⚠ 与 `team/render.py` 的标记块同口径（见模块 docstring）
     #

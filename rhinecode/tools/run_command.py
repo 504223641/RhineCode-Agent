@@ -100,6 +100,7 @@ class RunCommandTool(Tool):
     read_only = False
     # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
     workspace_aware = True
+    primary_arg = "command"
 
     def execute(self, args: dict, cwd=None) -> ToolResult:
         """

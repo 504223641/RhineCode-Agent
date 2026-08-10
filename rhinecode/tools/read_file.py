@@ -43,6 +43,8 @@ class ReadFileTool(Tool):
     read_only = True
     # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
     workspace_aware = True
+    # 界面上只显示路径（F12）——offset/limit 对「这次在读什么」没有信息量
+    primary_arg = "path"
 
     def execute(self, args: dict, cwd=None) -> ToolResult:
         """

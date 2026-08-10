@@ -57,6 +57,7 @@ class GlobTool(Tool):
     read_only = True
     # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
     workspace_aware = True
+    primary_arg = "pattern"
 
     def __init__(self, path_filter: PathFilter | None = None):
         self._path_filter = path_filter
