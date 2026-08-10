@@ -339,6 +339,65 @@ class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(widget._summary.split("\n")), 20)
 
 
+class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
+    """
+    AC11：终态耗时不足一秒时**整个括号不出现**（F13）。
+
+    改造前每一行都挂着 `(0s)`——绝大多数工具调用是毫秒级的（实测 write_file
+    从 tool_start 到 tool_result 只隔 2 毫秒），那个恒为零的括号是纯噪音，
+    还会把真正跑了很久的那几行淹掉：一屏十个 `(0s)` 里夹着一个 `(43s)`，
+    反而不显眼了。
+    """
+
+    async def test_sub_second_call_has_no_parenthesis(self) -> None:
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="read_file", arguments={"path": "a"}))
+            await pilot.pause()
+            widget.finish(True, "读取 1 行")
+            await pilot.pause()
+
+            text = _text_of(widget)
+            self.assertIn("完成", text)
+            self.assertNotIn("(0s)", text)
+            self.assertNotIn("0s", text)
+
+    async def test_slow_call_still_shows_the_seconds(self) -> None:
+        """超过一秒的照常显示——那正是这个数字有信息量的场合。"""
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(ToolCall(id="c1", name="run_command", arguments={"command": "x"}))
+            await pilot.pause()
+            # 把起点往前推 3 秒，等价于「这次调用跑了 3 秒」
+            widget._start -= 3.0
+            widget.finish(True, "跑完了")
+            await pilot.pause()
+
+            self.assertIn("(3s)", _text_of(widget))
+
+    async def test_running_timer_is_untouched(self) -> None:
+        """
+        **反证**：执行中的实时计时不受影响。
+
+        那是模型生成参数 / 等确认面板的那段时间里界面上唯一的活体信号，
+        从 0s 开始涨正是它的价值所在。把 F13 的规则误加到那边，用户会重新
+        看到一个几十秒完全静止的窗口——正是 tool_pending 那条护栏当初要解决的问题。
+        """
+        app = _ToolHarness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            widget = view.add_tool_widget(
+                ToolCall(id="c1", name="write_file", arguments=None), pending=True
+            )
+            await pilot.pause()
+
+            text = _text_of(widget)
+            self.assertIn("参数生成中", text)
+            self.assertIn("0s", text)
+
+
 class SummarizeResultTest(unittest.TestCase):
     """
     T14：`_summarize_result` 交出全文，把「省略」整个交给展示层。
