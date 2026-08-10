@@ -30,6 +30,7 @@ from rhinecode.team.render import (
     render_board,
     render_incoming,
     render_roster,
+    render_team_brief,
 )
 
 
@@ -321,6 +322,65 @@ class ServiceTest(unittest.TestCase):
         self.service.register_member("ro", "explorer", read_only=True)
         self.assertTrue(self.service.is_read_only("ro"))
         self.assertFalse(self.service.is_read_only("查无此人"))
+
+
+class TeamBriefTest(unittest.TestCase):
+    """
+    134「组队协作」槽位的触发口径护栏（2026-08-10 新增）。
+
+    ## 为什么此前没有护栏，而现在必须有
+
+    这一段是 C15 真实模型验收后补的，措辞刻意 pushy（「拿不准时倾向组队」），
+    而**它一直没有测试覆盖**——于是它与另两处（135 角色清单 / `run_agent`
+    的描述）是否同口径，全靠人读注释保证。
+
+    2026-08-10 三处一起从「推动委派」反转成「默认不委派」时，这一段
+    差点被漏掉：`SameVoiceTest` 只覆盖前两处，改完照样全绿，
+    而漏改的后果是**模型在单件委派上克制、在组队上照旧激进**——
+    界面上完全看不出来，只表现为「怎么还是动不动就派一队人」。
+
+    因此本类钉住它与另两处共用同一套触发口径。
+    """
+
+    def setUp(self) -> None:
+        self.brief = render_team_brief()
+
+    def test_defaults_to_not_forming_a_team(self) -> None:
+        """①**默认不组队**，与 `SameVoiceTest` 的第①条同口径。"""
+        self.assertIn("默认不要组队", self.brief)
+
+    def test_names_the_user_asking_as_a_trigger(self) -> None:
+        """②**用户开口**是触发路径之一。"""
+        self.assertIn("用户开口", self.brief)
+
+    def test_explains_the_cold_start_cost(self) -> None:
+        """
+        ③**冷启动成本**——组队是委派的放大版，每个队员各冷启动一次。
+
+        不说清楚的话模型会把「多派一个人」算成近乎免费。
+        """
+        self.assertIn("冷启动", self.brief)
+
+    def test_rejects_superficial_split_as_a_signal(self) -> None:
+        """
+        ④「任务字面上分成了三条」**不构成**组队信号。
+
+        这一条专治本次用户反馈的症状。⚠ 它与旧版**正好相反**：
+        旧版的判断依据就是「任务之间相不相干」，而那恰恰是让模型把
+        「三件各自一两步的小事」也当成组队信号的那句话。
+        """
+        self.assertIn("不构成组队信号", self.brief)
+
+    def test_no_longer_pushes_teaming(self) -> None:
+        """
+        **反证**：不得再出现旧版的推力措辞。
+
+        与 `SameVoiceTest::test_neither_pushes_delegation_anymore` 同理——
+        `skills/render.py` 那一侧刻意保持 pushy，措辞相近，容易被抄回来。
+        """
+        for banned in ("倾向组队", "不是活多不多"):
+            with self.subTest(phrase=banned):
+                self.assertNotIn(banned, self.brief)
 
 
 if __name__ == "__main__":

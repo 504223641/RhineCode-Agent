@@ -218,72 +218,111 @@ class SameVoiceTest(unittest.TestCase):
     """
     ⚠ **成对维护点的护栏**：工具描述与清单表头必须同口径。
 
-    这两处是模型决定「要不要委派」时读到的唯一两处文本。C11 已经踩过一次：
-    一处写成公告式、另一处写成指令式，模型按弱的那份行事，系统性欠触发。
+    这两处是模型决定「要不要委派」时读到的唯一两处文本。一处写得强、
+    另一处写得弱，模型会按弱的那份行事。
 
-    断言的是**四层意思**而不是逐字固化——措辞可以打磨，这四层不能丢。
+    ## ⚠ 2026-08-10：这一组断言整个反转过，别照着旧版本推理
+
+    原先钉的是**四条推力**（命中就委派 / 用户不必点名 / 拿不准就委派 /
+    不要先看一眼再决定），为的是对抗 C13/C15 验收观测到的**欠触发**。
+
+    **那四条把模型推到了另一个极端**：用户实测「一个非常简单的任务都要让子
+    Agent 去做」。⚠ 关键事实是**欠触发与过触发出自同一个模型**
+    （`deepseek-v4-flash`），所以问题不在模型强弱，在于那四条**单向**——
+    只写了该委派的理由，还点名禁掉了模型自己会用的两个刹车。
+
+    现在钉的是对齐 Claude Code `Agent` 工具的四层意思。措辞可以打磨，
+    这四层不能丢。完整论证见 `subagents/render.py` 的模块 docstring。
     """
 
     def setUp(self) -> None:
         self.header = "\n".join(_INDEX_HEADER)
         self.desc = RunAgentTool.description
 
-    def test_both_say_delegate_instead_of_doing_it_yourself(self) -> None:
-        """①「用它替代你自己动手」——最关键的一句，少了它模型会把委派当可选项。"""
-        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
-            with self.subTest(where=label):
-                self.assertIn("而不是自己动手做", text)
-
-    def test_both_say_user_need_not_name_it(self) -> None:
-        """②「用户不必点名」。"""
-        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
-            with self.subTest(where=label):
-                self.assertIn("不必明确说", text)
-
-    def test_both_say_when_unsure_delegate(self) -> None:
-        """③「拿不准就委派」。"""
-        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
-            with self.subTest(where=label):
-                self.assertIn("倾向委派", text)
-
-    def test_both_forbid_looking_first(self) -> None:
+    def test_both_default_to_not_delegating(self) -> None:
         """
-        ⑤ **「不要先看一眼再决定」**——真实模型验收实测加上的一条。
+        ①**默认不委派**——最关键的一条，它决定模型在灰色地带倒向哪边。
 
-        观测到的失败：模型判断对了（「适合委派给 explorer」），但接着说
-        「不过在此之前，我先快速看一下项目结构」，读完 7 个文件之后反过来
-        用「项目不大」证明自己不该委派。**一旦读了，委派的价值就已经归零**，
-        这是个与判断力无关的结构性滑坡。
-
-        原措辞还喂了它一个数字借口（「二十个文件」），7 个当然「不到二十」——
-        那个锚点已经一并去掉。
+        对应 Claude Code 的「Do not spawn agents unless the user asks」。
         """
         for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
             with self.subTest(where=label):
-                self.assertIn("先看一眼再决定", text)
-                self.assertIn("不是项目大小", text)
+                self.assertIn("默认不要委派", text)
+
+    def test_both_name_the_user_asking_as_the_main_trigger(self) -> None:
+        """
+        ②**用户开口是主要触发路径**。
+
+        与旧版的「用户不必明确说」正好相反，这是本次反转最直接的一处。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            with self.subTest(where=label):
+                self.assertIn("用户开口", text)
+
+    def test_both_explain_the_cold_start_cost(self) -> None:
+        """
+        ③ 说明**冷启动成本**——这是模型算得清的那本账。
+
+        旧版把委派算成「多一次调用」（近乎免费），模型据此永远选委派。
+        对应 Claude Code 的「starts cold and re-derives context you already
+        have — it's the expensive path」。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            with self.subTest(where=label):
+                self.assertIn("冷启动", text)
+
+    def test_both_reject_multi_part_tasks_as_a_signal(self) -> None:
+        """
+        ④「活分成好几部分 / 用户说了彻底、全面」**不构成**委派信号。
+
+        对应 Claude Code 的「A task with "multiple angles," "thorough," or
+        several parts is not a request to spawn; handle it inline」。
+        这一条专治本次用户反馈的症状：简单任务被字面匹配成「调研类」派出去。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            with self.subTest(where=label):
+                self.assertIn("不构成委派信号", text)
+                self.assertIn("彻底", text)
+
+    def test_both_give_a_countable_floor(self) -> None:
+        """
+        **可数的下限**：一两次工具调用能做完的活自己做。
+
+        `docs/todo/3-team-adoption.md` 留下的线索：模型对**有具体可匹配项**
+        的指令遵循得好，对抽象判断（「任务之间相不相干」）系统性偷懒。
+        所以刹车必须给成可数的，不能只说「简单的活自己做」。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            with self.subTest(where=label):
+                self.assertIn("一两次工具调用", text)
+
+    def test_neither_pushes_delegation_anymore(self) -> None:
+        """
+        **反证**：两处都不得再出现旧版的推力措辞。
+
+        ⚠ 这条反证有具体的现实针对性：`skills/render.py` 的清单表头
+        **刻意保持 pushy**（「用户不必明确说」原样留着），措辞几乎一样、
+        文件就在隔壁。下一个人极容易「统一口径」把它抄回来。
+
+        两者的成本结构相反：加载 Skill 只是往上下文加一段文本（便宜、可逆），
+        委派要起一整条子对话并冷启动（贵）。Claude Code 自己也是这么分的。
+        """
+        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
+            for banned in ("倾向委派", "用户不必明确说", "而不是自己动手做"):
+                with self.subTest(where=label, phrase=banned):
+                    self.assertNotIn(banned, text)
 
     def test_neither_anchors_on_a_file_count(self) -> None:
         """
-        **反证**：两处都不得再出现具体的文件数量锚点。
+        **反证**：两处都不得出现具体的文件数量锚点。
 
-        写「二十个文件」会让模型拿实际数量去比对，从而给自己找到不委派的理由。
-        代价要按**机制**说（内容常驻上下文、每轮重发），而不是按数量说。
+        这条从旧版**原样保留**，理由在反转后依然成立：给一个具体数字，
+        模型就会拿实际数量去比对，从而给自己找到一个与真实成本无关的借口。
+        成本要按**机制**说（冷启动、重新推导背景）。
         """
         for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
             with self.subTest(where=label):
                 self.assertNotIn("二十个文件", text)
-
-    def test_both_explain_the_context_cost(self) -> None:
-        """
-        ④ 说明**上下文成本**——那是委派唯一真正的收益。
-
-        不讲清楚的话模型无从权衡「多一次调用」与「省下的上下文」，
-        默认会选自己动手（少一次调用）。
-        """
-        for text, label in ((self.header, "清单表头"), (self.desc, "工具描述")):
-            with self.subTest(where=label):
-                self.assertIn("上下文", text)
 
 
 class IndexRenderTest(unittest.TestCase):
