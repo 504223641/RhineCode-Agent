@@ -65,6 +65,21 @@ KIND_BRANCH = "branch"
 # 分支式委派没有角色名，展示与作用域都用这个占位。
 BRANCH_AGENT_NAME = "(branch)"
 
+# ---------------------------------------------------------------------------
+# 活动区的两个上限（tui-display 扩展 F5/F6 / N5「一切展示都有界」）
+# ---------------------------------------------------------------------------
+# 展开活动区时，每条任务下方最多列出这么多次最近的工具调用。
+# 一个跑了 20 轮的子 Agent 可能调过上百次工具，全列出来会把活动区涨到比历史区
+# 还高；而用户在这里要的只是「它最近在动什么」，最近几条就够了。
+ACTIVITY_RECENT_LIMIT = 5
+# 任务结束后，那一行在活动区里继续停留多少秒才消失。
+#
+# 为什么要停留而不是立刻消失：终态行带着最终成本（次数 / token / 耗时），
+# 立刻消失的话用户什么都来不及看。为什么又不是永久留着：活动区是「现在在发生
+# 什么」，留着终态行会让它慢慢变成第二个历史区——**永久痕迹由历史区那条记录
+# 承担**（F6，两处成本数字同源）。
+ACTIVITY_LINGER_SECONDS = 5.0
+
 
 @dataclass
 class TaskRecord:
@@ -74,6 +89,8 @@ class TaskRecord:
     **可变**（与包内其它数据类不同）：运行器会在跑的过程中更新轮次与用量，
     TUI 轮询与 `/agents` 会读它。所有读写都经 `TaskManager` 的锁。
 
+    :param tool_calls: 已完成的工具调用次数（活动区那三个数字之一）
+    :param recent_tools: 最近若干次调用的已渲染短文本，有界。见字段处的注释
     :param task_id: 短标识，模型与用户都用它指代任务
     :param kind: `role` / `branch`
     :param agent_name: 角色名；分支式为 `(branch)`
@@ -136,6 +153,21 @@ class TaskRecord:
     # 为真时 Agent Loop 在准备自然结束前会停下来等它（见 agent/gate.py）；
     # `background=true` 置假——那是模型明说过不等的，循环不该为它停留。
     awaited: bool = True
+    # ── 活动区用的两个字段（tui-display 扩展 F3/F5）──
+    #
+    # `tool_calls`：这个子 Agent **已完成**的工具调用次数。它与 `turns` /
+    # `usage_tokens` 一起构成活动行那三个数字，共同点是「不用理解内容就能判断
+    # 它在动、动得快不快」。
+    tool_calls: int = 0
+    # `recent_tools`：最近若干次调用的**已渲染短文本**（如 `"Grep(Layer)"`），
+    # 供活动区展开时逐条列出。有界，见 `ACTIVITY_RECENT_LIMIT`。
+    #
+    # ⚠ **存的是渲染好的字符串，不是 `ToolCall` 对象。** 理由与 `worktree_path`
+    # 只存字符串完全相同：`TaskRecord` 的读写都在 `TaskManager` 的加锁临界区内，
+    # 而那里的硬不变量是**只做纯内存读写**。放一个 `ToolCall` 进去，是在诱导
+    # 后来的人在锁内做参数摘要与 markup 转义——那两件事都要调别处的函数，
+    # 而本项目已经因为「临界区里做了不该做的事」死锁过四次。
+    recent_tools: tuple[str, ...] = ()
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
 
@@ -268,6 +300,32 @@ class TaskManager:
                 record.turns = turns
             if tokens:
                 record.usage_tokens += tokens
+
+    def note_tool(self, task_id: str, rendered: str) -> None:
+        """
+        记一次**已完成**的工具调用（tui-display 扩展 F3/F5）。
+
+        :param task_id: 任务标识
+        :param rendered: **已经渲染好**的短文本，如 `"Grep(Layer)"`。
+            渲染（含 markup 转义）必须由调用方在**锁外**做完再传进来
+
+        计数与最近列表一起更新；最近列表尾部追加并裁到
+        `ACTIVITY_RECENT_LIMIT`（N5「一切展示都有界」）。
+
+        未知标识或已终态的任务静默忽略，与 `bump` 同口径——运行器的事件消费
+        循环可能在任务被取消之后才处理完最后几个事件，为此抛异常会让它在收尾
+        路径上炸掉。
+
+        副作用：改记录字段。**只做纯内存读写**，不调任何回调、不做任何 IO。
+        """
+        with self._lock:
+            record = self._tasks.get(task_id)
+            if record is None or record.status.is_terminal:
+                return
+            record.tool_calls += 1
+            record.recent_tools = (record.recent_tools + (rendered,))[
+                -ACTIVITY_RECENT_LIMIT:
+            ]
 
     def finish(
         self,

@@ -11,6 +11,7 @@ import threading
 import unittest
 
 from rhinecode.subagents.tasks import (
+    ACTIVITY_RECENT_LIMIT,
     BRANCH_AGENT_NAME,
     KIND_BRANCH,
     KIND_ROLE,
@@ -285,6 +286,70 @@ class ConcurrencyTest(unittest.TestCase):
 
         self.assertEqual(len(collected), 30)
         self.assertEqual(len(set(collected)), 30)
+
+
+class NoteToolTest(unittest.TestCase):
+    """
+    `note_tool`：活动区那三个数字里的第三个（tui-display 扩展 F3/F5，AC3/AC25b）。
+
+    ⚠ 它记的是**已完成**的调用，不是发起过的。口径由运行器那边保证
+    （消费 `TOOL_RESULT` 而不是 `TOOL_START`），本类只验计数与有界。
+    """
+
+    def setUp(self) -> None:
+        self.tm = TaskManager()
+        self.record = self.tm.create(KIND_ROLE, "explorer", "调研")
+
+    def test_counts_up(self) -> None:
+        for i in range(3):
+            self.tm.note_tool(self.record.task_id, f"Read(a{i}.py)")
+        self.assertEqual(self.record.tool_calls, 3)
+
+    def test_recent_keeps_order(self) -> None:
+        self.tm.note_tool(self.record.task_id, "Grep(Layer)")
+        self.tm.note_tool(self.record.task_id, "Read(engine.py)")
+        self.assertEqual(self.record.recent_tools, ("Grep(Layer)", "Read(engine.py)"))
+
+    def test_recent_is_bounded_but_the_count_is_not(self) -> None:
+        """
+        **两者刻意不同步**：最近列表有上限（展示用），计数没有（成本用）。
+
+        把计数也截到 5 会让活动行显示「5 次调用」而实际跑了 20 次——
+        那个数字的全部意义就在于反映真实规模。
+        """
+        for i in range(20):
+            self.tm.note_tool(self.record.task_id, f"Read(a{i}.py)")
+        self.assertEqual(self.record.tool_calls, 20)
+        self.assertEqual(len(self.record.recent_tools), ACTIVITY_RECENT_LIMIT)
+        # 保留的是**最近**的那几条，不是最早的
+        self.assertEqual(self.record.recent_tools[-1], "Read(a19.py)")
+
+    def test_unknown_id_is_ignored(self) -> None:
+        """
+        未知标识静默忽略，与 `bump` 同口径。
+
+        运行器的事件消费循环可能在任务被清理之后才处理完最后几个事件，
+        为此抛异常会让它在收尾路径上炸掉。
+        """
+        self.tm.note_tool("不存在", "Read(x)")  # 不抛异常即通过
+
+    def test_terminal_task_is_ignored(self) -> None:
+        """已结束的任务不再计数——终态的成本数字必须是定死的。"""
+        self.tm.finish(self.record.task_id, TaskStatus.COMPLETED, "好了")
+        self.tm.note_tool(self.record.task_id, "Read(x)")
+        self.assertEqual(self.record.tool_calls, 0)
+
+    def test_stores_strings_not_objects(self) -> None:
+        """
+        **结构护栏**：`recent_tools` 里只能是字符串。
+
+        存 `ToolCall` 对象会诱导后来的人在**锁内**做参数摘要与 markup 转义
+        ——那两件事都要调别处的函数，而本项目已经因为「临界区里做了不该做的事」
+        死锁过四次。与 `worktree_path` 只存字符串是同一条理由。
+        """
+        self.tm.note_tool(self.record.task_id, "Read(a.py)")
+        for item in self.record.recent_tools:
+            self.assertIsInstance(item, str)
 
 
 class LockInvariantTest(unittest.TestCase):
