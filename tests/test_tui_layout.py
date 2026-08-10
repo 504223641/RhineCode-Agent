@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import io
+from types import SimpleNamespace
 import unittest
 
 from rich.console import Console
@@ -336,6 +337,40 @@ class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(len(widget._summary.split("\n")), 20)
+
+
+class SummarizeResultTest(unittest.TestCase):
+    """
+    T14：`_summarize_result` 交出全文，把「省略」整个交给展示层。
+
+    职责因此分成两层——**这里负责取内容，组件负责决定画多少**。改造前
+    两件事挤在一处：取首行、截到 80 字符，于是内容在到达组件之前就没了，
+    展开无从谈起。
+    """
+
+    @staticmethod
+    def _res(output: str = "", summary: str = "", ok: bool = True):
+        return SimpleNamespace(output=output, summary=summary, ok=ok)
+
+    def test_tool_provided_summary_still_wins(self) -> None:
+        """工具自带的 summary 优先级不变——那是作者亲手写的概括。"""
+        self.assertEqual(
+            RhineApp._summarize_result(self._res(output="一大堆", summary="命中 23 处")),
+            "命中 23 处",
+        )
+
+    def test_full_output_is_handed_over_intact(self) -> None:
+        text = "\n".join(f"第 {i} 行" for i in range(30))
+        self.assertEqual(RhineApp._summarize_result(self._res(output=text)), text)
+
+    def test_long_single_line_is_not_clipped_at_80(self) -> None:
+        """改造前这里截到 80 字符，组件那边再想展开也没有内容可展。"""
+        line = "x" * 500
+        self.assertEqual(RhineApp._summarize_result(self._res(output=line)), line)
+
+    def test_empty_output_wording_depends_on_success(self) -> None:
+        self.assertEqual(RhineApp._summarize_result(self._res(ok=True)), "（无输出）")
+        self.assertEqual(RhineApp._summarize_result(self._res(ok=False)), "（无错误信息）")
 
 
 class DiffFoldTest(unittest.IsolatedAsyncioTestCase):

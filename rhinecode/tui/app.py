@@ -1290,22 +1290,33 @@ class RhineApp(App):
     @staticmethod
     def _summarize_result(res) -> str:
         """
-        把工具结果压缩为单行摘要，用于工具行的终态展示。
+        取工具结果在工具行上要展示的文本。
 
-        优先使用工具自带的 summary；否则回退到取 output 首个非空行并截断。
+        优先使用工具自带的 `summary`（那是工具作者亲手写的一句话概括，
+        比机器截出来的首行准确得多）；没有时回退到 `output` **全文**。
+
+        ## 为什么不再截断（tui-display 扩展 F41）
+
+        改造前这里取首个非空行、截到 80 字符。于是一次 `grep` 命中 23 处，
+        用户只看得到第一处，**而且没有任何迹象表明还有别的**——既不知道被省了
+        什么，也没法展开。
+
+        现在把「省略」整个交给展示层：`ToolCallWidget` 收全文、按
+        `BRANCH_LINE_LIMIT` 折叠、并在末行如实写出「… +N 行（Ctrl+O 展开）」。
+        职责因此清楚了一层——**这里负责取内容，那里负责决定画多少**。
+
+        ⚠ 不截断**不等于**无界（N5）：组件那边有行数上限，且 `output` 本身在
+        工具侧已受各自的上限约束（如 `run_command` 的前 30 + 后 10 行）。
 
         :param res: tools.base.ToolResult
-        :returns: 单行摘要
+        :returns: 展示文本，可能是多行
         """
         if getattr(res, "summary", ""):
             return res.summary
         text = (res.output or "").strip()
         if not text:
             return "（无输出）" if res.ok else "（无错误信息）"
-        first_line = text.splitlines()[0]
-        if len(first_line) > 80:
-            first_line = first_line[:80] + "…"
-        return first_line
+        return text
 
     # ------------------------------------------------------------------ #
     # 三类用户交互回调（均在 Worker 线程被调用，阻塞等待主线程选择）
