@@ -24,13 +24,21 @@
 
 from __future__ import annotations
 
+import io
 import unittest
 
+from rich.console import Console
 from textual.app import App, ComposeResult
 
 from rhinecode.provider.base import ToolCall
+from rhinecode.tools.diff import MARK_ADD, DiffRow, DiffView
 from rhinecode.tui.app import RhineApp
-from rhinecode.tui.widgets import BRANCH_LINE_LIMIT, HistoryView
+from rhinecode.tui.widgets import (
+    BRANCH_LINE_LIMIT,
+    DIFF_ROW_LIMIT,
+    HistoryView,
+    render_diff_block,
+)
 
 
 class _LayoutHarness(App):
@@ -328,6 +336,69 @@ class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(len(widget._summary.split("\n")), 20)
+
+
+class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
+    """
+    AC31c：diff 块同样受行数上限约束。
+
+    改造前它**完全没有上限**——一次大改动会把整块差异铺进历史区，
+    后面的对话全被挤出屏幕。
+    """
+
+    @staticmethod
+    def _big_diff(rows: int) -> DiffView:
+        view = DiffView(op="Update", path="rhinecode/tui/app.py")
+        for i in range(rows):
+            view.rows.append(DiffRow(MARK_ADD, None, i + 1, f"新增第 {i} 行"))
+        view.added = rows
+        return view
+
+    @staticmethod
+    def _render(view: DiffView, expanded: bool) -> str:
+        """把 diff 块渲染成纯文本（走真实的 Rich 渲染协议，不是读内部字段）。"""
+        console = Console(width=100, file=io.StringIO())
+        with console.capture() as cap:
+            console.print(render_diff_block(view, expanded=expanded))
+        return cap.get()
+
+    def test_folded_diff_is_capped_and_says_how_many_are_left(self) -> None:
+        text = self._render(self._big_diff(40), expanded=False)
+        self.assertIn("新增第 0 行", text)
+        self.assertIn(f"新增第 {DIFF_ROW_LIMIT - 1} 行", text)
+        self.assertNotIn(f"新增第 {DIFF_ROW_LIMIT} 行", text)
+        self.assertIn(f"+{40 - DIFF_ROW_LIMIT} 行", text)
+        self.assertIn("Ctrl+O", text)
+
+    def test_expanded_diff_shows_every_row(self) -> None:
+        text = self._render(self._big_diff(40), expanded=True)
+        self.assertIn("新增第 39 行", text)
+        self.assertNotIn("Ctrl+O", text)
+
+    def test_small_diff_is_untouched(self) -> None:
+        """未超限的 diff 逐字不变——绝大多数改动只有几行，加提示是纯噪音。"""
+        text = self._render(self._big_diff(3), expanded=False)
+        self.assertNotIn("Ctrl+O", text)
+        self.assertIn("新增第 2 行", text)
+
+    def test_generation_truncation_and_display_folding_are_separate(self) -> None:
+        """
+        **两种截断刻意不合并。**
+
+        `DiffView.truncated` 是 **diff 生成侧**（tools/diff.py）的标记，说的是
+        「这份 diff 本身就没算全」；折叠说的是「算全了但没画全」。合并会让
+        用户以为按 Ctrl+O 就能看到那些**根本没被生成出来**的行。
+        """
+        view = self._big_diff(40)
+        view.truncated = True
+        text = self._render(view, expanded=False)
+        self.assertIn("diff 已截断", text)
+        self.assertIn("Ctrl+O", text)
+
+        # 展开之后「生成侧截断」那条仍在——它不是展开能解决的
+        expanded = self._render(view, expanded=True)
+        self.assertIn("diff 已截断", expanded)
+        self.assertNotIn("Ctrl+O", expanded)
 
 
 if __name__ == "__main__":

@@ -257,7 +257,17 @@ class _DiffBlock:
         rows_out: list[tuple[str, Style, bool]] = []
         # 概要分支行（灰色，无背景）
         rows_out.append((f"{BRANCH_PREFIX}{_count_phrase(view.added, view.removed)}", dim, False))
-        for row in view.rows:
+
+        # 折叠（tui-display 扩展 F41 / AC31c）：改造前 diff 块**完全没有上限**，
+        # 一次大改动会把整块差异铺进历史区，后面的对话全被挤出屏幕。
+        # 与结果分支行同一套语义：截断 + 如实写出还剩多少行 + 指出怎么展开。
+        rows = list(view.rows)
+        hidden = 0
+        if not self._expanded and len(rows) > DIFF_ROW_LIMIT:
+            hidden = len(rows) - DIFF_ROW_LIMIT
+            rows = rows[:DIFF_ROW_LIMIT]
+
+        for row in rows:
             if row.marker == MARK_GAP:
                 # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
                 rows_out.append(("        ⋮", dim, False))
@@ -270,6 +280,12 @@ class _DiffBlock:
                 rows_out.append((f"{num}+ {row.text}", add_bg, True))
             else:  # MARK_CONTEXT：无背景，灰色前景
                 rows_out.append((f"{num}  {row.text}", dim, False))
+        if hidden:
+            rows_out.append((f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}", dim, False))
+        # `view.truncated` 是 **diff 生成侧**（tools/diff.py）的截断标记，与本处的
+        # 展示折叠是两回事：前者说「这份 diff 本身就没算全」，后者说「算全了但
+        # 没画全」。两条都可能出现，故各画各的、不合并——合并会让用户以为
+        # 按 Ctrl+O 就能看到那些**根本没被生成出来**的行。
         if view.truncated:
             rows_out.append(("        …（diff 已截断）", dim, False))
 
