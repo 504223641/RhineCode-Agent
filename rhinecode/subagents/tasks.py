@@ -81,6 +81,44 @@ ACTIVITY_RECENT_LIMIT = 5
 ACTIVITY_LINGER_SECONDS = 5.0
 
 
+@dataclass(frozen=True)
+class ActivityRow:
+    """
+    活动区的一行——给界面的**不可变只读快照**（tui-display 扩展 F2/F3）。
+
+    ## 为什么不把 `TaskRecord` 直接递给界面
+
+    三条：它是**可变**对象（后台线程随时在改 `turns` / `usage_tokens`），
+    它持有两个 `Event`（界面完全用不上，还会诱使人去 `set()` 它们），
+    而界面每 0.5 秒读一次。给不可变快照可以在领域层一次性算完
+    「名字口径统一」与「已结束多久」，界面只负责画。
+
+    ## 三个数字的共同点
+
+    耗时 / token / 调用次数，都是**不用理解内容就能判断「它在动、动得快不快」**
+    的量。刻意不把「子 Agent 正在做什么」翻译成人话展示——那既贵又容易误导，
+    而且会抵消掉委派的全部价值（把子 Agent 的输出喷回主界面）。
+
+    :param display_name: 已按 `/agents` 口径拼好的名字——协作启用时是
+        `队员名(角色名)`，否则只有角色名
+    :param status: 四态之一，界面据此选颜色与状态词
+    :param seconds: 运行中 = 至今耗时；已结束 = 总耗时
+    :param tokens: 该任务累计用量
+    :param tool_calls: 已完成的工具调用次数
+    :param recent_tools: 最近若干次调用的已渲染短文本（展开时逐条画）
+    :param settled_seconds: **已结束多久**；运行中为 0。界面据此判断这一行
+        还要不要继续显示（F6 的「留片刻后消失」）
+    """
+
+    display_name: str
+    status: "TaskStatus"
+    seconds: float
+    tokens: int
+    tool_calls: int
+    recent_tools: tuple[str, ...]
+    settled_seconds: float
+
+
 @dataclass
 class TaskRecord:
     """
@@ -384,6 +422,60 @@ class TaskManager:
         """
         with self._lock:
             return tuple(self._tasks.values())
+
+    def activity_rows(self) -> "tuple[ActivityRow, ...]":
+        """
+        取活动区要画的那几行（tui-display 扩展 F1/F2/F6）。
+
+        :returns: 不可变快照元组，按创建顺序。**没有可显示的行时返回空元组**
+            ——界面据此把整块隐藏且不占布局空间（F1）
+
+        收哪些行：
+        - 全部**运行中**的任务；
+        - 加上**刚结束不久**的（`settled_seconds < ACTIVITY_LINGER_SECONDS`）。
+          终态行要带着最终成本停留片刻，立刻消失的话用户什么都来不及看；
+          但也不能永久留着，否则活动区会慢慢变成第二个历史区——
+          永久痕迹由历史区那条记录承担（F6）。
+
+        名字口径与 `/agents` 的任务行**刻意保持一致**（`队员名(角色名)`，
+        没有队员名时只显示角色名）：用户在两处看到的必须是同一个称呼，
+        否则「活动区里那个 worker1 是 /agents 里的哪一条」要靠猜。
+
+        ⚠ **本方法在锁内只做纯内存读写**，与本类其余方法同一条不变量。
+        时间计算用的是 `time.monotonic()`，不涉及任何 IO 或回调。
+
+        副作用：无（只读）。
+        """
+        now = time.monotonic()
+        with self._lock:
+            rows = []
+            for record in self._tasks.values():
+                if record.status.is_terminal:
+                    if record.finished_at is None:
+                        continue
+                    settled = max(0.0, now - record.finished_at)
+                    if settled >= ACTIVITY_LINGER_SECONDS:
+                        continue
+                else:
+                    settled = 0.0
+                who = (
+                    f"{record.member_name}({record.agent_name})"
+                    if record.member_name
+                    else record.agent_name
+                )
+                end = record.finished_at if record.finished_at is not None else now
+                rows.append(
+                    ActivityRow(
+                        display_name=who,
+                        status=record.status,
+                        seconds=max(0.0, end - record.started_at),
+                        tokens=record.usage_tokens,
+                        tool_calls=record.tool_calls,
+                        recent_tools=record.recent_tools,
+                        settled_seconds=settled,
+                    )
+                )
+            return tuple(rows)
 
     def running_count(self) -> int:
         """当前运行中的任务数（并发上限的判据，spec F20）。"""
