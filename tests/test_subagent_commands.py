@@ -30,7 +30,8 @@ class AgentsCommandTest(unittest.TestCase):
     def test_bare_shows_report(self) -> None:
         c = self._dispatch("/agents")
         self.assertIn(("query_report", ReportTarget.AGENTS), c.calls)
-        self.assertIn(("show_message", "report:agents"), c.calls)
+        # 报告走专用通道（tui-display 扩展 F15/T28）
+        self.assertIn(("show_report", "report:agents"), c.calls)
 
     def test_uppercase_resolves(self) -> None:
         """C10 起命令大小写不敏感。"""
@@ -97,7 +98,8 @@ class AgentsCommandTest(unittest.TestCase):
 
     def test_appears_in_help(self) -> None:
         c = self._dispatch("/help")
-        shown = [x[1] for x in c.calls if x[0] == "show_message"]
+        # `/help` 是多行报告，走 show_report（tui-display 扩展 F15/T28）
+        shown = [x[1] for x in c.calls if x[0] == "show_report"]
         self.assertIn("/agents", shown[0])
 
     def test_registered_as_visible_command(self) -> None:

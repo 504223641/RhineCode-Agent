@@ -703,6 +703,7 @@ class ConversationManager:
         副作用：可能发起摘要 LLM 调用并原地重构 self.history。
         """
         notice = self._context_manager.manual_compact(self.history)
+        # 提示级：用户自己敲的 /compact，这只是回执（tui-display 扩展 F19）
         yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
         yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
 
@@ -748,6 +749,8 @@ class ConversationManager:
                 yield AgentEvent(
                     type=AgentEventType.NOTICE,
                     message=f"已取消 {cancelled} 个为上一个会话发起的子 Agent。",
+                    # 事件级：用户敲的是 /resume，未必预料到还会取消掉几个子 Agent
+                    level="event",
                 )
             # c15 F25：协作状态同理——花名册、共享清单、未读消息都属于会话 A。
             # ⚠ 必须排在取消**之后**：清空会唤醒待命队员让它们的线程退出，
@@ -771,8 +774,10 @@ class ConversationManager:
         if ok and self._context_manager is not None:
             self._context_manager.reset()
             for notice in self._context_manager.before_request(self.history):
+                # 提示级：上下文压缩是后台常规动作
                 yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
-        yield AgentEvent(type=AgentEventType.NOTICE, message=message)
+        # 事件级：会话恢复成功 —— 界面刚整个换了一段历史，这是本次操作的结论
+        yield AgentEvent(type=AgentEventType.NOTICE, message=message, level="event")
         yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
 
     def mcp_status_line(self) -> "str | None":
@@ -948,7 +953,7 @@ class ConversationManager:
     def _prepend_notice(
         message: str, events: Iterator[AgentEvent]
     ) -> Iterator[AgentEvent]:
-        """在一个事件流最前面插一条 NOTICE，其余原样透传。"""
+        """在一个事件流最前面插一条 NOTICE，其余原样透传（提示级）。"""
         yield AgentEvent(type=AgentEventType.NOTICE, message=message)
         yield from events
 
@@ -1439,7 +1444,9 @@ class ConversationManager:
         # 第 6 步拦下了全部 FINISHED，而 TUI 对 COMPLETED 的收尾行**不渲染任何东西**。
         # 不补这条，用户按 Esc 取消后界面会完全没有反应，像是卡住了。
         if failed:
-            yield AgentEvent(type=AgentEventType.NOTICE, message=conclusion)
+            # 事件级：这是用户按 Esc / 计划被拒之后界面上**唯一**的反应，
+            # 走 dim 通道会让它淹在别的提示里，看起来仍像卡住了
+            yield AgentEvent(type=AgentEventType.NOTICE, message=conclusion, level="event")
 
         # ── 10. 自然完成收尾：让 _wrap_events 触发 c9 的记忆钩子（F21）──
         yield AgentEvent(

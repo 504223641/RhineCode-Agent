@@ -334,5 +334,75 @@ class SystemLevelTest(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(glyph, markup)
 
 
+class LevelAssignmentTest(unittest.TestCase):
+    """
+    F20：每个调用点都有明确级别，**不留兜底**。
+
+    本组的全部价值就在于把「重要的」从「可忽略的」里分出来，留一个
+    「认不出就按提示级」的默认分支等于没分。
+    """
+
+    def test_finish_reasons_are_split_into_two_levels(self) -> None:
+        """
+        六种结束原因分两档，判据是「用户看到之后要不要做点什么」。
+
+        - 事件级：「已取消」「计划未执行」是用户自己刚做的决定的回执；
+        - 警告级：迭代上限 / 未知工具 / 流错误都是**任务没做完就停了**，
+          用户多半要重试或改写请求。漏看这三条会让人以为任务成功了。
+        """
+        from rhinecode.agent.events import StopReason
+        from rhinecode.tui.app import LEVEL_EVENT, LEVEL_WARNING, RhineApp
+
+        expected = {
+            StopReason.USER_CANCELLED: LEVEL_EVENT,
+            StopReason.PLAN_REJECTED: LEVEL_EVENT,
+            StopReason.MAX_ITERATIONS: LEVEL_WARNING,
+            StopReason.UNKNOWN_TOOL: LEVEL_WARNING,
+            StopReason.STREAM_ERROR: LEVEL_WARNING,
+        }
+        for reason, level in expected.items():
+            with self.subTest(reason=reason):
+                got_level, text = RhineApp._finish_line(reason, "")
+                self.assertEqual(got_level, level)
+                self.assertTrue(text, "非自然结束必须有可展示的文本")
+
+    def test_natural_completion_shows_nothing(self) -> None:
+        """自然完成不打扰用户——这条行为改造前后一字不变。"""
+        from rhinecode.agent.events import StopReason
+        from rhinecode.tui.app import RhineApp
+
+        _, text = RhineApp._finish_line(StopReason.COMPLETED, "")
+        self.assertEqual(text, "")
+
+    def test_finish_lines_carry_no_emoji(self) -> None:
+        """
+        F28：结束提示里不再有 `⏹` / `⚠`。
+
+        警告级由 widget 统一加「警告：」文字前缀，留着 `⚠` 会变成
+        「警告：⚠ 已达迭代上限」。
+        """
+        from rhinecode.agent.events import StopReason
+        from rhinecode.tui.app import RhineApp
+
+        for reason in StopReason:
+            with self.subTest(reason=reason):
+                _, text = RhineApp._finish_line(reason, "")
+                for glyph in ("⏹", "⚠", "🔄"):
+                    self.assertNotIn(glyph, text)
+
+    def test_unknown_level_raises_instead_of_degrading(self) -> None:
+        """
+        **反证**：认不出的级别当场炸，不静默退回提示级。
+
+        没有这条，任何一处拼错的级别都会悄悄降到最暗的那一档，
+        而界面上只表现为「那条消息不太显眼」——没人会去查。
+        """
+        from rhinecode.tui.app import RhineApp
+        from rhinecode.tui.widgets import HistoryView
+
+        with self.assertRaises(KeyError):
+            RhineApp._history_channel(HistoryView(), "拼错的级别")
+
+
 if __name__ == "__main__":
     unittest.main()

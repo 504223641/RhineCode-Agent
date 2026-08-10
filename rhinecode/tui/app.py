@@ -47,6 +47,18 @@ from rhinecode.hooks import HookEventType
 #
 # ⚠ 新增交互种类时要在这里加一行；漏改不报错，只是那种面板弹出时
 # `kind` 会退回内部标识，用户按文档写的条件匹配不上。
+# 系统行的四个档位（tui-display 扩展 F19）。
+#
+# 用字符串常量而不是枚举，与 `AgentEvent.level` 同一条理由：这个值要跨过
+# agent 层原样进 trace 负载，而 trace 是只依赖标准库的叶子包。
+#
+# ⚠ **不留「默认丢进提示级」的兜底**（F20）：本组的全部价值就在于把「重要的」
+# 从「可忽略的」里分出来，留兜底等于没分。每个调用点都必须明确挑一档——
+# `_LEVEL_CHANNELS` 里查不到的取值会当场 KeyError，而不是静默降级。
+LEVEL_NOTICE = "notice"
+LEVEL_EVENT = "event"
+LEVEL_WARNING = "warning"
+
 _NOTIFY_KINDS = {
     "confirm": "awaiting_confirm",
     "clarify": "awaiting_clarify",
@@ -496,6 +508,29 @@ class RhineApp(App):
         self._trace_ui_message("system", text)
         self.query_one(HistoryView).append_system(text)
 
+    @staticmethod
+    def _history_channel(history_view: HistoryView, level: str):
+        """
+        级别 → 历史区的对应渲染方法（tui-display 扩展 F19/F20）。
+
+        :param history_view: 历史区组件
+        :param level: `LEVEL_NOTICE` / `LEVEL_EVENT` / `LEVEL_WARNING` 之一
+        :returns: 可直接交给 `call_from_thread` 的绑定方法
+
+        ⚠ **未知取值当场 `KeyError`，刻意不给兜底**（F20）。留一个
+        「认不出就按提示级」的默认分支，等于让任何一处拼错的级别静默退回最暗的
+        那一档——而本组的全部价值就在于把「重要的」从「可忽略的」里分出来。
+        宁可在开发期炸掉，也不要在生产里悄悄降级。
+
+        错误级不在这张表里：它有独立的 `append_error`，且只由 `ERROR` 事件产出，
+        不经级别分发。
+        """
+        return {
+            LEVEL_NOTICE: history_view.append_system,
+            LEVEL_EVENT: history_view.append_event,
+            LEVEL_WARNING: history_view.append_warning,
+        }[level]
+
     def show_event(self, text: str) -> None:
         """
         显示一条**事件级**系统行（tui-display 扩展 F19）。
@@ -628,7 +663,9 @@ class RhineApp(App):
         try:
             finished = self._manager.drain_subagent_notifications()
             for record in finished:
-                self.show_message(_subagent_finish_text(record))
+                # 事件级：真的发生了一件事，而且它带着这次委派的全部成本。
+                # 与「记忆已更新」共用一条 dim 通道正是改造前最刺眼的问题。
+                self.show_event(_subagent_finish_text(record))
             running = self._manager.running_subagent_count()
             if finished or running != self._last_subagent_count:
                 self._last_subagent_count = running
@@ -637,7 +674,8 @@ class RhineApp(App):
             # **不新增 set_interval** —— 空闲会话的 CPU 占用与 C13/C14 完全相同
             # （spec N6 的落实方式，见 spec 里那段措辞修订）。
             for notice in self._manager.team_drain_notices():
-                self.show_message(notice)
+                # 事件级：协作侧的降级/状态变化，用户需要知道但无需动作
+                self.show_event(notice)
             # tui-display 扩展 F4：活动区的数据也搭这趟车。
             # **不新增定时器**——空闲会话的开销必须与改造前一致。
             self._refresh_activity()
@@ -693,7 +731,7 @@ class RhineApp(App):
             # ⚠ 只提示一次：本方法每 0.5 秒被调一次，不设标志会刷满整屏。
             if not self._auto_wake_limit_notified:
                 self._auto_wake_limit_notified = True
-                self.show_message(
+                self.show_event(
                     f"队友还在发消息，但自动唤起已达上限"
                     f"（连续 {self._manager.team_auto_wake_limit()} 次）——"
                     f"先停下来等你回来。说句话就能继续。"
@@ -703,8 +741,10 @@ class RhineApp(App):
         count = self._manager.team_bump_auto_wake()
         limit = self._manager.team_auto_wake_limit()
         # F21：用户回来时要能一眼看出「这段是我不在的时候程序自己跑的」。
-        self.show_message(
-            f"⟳ 自动唤起（第 {count}/{limit} 次）——队友发来了消息，"
+        # 事件级：用户回来时要能一眼看出「这段是我不在的时候程序自己跑的」。
+        # `⟳` 去掉（F28）——「自动唤起」四个字本身已经说清了，符号不添信息。
+        self.show_event(
+            f"自动唤起（第 {count}/{limit} 次）——队友发来了消息，"
             f"主对话在你不在场时自行处理。"
         )
         self._start_stream_worker(self._manager.run_auto_wake())
@@ -930,8 +970,11 @@ class RhineApp(App):
                 # 否则用户以为已经停了，而后台还在烧 token、还在往项目里写。
                 remaining = self._manager.request_cancel()
                 if remaining:
-                    self.show_message(
-                        f"已请求取消当前回合。⚠ 仍有 {remaining} 个子 Agent 在后台运行"
+                    # 警告级：后台还在烧 token、非隔离的那些还在往主项目根写。
+                    # 这是四级里最需要脱离颜色也认得出的一条，故走文字前缀通道。
+                    # 句中的 `⚠` 去掉——widget 已在行首加「警告：」（F21/F28）。
+                    self.show_warning(
+                        f"已请求取消当前回合。仍有 {remaining} 个子 Agent 在后台运行"
                         f"——Esc 只停主对话，不会停它们。"
                         f"要一并停止请用 /agents cancel all。"
                     )
@@ -1291,19 +1334,27 @@ class RhineApp(App):
                     )
 
                 elif etype == AgentEventType.FINISHED:
-                    line = self._finish_line(event.stop_reason, event.message)
+                    level, line = self._finish_line(event.stop_reason, event.message)
                     if line:
                         self._trace_ui_message("system", line)
-                        self.call_from_thread(history_view.append_system, line)
+                        self.call_from_thread(
+                            self._history_channel(history_view, level), line
+                        )
 
                 elif etype == AgentEventType.ERROR:
                     self._trace_ui_message("error", event.message)
                     self.call_from_thread(history_view.append_error, event.message)
 
                 elif etype == AgentEventType.NOTICE:
-                    # 系统级提示（c8：上下文压缩发生等），以系统行展示，不影响正文/工具渲染。
+                    # 系统级提示，按**事件自带的档位**分发（tui-display 扩展 F19/F22）。
+                    #
+                    # 档位由产出方声明（见 `AgentEvent.level`）：上下文压缩这类
+                    # 走提示级，子 Agent 结论送达这类走事件级。界面无法从文本
+                    # 本身判断哪条要紧——两者都只是一句陈述句。
                     self._trace_ui_message("system", event.message)
-                    self.call_from_thread(history_view.append_system, event.message)
+                    self.call_from_thread(
+                        self._history_channel(history_view, event.level), event.message
+                    )
 
                 elif etype == AgentEventType.HISTORY:
                     # 会话恢复成功（c9 /resume 交互化）：清屏并整体回放历史快照。
@@ -1405,27 +1456,40 @@ class RhineApp(App):
         tool_widgets.clear()
 
     @staticmethod
-    def _finish_line(stop_reason, message: str) -> str:
+    def _finish_line(stop_reason, message: str) -> "tuple[str, str]":
         """
         把循环结束原因转成一行系统提示（自然完成返回空串，不打扰用户）。
 
         :param stop_reason: StopReason
         :param message: 循环附带的补充说明（如有则优先使用）
-        :returns: 要展示的系统行；空串表示不展示
+        :returns: `(级别, 文本)`；文本为空串表示不展示
+
+        ## 为什么级别在这里定，而不是让调用方猜（tui-display 扩展 F20）
+
+        六种结束原因分成两档，判据是「用户看到之后要不要做点什么」：
+
+        - **事件级**——「已取消」「计划未执行」是**用户自己刚做的决定**的回执，
+          他知道发生了什么，不需要被醒目提示；
+        - **警告级**——迭代上限、未知工具、流错误都是**任务没做完就停了**，
+          用户多半要重试或改写请求。漏看这三条会让人以为任务成功了。
+
+        改造前六种全走同一条 `[dim]` 通道，最要紧的三条与最平常的三条长得
+        一模一样。emoji（`⏹` `⚠`）一并去掉：警告级由 widget 统一加「警告：」
+        文字前缀（F21/F28），留着会变成「警告：⚠ …」。
         """
         if stop_reason == StopReason.COMPLETED:
-            return ""
+            return LEVEL_NOTICE, ""
         if stop_reason == StopReason.USER_CANCELLED:
-            return "⏹ 已取消"
+            return LEVEL_EVENT, "已取消"
         if stop_reason == StopReason.PLAN_REJECTED:
-            return "⏹ 计划未执行"
+            return LEVEL_EVENT, "计划未执行"
         if stop_reason == StopReason.MAX_ITERATIONS:
-            return "⚠ " + (message or "已达迭代上限，自动停止")
+            return LEVEL_WARNING, message or "已达迭代上限，自动停止"
         if stop_reason == StopReason.UNKNOWN_TOOL:
-            return "⚠ " + (message or "连续调用未知工具，已停止")
+            return LEVEL_WARNING, message or "连续调用未知工具，已停止"
         if stop_reason == StopReason.STREAM_ERROR:
-            return "⏹ 因流错误已停止"
-        return ""
+            return LEVEL_WARNING, "因流错误已停止"
+        return LEVEL_NOTICE, ""
 
     @staticmethod
     def _summarize_result(res) -> str:
