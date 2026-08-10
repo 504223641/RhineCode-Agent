@@ -468,7 +468,7 @@ class ScopeTest(TraceHookBase):
         self.assertEqual(pairs, [(SCOPE_MAIN, 1), (SCOPE_SUMMARY, 1), (SCOPE_MAIN, 2)])
 
     def test_notes_scope_bound_on_worker_entry(self) -> None:
-        """笔记线程入口绑定 notes 作用域（T38 的位置正确性）。"""
+        """记忆线程入口绑定 memory 作用域（T38 的位置正确性）。"""
         seen: list[str] = []
 
         def worker() -> None:

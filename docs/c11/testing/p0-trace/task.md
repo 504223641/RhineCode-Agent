@@ -24,7 +24,7 @@
 | 改 | `rhinecode/mcp/config.py` | user_config_path / load_all 加 user_dir |
 | 改 | `rhinecode/context/offload.py` | 暴露「调用标识 → 落盘路径」明细 |
 | 改 | `rhinecode/context/manager.py` | recorder；summary 作用域；压缩事件 |
-| 改 | `rhinecode/memory/manager.py` | recorder；笔记线程作用域 |
+| 改 | `rhinecode/memory/manager.py` | recorder；记忆线程作用域 |
 | 改 | `rhinecode/skills/manager.py` | recorder；skill_state（锁外） |
 | 改 | `rhinecode/commands/dispatcher.py` | user_input / command_dispatch |
 | 改 | `rhinecode/tui/app.py` | recorder；四类界面埋点；作用域复位 |
@@ -64,7 +64,7 @@
    每个成员行尾注释标注对应 spec 的哪条 F。
 3. 定义 `SCOPE_MAIN = "main"` / `SCOPE_SUMMARY = "summary"` / `SCOPE_MEMORY = "memory"`，
    注释说明为什么需要后两个：`ContextManager` 与 `MemoryManager` 持有同一个 Provider 实例，
-   不区分会污染主对话的轮次计数；笔记还跑在独立线程、可能与用户下一条消息并发。
+   不区分会污染主对话的轮次计数；记忆还跑在独立线程、可能与用户下一条消息并发。
 4. 定义 `isolated_scope(name: str) -> str` 返回 `f"isolated:{name}"`。
 
 **验证：** `python -c "from rhinecode.trace.models import TraceEventType as T; print(len(list(T)))"`
@@ -515,7 +515,7 @@
 **依赖：** T26
 **步骤：** 覆盖——
 1. **AC30**：传入临时 `user_dir` 后四类用户级内容均不生效——系统提示不含用户级项目指令与
-   笔记索引、用户级 Skill 不在清单、用户级权限规则不参与求值、用户级 MCP 未被连接。
+   记忆索引、用户级 Skill 不在清单、用户级权限规则不参与求值、用户级 MCP 未被连接。
    做法：在临时 `user_dir` 下预置 `RHINE.md` / `memory/MEMORY.md` / `skills/x.md` /
    `permissions.yaml` / `mcp.yaml` 各一份内容可识别的文件，再用**另一个**空临时目录装配，
    断言这些内容都不出现。
@@ -697,7 +697,7 @@
 **验证：** `python -m unittest tests.test_context_manager tests.test_context_summarize -v` 全绿；
 触发一次手动压缩后断言 trace 含 `layer="summary"` 的事件，且该次 `api_request` 的 scope 为 `summary`。
 
-## T38: 笔记线程的作用域
+## T38: 记忆线程的作用域
 
 **文件：** `rhinecode/memory/manager.py`
 **依赖：** T7
@@ -707,10 +707,10 @@
    `self._recorder.bind_scope(SCOPE_MEMORY)`。
    ⚠️ **不要绑在 `on_natural_stop`**——那是 Worker 线程（由 `_wrap_events` 调用），
    绑在那里会把主对话线程永久标成 `memory`。`_update_memories` 才是 daemon 线程的目标函数。
-3. 注释说明：笔记跑独立线程且可能与用户的下一条消息并发，thread-local 天然隔离它，
+3. 注释说明：记忆跑独立线程且可能与用户的下一条消息并发，thread-local 天然隔离它，
    线程入口绑定一次即可，无需 `with`。
 
-**验证：** `python -m unittest tests.test_memory_manager -v` 全绿；触发一次笔记钩子后
+**验证：** `python -m unittest tests.test_memory_manager -v` 全绿；触发一次记忆钩子后
 断言该次 `api_request` 的 scope 为 `memory`，且**主对话后续事件仍为 `main`**。
 
 ## T39: Skill 状态埋点（锁外）

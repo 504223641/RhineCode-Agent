@@ -168,7 +168,7 @@
 4. `mode`：缺省 `"shared"`；不是 `shared`/`isolated` → 失败。
 5. `history_messages`：缺省 0；非 int（注意排除 bool）或 < 0 → 失败。
 6. `model`：缺省 None；非 str → 失败。**若 mode 为 SHARED 且 model 非空 → 不失败**，向 warnings 追加「Skill `<name>` 是共享模式，声明的 model 将被忽略（F22）」。
-7. 未知键：忽略，不失败不警告（向前兼容，与 c9 笔记 frontmatter 口径一致）。
+7. 未知键：忽略，不失败不警告（向前兼容，与 c9 记忆 frontmatter 口径一致）。
 8. 构造并返回 `SkillSpec`。
 
 **验证：** 临时脚本喂「六键写全」「只写两个必填」「allowed_tools 写成字符串」「name 含大写」「name 为 run」「共享模式带 model」六份文本，结果分别符合上述规则。
@@ -251,7 +251,7 @@
 **依赖：** T5
 **步骤：**
 1. 模块 docstring：所有「给模型看的文本」集中于此，纯函数无状态，便于测试与调整措辞；对应 F6/F9/F10/F12/F13/F24。
-2. 私有 `_truncate(text, max_lines, max_bytes) -> tuple[str, bool]`：按行截断与按 UTF-8 字节截断双重生效，**字节截断不得产生非法 UTF-8**（沿用 c9 笔记索引的既有做法）；返回是否发生截断。
+2. 私有 `_truncate(text, max_lines, max_bytes) -> tuple[str, bool]`：按行截断与按 UTF-8 字节截断双重生效，**字节截断不得产生非法 UTF-8**（沿用 c9 记忆索引的既有做法）；返回是否发生截断。
 3. `render_index(skills) -> str`：头部一句说明「以下 Skill 可用。共享模式可用 `load_skill` 工具加载；独立模式请建议用户执行其命令。」；每行 `- <name>（共享/独立）：<description>`；套 `INDEX_MAX_LINES/BYTES`，截断时末尾追加「（另有 N 个未列出）」。
 4. 空列表 → 返回空串（使槽位整体跳过，保证 N3）。
 
@@ -839,7 +839,7 @@
 4. 若走了「未产出」分支 → `yield AgentEvent(NOTICE, message=文案)`。注释写明：T49b 步骤 4 拦下了全部 FINISHED，而 `_do_stream` 对 `COMPLETED` 的 `_finish_line` 返回空串、**不渲染任何东西**（`tui/app.py:604-624`）；不补这条，用户按 Esc 取消后界面会完全没有反应。
 5. `yield AgentEvent(FINISHED, stop_reason=COMPLETED)`。
 6. 在 `_run_isolated_skill` 的 docstring 中写明**子对话触达上下文上限的兜底链路**（兑现 spec F21 的说明义务）：超窗 → API 报错 → `chunk.type=="error"` → 循环产出 ERROR 事件（`_do_stream` 渲染红色错误行）→ `FINISHED(STREAM_ERROR)` → 本任务步骤 2 判为未产出 → 步骤 4 的 NOTICE + 步骤 3 的历史记录。用户可见反馈两处，历史中留可追溯记录。
-7. 确认 `run_skill` 返回的是 `self._wrap_events(self._run_isolated_skill(...))`——步骤 5 的自然完成需触发 C9 笔记钩子（F21）。
+7. 确认 `run_skill` 返回的是 `self._wrap_events(self._run_isolated_skill(...))`——步骤 5 的自然完成需触发 C9 记忆钩子（F21）。
 
 **验证：** 见 T51。
 
@@ -869,7 +869,7 @@
 8. `record_usage=False`：主历史的估算锚点在子对话前后不变。
 9. `cancel_event` 被重建：先 `request_cancel()` 再跑独立 Skill → 子对话**不**开局即取消。
 10. `spec.model` 非空 → 用了不同的 Provider 实例。
-11. 事件流经 `_wrap_events` → 结束时触发了 C9 笔记钩子（用假 memory_manager 断言）。
+11. 事件流经 `_wrap_events` → 结束时触发了 C9 记忆钩子（用假 memory_manager 断言）。
 12. **AC21 的 C8 第一层**（决策 14 的唯一收益点，不验就不知道有没有接上）：让子对话产生一个超过第一层阈值的工具结果 → 断言它在子历史中被替换为「预览 + 路径」占位，且 `.rhinecode/context/` 下生成了对应文件；同时断言**第二层摘要未被调用**（假 provider 上无摘要请求）。
 
 **验证：** `python -m unittest tests.test_skill_isolated -v` 全绿。

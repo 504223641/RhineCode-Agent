@@ -126,7 +126,7 @@ class HappyPathTests(unittest.TestCase):
         """
         **抽取请求不得携带任何工具**（spec F15 / AC22）。
 
-        与 C8 摘要、C9 笔记同源的硬约束：模型在抽取阶段物理上无法调用工具。
+        与 C8 摘要、C9 记忆同源的硬约束：模型在抽取阶段物理上无法调用工具。
         """
         url = "https://a.test/x"
         p = _StubProvider()

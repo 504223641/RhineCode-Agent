@@ -238,7 +238,7 @@ stream_chat(messages, thinking_effort="off", tools=None, system=None) -> Iterato
    不得跨线程调度。见 §6.1 的死锁坑。
 4. **脱敏**：`api_key` 必须脱敏。trace 含被读过的文件内容与命令输出，
    与会话存档同属敏感产物，**必须进 `.gitignore`**。
-5. **线程安全**：埋点会在主线程、Worker 线程、只读并发桶的线程池、笔记 daemon
+5. **线程安全**：埋点会在主线程、Worker 线程、只读并发桶的线程池、记忆 daemon
    线程里被调用。写入需串行化，但只能用**一把只保护「追加一行」的独立锁**，
    临界区内只做 write。
 
@@ -348,8 +348,8 @@ idle == (not app._stream_active)
    **按键被丢掉、然后死等超时**。等待判据里要额外确认面板已 display 且已聚焦，
    或者干脆不模拟按键、直接在主线程调 App 的解析交互方法；
 3. 独立模式 Skill 会开子对话，期间主循环仍在跑；
-4. 笔记钩子是自然停止后的**异步 daemon 线程**，不影响 `_stream_active`，
-   但之后仍会写盘/调 LLM——断言「笔记已触发」需要单独信号。
+4. 记忆钩子是自然停止后的**异步 daemon 线程**，不影响 `_stream_active`，
+   但之后仍会写盘/调 LLM——断言「记忆已触发」需要单独信号。
 
 ### 5.5 读屏
 
@@ -454,7 +454,7 @@ idle == (not app._stream_active)
    ⚠️ 这条不能写成「不读用户主目录」——按当前代码**做不到**：
    `__main__.py:158-163` 的 `SkillManager(..., Path.home()/".rhinecode", ...)` 与
    `conversation.py:230` 的 `user_dir = Path.home()/".rhinecode"` 会把用户级
-   RHINE.md、笔记索引、skills、permissions.yaml 全带进系统提示与权限求值——
+   RHINE.md、记忆索引、skills、permissions.yaml 全带进系统提示与权限求值——
    同一场景在两台机器上 system 全文会不同。
    **正确写法是「驱动器可注入 user_dir，或用 HOME 重定向做隔离」**，
    并把它列进 P1 的必做项。

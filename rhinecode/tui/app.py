@@ -230,7 +230,7 @@ class RhineApp(App):
 
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
-        # 2. 笔记通知回调：笔记线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；
+        # 2. 记忆通知回调：记忆线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；
         # 3. 会话锁心跳：每 2 分钟 touch 一次，保证「进程活着锁就新鲜」（过期阈值 10 分钟）。
         # --continue 启动恢复对齐（c9 交互化）：若启动时已恢复出历史（history 非空），
         # 先把整段历史回放到聊天区，再显示启动提示——与 /resume 面板载入后的体验一致。
@@ -295,13 +295,13 @@ class RhineApp(App):
 
     def _notify_memory(self, text: str) -> None:
         """
-        笔记更新的低打扰通知（c9 F20）。运行在笔记 daemon 线程，
+        记忆更新的低打扰通知（c9 F20）。运行在记忆 daemon 线程，
         用 call_from_thread 把渲染调度回主线程（Textual 线程安全要求）。
 
         **埋点位置刻意排在 call_from_thread 之后**（全阶段复测观察 O5）。
 
         原先这里直接调 `append_system`、绕过了 `_trace_ui_message`，后果是
-        c9 的 AC19「笔记变更时界面出现低打扰提示」在**任何**基于 trace 的验收里
+        c9 的 AC19「记忆变更时界面出现低打扰提示」在**任何**基于 trace 的验收里
         都是盲区——记录里没有这条 `ui_message`，而「显示了没记」与「压根没显示」
         （notify 为 None，或下面这个 except 把异常吞了）在 trace 上完全无法区分。
 

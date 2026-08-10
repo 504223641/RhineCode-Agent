@@ -555,7 +555,7 @@
    抓取失败或跨主机重定向 → 直接 `render`，**不进抽取**；
    成功 → `truncate` 到 `content_budget(context_window)` → `build_extract_request`
    → `provider.stream_chat(messages, thinking_effort="off", tools=None, system=system)`。
-3. **`tools=None` 是硬约束**，注释点明与 C8 摘要、C9 笔记同源。
+3. **`tools=None` 是硬约束**，注释点明与 C8 摘要、C9 记忆同源。
 4. 抽取异常或空结果 → 降级到 `MAX_FALLBACK_CHARS`。
 5. provider 调用包在 `recorder.scope(SCOPE_WEB_EXTRACT)` 里。
    **⚠ `with` 必须包住整个流消费循环，不能只包 `stream_chat(...)` 那一行。**

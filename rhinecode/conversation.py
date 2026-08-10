@@ -215,7 +215,7 @@ class ConversationManager:
                          逐字一致。改成必选会把回归面从零推到五个测试文件
                          （`test_review_fixes` / `test_resume_replay` / `test_skill_isolated` /
                          `test_skill_sandbox` / `test_memory_*` 都直接构造本类且都不传它）。
-                         给定时，用户级项目指令 / 笔记索引 / Skill 目录 / 权限规则四类内容
+                         给定时，用户级项目指令 / 记忆索引 / Skill 目录 / 权限规则四类内容
                          一并改从该目录读取，使装配层能在临时目录里跑一次完整装配而不读
                          真实主目录（trace spec F23）。
         :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`——
@@ -300,7 +300,7 @@ class ConversationManager:
             )
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
-        # 工具能力；自动笔记由 memories_enabled 门控（仅工具模式，F21）。
+        # 工具能力；自动记忆由 memories_enabled 门控（仅工具模式，F21）。
         # user_dir 已在构造函数开头解析成 self._user_dir（权限层要先用），此处直接复用
         user_dir = self._user_dir
         self.memory_manager = MemoryManager(
@@ -311,7 +311,7 @@ class ConversationManager:
             memories_enabled=self._tools_enabled,
             recorder=self._recorder,
         )
-        # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。
+        # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级记忆全文。
         # 注册本身无副作用（写类判定不受影响），无条件执行即可。
         register_read_root(user_dir / "memory")
 
@@ -503,7 +503,7 @@ class ConversationManager:
         同时重置上下文压缩器的会话级状态（估算锚点、熔断计数、已存盘幂等集合，c8 F15）——
         历史清空后旧锚点与熔断态都不再适用，必须一并归零。
         c9：会话存档随之「开新档」——旧存档保留不动、后续消息写入新文件（F8），
-        笔记高水位一并归零。
+        记忆高水位一并归零。
         c11：已激活的 Skill 一并卸载（F11）——激活态属于「当前这段对话」，
         历史都清空了，还留着 SOP 注入与工具集收窄会让下一句话的行为莫名其妙。
 
@@ -1401,7 +1401,7 @@ class ConversationManager:
         if failed:
             yield AgentEvent(type=AgentEventType.NOTICE, message=conclusion)
 
-        # ── 10. 自然完成收尾：让 _wrap_events 触发 c9 的笔记钩子（F21）──
+        # ── 10. 自然完成收尾：让 _wrap_events 触发 c9 的记忆钩子（F21）──
         yield AgentEvent(
             type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED
         )
@@ -1566,7 +1566,7 @@ class ConversationManager:
         project_root = str(main_project_root())
         env = collect_environment(self._config, project_root)
         # c9：把 RHINE.md 拼接结果与记忆索引填进 110/130 槽位（两者都可能为空串，
-        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，笔记线程会话中途
+        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，记忆线程会话中途
         # 更新后，下一条消息就能看到新索引。
         # c11：第一阶段 Skill 清单填进 140 稳定槽位（进前缀缓存）；
         # 已激活正文不在这里填——它必须每轮重算，走下面 dynamic_provider 的动态通道。
@@ -1838,8 +1838,8 @@ class ConversationManager:
         ## 自然停止钩子（c9）
 
         看到 FINISHED 且停止原因为 COMPLETED（自然完成）时，先触发 MemoryManager
-        的异步笔记更新再透传——钩子只是「起一个 daemon 线程」，本身不阻塞事件流。
-        其它停止原因（取消/出错/迭代上限）不触发笔记：非自然结束的对话大概率
+        的异步记忆更新再透传——钩子只是「起一个 daemon 线程」，本身不阻塞事件流。
+        其它停止原因（取消/出错/迭代上限）不触发记忆：非自然结束的对话大概率
         不完整，不值得沉淀。
         """
         # **只记录起点、不在这里授予**（F12）。授予发生在 Skill 被**触发**的那一刻

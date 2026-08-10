@@ -509,7 +509,7 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
 
     host_state.build_result = result
     if args.mode == "scripted":
-        # F16 裁决：确定性形态关掉自动笔记——它本身就是不确定性来源
+        # F16 裁决：确定性形态关掉自动记忆——它本身就是不确定性来源
         # （实测：关掉时一轮对话模型被调 1 次，不关是 2 次）。
         # 该属性是普通实例属性、门控点每次调用现读，赋值即生效。
         result.manager.memory_manager.memories_enabled = False

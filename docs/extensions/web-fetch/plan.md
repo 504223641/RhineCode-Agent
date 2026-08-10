@@ -593,7 +593,7 @@ WebFetchManager(provider, context_window: int, *, recorder=None,
 1. `fetcher.fetch(...)`。失败或跨主机重定向 → 直接 `render`，**不进抽取**（也省一次 API 调用）。
 2. 成功 → `truncate` 到 `content_budget(context_window)` → `build_extract_request`
    → `provider.stream_chat(messages, thinking_effort="off", tools=None, system=...)`。
-   **`tools=None` 是硬约束**，与 C8 摘要、C9 笔记同源。
+   **`tools=None` 是硬约束**，与 C8 摘要、C9 记忆同源。
 3. 抽取异常或空结果 → 降级：本地正文截断到 `MAX_FALLBACK_CHARS`。
 4. `render` 包上不可信标记与元信息。
 

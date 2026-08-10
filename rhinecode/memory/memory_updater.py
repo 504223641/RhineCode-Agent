@@ -1,5 +1,5 @@
 """
-笔记 LLM 的请求渲染与响应解析（c9 F15，纯逻辑，不做 IO、不调网络）。
+记忆 LLM 的请求渲染与响应解析（c9 F15，纯逻辑，不做 IO、不调网络）。
 
 职责边界（与 c8 summarize 同定位）：本模块只负责「把素材变成请求」和「把响应变成
 结构化动作」，provider 调用与写盘都由 MemoryManager 编排——**LLM 只产出意图，
@@ -20,10 +20,10 @@ from typing import Optional
 from rhinecode.provider.base import Message
 from rhinecode.memory.memories import CATEGORIES, Memory
 
-# 笔记文件名白名单：小写字母/数字/连字符/下划线 + .md 后缀，禁止任何路径分隔符。
+# 记忆文件名白名单：小写字母/数字/连字符/下划线 + .md 后缀，禁止任何路径分隔符。
 _FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.md$")
 
-# 转录里单条工具结果的最大字符数：笔记 LLM 只需要判断「值不值得记」，
+# 转录里单条工具结果的最大字符数：记忆 LLM 只需要判断「值不值得记」，
 # 不需要工具结果全文；截断控制请求体积（工具结果动辄数千字符）。
 _TOOL_RESULT_PREVIEW_CHARS = 500
 
@@ -65,12 +65,12 @@ MEMORY_SYSTEM_PROMPT = """\
 @dataclass
 class MemoryAction:
     """
-    LLM 决定的一个笔记动作（只是意图，不含 IO）。
+    LLM 决定的一个记忆动作（只是意图，不含 IO）。
 
     :param op: "add" | "update" | "delete"
     :param scope: "user"（用户级目录）| "project"（项目级目录）
     :param filename: 目标文件名（已过白名单校验，不含目录）
-    :param memory: 要写入的笔记内容；op="delete" 时为 None
+    :param memory: 要写入的记忆内容；op="delete" 时为 None
     """
 
     op: str
@@ -85,7 +85,7 @@ def build_memory_request(
     project_index: str,
 ) -> "tuple[str, list[Message]]":
     """
-    把「本轮新增对话 + 现有两级索引」渲染成一次笔记 LLM 请求。
+    把「本轮新增对话 + 现有两级索引」渲染成一次记忆 LLM 请求。
 
     与 c8 摘要同一手法：素材渲染成**一条 user 转录**而非转发原始消息，规避 API 对
     tool 消息配对的校验；工具结果截断到前 _TOOL_RESULT_PREVIEW_CHARS 字符控制体积。
@@ -125,7 +125,7 @@ def build_memory_request(
 
 def parse_memory_response(text: str) -> list[MemoryAction]:
     """
-    把笔记 LLM 的输出解析为动作列表（宽松容错，F17）。
+    把记忆 LLM 的输出解析为动作列表（宽松容错，F17）。
 
     执行流程：
     1. 截取首个 `[` 到末个 `]` 的子串（容忍模型在 JSON 外包了解释文字或代码围栏）；

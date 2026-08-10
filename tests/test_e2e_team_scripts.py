@@ -320,7 +320,7 @@ class TeamRunTest(unittest.IsolatedAsyncioTestCase):
             provider_factory=lambda cfg: provider,
             exclude_tools=frozenset({"mcp_add_server", "mcp_resolve_server"}),
         )
-        # 自动笔记是不确定性来源（它另起一条对话、另调一次模型），关掉
+        # 自动记忆是不确定性来源（它另起一条对话、另调一次模型），关掉
         self.result.manager.memory_manager.memories_enabled = False
 
         app = self.result.app

@@ -108,7 +108,7 @@ def build_default_prompt(
     - memory_index（「长期记忆」，priority 130）：两级记忆索引。
     两者都以 **cacheable=True** 进稳定通道，覆盖 c5 空槽的 False 预设——动态通道的
     内容每轮作为不缓存的尾巴重发，RHINE.md 可达数百行、索引最大 25KB，每轮重发太贵；
-    而这两块在会话内基本稳定（RHINE.md 启动加载后不变、索引仅笔记更新后变化），
+    而这两块在会话内基本稳定（RHINE.md 启动加载后不变、索引仅记忆更新后变化），
     进 stable 尾部可被 DeepSeek 前缀缓存命中，索引变化也只失效它自己那段尾部缓存
     （c9 plan 技术决策）。传空串时槽位照旧整体跳过，输出与 c8 完全一致。
 

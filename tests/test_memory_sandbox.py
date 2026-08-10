@@ -75,7 +75,7 @@ class SandboxWhitelistTest(unittest.TestCase):
         self.assertFalse(is_readable_path(sneaky, _cwd()))
 
     def test_read_file_tool_reads_whitelisted(self) -> None:
-        """read_file 工具能读白名单目录里的笔记全文（AC17）。"""
+        """read_file 工具能读白名单目录里的记忆全文（AC17）。"""
         result = ReadFileTool().execute({"path": str(self.note)}, cwd=_cwd())
         self.assertTrue(result.ok, result.output)
         self.assertIn("正文", result.output)

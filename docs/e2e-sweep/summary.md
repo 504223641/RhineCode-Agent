@@ -63,7 +63,7 @@
 | **O1** | **P1a 对产品侧自主退出无感知**：`/exit` 后 Textual 消息循环已停，宿主仍报 `state: idle` 且 `send` 返回 `submitted`，但消息石沉大海 | 驱动者会拿到「一切正常」的假象；自动化脚本会静默失效 | 宿主感知 app 退出后切一个终态（如 `app_exited`），`send` 在该态明确报错。见 [c2.md](c2.md) |
 | **O2** | **`deny Read(X)` 不覆盖 `run_command`，而面板文案说「无规则命中」** | 用户以为已保护 `config.yaml`，面板却没有任何线索提示这条命令碰的正是它 | 面板在命令文本含「有 Read deny 规则的路径」时追加一句提示。**不改判定**，只补给人看的信息。见 [c6.md](c6.md) |
 | **O4** | **`mcp.yaml` 顶层键拼错时静默当「未配置」** | 文件在、YAML 合法、零警告，`/mcp` 却说「未配置任何 MCP Server」——最难排查的一类失败。我本次亲自踩了 | `_load_layer` 在「解析成 dict 但没有顶层 `mcpServers`」时收集一条提示。不改 fail-safe 行为。见 [c7.md](c7.md) |
-| **O5** ✅ | **AC19「笔记变更提示」不可观测**：`_notify_memory` 直接调 `append_system`，**绕过了 `_trace_ui_message`** | 该判据在任何基于 trace 的验收里都是盲区——无法区分「显示了没记」与「压根没显示」 | **已于 2026-08-05 修复**（埋点排在渲染**之后**，理由见第六节第 2 条）。见 [c9.md](c9.md) |
+| **O5** ✅ | **AC19「记忆变更提示」不可观测**：`_notify_memory` 直接调 `append_system`，**绕过了 `_trace_ui_message`** | 该判据在任何基于 trace 的验收里都是盲区——无法区分「显示了没记」与「压根没显示」 | **已于 2026-08-05 修复**（埋点排在渲染**之后**，理由见第六节第 2 条）。见 [c9.md](c9.md) |
 | **O9** | **`skill-creator` 的「按建议修复」依赖用户转述 `/skills` 输出** | `/skills` 是本地命令、输出不进模型历史；用户若原样粘贴又会被命令解析器吞掉（已知项 #13） | 改成「先自己照字段手册体检一遍，把结论摆给用户确认」——模型此时**已经读过手册**。见 [ext-skill-authoring.md](ext-skill-authoring.md) |
 | **O13** | **`tools=None` 时模型的工具调用标记原文泄漏到界面** | 用户拒绝后的下一轮，模型仍想调工具，`<｜｜DSML｜｜tool_calls>…` 这段内部标记原样显示在聊天区 | 呈现层过滤掉这类残留标记，或在该轮给一句「本轮无可用工具」的提示。见下方专条 |
 
@@ -84,7 +84,7 @@
 - **O10**（作者期）**模型会试图用 `run_command` 执行斜杠命令**（`/skills reload`）。
   建议 `skill-creator` 正文写明「这是界面命令，我无法代劳，请你执行」。
 - **O11**（P1a）**`quit` 耗时 ~31 秒而非判据说的「数秒」**。不是挂死，
-  是 `shutdown_on_main` 刻意 `join(timeout=30)` 等笔记线程。**建议改判据措辞**。
+  是 `shutdown_on_main` 刻意 `join(timeout=30)` 等记忆线程。**建议改判据措辞**。
 - **O12**（P1a）本次新加的 `seed_restore` 会连 `.rhinecode/traces/` 一起还原，
   导致同一文件里 `seq` 重叠（我因此误读过一次）。若 P1b 把它做成正式能力，**应跳过 traces 目录**。
 
@@ -100,7 +100,7 @@
 | `docs/c4/checklist.md` | 澄清面板「推荐项排首位**带标记**」 | 刻意**不加**标记（`widgets.py:1142` 写明理由） |
 | `docs/c11/testing/p0-trace/checklist.md` 场景 2 | 「白名单外调用」 | **收窄语义已随对齐改造删除**，该结局在产品里不存在 |
 | `docs/extensions/skill-authoring/checklist.md` 场景 3/5 | 「面板里能看到完整内容 / 改前改后」 | 面板截断；完整内容在**聊天区** |
-| `docs/c11/testing/p1-driver/checklist.md` 场景 5 | 「数秒内干净退出」 | ~31 秒（等笔记线程，上限 30s） |
+| `docs/c11/testing/p1-driver/checklist.md` 场景 5 | 「数秒内干净退出」 | ~31 秒（等记忆线程，上限 30s） |
 
 ---
 

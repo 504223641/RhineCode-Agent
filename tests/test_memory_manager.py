@@ -1,4 +1,4 @@
-"""MemoryManager 编排单测（c9 T11 / AC14–AC18/AC21 相关），用假 provider 断言笔记请求不带工具。"""
+"""MemoryManager 编排单测（c9 T11 / AC14–AC18/AC21 相关），用假 provider 断言记忆请求不带工具。"""
 
 import json
 import time
@@ -62,11 +62,11 @@ class ManagerTestBase(unittest.TestCase):
         )
 
     def _wait_notes_done(self, mgr: MemoryManager, timeout: float = 5.0) -> None:
-        """等待笔记后台线程结束（in-flight 标志清除）。"""
+        """等待记忆后台线程结束（in-flight 标志清除）。"""
         deadline = time.time() + timeout
         while mgr._memory_inflight.is_set():
             if time.time() > deadline:
-                self.fail("笔记线程超时未结束")
+                self.fail("记忆线程超时未结束")
             time.sleep(0.01)
 
 
@@ -100,7 +100,7 @@ class ParseResponseTest(unittest.TestCase):
 
 
 class NotesFlowTest(ManagerTestBase):
-    """自然停止 → 笔记落盘 → 索引重建 → 通知（T11 步骤 2–6）。"""
+    """自然停止 → 记忆落盘 → 索引重建 → 通知（T11 步骤 2–6）。"""
 
     def test_natural_stop_writes_note_and_index(self) -> None:
         provider = FakeProvider([_action_json("project", "arch-note.md")])
@@ -113,10 +113,10 @@ class NotesFlowTest(ManagerTestBase):
         mgr.on_natural_stop(history)
         self._wait_notes_done(mgr)
 
-        # 笔记请求不带工具（F15/N6④）
+        # 记忆请求不带工具（F15/N6④）
         self.assertEqual(len(provider.calls), 1)
         self.assertIsNone(provider.calls[0]["tools"])
-        # 项目级目录出现笔记文件与索引
+        # 项目级目录出现记忆文件与索引
         note_path = self.project / ".rhinecode" / "memory" / "arch-note.md"
         self.assertTrue(note_path.exists())
         index = (self.project / ".rhinecode" / "memory" / INDEX_FILENAME).read_text(encoding="utf-8")

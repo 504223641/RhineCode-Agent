@@ -15,7 +15,7 @@
 ## 脚本耗尽的兜底（F22）
 
 脚本写了两轮，模型却被调了第三次，怎么办？——返回 `fallback`，默认是一条含
-`[e2e-fallback]` 的文本。**不抛错、不挂起**：上下文摘要与自动笔记都会额外调模型，
+`[e2e-fallback]` 的文本。**不抛错、不挂起**：上下文摘要与自动记忆都会额外调模型，
 为它们抛错等于把一次正常的系统行为变成测试失败。取这个字面量是为了**可识别**：
 读记录时一眼能认出「这条不是脚本里写的」。
 
@@ -128,7 +128,7 @@ class RecordedCall:
     :param messages: 完整消息列表，**原样引用不截断**（与记录里的截断版本区别正在于此）
     :param system: 稳定系统提示全文
     :param tools: 本轮实际发出的工具 schema 列表（None 表示本轮禁用了工具，
-                  如上下文摘要与自动笔记的调用）
+                  如上下文摘要与自动记忆的调用）
     :param thinking_effort: 思考强度
     :param scope: 发出这次调用的**对话**（trace 作用域：`main` / `subagent:worker-a` /
                   `summary` …）。`ScriptedProvider` 不填（恒 `main`），

@@ -132,7 +132,7 @@ def build_app(
 
     :param cfg: 已加载校验过的配置
     :param user_dir: 用户级目录；缺省 `Path.home() / ".rhinecode"`（等于现状）。
-                     给定时用户级项目指令 / 笔记 / Skill / 权限规则 / MCP 声明
+                     给定时用户级项目指令 / 记忆 / Skill / 权限规则 / MCP 声明
                      五类内容一并改从该目录读取
     :param resume_latest: 对应 `rhine --continue`：启动时恢复最近的未锁定会话。
                           **不可漏传**——漏了 `--continue` 会静默失效

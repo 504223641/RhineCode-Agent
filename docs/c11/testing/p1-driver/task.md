@@ -361,7 +361,7 @@ except Exception as e: print('repo rejected:', e)"
 1. 六个模块级函数返回 `StreamChunk`：`text(s)` / `thinking(s)` /
    `tool(name, args, call_id=None)`（内部造 `ToolCall`，`call_id` 缺省自增）/
    `stream_error(msg)` / `usage(prompt, completion)` / `done()`。
-2. 常量 `FALLBACK_MARKER = "[e2e-fallback]"` 并注释用途：上下文摘要与自动笔记会额外
+2. 常量 `FALLBACK_MARKER = "[e2e-fallback]"` 并注释用途：上下文摘要与自动记忆会额外
    调模型，读记录时一眼能认出「这条不是脚本里写的」。
 
 **验证：** `python -c "from tests.e2e.scripted import *; c=tool('read_file',{'p':1}); print(c.type, c.tool_call.name)"`
@@ -832,10 +832,10 @@ except Exception as e: print('repo rejected:', e)"
 **步骤：**
 1. `--mode scripted`：从 `--script MOD:ATTR` 导入脚本构造 `ScriptedProvider`，
    工厂返回它；装配后立刻 `result.manager.memory_manager.notes_enabled = False`
-   （F16 裁决：确定性形态关自动笔记，它本身就是不确定性来源。
+   （F16 裁决：确定性形态关自动记忆，它本身就是不确定性来源。
    实测该属性是普通实例属性、门控点每次调用现读，赋值即生效）。
 2. `--mode live`：`provider_factory=None`（走真实）；`api_key` 缺失或为占位符时
-   **明确报错退出**，不静默降级（F23）。自动笔记**保留**。
+   **明确报错退出**，不静默降级（F23）。自动记忆**保留**。
 
 **验证：** 两种模式各手工起一次
 
@@ -1003,7 +1003,7 @@ except Exception as e: print('repo rejected:', e)"
    该 Skill 出现在 `/skills` 的输出里（经 `send` + `observe` 读界面消息）；
    **且只读版本控制命令能读到提交历史**（脚本化一次 `git log` 类调用并断言其输出非空）。
 3. **AC25**：断言 `status` 的 `user_dir` 位于系统临时目录之下、不是真实用户目录；
-   **且系统提示中不含真实用户级项目指令与笔记索引**
+   **且系统提示中不含真实用户级项目指令与记忆索引**
    （用 `check_stable_prompt(..., present=False)` 对一个只可能出现在真实用户目录里的
    标记串做否定断言）。
 4. **AC27**：断言记录的 `session_start` 快照里 MCP 状态为空；

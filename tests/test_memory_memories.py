@@ -1,4 +1,4 @@
-"""笔记与索引纯逻辑单测（c9 T6 / AC15 相关）：frontmatter 往返、宽松容错、索引截断。"""
+"""记忆与索引纯逻辑单测（c9 T6 / AC15 相关）：frontmatter 往返、宽松容错、索引截断。"""
 
 import unittest
 

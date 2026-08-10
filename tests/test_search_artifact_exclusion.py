@@ -5,7 +5,7 @@
 
 一次普通的 `grep_content('USAGE')` 实测返回「68 处匹配 · 5 个文件」，其中
 真正的源码命中**只有一个**，其余全来自 `.rhinecode/` 下的机器产物：
-会话存档（`sessions/*.jsonl`）、上下文存盘（`context/*.txt`）、记忆笔记。
+会话存档（`sessions/*.jsonl`）、上下文存盘（`context/*.txt`）、记忆记忆。
 
 三重危害，前两条在那次实跑里都真的发生了：
 
@@ -58,7 +58,7 @@ class SearchExclusionBase(unittest.TestCase):
         write(".rhinecode/context/call_1.txt", f"工具结果原文里也有 {NEEDLE}\n")
         write(".rhinecode/traces/run.jsonl", f'{{"text":"{NEEDLE}"}}\n')
 
-        # 刻意**不**排除的两类：记忆笔记与用户自己写的配置/角色
+        # 刻意**不**排除的两类：记忆记忆与用户自己写的配置/角色
         write(".rhinecode/memory/notes.md", f"项目知识：{NEEDLE}\n")
         write(".rhinecode/agents/worker.md", f"---\ndescription: {NEEDLE}\n---\n")
 
