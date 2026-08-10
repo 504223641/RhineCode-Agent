@@ -453,9 +453,9 @@ class WebExtractScopeTest(unittest.TestCase):
         self.assertEqual(SCOPE_WEB_EXTRACT, "web_extract")
 
     def test_distinct_from_other_scopes(self) -> None:
-        from rhinecode.trace import SCOPE_MAIN, SCOPE_NOTES, SCOPE_SUMMARY, SCOPE_WEB_EXTRACT
+        from rhinecode.trace import SCOPE_MAIN, SCOPE_MEMORY, SCOPE_SUMMARY, SCOPE_WEB_EXTRACT
 
-        scopes = {SCOPE_MAIN, SCOPE_SUMMARY, SCOPE_NOTES, SCOPE_WEB_EXTRACT}
+        scopes = {SCOPE_MAIN, SCOPE_SUMMARY, SCOPE_MEMORY, SCOPE_WEB_EXTRACT}
         self.assertEqual(len(scopes), 4, "作用域取值必须互不相同，否则 --scope 过滤会串")
 
 

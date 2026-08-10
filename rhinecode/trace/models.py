@@ -80,7 +80,7 @@ class TraceEventType(str, Enum):
 # - SCOPE_SUMMARY：c8 第二层的 LLM 摘要调用。它与主对话**共用同一个 Provider 实例**，
 #   若不区分，摘要请求会被算进主对话的轮次计数，读 trace 时会看到「用户只说了一句话，
 #   却发了两轮请求」的假象。
-# - SCOPE_NOTES：c9 的自动笔记调用。同样共用 Provider 实例，而且它跑在**独立的
+# - SCOPE_MEMORY：c9 的自动记忆调用。同样共用 Provider 实例，而且它跑在**独立的
 #   daemon 线程**上，可能与用户的下一条消息并发——不区分就会两条对话的事件交错。
 # - SCOPE_WEB_EXTRACT：web_fetch 扩展的抽取调用（把抓回的正文按提问压成答案）。
 #   同样共用 Provider 实例。不区分的话，一次抓取会在时间线上显示成「模型自己多发了
@@ -92,7 +92,7 @@ class TraceEventType(str, Enum):
 # 能不加就不加。
 SCOPE_MAIN = "main"
 SCOPE_SUMMARY = "summary"
-SCOPE_NOTES = "notes"
+SCOPE_MEMORY = "memory"
 SCOPE_WEB_EXTRACT = "web_extract"
 
 
@@ -288,7 +288,7 @@ __all__ = [
     "TraceEventType",
     "SCOPE_MAIN",
     "SCOPE_SUMMARY",
-    "SCOPE_NOTES",
+    "SCOPE_MEMORY",
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
     "subagent_scope",

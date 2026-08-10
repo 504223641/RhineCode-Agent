@@ -610,7 +610,7 @@ class DriverCore:
         ## 轮次预算的口径
 
         预算**跨 `send` 累计**，计数取自 `recorder.turn_total()`（含 `main` /
-        `isolated:*` / `summary` / `notes` 四种作用域——子对话和摘要也花钱）。
+        `isolated:*` / `summary` / `memory` 四种作用域——子对话和摘要也花钱）。
         它在**前置检查**处生效，**挡不住单次 send 内的循环**：单次上界由产品既有的
         `MAX_ITERATIONS = 25` 兜底，故最坏烧掉 `budget + 25` 轮；
         独立模式子对话另有独立预算，实际上界更高。这是刻意接受的口径。

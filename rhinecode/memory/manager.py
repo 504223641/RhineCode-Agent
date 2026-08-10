@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from rhinecode.provider.base import BaseProvider, Message
-from rhinecode.trace import SCOPE_NOTES, NullRecorder, TraceRecorderProtocol
+from rhinecode.trace import SCOPE_MEMORY, NullRecorder, TraceRecorderProtocol
 from rhinecode.memory import lockfile
 from rhinecode.memory.instructions import LoadedInstructions, load_instructions
 from rhinecode.memory.session import SessionStore, SessionInfo
@@ -290,7 +290,7 @@ class MemoryManager:
         # ⚠️ **不要绑在 `on_natural_stop`**：那个方法跑在 Worker 线程上
         # （由 `_wrap_events` 调用），绑在那里会把**主对话线程**永久标成 notes，
         # 此后用户的每一条消息都会被记成笔记作用域。
-        self._recorder.bind_scope(SCOPE_NOTES)
+        self._recorder.bind_scope(SCOPE_MEMORY)
         try:
             actions = self._decide_actions(new_msgs)
             if not actions:

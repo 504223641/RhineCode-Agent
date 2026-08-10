@@ -73,11 +73,11 @@ spec F2 只要求区分主对话与独立模式子对话。但实现调查发现
 ```python
 SCOPE_MAIN    = "main"      # 主对话，也是一切不隶属对话的事件的归属（F2）
 SCOPE_SUMMARY = "summary"   # C8 第二层摘要的 LLM 调用
-SCOPE_NOTES   = "notes"     # C9 自动笔记的 LLM 调用
+SCOPE_MEMORY  = "memory"    # C9 自动记忆的 LLM 调用
 def isolated_scope(skill_name: str) -> str:      # "isolated:<name>"
 ```
 
-**为什么必须有 `summary` 与 `notes`**：`ContextManager` 与 `MemoryManager` 持有的是
+**为什么必须有 `summary` 与 `memory`**：`ContextManager` 与 `MemoryManager` 持有的是
 **同一个 Provider 实例**（二者的 `self._provider.stream_chat` 调用），它们发出的请求同样
 会流经 Provider 装饰器。若不区分，摘要与笔记的请求会混进主对话的轮次计数，「第 N 轮」
 这个字段立刻失真；而笔记跑在**独立的后台线程**上，还可能与用户的下一条消息并发。
@@ -450,7 +450,7 @@ parser.add_argument("--trace", nargs="?", const=_TRACE_DEFAULT, default=None,
 | `main` | 默认值 | thread-local 未设置时的回退 |
 | `isolated:<name>` | `ConversationManager._run_isolated_skill` 包住子 Agent 的整个运行 | `with recorder.scope(...)` |
 | `summary` | `ContextManager` 调 `stream_chat` 前后 | `with recorder.scope(...)` |
-| `notes` | `MemoryManager` 的笔记 daemon 线程入口 | `bind_scope(SCOPE_NOTES)` |
+| `memory` | `MemoryManager` 的记忆 daemon 线程入口 | `bind_scope(SCOPE_MEMORY)` |
 | 只读并发桶 | `loop._run_readonly_concurrent` 提交任务前捕获父作用域，worker 入口重新绑定 | `bind_scope` |
 
 **⚠️ 必须有的泄漏防护：在 `_do_stream` 的 `finally` 里无条件 `bind_scope(SCOPE_MAIN)`，
@@ -576,7 +576,7 @@ docs / 规范
 | 决策点 | 选择 | 理由 |
 | --- | --- | --- |
 | 作用域的传递方式 | `threading.local()` + 并发桶显式绑定 + `_do_stream` 的 finally 无条件复位 | 参数透传要改十余个签名且污染每层接口；单个可变字段在笔记 daemon 与主对话并发时会串场。thread-local 天然隔离笔记线程；但 Textual 复用池化线程，故必须有一处可靠的复位点 |
-| 作用域取值 | 四种（`main`/`isolated:<名>`/`summary`/`notes`），而非 spec 字面的两种 | 摘要与笔记共用同一个 Provider 实例，不区分就会混进主对话的轮次计数；笔记还跑在独立线程、可能与用户下一条消息并发 |
+| 作用域取值 | 四种（`main`/`isolated:<名>`/`summary`/`memory`），而非 spec 字面的两种 | 摘要与笔记共用同一个 Provider 实例，不区分就会混进主对话的轮次计数；笔记还跑在独立线程、可能与用户下一条消息并发 |
 | 轮次号来源 | 记录器按作用域各自计数 | Provider 装饰器拿不到 `loop` 的 `iteration`；而埋在 loop 会漏掉摘要与笔记两条路径 |
 | Provider 埋点形态 | 装饰器包装，不改 `stream_chat` 签名 | 与 C11 的 `_provider_for` 同一思路——`BaseProvider` 接口一行不动。全局无任何 `isinstance` 检查，provider 对象也只被访问 `stream_chat` 一个成员，包一层是安全的 |
 | 装饰器的结算时机 | 显式 `contextlib.closing` + `finally` | 调用方会 `break` 提前退出。只靠 `try/finally` 正确但依赖 CPython 引用计数；显式 `closing` 把它变成代码事实 |

@@ -27,7 +27,7 @@ from rhinecode.permission.rules import RuleSet, Rule
 from rhinecode.provider.base import Message, StreamChunk, ToolCall
 from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.registry import ToolRegistry
-from rhinecode.trace.models import SCOPE_MAIN, SCOPE_NOTES, SCOPE_SUMMARY, TraceEventType
+from rhinecode.trace.models import SCOPE_MAIN, SCOPE_MEMORY, SCOPE_SUMMARY, TraceEventType
 from rhinecode.trace.recorder import TraceRecorder, bind_scope
 from rhinecode.trace.tracing_provider import TracingProvider
 from rhinecode.tools.path_guard import main_project_root
@@ -473,13 +473,13 @@ class ScopeTest(TraceHookBase):
 
         def worker() -> None:
             # 模拟 MemoryManager._update_notes 的入口绑定
-            self.rec.bind_scope(SCOPE_NOTES)
+            self.rec.bind_scope(SCOPE_MEMORY)
             seen.append(self.rec.current_scope())
 
         t = threading.Thread(target=worker)
         t.start()
         t.join(timeout=10)
-        self.assertEqual(seen, [SCOPE_NOTES])
+        self.assertEqual(seen, [SCOPE_MEMORY])
         # 主线程完全不受影响
         self.assertEqual(self.rec.current_scope(), SCOPE_MAIN)
 

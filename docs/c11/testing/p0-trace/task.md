@@ -62,7 +62,7 @@
    `API_RESPONSE` / `PERMISSION_DECISION` / `INTERACTION` / `TOOL_EXECUTE` / `UI_MESSAGE` /
    `STATUS_BAR` / `AGENT_EVENT` / `CONTEXT_COMPACTION` / `SKILL_STATE` / `HISTORY_RESTORED`。
    每个成员行尾注释标注对应 spec 的哪条 F。
-3. 定义 `SCOPE_MAIN = "main"` / `SCOPE_SUMMARY = "summary"` / `SCOPE_NOTES = "notes"`，
+3. 定义 `SCOPE_MAIN = "main"` / `SCOPE_SUMMARY = "summary"` / `SCOPE_MEMORY = "memory"`，
    注释说明为什么需要后两个：`ContextManager` 与 `MemoryManager` 持有同一个 Provider 实例，
    不区分会污染主对话的轮次计数；笔记还跑在独立线程、可能与用户下一条消息并发。
 4. 定义 `isolated_scope(name: str) -> str` 返回 `f"isolated:{name}"`。
@@ -704,14 +704,14 @@
 **步骤：**
 1. `__init__` 新增 `recorder=None` 关键字参数，缺省 `NullRecorder()`。
 2. 在 **`MemoryManager._update_notes` 的 `try:` 之前、函数体第一行**
-   `self._recorder.bind_scope(SCOPE_NOTES)`。
+   `self._recorder.bind_scope(SCOPE_MEMORY)`。
    ⚠️ **不要绑在 `on_natural_stop`**——那是 Worker 线程（由 `_wrap_events` 调用），
-   绑在那里会把主对话线程永久标成 `notes`。`_update_notes` 才是 daemon 线程的目标函数。
+   绑在那里会把主对话线程永久标成 `memory`。`_update_memories` 才是 daemon 线程的目标函数。
 3. 注释说明：笔记跑独立线程且可能与用户的下一条消息并发，thread-local 天然隔离它，
    线程入口绑定一次即可，无需 `with`。
 
 **验证：** `python -m unittest tests.test_memory_manager -v` 全绿；触发一次笔记钩子后
-断言该次 `api_request` 的 scope 为 `notes`，且**主对话后续事件仍为 `main`**。
+断言该次 `api_request` 的 scope 为 `memory`，且**主对话后续事件仍为 `main`**。
 
 ## T39: Skill 状态埋点（锁外）
 
@@ -907,7 +907,7 @@
 **依赖：** T50、T32、T34、T38、T42
 **步骤：** 覆盖——
 1. 子对话**全部事件**（模型请求响应、权限、工具、循环）作用域为 `isolated:<name>`（AC11）；
-2. 摘要调用 scope 为 `summary`、笔记调用 scope 为 `notes`，且**主对话后续事件仍为 `main`**；
+2. 摘要调用 scope 为 `summary`、记忆调用 scope 为 `memory`，且**主对话后续事件仍为 `main`**；
 3. 不隶属任何对话的事件（会话启停、命令分发、状态栏）作用域为 `main`（AC21）；
 4. **作用域泄漏防护**：`_do_stream` 抛异常后，后续事件 scope 回到 `main`；
 5. **AC6**：用一个 `emit` / `emit_lazy` **必抛**的 recorder 跑一轮含只读并发工具的循环，
