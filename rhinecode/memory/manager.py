@@ -300,7 +300,7 @@ class MemoryManager:
             if applied:
                 self._last_memory_result = f"已更新 {applied} 条记忆。"
                 if self.notify is not None:
-                    self.notify(f"🧠 已更新记忆（{applied} 条）")
+                    self.notify(f"已更新记忆（{applied} 条）")
             elif skipped_locked:
                 self._last_memory_result = "目标记忆目录正被其它实例写入，本轮跳过。"
             else:
@@ -455,7 +455,8 @@ class MemoryManager:
         for i, info in enumerate(infos, start=1):
             when = info.last_time.strftime("%Y-%m-%d %H:%M") if info.last_time else "未知时间"
             current = "（当前）" if info.session_id == self._session.session_id else ""
-            locked = "🔒 " if info.locked and not current else ""
+            # `🔒`→`[锁定]`（F28/F30）：语义由文字承担，不靠一个图形
+            locked = "[锁定] " if info.locked and not current else ""
             lines.append(
                 f"  {i}. {locked}{info.session_id}{current} · {when} · "
                 f"{info.message_count} 条 · {info.title}"
@@ -499,12 +500,12 @@ class MemoryManager:
     # ------------------------------------------------------------------ #
     def memory_report(self) -> str:
         """/memory 的只读报告（F19）：指令层、索引、记忆数、最近更新、会话与锁状态。"""
-        lines = ["🧠 记忆系统状态", "", "RHINE.md 项目指令："]
+        lines = ["记忆系统状态", "", "RHINE.md 项目指令："]
         for layer in self._instructions.layers:
             mark = f"已加载（{layer.size} 字符）" if layer.loaded else "未找到"
             lines.append(f"  [{layer.label}] {layer.path} — {mark}")
             for err in layer.errors:
-                lines.append(f"    ⚠ {err}")
+                lines.append(f"    警告：{err}")
 
         lines.append("")
         lines.append("自动记忆：" + ("启用" if self.memories_enabled else "未启用（仅 DeepSeek 工具模式）"))

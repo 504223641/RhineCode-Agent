@@ -410,7 +410,7 @@ def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
         if rule.tool.startswith(MCP_PREFIX):
             suggestion = (
                 "写成具体的工具名（如 `mcp__server__某个工具`）而不是通配。"
-                "⚠️ 远端工具**不要加参数模式**——权限引擎要求这类规则的括号必须为空，"
+                "注意：远端工具**不要加参数模式**——权限引擎要求这类规则的括号必须为空，"
                 "加了模式反而会让这条预授权永远匹配不上。"
             )
         else:
@@ -425,7 +425,7 @@ def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
             suggestion = (
                 f"加一个**具体**的参数模式收窄，形如 `{rule.tool}(具体前缀 *)`。"
                 f"只预授权这个 Skill 必然要做的那几件事，其余照常弹确认面板。"
-                f"⚠️ **换成另一个工具类别不算收窄**——裸写 `Edit` 或裸写 `Write` "
+                f"注意：**换成另一个工具类别不算收窄**——裸写 `Edit` 或裸写 `Write` "
                 f"同样是「该类别全部操作免确认」；真正收窄的是括号里的模式。"
             )
         out.append(

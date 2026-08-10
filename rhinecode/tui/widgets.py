@@ -146,7 +146,7 @@ def build_replay_items(messages) -> "list[tuple]":
        - role="tool"      → 跳过（结果已并入所属 assistant 的 tool 项）
        - 其它 role        → 防御性跳过
 
-    已知降级：会话存档不含思考（thinking）内容，回放不出现 💭 块。
+    已知降级：会话存档不含思考（thinking）内容，回放不出现思考块。
 
     :param messages: 历史消息列表（元素为 provider.base.Message）
     :returns: 渲染项列表，元素为 ("user", str) / ("assistant", str) / ("tool", ToolCall, str)
@@ -349,6 +349,10 @@ SECONDARY_COLOR = "#808080"
 # 用文字而不是图形，是为了让它们**脱离颜色也能辨认**：截图、配色异常的终端、
 # 端到端驱动抓到的纯文本里，颜色都可能丢失，而这三个字不会。
 # 提示级与事件级刻意**没有**前缀——误读那两者的代价为零，见 `append_event`。
+# 思考块的标记（F28/F29）。`💭` 换成 `✻`——单色字形，任何终端里都不会被渲染成
+# 彩色图形，且这是 Claude Code 的同款记号。它是白名单里唯一的「特例」类符号。
+THINKING_MARK = "✻"
+
 WARNING_PREFIX = "警告："
 ERROR_PREFIX = "错误："
 
@@ -950,7 +954,7 @@ class HistoryView(ScrollableContainer):
 
         :returns: 新建的 Static 组件，内容初始为带思考图标的空字符串
         """
-        return self._add_widget("[dim italic]💭 [/dim italic]")
+        return self._add_widget(f"[dim italic]{THINKING_MARK} [/dim italic]")
 
     def update_widget(self, widget: Static, markup: str) -> None:
         """

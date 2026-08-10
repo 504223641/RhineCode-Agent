@@ -88,6 +88,7 @@ from rhinecode.tui.widgets import (
     # 任意模型文本 × 任意截断点，没有理由赌它撞不上。
     escape,
     format_activity_cost,
+    THINKING_MARK,
 )
 
 
@@ -1343,7 +1344,7 @@ class RhineApp(App):
                     self.call_from_thread(
                         history_view.update_widget,
                         thinking_widget,
-                        f"[dim italic]💭 {escape(''.join(thinking_chunks))}[/dim italic]",
+                        f"[dim italic]{THINKING_MARK} {escape(''.join(thinking_chunks))}[/dim italic]",
                     )
 
                 elif etype == AgentEventType.TEXT:
@@ -1704,10 +1705,12 @@ class RhineApp(App):
         self.query_one(CommandPanel).hide()
         panel = self.query_one(ConfirmPanel)
         # 计划全文可能很长，已作为聊天记录中的普通助手消息展示；这里仅询问是否进入执行阶段。
+        # 三个 emoji 全部去掉（F28）：橘色分隔线已经表达「这是要你决定的事」，
+        # 两个选项的语义由序号 + 动词承担（面板自己加序号，见 NumberedPanel）。
         panel.show_prompt(
-            "📋 计划已就绪，是否开始执行？",
-            "✅ 开始执行  [dim]写文件/改文件/运行命令仍会逐个确认[/dim]",
-            "❌ 暂不执行  [dim]停止本次执行[/dim]",
+            "计划已就绪，是否开始执行？",
+            "开始执行  [dim]写文件/改文件/运行命令仍会逐个确认[/dim]",
+            "暂不执行  [dim]停止本次执行[/dim]",
         )
         panel.focus()
 

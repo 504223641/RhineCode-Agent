@@ -191,14 +191,14 @@ class MCPManager:
 
         for s in self.states:
             if s.connected:
-                lines.append(f"{s.name} ({s.kind}) ✓ 已连接 · {s.tool_count} 工具")
+                lines.append(f"{s.name} ({s.kind}) 已连接 · {s.tool_count} 工具")
                 for alias in s.aliases:
                     lines.append(f"  {alias}")
             else:
-                lines.append(f"{s.name} ({s.kind}) ✗ 失败：{s.error}")
+                lines.append(f"{s.name} ({s.kind}) 失败：{s.error}")
 
         for err in self.config_errors:
-            lines.append(f"⚠ 配置：{err}")
+            lines.append(f"警告：配置：{err}")
         return "\n".join(lines)
 
     def close_all(self) -> None:

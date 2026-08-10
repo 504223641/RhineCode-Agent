@@ -331,7 +331,10 @@ class ClosedLoopTest(HostFixture):
         # status 读到面板展示原文与可选项列表
         panel = self.status()["panel"]
         self.assertEqual(panel["kind"], "confirm")
-        self.assertIn("write_file", panel["display"])
+        # 面板表头走 B 组的主参数口径（tui-display 扩展 F12）：显示
+        # `Write(x.txt)` 而不是内部名 + 键值对。判据跟着改成**展示标签**——
+        # 它才是用户实际看到的字，而 option 的 id 才是契约（下面那条断言）。
+        self.assertIn("Write(x.txt)", panel["display"])
         self.assertEqual(
             [o["id"] for o in panel["options"]],
             ["yes", "yes_session", "yes_permanent", "no"],

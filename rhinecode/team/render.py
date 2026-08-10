@@ -264,7 +264,8 @@ def render_board(tasks: Sequence[BoardTask], blockers_of=None) -> str:
             else tuple(task.blocked_by)
         )
         if blockers and task.state is not TaskState.COMPLETED:
-            parts.append(f"⛔ 被 {'、'.join(blockers)} 挡着")
+            # `⛔` 去掉（F28）：「被 … 挡着」这句话本身已经说清了
+            parts.append(f"被 {'、'.join(blockers)} 挡着")
         elif task.blocked_by:
             parts.append(f"依赖 {'、'.join(task.blocked_by)}（已满足）")
 

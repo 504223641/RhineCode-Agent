@@ -275,7 +275,7 @@ class TaskGetTool(_BoardTool):
             if task.description:
                 lines.append(f"说明：{task.description}")
             if blockers:
-                lines.append(f"⛔ 现在被这些未完成的任务挡着：{'、'.join(blockers)}")
+                lines.append(f"现在被这些未完成的任务挡着：{'、'.join(blockers)}")
             elif task.blocked_by:
                 lines.append(f"依赖：{'、'.join(task.blocked_by)}（已全部完成）")
             else:
