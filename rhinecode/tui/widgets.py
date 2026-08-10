@@ -1659,7 +1659,90 @@ class StatusBar(Static):
         )
 
 
-class ConfirmPanel(OptionList):
+class NumberedPanel(OptionList):
+    """
+    三个可选面板（确认 / 澄清 / 会话）的共用底座（tui-display 扩展 E 组）。
+
+    它只做两件事，**不碰任何交互契约**（F27/N8）：
+
+    1. **给可选项编号**（F23）——序号只分配给真正可选的行；表头与详情行这类
+       `disabled` 的**不占号**，否则按 `2` 会落到一行说明文字上；
+    2. **让当前高亮项带一个非颜色的指示符**（F24）——改造前「当前是哪一项」
+       只靠背景色表达，而颜色在截图、配色异常的终端、端到端驱动抓到的纯文本里
+       都可能丢失。
+
+    ## 为什么抽成基类而不是在三个面板里各写一遍
+
+    序号与指示符必须**三处一致**，否则用户在确认面板学会的「按 2」到了会话面板
+    就不灵。而且 `watch_highlighted` 这类 Textual 钩子写错一次就会自激
+    （见下），三份实现意味着三次犯错的机会。
+
+    ## `watch_highlighted` 为什么不会自激
+
+    它用 `replace_option_prompt_at_index` 只换那一行的**提示文本**，
+    **不动 `highlighted` 本身**，因此不会触发第二次 watch。
+    换成「清空重建选项」的写法就会自激（重建会重置高亮 → 再次触发）。
+    """
+
+    def _reset_choices(self) -> None:
+        """清空选项与编号表。每次 `show_*` 的第一件事。"""
+        self.clear_options()
+        # `[(选项下标, 未加前缀的展示文本)]`，按可选顺序。序号即它在本表里的位置 + 1。
+        self._choices: "list[tuple[int, str]]" = []
+
+    def _add_static(self, markup: str) -> None:
+        """加一行**不可选**的行（表头、详情、URL 补充行）——不占序号。"""
+        self.add_option(Option(markup, disabled=True))
+
+    def _add_choice(self, option_id: "Optional[str]", markup: str) -> int:
+        """
+        加一个可选项，自动带上序号与高亮指示符。
+
+        :param option_id: `OptionList.OptionSelected` 里回传的标识
+        :param markup: 该项的展示内容（**可以已经是 markup**）
+        :returns: 该项在 `OptionList` 里的下标
+
+        副作用：往选项列表追加一项，并登记进编号表。
+        """
+        index = self.option_count
+        number = len(self._choices) + 1
+        # 建的时候一律按「未选中」画；真正的高亮由 `watch_highlighted` 铺上去。
+        self.add_option(Option(numbered_prompt(number, markup, False), id=option_id))
+        self._choices.append((index, markup))
+        return index
+
+    def choice_index(self, number: int) -> "Optional[int]":
+        """
+        序号（从 1 起）→ 该项在 `OptionList` 里的下标；越界返回 None。
+
+        数字键选中走这条（F23）。
+        """
+        if 1 <= number <= len(self._choices):
+            return self._choices[number - 1][0]
+        return None
+
+    def watch_highlighted(self, highlighted: "Optional[int]") -> None:
+        """
+        高亮变化时，把指示符从旧行挪到新行（F24）。
+
+        ⚠ 用 `replace_option_prompt_at_index` 而不是重建选项：那个方法
+        **不改 `highlighted`**，因此不会触发第二次 watch。重建会重置高亮，
+        进而再次触发本方法——一个安静的无限循环。
+
+        整段包 try/except：这是 Textual 的 watch 钩子，跑在**主线程的消息泵**上，
+        异常逃逸会打断整个界面；而它的职责只是「换一个前缀」，
+        失败的最坏后果是指示符没跟上，不值得为它拆掉应用。
+        """
+        try:
+            for number, (index, markup) in enumerate(self._choices, start=1):
+                self.replace_option_prompt_at_index(
+                    index, numbered_prompt(number, markup, index == highlighted)
+                )
+        except Exception:  # noqa: BLE001 —— 见上：装饰性更新绝不打断界面
+            pass
+
+
+class ConfirmPanel(NumberedPanel):
     """
     工具执行前的内联确认面板（取代旧的模态弹窗 ConfirmScreen）。
 
@@ -1686,9 +1769,34 @@ class ConfirmPanel(OptionList):
     # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
     DEFAULT_CSS = "ConfirmPanel { display: none; }"
 
-    # 表头与两个可选项在 OptionList 中的索引（表头 disabled 不可选）
+    # 表头在 OptionList 中的索引（表头 disabled 不可选）
     _HEADER_INDEX = 0
-    _YES_INDEX = 1  # 「执行」：默认高亮项，回车即执行
+
+    # 工具行标题用的主参数映射（F12），由 `app.on_mount` 灌进来。
+    # 缺省空字典 → 退回键值对摘要，与改造前逐字一致。
+    _primary_args: dict = {}
+
+    def set_primary_args(self, mapping: dict) -> None:
+        """接收「工具名 → 主参数键名」映射（F12），与 `HistoryView` 同一份。"""
+        self._primary_args = dict(mapping or {})
+
+    def _add_choices(self, items) -> None:
+        """
+        批量加可选项：`[(id, 主文本, 说明)]`。
+
+        说明用暗色跟在主文本后面——它是次级信息，与主文本同亮度会让每一行
+        都在争注意力，而用户真正要读的只有那几个动词。
+        """
+        first = None
+        for option_id, label, detail in items:
+            markup = f"{label}  [dim]{detail}[/dim]" if detail else label
+            index = self._add_choice(option_id, markup)
+            if first is None:
+                first = index
+        # 默认高亮第一个可选项。**用实际下标而不是写死的 1**：URL 类请求会在
+        # 表头后面插几行补充说明（web_fetch 扩展 F9），写死会落到一行 disabled
+        # 的说明文字上。
+        self._first_choice = first
 
     class Cancelled(TextualMessage):
         """用户按 Esc 取消确认时发出，由 App 视为拒绝执行。"""
@@ -1757,18 +1865,23 @@ class ConfirmPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见。
         """
-        args_summary = summarize_args(tool_call.arguments, max_len=200)
+        # 工具名与参数走 B 组的主参数口径（F12）：确认面板上显示
+        # `Write(docs/notes.md)` 而不是 `write_file(path=docs/notes.md, con…)`。
+        # 用户是靠这一行决定放不放行的，键名在这里同样只占地方。
+        label, inner = resolve_call_title(tool_call, self._primary_args)
+        if not self._primary_args or not inner:
+            # 没有主参数映射（非 DeepSeek Provider）时退回宽松的键值对摘要。
+            # ⚠ 这里的上限是 **200 而不是工具行的 60**：面板这一行是人在回路的
+            # 判断依据，按工具行的宽度截会把关键信息切掉（web_fetch 扩展 F9
+            # 记过这个坑：地址被截断意味着攻击者只要把恶意部分放在第 31 个字符
+            # 之后，这一层就形同虚设）。
+            inner = summarize_args(tool_call.arguments, max_len=200)
         # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
         reason = f"  [dim]· {escape(decision.reason)}[/dim]" if decision is not None else ""
-        safe_name = escape(str(tool_call.name))
-        self.clear_options()
-        # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航
-        self.add_option(
-            Option(
-                f"[#FFA500]⚠ 确认执行：{safe_name}({args_summary})[/#FFA500]{reason}",
-                disabled=True,
-            )
-        )
+        self._reset_choices()
+        # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航。
+        # `⚠` 去掉（F28）——「确认执行」四个字 + 橘色分隔线已经说清了它的性质。
+        self._add_static(f"[#FFA500]确认执行  {label}({inner})[/#FFA500]{reason}")
         # URL 类专用补充行（web_fetch 扩展 F9）。
         #
         # **为什么需要它**：上面那行走 summarize_args，它把每个参数值截到 30 字符，
@@ -1782,14 +1895,21 @@ class ConfirmPanel(OptionList):
         # AttributeError 属于「没有任何 try/except 兜得住」的那一类。
         if decision is not None and getattr(decision, "kind", "") == "url":
             for line in self._url_detail_lines(tool_call, decision):
-                self.add_option(Option(line, disabled=True))
-        self.add_option(Option("✅ 本次放行  [dim]仅执行本次[/dim]", id="yes"))
-        self.add_option(Option("🟢 本会话放行  [dim]本会话内相同调用不再询问[/dim]", id="yes_session"))
-        self.add_option(Option("💾 永久放行  [dim]写入本地配置，重启仍生效[/dim]", id="yes_permanent"))
-        self.add_option(Option("❌ 拒绝  [dim]拒绝并让模型据此调整[/dim]", id="no"))
+                self._add_static(line)
+        # 四个可选项带序号（F23），用户可以直接按数字键选中。
+        # 改造前这里是四个彩色 emoji（`✅ 🟢 💾 ❌`）——四种颜色反而盖过了
+        # 「哪个是当前选中」这个唯一重要的信息。语义现在由序号 + 文字承担。
+        self._add_choices(
+            [
+                ("yes", "本次放行", "仅执行本次"),
+                ("yes_session", "本会话放行", "本会话内相同调用不再询问"),
+                ("yes_permanent", "永久放行", "写入本地配置，重启仍生效"),
+                ("no", "拒绝", "让模型据此调整                    Esc"),
+            ]
+        )
         self.display = True
         # 默认高亮「本次放行」，回车即执行（与 / 命令面板一致的顺手体验）
-        self.highlighted = self._YES_INDEX
+        self.highlighted = self._first_choice
 
     def show_prompt(self, title: str, yes_label: str, no_label: str) -> None:
         """
@@ -1804,12 +1924,11 @@ class ConfirmPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见。
         """
-        self.clear_options()
-        self.add_option(Option(f"[#FFA500]{escape(title)}[/#FFA500]", disabled=True))
-        self.add_option(Option(yes_label, id="yes"))
-        self.add_option(Option(no_label, id="no"))
+        self._reset_choices()
+        self._add_static(f"[#FFA500]{escape(title)}[/#FFA500]")
+        self._add_choices([("yes", yes_label, ""), ("no", no_label, "Esc")])
         self.display = True
-        self.highlighted = self._YES_INDEX
+        self.highlighted = self._first_choice
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
@@ -1820,7 +1939,7 @@ class ConfirmPanel(OptionList):
         self.post_message(self.Cancelled())
 
 
-class ClarifyPanel(OptionList):
+class ClarifyPanel(NumberedPanel):
     """
     Plan Mode 需求澄清面板（spec F12）。
 
@@ -1863,24 +1982,26 @@ class ClarifyPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见。
         """
-        self.clear_options()
-        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过
-        self.add_option(Option(f"[#7AEEFF]❓ {escape(question)}[/#7AEEFF]", disabled=True))
+        self._reset_choices()
+        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过。
+        # `❓` 去掉（F28）——问句本身加上青色分隔线已经说清它是个提问。
+        self._add_static(f"[#7AEEFF]{escape(question)}[/#7AEEFF]")
 
-        first_selectable: int | None = None
+        first_selectable: "int | None" = None
         for idx, opt in enumerate(options):
-            # 概述行：可选，id 为该候选项下标（字符串）
+            # 概述行：可选、带序号，id 为该候选项下标（字符串）。
             # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
-            #     故不再额外加「⭐ 推荐」前缀，避免重复提示。
-            option_index = self.option_count  # 加入前的位置即本概述行的索引
-            self.add_option(Option(escape(opt.summary), id=str(idx)))
+            #     故不再额外加「推荐」前缀，避免重复提示。
+            option_index = self._add_choice(str(idx), escape(opt.summary))
             if first_selectable is None:
                 first_selectable = option_index
-            # 详情行：disabled，仅展示，导航会跳过
-            # 不缩进，使详情与上方概述行左边缘对齐
+            # 详情行：disabled，仅展示，导航会跳过，**不占序号**（F23）——
+            # 占了的话按 `2` 会落到一行说明文字上。
+            # 缩进与上方概述行的正文左缘对齐（序号前缀占四格）。
             if opt.detail:
-                self.add_option(Option(f"[dim]{escape(opt.detail)}[/dim]", disabled=True))
+                self._add_static(f"[dim]     {escape(opt.detail)}[/dim]")
 
+        self._add_static("[dim]                                              Esc 取消[/dim]")
         self.display = True
         # 默认高亮第一个可选概述行
         if first_selectable is not None:
@@ -1895,7 +2016,7 @@ class ClarifyPanel(OptionList):
         self.post_message(self.Cancelled())
 
 
-class SessionPanel(OptionList):
+class SessionPanel(NumberedPanel):
     """
     /resume 的交互式会话选择面板（c9 交互化）。
 
@@ -1941,32 +2062,33 @@ class SessionPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见、重置高亮到第一个可选项。
         """
-        self.clear_options()
-        self.add_option(
-            Option(
-                "[#7AEEFF]📂 选择要恢复的会话（↑↓ 选择，回车载入，Esc 取消）[/#7AEEFF]",
-                disabled=True,
-            )
+        self._reset_choices()
+        # `📂` 与 `↑↓` 都去掉（F28/F29）：前者是装饰，后者在中文界面里写字更清楚。
+        self._add_static(
+            "[#7AEEFF]选择要恢复的会话        上下键选择，回车载入，Esc 取消[/#7AEEFF]"
         )
         first_selectable: "int | None" = None
-        for i, info in enumerate(infos, start=1):
+        for info in infos:
             when = info.last_time.strftime("%Y-%m-%d %H:%M") if info.last_time else "未知时间"
             is_current = info.session_id == current_id
             locked = info.locked and not is_current
-            # session_id / title 都可能含 "["（title 来自用户消息原文），必须 escape，
-            # 否则被 Textual markup 当标签吞掉（项目已知坑，见 CLAUDE.md 成对维护点备忘）
+            # ⚠ session_id / title 都可能含 "["（title 来自用户消息原文），必须
+            # escape，否则被 Textual markup 当标签吞掉（项目已知坑）。
+            #
+            # `🔒`→`[锁定]`、`（当前）`→`[当前]`（F28/F30）：语义由**文字**承担，
+            # 不靠一个图形。这两条本来就不可选，用户需要知道的是「为什么点不了」。
+            mark = "[锁定] " if locked else ("[当前] " if is_current else "")
             line = (
-                f"{i}. {'🔒 ' if locked else ''}{escape(info.session_id)}"
-                f"{'（当前）' if is_current else ''} · {when} · "
+                f"{escape(mark)}{escape(info.session_id)} · {when} · "
                 f"{info.message_count} 条 · [dim]{escape(info.title)}[/dim]"
             )
-            option_index = self.option_count  # 加入前的位置即本行索引
-            # 锁定/当前会话 disabled：导航自动跳过；可恢复项 id 携带完整 session_id
-            self.add_option(
-                Option(line, id=None if (locked or is_current) else info.session_id,
-                       disabled=locked or is_current)
-            )
-            if first_selectable is None and not (locked or is_current):
+            if locked or is_current:
+                # 不可选行**不占序号**（F23）——占了的话序号会跳号，
+                # 而用户按下的那个数字对应的是另一条。
+                self._add_static(f"[dim]   {line}[/dim]")
+                continue
+            option_index = self._add_choice(info.session_id, line)
+            if first_selectable is None:
                 first_selectable = option_index
         self.display = True
         # 默认高亮第一个可选会话（最近的可恢复会话，回车即载入）

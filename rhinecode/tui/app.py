@@ -338,7 +338,11 @@ class RhineApp(App):
         # 必须排在 `render_history` **之前**——`--continue` 恢复出来的历史里
         # 有工具行，晚一步的话首屏那批会用空映射画成键值对形态，与其后新产生的
         # 行长得不一样，而这在界面上只表现为「上下两截风格不同」。
-        self.query_one(HistoryView).set_primary_args(self._manager.primary_arg_map())
+        primary_args = self._manager.primary_arg_map()
+        self.query_one(HistoryView).set_primary_args(primary_args)
+        # 确认面板也要（E 组做完的样子里那句「工具名也走 B 组的主参数口径」）：
+        # 用户就是靠面板上那一行决定放不放行的，键名在那里同样只占地方。
+        self.query_one(ConfirmPanel).set_primary_args(primary_args)
 
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
