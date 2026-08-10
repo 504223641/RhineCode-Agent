@@ -423,6 +423,48 @@ class TaskManager:
         with self._lock:
             return tuple(self._tasks.values())
 
+    @staticmethod
+    def row_of(record: "TaskRecord", now: "Optional[float]" = None) -> "ActivityRow":
+        """
+        把一条任务记录冻结成一行活动快照。
+
+        :param record: 任务记录
+        :param now: 当前时刻（`time.monotonic()`）。批量转换时由调用方传同一个值，
+            免得同一次轮询里各行的「现在」差了几微秒
+        :returns: 不可变快照
+
+        ## 为什么这是一个公开的静态方法（F6）
+
+        它有**两个**调用方：`activity_rows()` 给活动区，以及界面产出**完成通知**
+        时给那一条历史留痕。spec F6 要求两处的成本数字**同源同口径**——
+        各自从 `TaskRecord` 上取字段拼一遍的话，一次口径改动只改一处不报错，
+        用户会看到同一个任务的成本在活动区与历史区对不上，而那种不一致最难解释
+        （两个数字都「看起来对」，只是不相等）。
+
+        副作用：无（纯函数）。
+        """
+        moment = time.monotonic() if now is None else now
+        settled = (
+            max(0.0, moment - record.finished_at)
+            if record.status.is_terminal and record.finished_at is not None
+            else 0.0
+        )
+        end = record.finished_at if record.finished_at is not None else moment
+        who = (
+            f"{record.member_name}({record.agent_name})"
+            if record.member_name
+            else record.agent_name
+        )
+        return ActivityRow(
+            display_name=who,
+            status=record.status,
+            seconds=max(0.0, end - record.started_at),
+            tokens=record.usage_tokens,
+            tool_calls=record.tool_calls,
+            recent_tools=record.recent_tools,
+            settled_seconds=settled,
+        )
+
     def activity_rows(self) -> "tuple[ActivityRow, ...]":
         """
         取活动区要画的那几行（tui-display 扩展 F1/F2/F6）。
@@ -450,31 +492,12 @@ class TaskManager:
         with self._lock:
             rows = []
             for record in self._tasks.values():
-                if record.status.is_terminal:
-                    if record.finished_at is None:
-                        continue
-                    settled = max(0.0, now - record.finished_at)
-                    if settled >= ACTIVITY_LINGER_SECONDS:
-                        continue
-                else:
-                    settled = 0.0
-                who = (
-                    f"{record.member_name}({record.agent_name})"
-                    if record.member_name
-                    else record.agent_name
-                )
-                end = record.finished_at if record.finished_at is not None else now
-                rows.append(
-                    ActivityRow(
-                        display_name=who,
-                        status=record.status,
-                        seconds=max(0.0, end - record.started_at),
-                        tokens=record.usage_tokens,
-                        tool_calls=record.tool_calls,
-                        recent_tools=record.recent_tools,
-                        settled_seconds=settled,
-                    )
-                )
+                if record.status.is_terminal and (
+                    record.finished_at is None
+                    or now - record.finished_at >= ACTIVITY_LINGER_SECONDS
+                ):
+                    continue
+                rows.append(self.row_of(record, now))
             return tuple(rows)
 
     def running_count(self) -> int:

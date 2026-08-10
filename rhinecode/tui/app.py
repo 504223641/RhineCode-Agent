@@ -26,7 +26,7 @@ from textual.events import Key
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
-from rhinecode.subagents.tasks import STATUS_LABELS
+from rhinecode.subagents.tasks import STATUS_LABELS, TaskManager
 from rhinecode.commands import (
     CommandDispatcher,
     CommandRegistry,
@@ -75,7 +75,44 @@ from rhinecode.tui.widgets import (
     # 「两个未闭合括号」的用例）；换成安全版是因为输入性质相同——
     # 任意模型文本 × 任意截断点，没有理由赌它撞不上。
     escape,
+    format_activity_cost,
 )
+
+
+def _subagent_finish_text(record) -> str:
+    """
+    子 Agent 结束时写进历史区的那**一条**记录（tui-display 扩展 F6/F7）。
+
+    :param record: `subagents.tasks.TaskRecord`
+    :returns: 两行文本——首行是「谁 · 什么结局 · 花了多少」，次行说明结论的去向
+
+    ## ⚠ F6 的「历史永久痕」与 F7 的「完成通知」是**同一行**
+
+    写成两行不报错，只是每个子 Agent 在历史区留下**重复的两条**——用户会
+    以为它跑了两次。所以这里只有一个产出点，活动区那条终态行是它的短期镜像，
+    数秒后消失。
+
+    ## 成本数字为什么绕道 `TaskManager.row_of`
+
+    spec F6 要求活动区终态行与这条留痕的成本数字**同源同口径**。两边各自
+    从 `TaskRecord` 上取字段拼一遍的话，一次口径改动只改一处不报错，
+    而两个数字都「看起来对」、只是不相等——那种不一致最难解释。
+
+    ## 次行为什么对失败也说「交给 AI」
+
+    因为那是**事实**：失败与取消的任务同样会被 `take_deliverables` 取走，
+    它们的「结论」是一段可读的失败说明。不交给模型的话，模型发起的委派会
+    石沉大海，它永远等不到回音、也无从判断该不该重试。
+
+    副作用：无（纯函数）。
+    """
+    row = TaskManager.row_of(record)
+    return (
+        f"{row.display_name} "
+        f"{STATUS_LABELS.get(record.status, record.status.value)} "
+        f"({format_activity_cost(row)})\n"
+        f"  结论将在下一轮对话中自动交给 AI。"
+    )
 
 
 class RhineApp(App):
@@ -561,12 +598,7 @@ class RhineApp(App):
         try:
             finished = self._manager.drain_subagent_notifications()
             for record in finished:
-                self.show_message(
-                    f"子 Agent {record.agent_name}[{record.task_id}] "
-                    f"{STATUS_LABELS.get(record.status, record.status.value)}"
-                    f"（{record.turns} 轮 · {record.duration_seconds:.1f}s）"
-                    f"——结论将在下一轮对话中自动交给 AI。"
-                )
+                self.show_message(_subagent_finish_text(record))
             running = self._manager.running_subagent_count()
             if finished or running != self._last_subagent_count:
                 self._last_subagent_count = running

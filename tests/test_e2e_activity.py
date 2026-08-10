@@ -90,8 +90,8 @@ def _tool_call(call_id: str, name: str, args: dict):
     return ToolCall(id=call_id, name=name, arguments=args)
 
 
-class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
-    """AC1：无委派时不存在活动区；发起一次委派后它出现。"""
+class ActivityFixture(unittest.IsolatedAsyncioTestCase):
+    """装配一个真实 App + 带闸门的假 Provider，供本文件各组用例共用。"""
 
     def setUp(self) -> None:
         # ⚠ 沙箱目录必须走 `tests/e2e/sandbox.py` 建与删：它在目录里放一个
@@ -142,6 +142,23 @@ class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
         # Windows 下删目录会一路重试到超时——一条用例因此白等十几秒。
         self.addCleanup(self.result.cleanup, "test_teardown")
 
+    @staticmethod
+    async def _send(app, pilot, text: str) -> None:
+        """
+        走**真人提交入口**（聚焦输入框 → 设值 → 按回车）。
+
+        不调任何内部方法：那会绕过命令层与协调层的接线，验到的就不是用户
+        实际走的那条路（驱动设施的同一条纪律）。
+        """
+        bar = app.query_one(InputBar)
+        bar.focus()
+        bar.value = text
+        await pilot.press("enter")
+
+
+class ActivityWiringTest(ActivityFixture):
+    """AC1 / AC2：无委派时不存在活动区；发起一次委派后它出现并带三个数字。"""
+
     async def test_hidden_before_any_delegation(self) -> None:
         """
         AC1a / F9：从未委派过时活动区**不存在于视觉上**，也不占布局空间。
@@ -159,10 +176,7 @@ class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
         app = self.result.app
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            bar = app.query_one(InputBar)
-            bar.focus()
-            bar.value = "找人复核一下"
-            await pilot.press("enter")
+            await self._send(app, pilot, "找人复核一下")
 
             # 等子 Agent 真的起来（否则「活动区没出现」会被误判成组件坏了）
             await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
@@ -189,10 +203,7 @@ class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
         app = self.result.app
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            bar = app.query_one(InputBar)
-            bar.focus()
-            bar.value = "找人复核一下"
-            await pilot.press("enter")
+            await self._send(app, pilot, "找人复核一下")
 
             await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
             view = app.query_one(ActivityView)
@@ -209,6 +220,97 @@ class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1 次调用", text)
 
             self.gate.set()
+
+
+class FinishTraceTest(ActivityFixture):
+    """AC6 / AC6b / AC7：终态成本、历史留痕**只有一条**、且不依赖模型说话。"""
+
+    async def test_history_gets_exactly_one_line_with_the_cost(self) -> None:
+        """
+        ⚠ **F6 的历史永久痕与 F7 的完成通知是同一行。**
+
+        写成两行不报错，只是每个子 Agent 在历史区留下重复的两条——
+        用户会以为它跑了两次。这条用例是那个「同一行」的唯一判据。
+        """
+        app = self.result.app
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await self._send(app, pilot, "找人复核一下")
+            await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
+            self.gate.set()
+
+            await _wait_for(
+                lambda: "checker(reviewer)" in _history_text(app), pilot, 20.0
+            )
+
+            text = _history_text(app)
+            self.assertEqual(
+                text.count("checker(reviewer)"),
+                1,
+                f"该任务的完成行只该出现一次，实际：\n{text}",
+            )
+            self.assertIn("已完成", text)
+            self.assertIn("次调用", text)
+            self.assertIn("tokens", text)
+            self.assertIn("结论将在下一轮对话中自动交给 AI", text)
+
+    async def test_cost_numbers_match_the_activity_row(self) -> None:
+        """
+        AC6：历史留痕与活动区终态行的成本数字**同源**。
+
+        两边各自从 TaskRecord 上取字段拼一遍的话，一次口径改动只改一处不报错，
+        而两个数字都「看起来对」、只是不相等——那种不一致最难解释。
+        """
+        from rhinecode.subagents.tasks import TaskManager
+        from rhinecode.tui.widgets import format_activity_cost
+
+        app = self.result.app
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await self._send(app, pilot, "找人复核一下")
+            await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
+            self.gate.set()
+            await _wait_for(
+                lambda: "checker(reviewer)" in _history_text(app), pilot, 20.0
+            )
+
+            record = self.result.manager.subagent_service.tasks.snapshot()[0]
+            expected = format_activity_cost(TaskManager.row_of(record))
+            # 耗时那一段可能因为「已结束」而冻结，取前两段（次数 · token）比对
+            head = " · ".join(expected.split(" · ")[:2])
+            self.assertIn(head, _history_text(app))
+
+    async def test_notice_does_not_depend_on_the_model(self) -> None:
+        """
+        AC7：完成通知由**界面轮询**产出，不依赖模型说任何话。
+
+        本文件的剧本里子 Agent 只说了「我看完了，没发现问题。」——
+        一个数字、一个状态词都没提。
+        """
+        app = self.result.app
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await self._send(app, pilot, "找人复核一下")
+            await _wait_for(lambda: self.provider.subagent_started.is_set(), pilot, 20.0)
+            self.gate.set()
+            await _wait_for(lambda: "已完成" in _history_text(app), pilot, 20.0)
+
+            self.assertIn("次调用", _history_text(app))
+
+
+def _history_text(app) -> str:
+    """把历史区所有组件的文本拍平成一段，用于「出现过 / 出现几次」这类判据。"""
+    view = app.query_one(HistoryView)
+    parts = []
+    for child in view.query_one("#history-messages").children:
+        content = getattr(child, "content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        else:
+            for item in getattr(content, "renderables", ()) or ():
+                plain = getattr(item, "plain", None)
+                parts.append(plain if plain is not None else str(item))
+    return "\n".join(parts)
 
 
 def _activity_text(view: ActivityView) -> str:
