@@ -100,9 +100,35 @@ class RhineApp(App):
         border: solid #7AEEFF 60%;
         padding: 0 1;
     }
-    /* 内容容器随消息增长，超出 HistoryView 高度时触发父容器滚动 */
+    /*
+     * 内容容器随消息增长，超出 HistoryView 高度时触发父容器滚动。
+     *
+     * `min-height: 100%` 是 tui-display 扩展 F39/F40 的**全部实现**——
+     * 一行 CSS 同时兑现「内容短时贴顶」与「内容长时跟随最新」两件事。
+     *
+     * ## 它解决的是什么
+     *
+     * `HistoryView.on_mount` 里的 `anchor()` 让视口粘在底部。内容比视口长时
+     * 这正是要的；但内容**短于**视口时，锚点会产生一个**负的滚动偏移**，
+     * 把两条消息整个推到视口底部，上方留一大片空白——用户看到的是
+     * 「对话从下往上长」。实测（视口 13 行、内容 2 行）：
+     *
+     *     HistoryView       region=(y=0, height=13)   scroll_y=-9
+     *     #history-messages region=(y=10, height=2)   ← 落在第 10、11 行
+     *
+     * 让内容容器**至少和视口一样高**之后，"内容短于视口" 这个前提就不成立了：
+     * 容器被撑到满高，锚点把它按到底 == 按在顶（`scroll_y` 由 -9 变 0），
+     * 消息自然从第一行开始排。内容超过视口时容器高度由 `height: auto` 接管，
+     * 跟随最新的行为逐字不变（实测 `scroll_y == max_scroll_y`）。
+     *
+     * ⚠ **不要改成删掉 `anchor()`。** 那个调用是带实测证据加进去的
+     * （理由见 `HistoryView.on_mount` 的 docstring：不用它时 `scroll_end()`
+     * 取到的是**加新组件之前**的 `max_scroll_y`，每次都停在「差最后一条消息」
+     * 的位置）。两个需求必须同时满足，而这一行 CSS 让它们不再互相冲突。
+     */
     HistoryView > Vertical {
         height: auto;
+        min-height: 100%;
     }
     CommandPanel {
         height: auto;
