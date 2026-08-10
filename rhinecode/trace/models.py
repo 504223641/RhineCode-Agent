@@ -249,6 +249,10 @@ def agent_event_payload(event: Any) -> dict:
     text = getattr(event, "text", None)
     iteration = getattr(event, "iteration", None)
     message = getattr(event, "message", None)
+    # tui-display 扩展 F19：NOTICE 的展示档位。缺省的 `"notice"` 不写进负载
+    # （下面的稀疏过滤会滤掉），只有被明确抬到 `"event"` 时才留下一条痕迹
+    # ——记录里因此能看出「这条提示当时是按要紧的那档显示的」。
+    level = getattr(event, "level", None)
 
     payload = {
         "event_type": event_type,
@@ -261,6 +265,7 @@ def agent_event_payload(event: Any) -> dict:
         "result_ok": getattr(tool_result, "ok", None),
         # 只记长度，不记正文——正文由 api_response 承载
         "text_length": len(text) if text else None,
+        "level": level if level and level != "notice" else None,
     }
     return {k: v for k, v in payload.items() if v is not None}
 

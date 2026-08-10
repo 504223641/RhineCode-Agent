@@ -140,7 +140,8 @@ class AgentEvent:
     - PROGRESS：iteration 为当前迭代序号（从 1 开始）
     - FINISHED：stop_reason 为结束原因，message 为可选补充说明
     - ERROR：message 为可读错误描述
-    - NOTICE：message 为系统级提示文本（如「已摘要早前 N 条消息」），仅展示、不参与决策
+    - NOTICE：message 为系统级提示文本（如「已摘要早前 N 条消息」），仅展示、不参与决策；
+      `level` 指明它该走界面的哪一档通道（tui-display 扩展 F19/F22）
     - HISTORY：messages 为恢复出来的完整历史消息快照（provider.Message 列表），
       供 TUI 清屏后整体回放；快照取自 c8 压缩改写之前，保证回放的是原始对话
 
@@ -154,6 +155,24 @@ class AgentEvent:
     :param message: ERROR 的错误描述 / FINISHED 的补充说明
     :param messages: HISTORY 携带的历史消息快照（元素为 provider.base.Message，
                      标 Optional[list] 以免事件层对 provider 增加新的强依赖面）
+    :param level: NOTICE 的展示档位（tui-display 扩展 F19/F22）。
+                  `"notice"`（缺省，暗色）/ `"event"`（正常亮度）。
+
+                  ## 为什么档位由**产出方**声明
+
+                  界面无法从文本本身判断一条提示要紧不要紧——「已摘要早前 32 条
+                  消息」与「子 Agent explorer 的结论已送达」都只是一句陈述句。
+                  知道哪条要紧的是产出它的那一层。
+
+                  ## 为什么是字符串而不是枚举
+
+                  它要原样进 trace 负载（`agent_event_payload`），而 trace 是
+                  **只依赖标准库的叶子包**——让它认识 agent 层的一个枚举会破坏
+                  那条不变量。字符串在两边都是自解释的，与 `KIND_ROLE` /
+                  `KIND_BRANCH` 用字符串常量是同一条理由。
+
+                  缺省 `"notice"` 使既有的全部构造点一字不用改，且落在**最低
+                  打扰**的那一档——漏声明的后果是「不够显眼」，不是「乱刷屏」。
     """
 
     type: AgentEventType
@@ -165,3 +184,4 @@ class AgentEvent:
     stop_reason: Optional[StopReason] = None
     message: str = ""
     messages: Optional[list] = None
+    level: str = "notice"

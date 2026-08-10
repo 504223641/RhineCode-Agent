@@ -168,7 +168,11 @@ def _s_status_bar(r: dict) -> str:
 
 def _s_agent_event(r: dict) -> str:
     bits = [str(r.get("event_type"))]
-    for key in ("iteration", "stop_reason", "tool_name", "result_ok", "text_length"):
+    # ⚠ 新增负载字段必须同步登记到这张表里（CLAUDE.md 的成对维护点）：
+    # 不进摘要行的字段等于白记——读时间线的人看不见它，只有 `--seq` 展开才发现
+    # 「原来早就记了」。`level` 进这里的判据是「排查时第一眼要不要看到它」：
+    # 用户说「我没看见那条通知」时，第一件要确认的就是它当时按哪一档显示的。
+    for key in ("iteration", "stop_reason", "tool_name", "result_ok", "text_length", "level"):
         if key in r:
             bits.append(f"{key}={r[key]}")
     if r.get("message"):
