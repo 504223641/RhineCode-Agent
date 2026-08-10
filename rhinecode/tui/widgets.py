@@ -38,7 +38,7 @@ from textual.message import Message as TextualMessage
 from rhinecode.agent.events import ClarifyOption
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
-from rhinecode.subagents.tasks import BRANCH_AGENT_NAME
+from rhinecode.subagents.tasks import BRANCH_AGENT_NAME, STATUS_LABELS, TaskStatus
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 from rhinecode.tools.display import (
     TOOL_LABELS,
@@ -1099,6 +1099,159 @@ class HistoryView(ScrollableContainer):
         if widgets:
             container.mount(*widgets)
         self._scroll_to_latest()
+
+
+def format_duration(seconds: float) -> str:
+    """
+    把秒数渲染成人读的时长：`43s` / `1m 12s`。
+
+    不足一分钟只写秒——`0m 43s` 里那个零毫无信息量。
+
+    副作用：无（纯函数）。
+    """
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m {total % 60}s"
+
+
+def format_tokens(tokens: int) -> str:
+    """
+    把 token 数渲染成人读的量级：`820 tokens` / `28.5k tokens`。
+
+    上千就换成 `k`：活动行的横向空间很紧，而这个数字要的是**量级**
+    （「烧得快不快」），不是精确值。
+
+    副作用：无（纯函数）。
+    """
+    value = max(0, int(tokens))
+    if value < 1000:
+        return f"{value} tokens"
+    return f"{value / 1000:.1f}k tokens"
+
+
+def format_activity_cost(row) -> str:
+    """
+    渲染一条活动行的三个数字（tui-display 扩展 F2/F3/F6）。
+
+    :param row: `subagents.tasks.ActivityRow`
+    :returns: 形如 `23s · ↑3.1k tokens · 8 次调用`（运行中）
+              或 `14 次调用 · 28.5k tokens · 1m 12s`（终态）
+
+    ## 为什么两种顺序不同
+
+    运行中把**耗时排在最前**——它是唯一每秒都在跳的数字，用户扫一眼就是想确认
+    「它还活着」。终态把**调用次数排在最前**——那时耗时已经不重要了，用户要的
+    是「这次委派花了多少」。
+
+    ## 为什么这是一个共用的纯函数（F6）
+
+    终态的这串数字要在**两个地方**出现：活动区那条即将淡出的终态行，
+    与历史区那条永久留痕。spec 明确要求两处**同源同口径**——各拼一次的话，
+    一次改动只改一处不报错，用户会看到同一个任务的成本在两个地方对不上，
+    而那种不一致最难解释。
+
+    副作用：无（纯函数）。
+    """
+    duration = format_duration(row.seconds)
+    tokens = format_tokens(row.tokens)
+    calls = f"{row.tool_calls} 次调用"
+    if row.status is TaskStatus.RUNNING:
+        return f"{duration} · ↑{tokens} · {calls}"
+    return f"{calls} · {tokens} · {duration}"
+
+
+class ActivityView(Vertical):
+    """
+    子 Agent 活动区（tui-display 扩展 A 组，F1–F6）。
+
+    位于历史区**下方**、各交互面板与输入框**上方**的一块独立区域。
+    「有正在运行的任务」或「有尚未淡出的终态行」时出现，两者都没有时
+    **整块隐藏且不占布局空间**。
+
+    ## 它解决的问题
+
+    改造前，子 Agent 派出去之后是几分钟的静默——唯一的活体信号是状态栏角落
+    那个 `子Agent:2` 计数。用户无从判断它是在干活还是卡住了。
+
+    ## 为什么数据靠轮询而不是推送（F4 / N1）
+
+    本项目**已经因为「在加锁临界区里做跨线程调度」死锁过四次**。子 Agent 跑在
+    独立线程上，任何「跑完一步就通知界面」的设计都要跨线程，而跨线程调度一旦
+    与持锁相遇就是确定性死锁（Textual 的 `call_from_thread` 是阻塞式的）。
+    轮询从结构上消掉这一整类问题：**主线程**每 0.5 秒去任务表读一份不可变快照，
+    没有任何一条边是从子 Agent 线程指向界面的。
+
+    复用既有的子 Agent 轮询节拍、**不新增定时器**，因此空闲会话的开销与改造前
+    完全一致。
+
+    ## 它只观测，不操作（F10）
+
+    区内没有取消或任何改变任务状态的入口。取消仍走 `/agents cancel`，
+    全量信息仍看 `/agents`——**活动区给概览，`/agents` 给全量**。
+
+    ## 展开（F5）
+
+    默认折叠，每个任务一行。`Ctrl+O` 切换**整个区域**的展开态，展开时每条任务
+    下方列出它内部最近若干次工具调用。⚠ 快捷键**不引入焦点切换**——活动区
+    任何时候都不抢焦点，输入框与四个面板的键位体系一字不动。
+    """
+
+    # 缺省隐藏，避免依赖外部 App CSS 才能初始隐藏（与四个面板同一做法）。
+    DEFAULT_CSS = "ActivityView { display: none; }"
+
+    # 状态 → 颜色。运行中橘色（与工具行的「执行中」同色系，语义都是「还在跑」），
+    # 完成绿、失败与取消红。
+    _STATUS_COLORS = {
+        TaskStatus.RUNNING: "#FFA500",
+        TaskStatus.COMPLETED: "#5FD75F",
+        TaskStatus.FAILED: "#FF5F5F",
+        TaskStatus.CANCELLED: "#FF5F5F",
+    }
+
+    def update_rows(self, rows, expanded: bool = False) -> None:
+        """
+        整块重绘活动区。
+
+        :param rows: `ActivityRow` 元组（`conversation.subagent_activity()` 的产出）
+        :param expanded: 展开态则在每行下方列出最近的工具调用
+
+        **整块重绘而不是增量 diff**：行数以并发上限（5）为界，重绘一次比算差异
+        便宜，而且不会错——增量更新要维护「哪一行对应哪个任务」的映射，
+        那是一类典型的、出错后表现为「数字串行」的 bug。
+
+        无行时 `display = False`，Textual 会连带收回它占的布局空间（F1）。
+
+        ⚠ **一切文本必须经本模块的 `escape`**：队员名来自模型给的参数、
+        角色名来自用户写的角色定义文件、工具文本里含路径与命令。落单的 `[`
+        会在布局阶段抛 `MarkupError`，没有任何 try/except 兜得住，整个应用退出。
+
+        副作用：移除并重建全部子组件；改自身可见性。
+        """
+        self.remove_children()
+        if not rows:
+            self.display = False
+            return
+
+        lines: list[str] = []
+        for row in rows:
+            color = self._STATUS_COLORS.get(row.status, SECONDARY_COLOR)
+            lines.append(
+                f"[{color}]● {escape(row.display_name)} "
+                f"{STATUS_LABELS.get(row.status, row.status.value)} "
+                f"({format_activity_cost(row)})[/]"
+            )
+            if expanded:
+                for brief in row.recent_tools:
+                    lines.append(
+                        f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(brief)}[/]"
+                    )
+        # 末行给出快捷键提示——不写的话没人知道还能展开。
+        hint = "Ctrl+O 收回" if expanded else "Ctrl+O 展开"
+        lines.append(f"[{SECONDARY_COLOR}]  {hint}[/]")
+
+        self.mount(Static("\n".join(lines), markup=True))
+        self.display = True
 
 
 class CommandHighlighter(Highlighter):
