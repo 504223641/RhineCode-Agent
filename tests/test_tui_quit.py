@@ -152,6 +152,45 @@ class QuitHintLifetimeTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNot(app._quit_hint_timer, first_timer, "应当换了一个新定时器")
             self.assertIn(QUIT_HINT_TEXT, self._status_text(app))
 
+    def test_the_hint_is_dim_and_leftmost(self) -> None:
+        """
+        提示是**灰色**、且排在**最左**（对齐 Claude Code）。
+
+        两条都容易在后续改动里静默漂走，而且都不报错：
+
+        - **灰色**：状态栏其余高亮段用的是橘色（放行档 / 上下文预警），
+          顺手统一过去看着更「一致」，实际是把语义搞混了——橘色的意思是
+          「你没做什么但情况变了」，而这条是用户刚按下一个键的直接回应。
+          醒目的东西越多，醒目就越不值钱；
+        - **最左**：它是瞬时的，接在尾部会被按需出现的 MCP / 上下文 / Skill /
+          子 Agent 各段挤出视线——恰恰在它唯一有用的那两秒里看不见。
+        """
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT, compose_status_text
+
+        markup = compose_status_text("deepseek", "deepseek-chat", "off", quit_hint=True)
+
+        self.assertIn(f"[dim]{QUIT_HINT_TEXT}[/dim]", markup)
+        self.assertNotIn("#FFA500", markup, "刻意不用橘色——那是「需要留意」的专用色")
+        self.assertLess(
+            markup.index(QUIT_HINT_TEXT),
+            markup.index("deepseek"),
+            "提示必须排在第一段（provider）之前",
+        )
+
+    def test_no_hint_means_the_bar_is_byte_for_byte_unchanged(self) -> None:
+        """
+        **反证**：不在有效期内时，状态栏与加这个字段之前逐字一致。
+
+        没有这条，「提示段永远挂着、只是内容为空」也能让上面那条通过——而那会
+        在每一行状态栏最左边留一个多余的 ` | `，用户天天看得见。
+        """
+        args = ("deepseek", "deepseek-chat", "off")
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT, compose_status_text
+
+        plain = compose_status_text(*args)
+        self.assertEqual(compose_status_text(*args, quit_hint=False), plain)
+        self.assertNotIn(QUIT_HINT_TEXT, plain)
+
     async def test_copying_does_not_show_the_hint(self) -> None:
         """有选中文本时那一下是复制，状态栏不该挂出退出提示。"""
         from unittest import mock
