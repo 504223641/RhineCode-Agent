@@ -1568,6 +1568,18 @@ class InputBar(Input):
 _MODE_DEFAULT_MARKUP = "[dim]\\[DEFAULT][/dim]"
 _MODE_PLAN_MARKUP = "[bold #00D7D7]\\[PLAN][/bold #00D7D7]"
 
+# 「再按一次 Ctrl+C 退出」的提示文本（tui-display 扩展 F31）。
+#
+# 它**不进聊天区**：那是对话内容的地方，而这条提示是一个**只活两秒的瞬时状态**，
+# 留在历史里等于给每一次误按都攒下一条永久噪音。状态栏才是「当前是什么状态」
+# 该待的地方——窗口一过它自己消失，什么痕迹都不留。
+#
+# 用橘色（#FFA500）与「放行档」「上下文预警」「确认面板」同色，语义一致：
+# **需要用户留意**。刻意不加任何图形符号——F29 的符号白名单里没有为提示级
+# 新造的记号，脱离颜色也能辨认的唯一依靠就是文字本身。
+QUIT_HINT_TEXT = "再按一次 Ctrl+C 退出"
+_QUIT_HINT_MARKUP = f"[#FFA500]{QUIT_HINT_TEXT}[/#FFA500]"
+
 
 def compose_status_text(
     provider: str,
@@ -1580,6 +1592,7 @@ def compose_status_text(
     context_warn: bool = False,
     skill_status: "str | None" = None,
     subagent_status: "str | None" = None,
+    quit_hint: bool = False,
 ) -> str:
     """
     组装状态栏的 Content markup 文本（纯函数，c10 抽出便于单测）。
@@ -1628,6 +1641,14 @@ def compose_status_text(
     # 与 MCP / Skill 两段「None 即隐藏」同构——没用委派的用户状态栏与 c12 一致。
     if subagent_status is not None:
         text += f" | {escape(str(subagent_status))}"
+    # 退出提示段（F31）：**排在最左**，与其余各段的取舍方向相反。
+    #
+    # 其余各段都是「常驻状态」，按稳定程度从左往右排；这一段是**瞬时**的，
+    # 而瞬时的东西挂在尾部会被 MCP / 上下文 / Skill / 子 Agent 这些按需出现的段
+    # 挤到用户视线之外——恰恰在它唯一有用的那两秒里看不见。放最左则位置固定，
+    # 不管其余哪几段出现，它永远在同一个地方。
+    if quit_hint:
+        text = f" {_QUIT_HINT_MARKUP} |{text}"
     return text + " "
 
 
@@ -1652,6 +1673,7 @@ class StatusBar(Static):
         context_warn: bool = False,
         skill_status: "str | None" = None,
         subagent_status: "str | None" = None,
+        quit_hint: bool = False,
     ) -> None:
         """
         刷新状态栏显示内容（文本组装见 compose_status_text 纯函数）。
@@ -1668,6 +1690,8 @@ class StatusBar(Static):
         :param skill_status: 已激活 Skill 摘要（如 "Skill:2"）；为 None 时不展示该段（c11）。
         :param subagent_status: 运行中的子 Agent 摘要（如 "子Agent:2"）；
                                 为 None（无任务在跑）时不展示该段（c13）。
+        :param quit_hint: 是否处在「按了一次 Ctrl+C」的有效期内（F31）。
+                          为真时最左侧挂出退出提示，窗口一过由 App 侧复位。
         """
         self.update(
             compose_status_text(
@@ -1681,6 +1705,7 @@ class StatusBar(Static):
                 context_warn,
                 skill_status,
                 subagent_status,
+                quit_hint,
             )
         )
 

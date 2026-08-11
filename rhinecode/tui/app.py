@@ -18,6 +18,8 @@ RhineApp 是 TUI 层的核心，负责：
   call_from_thread 在主线程弹面板、用 threading.Event 阻塞 Worker 等待用户选择（不死锁，N2）。
 """
 
+import asyncio
+import signal
 import threading
 from time import monotonic
 from typing import Optional
@@ -330,6 +332,16 @@ class RhineApp(App):
         # 上一次按下 `Ctrl+C` 的时刻（`time.monotonic`）。
         # 初值取一个足够久远的负数，保证第一次按下必然走「提示」那一支。
         self._last_quit_request = -1e9
+        # SIGINT 守卫的两个字段（见 `_install_sigint_guard`）。
+        # `_sigint_previous` 存原处理器用于卸载时还原；`_sigint_loop` 存事件循环，
+        # 信号处理器靠它把动作**排队**回事件循环而不是就地执行。
+        self._sigint_previous = None
+        self._sigint_loop: Optional[asyncio.AbstractEventLoop] = None
+        # 退出提示的显示态与它的到期定时器（F31）。
+        # ⚠ **判定的依据始终是上面那个时间戳，不是这个标志**——它只负责「显示」。
+        # 反过来（拿标志当判据）会让定时器的调度抖动变成退出行为的抖动。
+        self._quit_hint_active = False
+        self._quit_hint_timer = None
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
@@ -419,6 +431,86 @@ class RhineApp(App):
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
 
+        # SIGINT 守卫必须在这里装（见下面那个方法的说明）。
+        self._install_sigint_guard()
+
+    # ------------------------------------------------------------------ #
+    # SIGINT 守卫（tui-display 扩展 F31 的兜底）
+    # ------------------------------------------------------------------ #
+
+    def _install_sigint_guard(self) -> None:
+        """
+        接管 `SIGINT`，让它走与 `Ctrl+C` **同一条**连按两次的判定。
+
+        ## 为什么需要这层兜底：`Ctrl+C` 有两条完全不同的抵达路径
+
+        终端把 `Ctrl+C` 交给程序的方式取决于**控制台输入模式**：
+
+        - 关掉 `ENABLE_PROCESSED_INPUT` 时（Textual 启动时正是这么设的），
+          它只是一个**普通按键**——`0x03` 字节进输入流，走 BINDINGS 那条
+          `ctrl+c → request_quit`，连按两次的判定生效；
+        - 开着 `ENABLE_PROCESSED_INPUT` 时，控制台改为向进程组发
+          `CTRL_C_EVENT`，Python 的**默认处理器**在主线程抛 `KeyboardInterrupt`
+          ——它会直接把 `app.run()` 掀翻，**一次按下就退出**，而且是带回溯的
+          难看退出，`request_quit` 里的计数一个字都读不到。
+
+        第二条路径在本项目里是**可达**的：控制台输入模式是**整个控制台共享**的
+        属性，不是每个进程各一份。`run_command` 用 `shell=True` 起
+        `cmd.exe`，子进程完全可能改掉这个模式且不还原干净；再加上终端复用、
+        SSH、以及外部程序直接投递 `CTRL_C_EVENT` 等情形，都会让后续的
+        `Ctrl+C` 突然从「按键」变成「信号」。用户看到的现象就是
+        **平时要按两下，偶尔一下就退了**。
+
+        所以这里不去猜是哪种情形，直接把两条路径**收敛到同一个判定**上：
+        信号来了也当成一次 `Ctrl+C` 按下，该提示提示、该退出退出。
+
+        ## 实现上的两个要点
+
+        1. **信号处理器里不做任何实际工作**，只 `call_soon_threadsafe` 把
+           `action_request_quit` 排进事件循环。Python 的信号处理器是在主线程的
+           字节码边界上被插进来执行的，可能打断任意一段代码——在那里直接碰
+           Textual 的组件树等于在不确定的时机重入 UI；
+        2. **失败一律静默**（`signal.signal` 只能在主线程调，某些嵌入场景会抛
+           `ValueError`）。守卫装不上时行为退回今天的样子，不该反过来让程序起不来。
+
+        副作用：安装进程级 SIGINT 处理器，在 `on_unmount` 还原。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            self._sigint_previous = signal.signal(signal.SIGINT, self._on_sigint)
+            self._sigint_loop = loop
+        except (ValueError, OSError, RuntimeError):  # noqa: BLE001 —— 见上：装不上就退回原行为
+            self._sigint_previous = None
+            self._sigint_loop = None
+
+    def _on_sigint(self, signum, frame) -> None:
+        """
+        `SIGINT` 处理器：把它转成一次「按了 `Ctrl+C`」。
+
+        :param signum: 信号编号（未使用，签名由 `signal.signal` 规定）
+        :param frame: 被打断的栈帧（未使用，同上）
+
+        ⚠ **只排队、不执行**。理由见 `_install_sigint_guard` 的要点 1。
+        """
+        loop = self._sigint_loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self.action_request_quit)
+        except RuntimeError:
+            # 循环已经关了（退出竞态）。此时程序本来就在收尾，忽略即可。
+            pass
+
+    def on_unmount(self) -> None:
+        """还原 SIGINT 处理器，避免把进程级状态留给退出之后的代码。"""
+        if self._sigint_previous is not None:
+            try:
+                signal.signal(signal.SIGINT, self._sigint_previous)
+            except (ValueError, OSError, RuntimeError):  # noqa: BLE001 —— 还原失败不该阻断退出
+                pass
+            self._sigint_previous = None
+        self._sigint_loop = None
+
     def _show_busy_hint(self, text: str) -> None:
         """
         显示一次「当前不能提交」的提示（c11 T55）。
@@ -496,6 +588,8 @@ class RhineApp(App):
             # 运行中的子 Agent 数（c13）：为 0 时给 None，状态栏隐藏该段——
             # 没用委派的用户看到的状态栏与 c12 逐字一致。
             subagent_status=self._subagent_status_segment(),
+            # 「再按一次 Ctrl+C 退出」（F31）：只在那 2 秒有效期内为真。
+            quit_hint=self._quit_hint_active,
         )
         self.query_one(StatusBar).update_status(**status_args)
         # 为什么记「组装后的文本」而不是九个散字段（trace F15）：用户真正看到的
@@ -1002,11 +1096,16 @@ class RhineApp(App):
         """
         `Ctrl+C`：**连按两次**才退出（F31/F32）。
 
+        ⚠ **本方法是两条路径共同的落点**：按键（BINDINGS）与 `SIGINT`
+        （`_on_sigint`）。判定只有这一份，两条路径因此不可能给出不同的结果
+        ——写成两套的话，「按键要两下、信号一下就退」这种偏差在界面上完全看不出来。
+
         ## 三条分支，顺序固定
 
         1. **屏幕上有选中文本 → 复制，且不计数**；
         2. 距上次按下 ≤ `QUIT_CONFIRM_SECONDS` → 退出；
-        3. 否则记下时间戳并提示「再按一次 Ctrl+C 退出」。
+        3. 否则记下时间戳，并在**状态栏最左侧**挂出「再按一次 Ctrl+C 退出」
+           （见 `_arm_quit_hint`）。
 
         ## 为什么复制这一支必须存在
 
@@ -1028,7 +1127,7 @@ class RhineApp(App):
         **已知代价（接受）**：屏幕上有选中内容时按两次得到的是「复制两次」，
         不会退出；想退出需先清掉选中。相比「复制两次就退出」，这个方向更安全。
 
-        副作用：可能复制到剪贴板、可能显示一行提示、可能退出应用。
+        副作用：可能复制到剪贴板、可能改状态栏并起一个定时器、可能退出应用。
         """
         if self._copy_selection_if_any():
             return
@@ -1039,9 +1138,53 @@ class RhineApp(App):
             return
 
         self._last_quit_request = now
-        # ⚠ 文案必须写明是**退出**而不是取消——`Esc` 才是取消当前回合，
-        # 两者不能让用户混淆。
-        self.show_message("再按一次 Ctrl+C 退出")
+        self._arm_quit_hint()
+
+    def _arm_quit_hint(self) -> None:
+        """
+        在状态栏最左侧挂出退出提示，并安排它在有效期结束时自己消失（F31）。
+
+        ## 为什么是状态栏而不是聊天区
+
+        这条提示是一个**只活两秒的瞬时状态**，不是对话内容。写进聊天区的话，
+        每一次误按都会在历史里留下一条永久噪音，而它在两秒后就已经**不再成立**
+        ——历史区里躺着一句「再按一次就退出」，可那时按一次根本不会退，
+        提示本身变成了错的。状态栏是「当前是什么状态」该待的地方：窗口一过
+        自己消失，什么痕迹都不留。
+
+        ## 到期与判定的关系
+
+        定时器与判定共用同一个 `QUIT_CONFIRM_SECONDS`，所以提示在屏幕上的存续期
+        **就是**连按有效期：看得见提示 = 现在按第二下能退出，提示没了 = 得重新按。
+
+        ⚠ 但**判定的依据始终是 `_last_quit_request` 这个时间戳，不是显示标志**。
+        定时器的调度有抖动（事件循环忙的时候会晚几毫秒），拿标志当判据等于把
+        这点抖动变成退出行为的抖动；而反过来（时间戳判定 + 标志只管显示）
+        最坏也只是提示多挂了几毫秒，没有任何行为后果。
+
+        ## 重复按下的处理
+
+        每次都先**取消**上一个定时器再起新的。不取消的话，第一次按下起的那个
+        定时器会在第二次按下之后的某个时刻把提示清掉——用户明明刚按过一下，
+        提示却提前消失了，看上去像窗口缩短了。
+
+        副作用：改状态栏显示态，起一个 `QUIT_CONFIRM_SECONDS` 后触发的定时器。
+        """
+        if self._quit_hint_timer is not None:
+            self._quit_hint_timer.stop()
+        self._quit_hint_active = True
+        self._refresh_status()
+        self._quit_hint_timer = self.set_timer(
+            self.QUIT_CONFIRM_SECONDS, self._expire_quit_hint
+        )
+
+    def _expire_quit_hint(self) -> None:
+        """有效期结束：撤下状态栏上的退出提示（F31）。"""
+        self._quit_hint_timer = None
+        if not self._quit_hint_active:
+            return
+        self._quit_hint_active = False
+        self._refresh_status()
 
     def _copy_selection_if_any(self) -> bool:
         """

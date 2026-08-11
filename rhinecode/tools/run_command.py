@@ -126,6 +126,21 @@ class RunCommandTool(Tool):
             timeout = args.get("timeout") or DEFAULT_TIMEOUT
 
             # 显式固定 cwd，避免调用方未来改变进程目录后命令跑到工作区外。
+            #
+            # ⚠ `stdin=DEVNULL` 不可省，两条独立理由：
+            #
+            # 1. **不让子进程抢用户的键盘**。不给 stdin 的话子进程会**继承**我们的
+            #    终端输入句柄，一个等输入的命令（`git commit` 开编辑器、
+            #    `npm init`……）会和 Textual 的输入读取器抢同一批按键，
+            #    而且要一直卡到 timeout；
+            # 2. **不让子进程改掉控制台输入模式**。Windows 上控制台输入模式是
+            #    **整个控制台共享**的属性，`shell=True` 起的 `cmd.exe` 拿到的若是
+            #    真控制台句柄，它对模式的改动会留给我们——一旦
+            #    `ENABLE_PROCESSED_INPUT` 被重新打开，此后的 `Ctrl+C` 就从「按键」
+            #    变成 `CTRL_C_EVENT`/`SIGINT`，连按两次退出的判定被整个跳过。
+            #    指到 NUL 之后子进程的标准输入不再是控制台，也就碰不到那个模式。
+            #    （`tui/app.py` 的 `_install_sigint_guard` 是同一问题的另一半兜底。）
+            #
             # 刻意不传 text=True：由 decode_subprocess_output 自己按 UTF-8 优先解码，
             # 否则中文输出会在 subprocess 的读取线程里解码失败并被静默吞成空串。
             proc = subprocess.run(
@@ -133,6 +148,7 @@ class RunCommandTool(Tool):
                 shell=True,
                 cwd=_require_cwd(cwd),
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 timeout=timeout,
             )
 

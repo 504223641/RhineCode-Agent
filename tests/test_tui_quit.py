@@ -63,18 +63,109 @@ class SingleCtrlCTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_press_shows_a_hint(self) -> None:
         """
-        AC20b：第一次按下给出提示。
+        AC20b：第一次按下给出提示——提示挂在**状态栏**上。
 
         ⚠ 文案必须写明是**退出**——`Esc` 才是取消当前回合，两者不能混淆。
         """
-        from tests.test_command_tui import _history_text
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT, StatusBar
 
         app, _ = _make_app()
         async with app.run_test() as pilot:
             await pilot.press("ctrl+c")
             await pilot.pause()
-            text = _history_text(app)
-            self.assertIn("再按一次 Ctrl+C 退出", text)
+            self.assertIn(QUIT_HINT_TEXT, app.query_one(StatusBar).render().markup)
+
+    async def test_the_hint_stays_out_of_the_chat_area(self) -> None:
+        """
+        **本条的分辨力所在**：提示**不进聊天区**。
+
+        它是个只活两秒的瞬时状态，不是对话内容。留在历史里的话每次误按都攒一条
+        永久噪音，而两秒之后那句话已经不成立了（那时按一次并不会退出）
+        ——历史区里躺着一句错的提示，比没有提示更糟。
+        """
+        from tests.test_command_tui import _history_text
+
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT
+
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            self.assertNotIn(QUIT_HINT_TEXT, _history_text(app))
+
+
+class QuitHintLifetimeTest(unittest.IsolatedAsyncioTestCase):
+    """
+    提示的存续期**就是**连按有效期：看得见 = 现在按第二下能退，看不见 = 得重新按。
+
+    没有这组的话，「提示挂上去之后再也不撤」同样能让上面那条通过——而那正是
+    用户要的反面：他要的是超时之后提示自己消失。
+    """
+
+    @staticmethod
+    def _status_text(app) -> str:
+        from rhinecode.tui.widgets import StatusBar
+
+        return app.query_one(StatusBar).render().markup
+
+    async def test_hint_disappears_when_the_window_expires(self) -> None:
+        """
+        超时后提示消失。
+
+        直接调到期回调，等价于「定时器烧完了」——真等两秒会让整份测试慢一倍，
+        而验的东西一模一样（`test_timeout_resets_the_counter` 同款手法）。
+        """
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT
+
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            self.assertIn(QUIT_HINT_TEXT, self._status_text(app))
+
+            app._expire_quit_hint()
+            await pilot.pause()
+            self.assertNotIn(QUIT_HINT_TEXT, self._status_text(app))
+            self.assertTrue(app.is_running, "撤提示不该顺手把程序也退了")
+
+    async def test_pressing_again_restarts_the_window(self) -> None:
+        """
+        **重复按下要重开窗口，不能沿用上一个定时器**。
+
+        沿用的话，第一次按下起的那个定时器会在第二次按下之后不久把提示清掉
+        ——用户刚按过一下，提示却提前消失，看上去像窗口被缩短了。
+        """
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT
+
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            first_timer = app._quit_hint_timer
+
+            # 把时间戳前拨，让下一次按下同样走「第一次」那一支（不退出）
+            app._last_quit_request -= RhineApp.QUIT_CONFIRM_SECONDS + 1
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+
+            self.assertTrue(app.is_running)
+            self.assertIsNot(app._quit_hint_timer, first_timer, "应当换了一个新定时器")
+            self.assertIn(QUIT_HINT_TEXT, self._status_text(app))
+
+    async def test_copying_does_not_show_the_hint(self) -> None:
+        """有选中文本时那一下是复制，状态栏不该挂出退出提示。"""
+        from unittest import mock
+
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT
+
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            with mock.patch.object(
+                type(app.screen), "get_selected_text", lambda self: "一段文本"
+            ), mock.patch.object(app, "copy_to_clipboard"):
+                await pilot.press("ctrl+c")
+                await pilot.pause()
+                self.assertNotIn(QUIT_HINT_TEXT, self._status_text(app))
 
 
 class DoublePressTest(unittest.IsolatedAsyncioTestCase):
@@ -180,6 +271,75 @@ class CopyTakesPrecedenceTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+c")
             await pilot.pause()
             self.assertTrue(app.is_running, "复制不该给退出「上膛」")
+
+
+class SigintGuardTest(unittest.IsolatedAsyncioTestCase):
+    """
+    `SIGINT` 必须走**同一条**连按两次的判定。
+
+    ## 这组测试防的是什么
+
+    `Ctrl+C` 有两条抵达路径：控制台输入模式决定它是一个**按键**（`0x03` 进输入流）
+    还是一个**信号**（`CTRL_C_EVENT` → `SIGINT`）。后一条路径上，Python 默认处理器
+    会在主线程抛 `KeyboardInterrupt` 把 `app.run()` 掀翻——**一次就退**，
+    `request_quit` 里的计数一个字都读不到。
+
+    用户实测反馈的「有时一下就退了」正是这条路径。它在单元测试里不会自己出现
+    （测试环境的控制台模式是另一回事），所以必须显式钉住：**装了守卫**，
+    且守卫落到 `action_request_quit` 上而不是自己另写一份判定。
+    """
+
+    async def test_guard_is_installed_and_restored(self) -> None:
+        """挂载时接管 SIGINT，卸载时还原——不把进程级状态留给退出之后的代码。"""
+        import signal
+
+        app, _ = _make_app()
+        before = signal.getsignal(signal.SIGINT)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # ⚠ 用 `assertEqual` 而不是 `assertIs`：每次取 `app._on_sigint` 都会
+            # 现造一个新的 bound method 对象，`is` 恒为假。相等性才比的是
+            # 「同一个函数 + 同一个实例」。
+            self.assertEqual(
+                signal.getsignal(signal.SIGINT),
+                app._on_sigint,
+                "挂载后 SIGINT 应当由本应用接管",
+            )
+        self.assertIs(signal.getsignal(signal.SIGINT), before, "退出后应当还原")
+
+    async def test_signal_goes_through_the_same_double_press_logic(self) -> None:
+        """
+        **本组的分辨力所在**：一次 `SIGINT` 只是「第一次」，两次才退出。
+
+        没有这条，把处理器写成「收到信号直接 `self.exit()`」也能让上一条通过
+        ——而那正是要防的形态。
+        """
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            app._on_sigint(2, None)
+            await pilot.pause()
+            self.assertTrue(app.is_running, "一次信号不该退出")
+
+            app._on_sigint(2, None)
+            await pilot.pause()
+            self.assertFalse(app.is_running, "两次信号应当退出")
+
+    async def test_signal_and_key_press_share_one_counter(self) -> None:
+        """
+        两条路径共用同一个计数器：先按键、再来信号，同样退出。
+
+        计数器要是各存一份，「按一下再收一个信号」会两边都停在「第一次」，
+        用户按了两下却退不掉——而那种偏差在界面上完全看不出来。
+        """
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+
+            app._on_sigint(2, None)
+            await pilot.pause()
+            self.assertFalse(app.is_running)
 
 
 class CtrlQTest(unittest.IsolatedAsyncioTestCase):
