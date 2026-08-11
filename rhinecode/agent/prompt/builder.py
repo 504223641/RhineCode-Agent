@@ -98,10 +98,10 @@ def build_default_prompt(
     untrusted_enabled: bool = False,
 ) -> AssembledPrompt:
     """
-    构造 RhineCode 默认系统提示：7 固定模块 + 环境信息 + 可选槽位（c5 预留、c9 填充）。
+    构造 RhineCode 默认系统提示：8 固定模块 + 环境信息 + 可选槽位（c5 预留、c9 填充）。
 
     这是上层（ConversationManager）每次运行调用的便捷入口。环境信息被包装成一个
-    priority=100、cacheable=False 的模块，因此它排在 7 个固定模块之后、走动态通道（F2/F5）。
+    priority=100、cacheable=False 的模块，因此它排在固定模块之后、走动态通道（F2/F5）。
 
     c9 起两个预留槽位有了真实内容：
     - custom_instructions（「自定义指令」，priority 110）：三层 RHINE.md 拼接结果；
