@@ -507,6 +507,37 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
         recorder.close()
         return 1
 
+    async def _wait_for_stop(state: "HostState", running_app) -> None:
+        """
+        等到宿主该收工——**两个来源，任意一个都算**。
+
+        1. 控制通道的 `quit`（或空闲看门狗）置了 `stop_event`；
+        2. **产品自己退出了**（用户在界面上退出，如连按两次 `Ctrl+C`）。
+
+        ## 为什么第 2 条不可省
+
+        原先这里只等 `stop_event`。于是「产品退出了、宿主还杵着」——
+        实测形态很有迷惑性：`status` 照常应答（控制通道是独立的 socket），
+        `send` 也回 `{"submitted": ...}`，但那条消息**再也进不了应用**
+        （trace 里不再出现 `user_input`）。看起来像「双击退出没生效」，
+        实际是产品已经退了、宿主没跟着走。
+
+        这条是 tui-display 扩展验 AC20a 时撞出来的：checklist 写的验证方式是
+        「`client keys ctrl+c ctrl+c`，宿主进程退出」，而按原实现那条永远不成立。
+
+        轮询而不是等事件：Textual 没有「应用停了」的可等待信号，
+        而 0.1 秒一次的属性读取在一个本来就空闲的协程里可以忽略。
+        """
+        while not state.stop_event.is_set():
+            if not getattr(running_app, "is_running", True):
+                # 产品退出优先——把停止原因记成它，别与 `quit` 混为一谈
+                state.stop_reason = "app_exited"
+                return
+            try:
+                await asyncio.wait_for(state.stop_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
     host_state.build_result = result
     if args.mode == "scripted":
         # F16 裁决：确定性形态关掉自动记忆——它本身就是不确定性来源
@@ -531,7 +562,7 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
             host_state.state = SessionState.IDLE.value
             log(f"就绪：pid={os.getpid()} mode={args.mode} workspace={workspace}")
 
-            await host_state.stop_event.wait()
+            await _wait_for_stop(host_state, app)
             host_state.state = SessionState.SHUTTING_DOWN.value
             # ⚠️ 只能在主线程调用，且内部不得使用 run_on_main（见其 docstring）
             await core.shutdown_on_main(host_state.stop_reason, live_mode=args.mode == "live")
