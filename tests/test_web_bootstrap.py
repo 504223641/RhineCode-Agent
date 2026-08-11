@@ -52,16 +52,22 @@ class UntrustedPromptModuleTests(unittest.TestCase):
         缺省不注入，输出与本扩展之前**逐字一致**（spec F4）。
 
         `fixed_modules()` 无参调用是既有全部调用点的形态。
+
+        ⚠ 判据是「开关关闭时这个模块不在」+ 下一条的「开关是二者唯一差异」，
+        **刻意不断言模块总数**：写死个数表达的是同一件事，但任何一次无关的
+        新增模块都会把它撞碎（prompt-hardening 加「交付标准」时真撞了），
+        而那种失败读起来像是不可信内容模块出了问题，指向完全错误的方向。
         """
         names = [m.name for m in fixed_modules()]
         self.assertNotIn("外部不可信内容", names)
-        self.assertEqual(len(names), 7)
 
-    def test_enabled_inserts_module(self) -> None:
-        modules = sorted(fixed_modules(True), key=lambda m: m.priority)
-        names = [m.name for m in modules]
-        self.assertIn("外部不可信内容", names)
-        self.assertEqual(len(names), 8)
+    def test_enabled_inserts_only_that_module(self) -> None:
+        """开关打开时**恰好**多出「外部不可信内容」一个模块，其余一字不动。"""
+        off = [m.name for m in sorted(fixed_modules(), key=lambda m: m.priority)]
+        on = [m.name for m in sorted(fixed_modules(True), key=lambda m: m.priority)]
+        self.assertIn("外部不可信内容", on)
+        # 把新增项摘掉之后，两份列表必须逐项相等（顺序也不能变）
+        self.assertEqual([n for n in on if n != "外部不可信内容"], off)
 
     def test_position_between_constraints_and_task_mode(self) -> None:
         """

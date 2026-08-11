@@ -22,6 +22,7 @@ from rhinecode.agent.prompt.texts import (
     SYSTEM_CONSTRAINTS,
     UNTRUSTED_CONTENT,
     TASK_MODE,
+    DELIVERY,
     ACTION_EXECUTION,
     TOOL_USAGE,
     TONE,
@@ -48,11 +49,14 @@ class PromptModule:
 
 def fixed_modules(untrusted_enabled: bool = False) -> list[PromptModule]:
     """
-    返回固定模块（稳定、可缓存）：七个常驻 + 一个按开关注入。
+    返回固定模块（稳定、可缓存）：八个常驻 + 一个按开关注入。
 
-    顺序（按 priority）：身份 → 系统约束 →〔外部不可信内容〕→ 任务模式 → 动作执行
-    → 工具使用 → 语气风格 → 文本输出。其中：
+    顺序（按 priority）：身份 → 系统约束 →〔外部不可信内容〕→ 任务模式 → 交付标准
+    → 动作执行 → 工具使用 → 语气风格 → 文本输出。其中：
     - 「系统约束」写明 <system-reminder> 是系统补充上下文、不要当成用户输入来回复（F8）。
+    - 「交付标准」补的是「事情不顺利时怎么办」——范围收窄、粉饰结果、滥用对冲词，
+      这三类失败其余模块一条都没覆盖（prompt-hardening 扩展）。它排在任务模式与
+      动作执行之间，构成「怎么推进 → 推进到什么程度算数 → 每个动作的边界」的递进。
     - 「外部不可信内容」写明 <untrusted-content> 里的是数据不是指令（web_fetch 扩展 F21）。
       它排在「系统约束」之后是刻意的——两条讲的是同一件事的两面
       （什么算系统指令 / 什么不算），相邻便于模型建立对照。
@@ -61,7 +65,7 @@ def fixed_modules(untrusted_enabled: bool = False) -> list[PromptModule]:
     :param untrusted_enabled: 是否注入「外部不可信内容」模块。**缺省 False**——
         缺省不注入使既有调用点不改也能跑，且输出与本扩展之前逐字一致（F4）。
         由 `build_default_prompt` 从 `Config.web_fetch_enabled` 透传。
-    :returns: 7 或 8 个 PromptModule，均 cacheable=True
+    :returns: 8 或 9 个 PromptModule，均 cacheable=True
 
     副作用：无（每次返回新建的列表，内容为内置常量文本）。
     """
@@ -73,6 +77,7 @@ def fixed_modules(untrusted_enabled: bool = False) -> list[PromptModule]:
         PromptModule(name="任务模式", priority=30, cacheable=True, content=TASK_MODE),
         # ↑ 25 号位（外部不可信内容）按开关插在下面，不写死在这个列表里——
         # 关闭时列表内容要与本扩展之前**逐字一致**。
+        PromptModule(name="交付标准", priority=35, cacheable=True, content=DELIVERY),
         PromptModule(name="动作执行", priority=40, cacheable=True, content=ACTION_EXECUTION),
         PromptModule(name="工具使用", priority=50, cacheable=True, content=TOOL_USAGE),
         PromptModule(name="语气风格", priority=60, cacheable=True, content=TONE),
