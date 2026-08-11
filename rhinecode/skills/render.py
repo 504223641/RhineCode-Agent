@@ -91,8 +91,8 @@ def _truncate(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
 
     **字节截断按整行回退，绝不切在字符中间**：直接 `text.encode()[:N].decode()`
     会把一个多字节汉字切成两半产生非法 UTF-8，序列化成 JSON 发给 API 时会炸。
-    这里逐行累加字节数，放不下的行整行丢弃——沿用 c9 笔记索引的既有做法
-    （`memory/notes.py` 的 `truncate_index`）。
+    这里逐行累加字节数，放不下的行整行丢弃——沿用 c9 记忆索引的既有做法
+    （`memory/memories.py` 的 `truncate_index`）。
 
     副作用：无。
     """

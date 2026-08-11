@@ -89,9 +89,9 @@ class LiveModeTest(HostFixture):
 
     def test_notes_thread_converges_before_exit(self):
         """
-        AC24 的 live 一半：真实模式保留自动笔记，退出前必须等它收敛。
+        AC24 的 live 一半：真实模式保留自动记忆，退出前必须等它收敛。
 
-        它是 daemon 线程，不 join 就会被进程退出截断——那样笔记会写到一半。
+        它是 daemon 线程，不 join 就会被进程退出截断——那样记忆会写到一半。
         """
         self.start_host("--mode", "live", "--idle-timeout", "600")
         self.send("用一句话介绍你自己")

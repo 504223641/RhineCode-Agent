@@ -218,7 +218,7 @@ class UserDirIsolationTest(BootstrapFixture):
         AC30：在 A 目录预置四类用户级内容，用 B 目录装配，四类均不生效。
 
         四类分别经**不同**的取值点，必须逐项验证：
-        项目指令与笔记索引 → memory；Skill → skills；权限规则 → permission.config；
+        项目指令与记忆索引 → memory；Skill → skills；权限规则 → permission.config；
         MCP 声明 → mcp.config。
         """
         other = Path(tempfile.mkdtemp()).resolve()
@@ -246,7 +246,7 @@ class UserDirIsolationTest(BootstrapFixture):
         mm = result.manager.memory_manager
         # ① 用户级项目指令不进「自定义指令」槽位
         self.assertNotIn("MAGIC_USER_INSTRUCTION", mm.custom_instructions())
-        # ② 用户级笔记索引不进「长期记忆」槽位
+        # ② 用户级记忆索引不进「长期记忆」槽位
         self.assertNotIn("MAGIC_USER_NOTE", mm.memory_index())
         # ③ 用户级 Skill 不在第一阶段清单里
         self.assertNotIn("magicskill", result.skill_manager.index_text())

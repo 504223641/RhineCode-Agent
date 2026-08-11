@@ -8,9 +8,13 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 
+from rhinecode.subagents.models import MAX_CONCURRENT
 from rhinecode.subagents.tasks import (
+    ACTIVITY_LINGER_SECONDS,
+    ACTIVITY_RECENT_LIMIT,
     BRANCH_AGENT_NAME,
     KIND_BRANCH,
     KIND_ROLE,
@@ -285,6 +289,189 @@ class ConcurrencyTest(unittest.TestCase):
 
         self.assertEqual(len(collected), 30)
         self.assertEqual(len(set(collected)), 30)
+
+
+class NoteToolTest(unittest.TestCase):
+    """
+    `note_tool`：活动区那三个数字里的第三个（tui-display 扩展 F3/F5，AC3/AC25b）。
+
+    ⚠ 它记的是**已完成**的调用，不是发起过的。口径由运行器那边保证
+    （消费 `TOOL_RESULT` 而不是 `TOOL_START`），本类只验计数与有界。
+    """
+
+    def setUp(self) -> None:
+        self.tm = TaskManager()
+        self.record = self.tm.create(KIND_ROLE, "explorer", "调研")
+
+    def test_counts_up(self) -> None:
+        for i in range(3):
+            self.tm.note_tool(self.record.task_id, f"Read(a{i}.py)")
+        self.assertEqual(self.record.tool_calls, 3)
+
+    def test_recent_keeps_order(self) -> None:
+        self.tm.note_tool(self.record.task_id, "Grep(Layer)")
+        self.tm.note_tool(self.record.task_id, "Read(engine.py)")
+        self.assertEqual(self.record.recent_tools, ("Grep(Layer)", "Read(engine.py)"))
+
+    def test_recent_is_bounded_but_the_count_is_not(self) -> None:
+        """
+        **两者刻意不同步**：最近列表有上限（展示用），计数没有（成本用）。
+
+        把计数也截到 5 会让活动行显示「5 次调用」而实际跑了 20 次——
+        那个数字的全部意义就在于反映真实规模。
+        """
+        for i in range(20):
+            self.tm.note_tool(self.record.task_id, f"Read(a{i}.py)")
+        self.assertEqual(self.record.tool_calls, 20)
+        self.assertEqual(len(self.record.recent_tools), ACTIVITY_RECENT_LIMIT)
+        # 保留的是**最近**的那几条，不是最早的
+        self.assertEqual(self.record.recent_tools[-1], "Read(a19.py)")
+
+    def test_unknown_id_is_ignored(self) -> None:
+        """
+        未知标识静默忽略，与 `bump` 同口径。
+
+        运行器的事件消费循环可能在任务被清理之后才处理完最后几个事件，
+        为此抛异常会让它在收尾路径上炸掉。
+        """
+        self.tm.note_tool("不存在", "Read(x)")  # 不抛异常即通过
+
+    def test_terminal_task_is_ignored(self) -> None:
+        """已结束的任务不再计数——终态的成本数字必须是定死的。"""
+        self.tm.finish(self.record.task_id, TaskStatus.COMPLETED, "好了")
+        self.tm.note_tool(self.record.task_id, "Read(x)")
+        self.assertEqual(self.record.tool_calls, 0)
+
+    def test_stores_strings_not_objects(self) -> None:
+        """
+        **结构护栏**：`recent_tools` 里只能是字符串。
+
+        存 `ToolCall` 对象会诱导后来的人在**锁内**做参数摘要与 markup 转义
+        ——那两件事都要调别处的函数，而本项目已经因为「临界区里做了不该做的事」
+        死锁过四次。与 `worktree_path` 只存字符串是同一条理由。
+        """
+        self.tm.note_tool(self.record.task_id, "Read(a.py)")
+        for item in self.record.recent_tools:
+            self.assertIsInstance(item, str)
+
+
+class ActivityRowsTest(unittest.TestCase):
+    """
+    `activity_rows`：给活动区的只读快照（tui-display 扩展 F1/F2/F6，AC1/AC25a）。
+    """
+
+    def setUp(self) -> None:
+        self.tm = TaskManager()
+
+    def test_empty_when_nothing_ever_ran(self) -> None:
+        """
+        没有任何任务时返回空元组——界面据此把整块隐藏且不占布局空间（F1/F9）。
+
+        这是**零回归的那一半**：不使用子 Agent 的用户永远走这一支。
+        """
+        self.assertEqual(self.tm.activity_rows(), ())
+
+    def test_running_task_shows_up(self) -> None:
+        r = self.tm.create(KIND_ROLE, "explorer", "调研")
+        self.tm.bump(r.task_id, turns=3, tokens=1200)
+        self.tm.note_tool(r.task_id, "Grep(Layer)")
+
+        rows = self.tm.activity_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].display_name, "explorer")
+        self.assertIs(rows[0].status, TaskStatus.RUNNING)
+        self.assertEqual(rows[0].tokens, 1200)
+        self.assertEqual(rows[0].tool_calls, 1)
+        self.assertEqual(rows[0].recent_tools, ("Grep(Layer)",))
+        self.assertEqual(rows[0].settled_seconds, 0.0)
+
+    def test_member_name_takes_the_agents_format(self) -> None:
+        """
+        名字口径与 `/agents` 的任务行**必须一致**。
+
+        两处不一致的话，「活动区里那个 worker1 是 /agents 里的哪一条」
+        要靠用户自己猜——而同一个角色可以派出多个队员，猜不出来。
+        """
+        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        r.member_name = "worker1"
+        self.assertEqual(self.tm.activity_rows()[0].display_name, "worker1(explorer)")
+
+    def test_just_finished_task_lingers(self) -> None:
+        """终态行要带着最终成本停留片刻，立刻消失的话用户什么都来不及看。"""
+        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        self.tm.finish(r.task_id, TaskStatus.COMPLETED, "结论")
+
+        rows = self.tm.activity_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0].status, TaskStatus.COMPLETED)
+        self.assertLess(rows[0].settled_seconds, ACTIVITY_LINGER_SECONDS)
+
+    def test_long_finished_task_is_dropped(self) -> None:
+        """
+        结束够久的行不再返回——活动区是「现在在发生什么」。
+
+        留着的话它会慢慢变成第二个历史区，而永久痕迹由历史区那条记录承担（F6）。
+        """
+        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        self.tm.finish(r.task_id, TaskStatus.COMPLETED, "结论")
+        # 把结束时刻往前拨，等价于「已经过去很久了」
+        r.finished_at -= ACTIVITY_LINGER_SECONDS + 1
+
+        self.assertEqual(self.tm.activity_rows(), ())
+
+    def test_finished_row_freezes_its_duration(self) -> None:
+        """已结束的行显示总耗时，不能继续涨——那是这次委派的最终成本。"""
+        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        self.tm.finish(r.task_id, TaskStatus.COMPLETED, "x")
+        first = self.tm.activity_rows()[0].seconds
+        time.sleep(0.02)
+        self.assertEqual(self.tm.activity_rows()[0].seconds, first)
+
+    def test_rows_are_capped_by_the_concurrency_limit(self) -> None:
+        """
+        AC25a：并发上限（5）本身就是行数的界。
+
+        本方法不另设截断——`MAX_CONCURRENT` 已经保证同时运行的任务不超过它，
+        再加一道会让「明明有 6 个在跑却只显示 5 个」成为一个查不出来的谜。
+        真正要钉的是**上限确实生效**，那由服务层负责；这里只确认「行数 ==
+        运行中任务数」这条恒等式。
+        """
+        for i in range(MAX_CONCURRENT):
+            self.tm.create(KIND_ROLE, f"a{i}", "t")
+        self.assertEqual(len(self.tm.activity_rows()), MAX_CONCURRENT)
+        self.assertEqual(len(self.tm.activity_rows()), self.tm.running_count())
+
+    def test_recent_tools_are_bounded(self) -> None:
+        """AC25b：展开时每条任务的工具调用条数不超过约定上限。"""
+        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        for i in range(20):
+            self.tm.note_tool(r.task_id, f"Read(a{i}.py)")
+        self.assertLessEqual(
+            len(self.tm.activity_rows()[0].recent_tools), ACTIVITY_RECENT_LIMIT
+        )
+
+    def test_rows_are_immutable(self) -> None:
+        """
+        快照必须是不可变的。
+
+        可变的话，界面拿到手之后有人会顺手改它，而它是**共享**对象——
+        改动会静默流回领域层，或者反过来被后台线程改到一半读出去。
+        """
+        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        row = self.tm.activity_rows()[0]
+        with self.assertRaises(Exception):
+            row.tokens = 999  # type: ignore[misc]
+
+    def test_does_not_expose_the_live_record(self) -> None:
+        """
+        **反证**：返回的不是 `TaskRecord` 本身。
+
+        `snapshot()` 刻意返回活对象（报告层要读运行中的实时值），
+        而活动区拿的必须是冻结的一份——两者语义不同，别把这条改成
+        「返回 snapshot 就行」。
+        """
+        self.tm.create(KIND_ROLE, "explorer", "t")
+        self.assertNotIsInstance(self.tm.activity_rows()[0], type(self.tm.snapshot()[0]))
 
 
 class LockInvariantTest(unittest.TestCase):

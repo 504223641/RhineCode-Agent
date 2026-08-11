@@ -754,6 +754,7 @@ class Agent:
                 for notice in context_manager.before_request(
                     history, allow_summary=options.allow_summary
                 ):
+                    # 提示级：上下文压缩是后台常规动作（tui-display 扩展 F19）
                     yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
 
             # 工具集收窄策略**每轮现取**（c11 F14）：模型可能上一轮才激活 Skill，
@@ -857,6 +858,9 @@ class Agent:
                     yield AgentEvent(
                         type=AgentEventType.NOTICE,
                         message=f"等待子 Agent 完成：{waiting}（按 Esc 可取消）",
+                        # 事件级：这条正在解释「AI 为什么突然不说话了」，
+                        # 用 dim 渲染的话它本身也不显眼，等于没解释
+                        level="event",
                     )
                     if gate.wait_any(cancel_event):
                         # 等到了结论 → 下一轮迭代开头的 take_pending 会把它注入

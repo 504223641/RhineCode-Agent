@@ -36,7 +36,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | C6 | 五层防御权限系统 | 每次工具执行前由**代码**（非模型/prompt）算「放行 / 拒绝 / 问用户」；被拒不终止循环，结构化原因回灌模型 |
 | C7 | MCP 客户端 | 启动时连外部 MCP Server（stdio / Streamable HTTP），把远端工具包装成已有 `Tool` 接口注册进工具中心，对上层完全无感 |
 | C8 | 上下文管理（两层压缩） | 每次请求前「锚点 + 增量」估算用量；第一层把过大工具结果存盘留占位，第二层调 LLM 把早段压成结构化摘要。幂等、fail-safe、连续失败 3 次熔断，用户原始消息永不改写 |
-| C9 | 记忆系统 | 三层 RHINE.md 项目指令（含 `@include` 展开）+ 每条消息即时 JSONL 存档与容错恢复 + Agent 自然停止后异步沉淀四类笔记；多实例由锁文件防护 |
+| C9 | 记忆系统 | 三层 RHINE.md 项目指令（含 `@include` 展开）+ 每条消息即时 JSONL 存档与容错恢复 + Agent 自然停止后异步沉淀四类记忆；多实例由锁文件防护 |
 | C10 | 斜杠命令系统 | 单一 `CommandSpec` 注册表同时驱动执行 / `/help` / 补全 / 高亮；本地与界面命令绕过 Agent，未知命令不进 AI |
 | C11 | Skill 系统 | 把重复输入的提示词封装成独立 Markdown 文件（三级存放、两阶段加载、`context: fork` 子对话、`allowed-tools` 预授权、自动注册短命令）。**已对齐 Agent Skills 开放标准**，外部 Skill 目录复制进来即可用。字段与行为细节见下一节 |
 | C13 | **子 Agent 系统** | 主 Agent 把子任务委派给独立上下文的子 Agent，只拿回结论。两条路径：**定义式**（Markdown+frontmatter 定义的角色，从空白对话起步）与**分支式**（继承父历史快照、强制后台）。子 Agent 一律独立线程运行、**全程非交互**（判 ASK 自动拒绝）、能力**只会比主对话小**（工具集三层过滤 / 权限只能收紧 / 不继承回合级预授权）。**委派永不阻塞**（多个委派天然并行），结论在 Agent Loop 的**每轮迭代**注入主历史，且模型准备收工时循环会停下来等它。内置三个角色：`explorer`（只读调研）/ `planner`（只读方案）/ `general-purpose`（全工具执行） |
@@ -123,13 +123,13 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 | 层 | 路径 | 职责 | ⚠ 致命不变量 |
 | --- | --- | --- | --- |
-| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现 `CommandController` 协议 | **markup 转义必须用 `tui/widgets.py` 的 `escape`**，绝不用 rich 那版——落单的 `[` 会在布局阶段主线程抛 `MarkupError`，**没有 try/except 兜得住，整个 app 退出** |
+| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现 `CommandController` 协议。**子 Agent 活动区**（主线程轮询，`ActivityView`）、**系统行四级分级**、**命令报告分级渲染**、面板序号与数字键直选、连按两次 `Ctrl+C` 退出（tui-display 扩展） | **markup 转义必须用 `tui/widgets.py` 的 `escape`**，绝不用 rich 那版——落单的 `[` 会在布局阶段主线程抛 `MarkupError`，**没有 try/except 兜得住，整个 app 退出**。**另一条**：活动区的数据一律**主线程轮询**，绝不新增从子 Agent 线程到界面的推送——本项目已因「加锁临界区内做跨线程调度」死锁四次 |
 | Commands | `commands/` | 斜杠命令注册与分发（纯逻辑，不依赖 Textual） | `_specs` 是两个列表的只读拼接，**写入必须直接操作其中之一**——对属性 append 不报错也不生效 |
 | 协调层 | `conversation.py` | TUI 与 Agent/Provider 的中转；历史、权限引擎、四类回调、上下文/记忆/Skill 接线 | 预授权**先取令牌再授予**；`clear()` 与 `_resume_stream` 两处必须清空 Skill 激活态 |
 | Agent | `agent/` | ReAct 循环、事件类型、流式收集、结构化系统提示 | `dynamic` 是**每轮求值**的 callable，改回取值型会让两阶段加载失效；trace 埋点一律走 `_safe_emit` 漏斗 |
 | Permission | `permission/` | 五层防御的纯逻辑引擎 | 第③层规则**必须排在①黑名单②沙箱之后**——这是预授权安全性的全部依据。**②′网络边界层同理必须排在③之前**：晚于③会让一条 `allow: WebFetch(domain:*)` 在③层先行放行，`file://` 与 `127.0.0.1` 整个跳过硬校验。注意理由**不是**「白名单会失效」（那是错的，两种顺序下白名单结论相同）——正因如此，顺序护栏必须用「全域名 allow + 禁止地址」构造，实测「白名单未命中」那种形态在错序下照样通过。**另一条**：命令类规则的 deny 与 allow 用一对**语义相反**的判定（`match_command_deep` / `match_command_every_segment`），拆分口径也不同（朴素 / 认引号）——合一或对调任一处都会静默放宽权限，见「成对维护点」 |
 | MCP | `mcp/` | 配置、JSON-RPC、两种传输、工具适配、多 Server 编排 | stdio 的 stderr 必须后台 drain，否则 Server 写日志会把子进程写阻塞 |
-| Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、笔记与索引 | 写盘权收拢在 manager 的锁临界区内——拿锁的人就是写盘的人 |
+| Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、记忆与索引 | 写盘权收拢在 manager 的锁临界区内——拿锁的人就是写盘的人 |
 | Hooks | `hooks/` | Hook 规则的解析/条件求值/动作执行/分发编排 | 两条：**Hook 只能收紧不能放宽**（`HookDecision` 里没有 ALLOW，`_apply_hook_ask` 只把 ALLOW 升级为 ASK、绝不降级 DENY）——这是本章全部安全论证的依据；**加锁临界区只做纯内存读写**，动作执行、埋点、跨线程调度一律在锁外，违反会让一个 60 秒超时的命令锁死整个 manager，界面假死而调用栈上无线索 |
 | Worktree | `worktree/` | 隔离工作区的建/查/删与启动清理，**全项目唯一执行 git 的地方**（c14） | 两条：**`lifecycle.remove` 是唯一删除入口**，它先过纯判定 `judge_removal` 的三层过滤（①位置必须严格落在 `.rhinecode/worktrees/` 内且不等于它本身 ②归属必须被版本库登记 ③有未提交改动一律否决），未获许可**一步都不往下走**——绕过它等于把「空变量 rmtree 删掉整个仓库」那次事故的闸门拆了；**名字校验必须先于任何路径拼接**，先拼后验时越界路径已经产生，任何一处漏检返回值就直接落盘 |
 | SubAgents | `subagents/` | 角色解析/三层扫描/工具过滤/任务表/运行器/服务门面（c13） | 三条：**权限必须 `derive()` 派生，绝不改主引擎的 `mode`**——引擎是单实例共享、`mode` 与 `turn_rules` 都可变，后台线程改它等于静默改掉主对话的权限档位，界面上完全看不出来；**`TaskManager` 加锁临界区只做纯内存读写**，`Event.set()` 一律在锁外（它唤醒等待线程，属跨线程调度），且本类**刻意不持有任何回调**、从结构上杜绝违反；**运行器绝不调 `hooks.consume_injections()`**——那是个会被取走的队列，子 Agent 消费它会让主对话的注入型 Hook 凭空消失 |
@@ -188,8 +188,29 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增 MCP 传输方式 → `mcp/transport.py`（`Transport` 子类）+ `mcp/manager.py` `_build_transport`（按 `kind` 分支）
 - 新增斜杠命令 → 只需 `commands/builtins.py` 登记一条 `CommandSpec` + 处理函数 + 测试（c10 单一注册来源；补全/帮助/高亮自动生效）
 - 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
-- 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
+- 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单。
+  ⚠ **状态栏那一行是左右两个区**（tui-display F31）：`StatusHint`（贴左边缘，瞬时提示）+ `StatusBar`（右对齐，常驻状态），装在 `#status-row` 里。**常驻状态一律进右区**；只有「刚发生了什么」这类瞬时提示才进左区，且**不能拼进 `compose_status_text`** ——右区整块 `text-align: right`，拼进去只会落在右对齐块的最左边、随其余各段长度在屏幕中间浮动，**判据写成「排在第一段之前」会全绿而屏幕上并不贴左**（真踩过）。左区新增内容要同步 `_refresh_status` 里那行 `set_quit_hint` 同位置的刷新，以及 trace 负载里与 `text` 并列的那个布尔字段（左区不在 `text` 里，漏记等于那两秒的界面反馈没有任何物证）
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+- **活动区终态行与历史区完成通知的成本数字必须同源（tui-display）** → 两处都经
+  `subagents/tasks.py` 的 `TaskManager.row_of` 取快照、再交给
+  `tui/widgets.py` 的 `format_activity_cost` 渲染。**各自从 `TaskRecord` 上取字段
+  拼一遍不报错**，只是同一个任务的成本在两处对不上——而那种不一致最难解释
+  （两个数字都「看起来对」，只是不相等）。⚠ 连带一条：**F6 的「历史永久痕」与
+  F7 的「完成通知」是同一行**，产出点只有 `tui/app.py` 的 `_subagent_finish_text`
+  一处；写成两行同样不报错，只是每个子 Agent 在历史区留下重复的两条，
+  用户会以为它跑了两次。护栏见 `tests/test_e2e_activity.py::FinishTraceTest`
+  （断言该任务名在历史区**恰好出现一次**）
+- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 六个：
+  `●`（发生了一件事——工具行、活动行，状态靠**颜色**区分）、`⎿`（从属于上一行）、
+  `>`（你，或当前选中——用户消息前缀与面板高亮指示符**刻意合一**）、
+  `·`（行内分隔，不作行首前缀）、`↑`（token 计数）、`✻`（思考块）。
+  **不在表内的一律不用**，包括为消息分级发明的图形——警告与错误靠**文字前缀**
+  （「警告：」「错误：」），那是它们脱离颜色也能辨认的唯一依靠。
+  改动要同步三处：本表、`tests/test_tui_symbols.py` 的 `WHITELIST`、
+  以及那份扫描覆盖的模块清单。⚠ 扫描**刻意不管注释与发给模型的提示词**
+  （`skills/render.py` / `subagents/render.py` / `team/render.py` 的
+  `render_team_brief` 等）——那些是 prompt 不是界面，措辞是真实模型验收
+  反复调过的，为一条排版约束去动它们是拿行为回归换看不见的整洁
 - **工具行的「建行 / 定色」必须成对**，且 `_do_stream` 的 `tool_widgets` 表**只装还没定色的行**：`TOOL_PENDING` 建行、`TOOL_START` 复用（`get` 后 `begin_running`）、`TOOL_RESULT` **必须 `pop`**、`finally` 里 `_settle_unfinished_tools` 收尾剩下的。**把 `pop` 写成 `get` 不报错**：已经定成绿色「完成」的行会在收尾时被再收一次、覆写成「失败 · 未执行」——用户看到的是「明明写成功了却显示没执行」，而调用栈上什么线索都没有。护栏见 `tests/test_tui_tool_pending.py::DoStreamWiringTest`（含这条覆写的反证）
 - **`ToolCallWidget` 的 `(Ns)` 语义是「工具执行耗时」** → `begin_running` 必须重置 `_start`。漏了不报错，只是把「模型生成参数」与「用户盯着确认面板发呆」的时间一并算进去，一次 2 毫秒的写盘可能显示成 `(600s)`
 - 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
@@ -282,7 +303,7 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 - `/context`（别名 `/ctx`）：查看当前上下文近似用量（估算 token / 窗口上限 / 余量 / 已存盘工具结果数 / 是否熔断），纯只读（DeepSeek 工具模式生效）。
 - `/compact`：手动触发第二层 LLM 摘要压缩，无余量阈值——主动触发即尝试；历史尚无够旧的早段可摘要时如实回「无可摘要的早段」（DeepSeek 工具模式生效）。
 - `/resume`（别名 `/continue`）：无参弹出交互式会话选择面板（列出全部会话：编号/ID/标题/消息数/时间/锁标记，上下键选择、回车载入、Esc 退出；锁定项与当前会话置灰跳过）；`/resume <编号或ID>` 直接载入。载入成功后聊天区清空并回放该会话全部历史（用户消息/AI 回复/简化工具行），存档指针随之切换（被其它实例新鲜锁占用时拒绝且不清屏；载入后逼近窗口先跑一次 c8 压缩）。`rhine --continue` 启动恢复同样回放历史。所有 Provider 生效（c9）。
-- `/memory`：查看记忆系统状态——RHINE.md 各层加载与 include 展开、两级笔记数量与索引超限标记、最近一次自动笔记更新结果、当前会话 ID 与已存档消息数、写锁状态。纯只读（c9）。
+- `/memory`：查看记忆系统状态——RHINE.md 各层加载与 include 展开、两级记忆数量与索引超限标记、最近一次自动记忆更新结果、当前会话 ID 与已存档消息数、写锁状态。纯只读（c9）。
 - `/init`：用内置指令启动一次 Agent Loop，探索项目生成项目根 `RHINE.md`；已存在时不覆盖、只输出改进建议。写盘走完整权限管线（DeepSeek 工具模式生效，c9）。c10 双内容：界面与恢复回放显示 `/init`，模型历史与存档保留展开后的完整提示词（`Message.display_content`）。
 - `/skills`：管理 Skill（c11）。五种形态——无参列出全部 Skill 及其来源层级、在哪执行（主对话 / 子对话）、激活状态、加载错误、字段提示，**以及体检建议段**（作者期扩展：七项检查，每条都给出具体改法；无建议时整段不出现；有建议时段尾指向 `/skill-creator`）；`/skills prompt` 查看当前**实际注入**了什么（第一阶段清单 / 已激活正文 / 当前可见工具集），排查「为什么模型没按我的 Skill 做」用；`/skills reload` 热更新定义（已激活的正文自动换新，定义消失的自动卸载，**斜杠短命令一并重新注册**——新增的立刻可补全可执行、删除的随之消失，`allowed-tools` 里认不出的项只丢弃并警告，既不终止进程也不影响下次启动——外部 Skill 里出现 `Task` / `TodoWrite` 这类名字是正常现象。**注意 `WebFetch` 现在是真工具**，写它不再产生「无对应工具类别」警告，但括号里必须写成 `WebFetch(domain:...)`，漏掉前缀会被丢弃并单独警告）；`/skills off [名字]` 卸载指定或全部激活项；`/skills run <名字> [参数]` 执行指定 Skill（通用入口，也是短命令被重名跳过时的替代入口）。
 - **Skill 短命令**：每个 Skill 自动注册 `/<name>`（如 `/commit`、`/review`），进 Tab 补全与 `/help`；与内置命令或其别名重名时跳过注册并在启动时提示改用 `/skills run <name>`。
@@ -295,6 +316,23 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 补全与高亮（c10）：输入 `/` 前缀实时弹候选（只显示规范名，别名不参与补全——仍可直接输入执行、完整命中仍高亮、`/help` 可见；隐藏命令不出现）；Tab 单候选直补（有参数提示的命令末尾留一个空格）、多候选弹稳定排序菜单；菜单可见时回车执行当前高亮项；光标进入参数区后 Tab 不拦截。输入框只在命令字段完整命中规范名或别名时以青色加粗高亮该字段，参数与未完成前缀保持普通样式。无参命令忽略多余参数（`/clear now` 仍清空）。
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
+
+`Ctrl+O` 在「折叠 / 展开」之间切换**一个全局开关**——同时管子 Agent 活动区
+（展开后列出每个队员最近的工具调用）与历史区里被折叠的长工具结果 / diff 块。
+它**不改变焦点**（tui-display 扩展 F5/F41）。
+
+**退出是连按两次 `Ctrl+C`**（tui-display 扩展 F31）：第一次**贴着状态栏左边缘**
+挂出「再按一次 Ctrl+C 退出」（**灰色**，对齐 Claude Code；**不进聊天区**——那是
+只活两秒的瞬时状态，不是对话内容。⚠ 刻意不用橘色：橘色专指「用户没主动做什么、
+但情况变了」，而这条是按键的直接回应），两秒内没有第二下就自动复位、提示随之撤下。**提示的存续期就是
+连按有效期**，但**判定的依据始终是时间戳而非提示的显示态**。
+⚠ **`SIGINT` 被接管并转成一次「按了 `Ctrl+C`」**（F31a），与按键落到同一个判定上
+——不接管的话，控制台一旦回到 `ENABLE_PROCESSED_INPUT` 模式（`run_command` 的
+子进程能改掉它，那是整个控制台共享的属性），`Ctrl+C` 就从按键变成信号、
+Python 默认处理器一次就把程序掀翻，表现为「平时按两下、偶尔一下就退」。⚠ **屏幕上有选中文本时 `Ctrl+C` 是复制，且不计数**
+——连续复制多少次都不会靠近退出，这是 c2 AC9「`Ctrl+C` 用于复制场景」在新键位
+下的落点。`Ctrl+Q` **已不再退出**（绑到一个空动作上吃掉 Textual 自带的绑定），
+`/exit` 不受影响。
 
 ⚠️ **`Esc` 的语义是「我不等了」，不是「全停」**：它只停主对话，**不会取消正在跑的子 Agent**
 （那是 C13「委派永不阻塞」的契约——`background=true` 那些是模型明说过不等的）。
@@ -337,7 +375,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 2323 项，skipped 4
+python -m unittest discover -s tests      # 2504 项，skipped 4
 ```
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
@@ -491,7 +529,7 @@ python -m unittest discover -s tests      # 2323 项，skipped 4
   （同样落在 `other` 分支、同样能任意联网）都不受它约束——这是与已知项 #4（OS 级沙箱）
   同一个缺口的两面。另：连接期的域名解析**不受任何超时约束**（标准库解析函数无超时参数，
   `Esc` 也打断不了），DNS rebinding 的时间窗同样未封死，两者都是已知边界。
-- 记忆系统（c9）：**会话存档含完整对话原文**（含被读过的敏感文件内容、工具输出），`.rhinecode/sessions/`、`.rhinecode/memory/`、`.rhinecode/context/` 已加入 `.gitignore`，勿提交。笔记落盘与索引重建是**内部可信写盘**（同 c8 存盘先例，不经工具权限管线），但写入路径由代码锁死：LLM 只产出 JSON 动作，`filename` 过 `[a-z0-9_-]+\.md` 白名单校验（防路径注入），物理上出不了两个 memory 目录。用户级 `~/.rhinecode/memory/` 经 path_guard **只读白名单**放行——只对 read 类判定生效（`resolve_readable`/`is_readable_path`），write/glob 判定完全不动，不扩大沙箱其它面。笔记 LLM 请求强制 `tools=None`。锁文件只保证「写不坏」，不提供跨实例实时一致性（语义重复笔记靠 LLM 去重收敛）。/init 生成 RHINE.md 走 `write_file` 完整权限管线（人在回路确认后才落盘）。
+- 记忆系统（c9）：**会话存档含完整对话原文**（含被读过的敏感文件内容、工具输出），`.rhinecode/sessions/`、`.rhinecode/memory/`、`.rhinecode/context/` 已加入 `.gitignore`，勿提交。记忆落盘与索引重建是**内部可信写盘**（同 c8 存盘先例，不经工具权限管线），但写入路径由代码锁死：LLM 只产出 JSON 动作，`filename` 过 `[a-z0-9_-]+\.md` 白名单校验（防路径注入），物理上出不了两个 memory 目录。用户级 `~/.rhinecode/memory/` 经 path_guard **只读白名单**放行——只对 read 类判定生效（`resolve_readable`/`is_readable_path`），write/glob 判定完全不动，不扩大沙箱其它面。记忆 LLM 请求强制 `tools=None`。锁文件只保证「写不坏」，不提供跨实例实时一致性（语义重复记忆靠 LLM 去重收敛）。/init 生成 RHINE.md 走 `write_file` 完整权限管线（人在回路确认后才落盘）。
 - 上下文管理（c8）：第一层存盘写入 `<项目根>/.rhinecode/context/<id>.txt` 属**内部可信写盘**，不经工具权限管线（不是模型发起的工具调用）；存盘内容是工具结果原文，可能含被读过的敏感文件片段，故 `.rhinecode/context/` 应随 `.rhinecode/` 一并 git 忽略、勿提交（已在 `.gitignore`）。第二层摘要会把「较早的对话历史（含工具结果）」作为一条 user 转录发给 LLM——与正常对话同样是把上下文交给模型，无额外外泄面，但若用了 `deny Read(敏感文件)`，注意该文件内容一旦已进入历史仍可能被摘要带走（deny 只挡新读取，挡不住已在历史里的内容）。摘要请求强制 `tools=None`，模型在摘要阶段无法调用任何工具。
 
 ## 已知后续工程项
@@ -508,7 +546,7 @@ python -m unittest discover -s tests      # 2323 项，skipped 4
 8. 上下文管理后续项（C8 spec 明确不做）：精确 tokenizer（当前仅「锚点+增量」近似估算）、摘要策略的机器学习/质量优化、存盘文件的清理与生命周期管理（`/clear` 只复位幂等状态、不删磁盘文件）、除窗口大小外其它阈值（存盘/保留/余量等）的可配置化、摘要内容的分段/多轮压缩与跨会话持久化。~~其中「保留区阈值」曾有一处实测局限~~ **已于 2026-07-29 修复**：`RETAIN_TOKENS` 与 `auto_margin` 原是固定常量、不随 `context_window` 缩放，导致小窗口（如 8192）上保留区比整个窗口还大、触发线为负——第二层摘要**永不真正压缩**且每轮空转。现改为「按窗口比例算再夹上限」（`summarize.retain_budget` / `manager._derive_margin`），**64K 及以上逐字维持原值**。护栏见 `tests/test_context_summarize.py::RetainScalesWithWindowTest`。
 9. Skill 系统后续项（C11 spec 明确不做）：Skill 的市场分发与版本管理、嵌套激活（Skill 里再激活 Skill）、参数 schema 与校验、模板引擎（`$ARGUMENTS` 只做字面替换）、多个 Skill 并行执行、跨会话保持激活态、文件监听式自动热更新（当前需显式 `/skills reload`）。
 10. Trace 记录器后续项（spec 明确不做）：TUI 驱动器（P1，用 Pilot 无人驱动界面跑完整场景，本轮只做 P0 记录器）、记录文件的自动清理与轮转（`--trace` 每次运行产一个新文件，攒多了要手工删）、实时流式查看（当前只能事后读文件）、可视化时间线、跨运行对比与差异分析、采样与按类型开关（当前只有「全开」与「全关」两态）。~~阈值（字段截断 4000 字符 / 消息条数 400）可配置化~~ **已于 2026-08-09 作废**——两个阈值整体删除，记录层不再做任何截断（`models.full_text`）。理由是它们与 trace 的立项目的直接冲突：实测系统提示在最小配置下已有 3886 字符、贴着 4000 线，而稳定通道尾部依次是 134 组队协作 / 135 角色清单 / 140 Skill 清单——任何一份真实的 RHINE.md 一进来，被切掉的正好是那三段清单。代价是记录文件更大（`api_request` 每轮含完整历史），这是刻意付的。
-11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复笔记靠 LLM 去重收敛）、笔记自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
+11. 记忆系统后续项（C9 spec 明确不做）：向量数据库/RAG 语义检索（召回只靠索引注入 + 按路径读文件）、团队记忆同步/跨机器共享、跨实例实时一致性（锁只保证「写不坏」，语义重复记忆靠 LLM 去重收敛）、记忆自动清理与遗忘机制、各阈值（24h 提醒/30 天过期/索引 200 行/锁 600 秒等）可配置化、存档格式版本迁移工具、存档加密或压缩存储。
 
 12. ~~**③可配置规则层的复合命令口径**（deny 与 allow 两侧）~~ **已全部修复**：
 

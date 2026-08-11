@@ -301,7 +301,7 @@ def check_permission(
 
 
 def check_scope(view: TraceView, seq: int, expected_scope: str) -> CheckResult:
-    """⑥ 指定序号的事件属于哪个作用域（`main` / `isolated:<skill>` / `summary` / `notes`）。"""
+    """⑥ 指定序号的事件属于哪个作用域（`main` / `isolated:<skill>` / `summary` / `memory`）。"""
     try:
         record = view.by_seq(seq)
     except LookupError as e:

@@ -61,6 +61,8 @@ class WebFetchTool(Tool):
         "required": ["url", "prompt"],
     }
     read_only = False
+    # 显示地址而不是 prompt：地址决定「去了哪」，也是用户放不放行的依据
+    primary_arg = "url"
 
     def __init__(self, manager) -> None:
         """

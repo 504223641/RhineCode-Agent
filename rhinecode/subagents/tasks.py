@@ -65,6 +65,59 @@ KIND_BRANCH = "branch"
 # 分支式委派没有角色名，展示与作用域都用这个占位。
 BRANCH_AGENT_NAME = "(branch)"
 
+# ---------------------------------------------------------------------------
+# 活动区的两个上限（tui-display 扩展 F5/F6 / N5「一切展示都有界」）
+# ---------------------------------------------------------------------------
+# 展开活动区时，每条任务下方最多列出这么多次最近的工具调用。
+# 一个跑了 20 轮的子 Agent 可能调过上百次工具，全列出来会把活动区涨到比历史区
+# 还高；而用户在这里要的只是「它最近在动什么」，最近几条就够了。
+ACTIVITY_RECENT_LIMIT = 5
+# 任务结束后，那一行在活动区里继续停留多少秒才消失。
+#
+# 为什么要停留而不是立刻消失：终态行带着最终成本（次数 / token / 耗时），
+# 立刻消失的话用户什么都来不及看。为什么又不是永久留着：活动区是「现在在发生
+# 什么」，留着终态行会让它慢慢变成第二个历史区——**永久痕迹由历史区那条记录
+# 承担**（F6，两处成本数字同源）。
+ACTIVITY_LINGER_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class ActivityRow:
+    """
+    活动区的一行——给界面的**不可变只读快照**（tui-display 扩展 F2/F3）。
+
+    ## 为什么不把 `TaskRecord` 直接递给界面
+
+    三条：它是**可变**对象（后台线程随时在改 `turns` / `usage_tokens`），
+    它持有两个 `Event`（界面完全用不上，还会诱使人去 `set()` 它们），
+    而界面每 0.5 秒读一次。给不可变快照可以在领域层一次性算完
+    「名字口径统一」与「已结束多久」，界面只负责画。
+
+    ## 三个数字的共同点
+
+    耗时 / token / 调用次数，都是**不用理解内容就能判断「它在动、动得快不快」**
+    的量。刻意不把「子 Agent 正在做什么」翻译成人话展示——那既贵又容易误导，
+    而且会抵消掉委派的全部价值（把子 Agent 的输出喷回主界面）。
+
+    :param display_name: 已按 `/agents` 口径拼好的名字——协作启用时是
+        `队员名(角色名)`，否则只有角色名
+    :param status: 四态之一，界面据此选颜色与状态词
+    :param seconds: 运行中 = 至今耗时；已结束 = 总耗时
+    :param tokens: 该任务累计用量
+    :param tool_calls: 已完成的工具调用次数
+    :param recent_tools: 最近若干次调用的已渲染短文本（展开时逐条画）
+    :param settled_seconds: **已结束多久**；运行中为 0。界面据此判断这一行
+        还要不要继续显示（F6 的「留片刻后消失」）
+    """
+
+    display_name: str
+    status: "TaskStatus"
+    seconds: float
+    tokens: int
+    tool_calls: int
+    recent_tools: tuple[str, ...]
+    settled_seconds: float
+
 
 @dataclass
 class TaskRecord:
@@ -74,6 +127,8 @@ class TaskRecord:
     **可变**（与包内其它数据类不同）：运行器会在跑的过程中更新轮次与用量，
     TUI 轮询与 `/agents` 会读它。所有读写都经 `TaskManager` 的锁。
 
+    :param tool_calls: 已完成的工具调用次数（活动区那三个数字之一）
+    :param recent_tools: 最近若干次调用的已渲染短文本，有界。见字段处的注释
     :param task_id: 短标识，模型与用户都用它指代任务
     :param kind: `role` / `branch`
     :param agent_name: 角色名；分支式为 `(branch)`
@@ -136,6 +191,21 @@ class TaskRecord:
     # 为真时 Agent Loop 在准备自然结束前会停下来等它（见 agent/gate.py）；
     # `background=true` 置假——那是模型明说过不等的，循环不该为它停留。
     awaited: bool = True
+    # ── 活动区用的两个字段（tui-display 扩展 F3/F5）──
+    #
+    # `tool_calls`：这个子 Agent **已完成**的工具调用次数。它与 `turns` /
+    # `usage_tokens` 一起构成活动行那三个数字，共同点是「不用理解内容就能判断
+    # 它在动、动得快不快」。
+    tool_calls: int = 0
+    # `recent_tools`：最近若干次调用的**已渲染短文本**（如 `"Grep(Layer)"`），
+    # 供活动区展开时逐条列出。有界，见 `ACTIVITY_RECENT_LIMIT`。
+    #
+    # ⚠ **存的是渲染好的字符串，不是 `ToolCall` 对象。** 理由与 `worktree_path`
+    # 只存字符串完全相同：`TaskRecord` 的读写都在 `TaskManager` 的加锁临界区内，
+    # 而那里的硬不变量是**只做纯内存读写**。放一个 `ToolCall` 进去，是在诱导
+    # 后来的人在锁内做参数摘要与 markup 转义——那两件事都要调别处的函数，
+    # 而本项目已经因为「临界区里做了不该做的事」死锁过四次。
+    recent_tools: tuple[str, ...] = ()
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
 
@@ -269,6 +339,32 @@ class TaskManager:
             if tokens:
                 record.usage_tokens += tokens
 
+    def note_tool(self, task_id: str, rendered: str) -> None:
+        """
+        记一次**已完成**的工具调用（tui-display 扩展 F3/F5）。
+
+        :param task_id: 任务标识
+        :param rendered: **已经渲染好**的短文本，如 `"Grep(Layer)"`。
+            渲染（含 markup 转义）必须由调用方在**锁外**做完再传进来
+
+        计数与最近列表一起更新；最近列表尾部追加并裁到
+        `ACTIVITY_RECENT_LIMIT`（N5「一切展示都有界」）。
+
+        未知标识或已终态的任务静默忽略，与 `bump` 同口径——运行器的事件消费
+        循环可能在任务被取消之后才处理完最后几个事件，为此抛异常会让它在收尾
+        路径上炸掉。
+
+        副作用：改记录字段。**只做纯内存读写**，不调任何回调、不做任何 IO。
+        """
+        with self._lock:
+            record = self._tasks.get(task_id)
+            if record is None or record.status.is_terminal:
+                return
+            record.tool_calls += 1
+            record.recent_tools = (record.recent_tools + (rendered,))[
+                -ACTIVITY_RECENT_LIMIT:
+            ]
+
     def finish(
         self,
         task_id: str,
@@ -326,6 +422,83 @@ class TaskManager:
         """
         with self._lock:
             return tuple(self._tasks.values())
+
+    @staticmethod
+    def row_of(record: "TaskRecord", now: "Optional[float]" = None) -> "ActivityRow":
+        """
+        把一条任务记录冻结成一行活动快照。
+
+        :param record: 任务记录
+        :param now: 当前时刻（`time.monotonic()`）。批量转换时由调用方传同一个值，
+            免得同一次轮询里各行的「现在」差了几微秒
+        :returns: 不可变快照
+
+        ## 为什么这是一个公开的静态方法（F6）
+
+        它有**两个**调用方：`activity_rows()` 给活动区，以及界面产出**完成通知**
+        时给那一条历史留痕。spec F6 要求两处的成本数字**同源同口径**——
+        各自从 `TaskRecord` 上取字段拼一遍的话，一次口径改动只改一处不报错，
+        用户会看到同一个任务的成本在活动区与历史区对不上，而那种不一致最难解释
+        （两个数字都「看起来对」，只是不相等）。
+
+        副作用：无（纯函数）。
+        """
+        moment = time.monotonic() if now is None else now
+        settled = (
+            max(0.0, moment - record.finished_at)
+            if record.status.is_terminal and record.finished_at is not None
+            else 0.0
+        )
+        end = record.finished_at if record.finished_at is not None else moment
+        who = (
+            f"{record.member_name}({record.agent_name})"
+            if record.member_name
+            else record.agent_name
+        )
+        return ActivityRow(
+            display_name=who,
+            status=record.status,
+            seconds=max(0.0, end - record.started_at),
+            tokens=record.usage_tokens,
+            tool_calls=record.tool_calls,
+            recent_tools=record.recent_tools,
+            settled_seconds=settled,
+        )
+
+    def activity_rows(self) -> "tuple[ActivityRow, ...]":
+        """
+        取活动区要画的那几行（tui-display 扩展 F1/F2/F6）。
+
+        :returns: 不可变快照元组，按创建顺序。**没有可显示的行时返回空元组**
+            ——界面据此把整块隐藏且不占布局空间（F1）
+
+        收哪些行：
+        - 全部**运行中**的任务；
+        - 加上**刚结束不久**的（`settled_seconds < ACTIVITY_LINGER_SECONDS`）。
+          终态行要带着最终成本停留片刻，立刻消失的话用户什么都来不及看；
+          但也不能永久留着，否则活动区会慢慢变成第二个历史区——
+          永久痕迹由历史区那条记录承担（F6）。
+
+        名字口径与 `/agents` 的任务行**刻意保持一致**（`队员名(角色名)`，
+        没有队员名时只显示角色名）：用户在两处看到的必须是同一个称呼，
+        否则「活动区里那个 worker1 是 /agents 里的哪一条」要靠猜。
+
+        ⚠ **本方法在锁内只做纯内存读写**，与本类其余方法同一条不变量。
+        时间计算用的是 `time.monotonic()`，不涉及任何 IO 或回调。
+
+        副作用：无（只读）。
+        """
+        now = time.monotonic()
+        with self._lock:
+            rows = []
+            for record in self._tasks.values():
+                if record.status.is_terminal and (
+                    record.finished_at is None
+                    or now - record.finished_at >= ACTIVITY_LINGER_SECONDS
+                ):
+                    continue
+                rows.append(self.row_of(record, now))
+            return tuple(rows)
 
     def running_count(self) -> int:
         """当前运行中的任务数（并发上限的判据，spec F20）。"""

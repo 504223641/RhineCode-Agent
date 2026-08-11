@@ -16,6 +16,7 @@ TUI 组件模块，定义四个自定义 Textual Widget。
 """
 
 import re
+from enum import Enum
 from time import monotonic
 from typing import Optional, TypeVar
 
@@ -37,7 +38,14 @@ from textual.message import Message as TextualMessage
 from rhinecode.agent.events import ClarifyOption
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
+from rhinecode.subagents.tasks import BRANCH_AGENT_NAME, STATUS_LABELS, TaskStatus
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
+from rhinecode.tools.display import (
+    TOOL_LABELS,
+    clip_value,
+    resolve_call_parts,
+    summarize_args_plain,
+)
 
 
 # 「把一段纯文本安全地嵌进 markup 字符串」的转义正则：匹配任意 `[` 及其前导反斜杠。
@@ -95,24 +103,15 @@ def summarize_args(arguments: "dict | None", max_len: int = 60) -> str:
     取每个参数 "键=值" 拼接，值过长则截断，整体再做长度上限截断，
     目的是让用户一眼看清工具将操作什么（如 path=...），而非展示完整内容。
 
+    判定本身在 `tools/display.py`（那份是纯文本、无转义，子 Agent 侧也要用它）；
+    这里只加一层**转义**。⚠ 转义必须留在这一侧且只做一次：产出会被拼进 markup
+    字符串，而参数值里的 `[` 全是字面量。
+
     :param arguments: 解析后的参数字典；None（解析失败）时返回占位提示
     :param max_len: 摘要最大长度，超出截断
-    :returns: 单行参数摘要字符串
+    :returns: 单行参数摘要字符串，**已转义**
     """
-    if arguments is None:
-        return "<参数解析失败>"
-    if not isinstance(arguments, dict):
-        return "<参数格式错误>"
-    parts = []
-    for key, value in arguments.items():
-        text = str(value).replace("\n", " ")
-        if len(text) > 30:
-            text = text[:30] + "…"
-        parts.append(f"{key}={text}")
-    summary = ", ".join(parts)
-    if len(summary) > max_len:
-        summary = summary[:max_len] + "…"
-    return escape(summary)
+    return escape(summarize_args_plain(arguments, max_len))
 
 
 # 回放时工具结果摘要的最大展示长度（取首行再截断，避免长结果撑爆历史区）
@@ -147,7 +146,7 @@ def build_replay_items(messages) -> "list[tuple]":
        - role="tool"      → 跳过（结果已并入所属 assistant 的 tool 项）
        - 其它 role        → 防御性跳过
 
-    已知降级：会话存档不含思考（thinking）内容，回放不出现 💭 块。
+    已知降级：会话存档不含思考（thinking）内容，回放不出现思考块。
 
     :param messages: 历史消息列表（元素为 provider.base.Message）
     :returns: 渲染项列表，元素为 ("user", str) / ("assistant", str) / ("tool", ToolCall, str)
@@ -228,9 +227,14 @@ class _DiffBlock:
     与 DiffView.to_text() 的取值规则一致，保证人看到的与回灌给模型的对得上。
     """
 
-    def __init__(self, view) -> None:
-        """:param view: tools.diff.DiffView"""
+    def __init__(self, view, expanded: bool = False) -> None:
+        """
+        :param view: tools.diff.DiffView
+        :param expanded: 全局展开开关（`Ctrl+O`）。为假时 diff 行数受
+                         `DIFF_ROW_LIMIT` 约束（F41）
+        """
         self._view = view
+        self._expanded = expanded
 
     def __rich_console__(self, console, options):
         """
@@ -249,8 +253,18 @@ class _DiffBlock:
         # 先收集每行的 (文本, 样式, 是否整行铺背景)
         rows_out: list[tuple[str, Style, bool]] = []
         # 概要分支行（灰色，无背景）
-        rows_out.append((f"  ⎿  {_count_phrase(view.added, view.removed)}", dim, False))
-        for row in view.rows:
+        rows_out.append((f"{BRANCH_PREFIX}{_count_phrase(view.added, view.removed)}", dim, False))
+
+        # 折叠（tui-display 扩展 F41 / AC31c）：改造前 diff 块**完全没有上限**，
+        # 一次大改动会把整块差异铺进历史区，后面的对话全被挤出屏幕。
+        # 与结果分支行同一套语义：截断 + 如实写出还剩多少行 + 指出怎么展开。
+        rows = list(view.rows)
+        hidden = 0
+        if not self._expanded and len(rows) > DIFF_ROW_LIMIT:
+            hidden = len(rows) - DIFF_ROW_LIMIT
+            rows = rows[:DIFF_ROW_LIMIT]
+
+        for row in rows:
             if row.marker == MARK_GAP:
                 # hunk 间省略：用居中省略号表示中间有未展示的未改动内容
                 rows_out.append(("        ⋮", dim, False))
@@ -263,6 +277,12 @@ class _DiffBlock:
                 rows_out.append((f"{num}+ {row.text}", add_bg, True))
             else:  # MARK_CONTEXT：无背景，灰色前景
                 rows_out.append((f"{num}  {row.text}", dim, False))
+        if hidden:
+            rows_out.append((f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}", dim, False))
+        # `view.truncated` 是 **diff 生成侧**（tools/diff.py）的截断标记，与本处的
+        # 展示折叠是两回事：前者说「这份 diff 本身就没算全」，后者说「算全了但
+        # 没画全」。两条都可能出现，故各画各的、不合并——合并会让用户以为
+        # 按 Ctrl+O 就能看到那些**根本没被生成出来**的行。
         if view.truncated:
             rows_out.append(("        …（diff 已截断）", dim, False))
 
@@ -278,28 +298,250 @@ class _DiffBlock:
                 yield Segment.line()
 
 
-def render_diff_block(view) -> "_DiffBlock":
+def render_diff_block(view, expanded: bool = False) -> "_DiffBlock":
     """
     构造 diff 块的可渲染对象（见 _DiffBlock）。保留函数形式，调用方无需感知具体类型。
 
     :param view: tools.diff.DiffView
+    :param expanded: 全局展开开关；为假时行数受 `DIFF_ROW_LIMIT` 约束
     :returns: 一个 Rich 可渲染对象，删除/新增行整行背景高亮、自适应宽度
     """
-    return _DiffBlock(view)
+    return _DiffBlock(view, expanded=expanded)
 
 
-# 工具名 → 标题展示标签。把面向模型的内部名（snake_case）换成更易读的动词式标签，
-# 与改文件工具的 "Update"/"Write" 风格统一。这里是「展示层」的映射：
-# - 真实工具名仍是各工具的 name（API 用、注册中心用），此表只决定 UI 标题怎么写；
-# - 未登记的工具回退到原始名，保证新增工具即便忘了登记也不会显示异常。
-_TOOL_LABELS = {
-    "read_file": "Read",
-    "glob_files": "Glob",
-    "grep_content": "Grep",
-    "run_command": "Run",
-    "edit_file": "Update",
-    "write_file": "Write",
-}
+# ---------------------------------------------------------------------------
+# 分支符号与次级信息配色：**全界面单一来源**（tui-display 扩展 F14 / AC12）
+# ---------------------------------------------------------------------------
+# 三处会画「从属于上一行」的次级信息：工具行的结果分支、活动区展开后的子调用行、
+# 命令报告里缩进的详情行。它们**必须取自同一处定义**——各写一份的话，改了一处
+# 另外两处不会跟着变，而这**不报错**：界面照常渲染，只是三处的灰度慢慢分叉，
+# 最后没人说得清哪个才是「对的灰」。
+#
+# `⎿` 与 `·` `↑` `●` `>` `✻` 一起构成本项目的**符号白名单**（F29）。
+# 不在白名单里的符号一律不用，新增要先进 CLAUDE.md 里那张表。
+BRANCH_MARK = "⎿"
+# 分支行的完整前缀：两格缩进体现层级，符号后两个空格与正文拉开距离。
+BRANCH_PREFIX = f"  {BRANCH_MARK}  "
+# 分支块**续行**的缩进：与首行正文左缘对齐，让多行结果读起来是一块而不是几条。
+# 宽度由 `cell_len` 算而不是写死——`⎿` 是 East Asian Width「模糊」字符，
+# 在 CJK 终端里占两格，写死 5 会让续行在中文环境下错位一格。
+BRANCH_CONT_INDENT = " " * cell_len(BRANCH_PREFIX)
+
+# 折叠上限（tui-display 扩展 F41 / N5「一切展示都有界」）。
+#
+# 改造前工具结果**只取首行、截到 80 字符**：一次 `grep` 命中 23 处，用户只看得到
+# 第一处，而且**没有任何迹象表明还有别的**——既不知道被省了什么，也没法展开。
+# 现在改成保留全文、折叠展示，并在末行如实写出还有多少行。
+BRANCH_LINE_LIMIT = 5
+# diff 块的行数上限。改造前**完全没有上限**，一次大改动会把整块差异铺进历史区。
+# 取 12 而不是 5：diff 的每一行信息量比结果行低（大半是上下文行），
+# 5 行往往连一个 hunk 都放不下。
+DIFF_ROW_LIMIT = 12
+# 折叠提示里给出的展开方式。**与 A 组共用同一个快捷键**，不为工具行另立一个
+# （F41：对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套）。
+EXPAND_HINT = "（Ctrl+O 展开）"
+# 次级信息的灰色前景。取值沿用改造前 `ToolCallWidget._COLOR_BRANCH` 的 #808080，
+# 这样「统一来源」这件事本身不改变任何一处的既有观感。
+SECONDARY_COLOR = "#808080"
+
+# 系统行分级里两个高档位的**文字**前缀（tui-display 扩展 F19/F21）。
+#
+# 用文字而不是图形，是为了让它们**脱离颜色也能辨认**：截图、配色异常的终端、
+# 端到端驱动抓到的纯文本里，颜色都可能丢失，而这三个字不会。
+# 提示级与事件级刻意**没有**前缀——误读那两者的代价为零，见 `append_event`。
+# 思考块的标记（F28/F29）。`💭` 换成 `✻`——单色字形，任何终端里都不会被渲染成
+# 彩色图形，且这是 Claude Code 的同款记号。它是白名单里唯一的「特例」类符号。
+THINKING_MARK = "✻"
+
+WARNING_PREFIX = "警告："
+ERROR_PREFIX = "错误："
+
+
+class ReportLineKind(Enum):
+    """
+    命令报告里一行的层级（tui-display 扩展 F16）。
+
+    改造前所有报告整段走 `append_system` 的 `[dim]` 通道——段落标题、条目、
+    次级信息在视觉上完全等价，一份 `/agents` 报告读起来是一堵均匀的暗色墙。
+    本枚举让展示层能按行施加不同的亮度与强调。
+    """
+
+    TITLE = "title"      # 首行：加粗 + 强调色，一眼看出「这是一次命令的结果」
+    SECTION = "section"  # 段落标题（无缩进的非条目行）：正常亮度 + 加粗
+    ITEM = "item"        # 条目行（• / - / · 开头）：正常亮度
+    DETAIL = "detail"    # 缩进 ≥4 的次级信息：暗色
+    BLANK = "blank"      # 空行
+
+
+# 条目行的项目符号。`·` 也算，因为部分报告用它做次级列表。
+_ITEM_BULLETS = ("•", "-", "·")
+# 判定为「次级信息」的最小缩进。取 4 是因为各报告的产出函数一律用
+# 「2 空格 = 条目、4 空格 = 该条目的细节」这套缩进（见 subagents/report.py 的
+# `_agent_block`：`  • 名字` 配 `    说明：…`）。
+_DETAIL_INDENT = 4
+
+
+def classify_report(text: str) -> "tuple[tuple[ReportLineKind, str], ...]":
+    """
+    把一段命令报告逐行判定层级。
+
+    ## 为什么只看「行的形状」，不认识任何一个具体报告
+
+    spec F16 要求**各报告的文本产出函数一字不改**——它们是纯函数，且有大量
+    逐字断言的护栏钉着（`subagents/report.py` / `team/render.py` /
+    `skills/render.py` / `hooks/report.py` …）。为某个报告的具体措辞写判定，
+    等于把展示层与那些函数的内容绑死，改一句话就要改这里。
+
+    所以判据只有缩进与首字符。代价是判错时无非是某一行的亮度不对，
+    不会出任何功能问题——这是刻意选的、**失败代价极小**的方向。
+
+    判定顺序（**顺序即优先级，不可调换**）：
+    1. 第一行且非空 → TITLE；
+    2. 空行（或纯空白）→ BLANK；
+    3. 去掉前导空格后以 `•` / `-` / `·` 开头 → ITEM
+       （**排在缩进判定之前**：一个缩进 6 格的条目仍是条目，不是详情）；
+    4. 前导空格 ≥ 4 → DETAIL；
+    5. 其余 → SECTION。
+
+    :param text: 报告全文（多行）
+    :returns: `((级别, 原始行), …)`，行文本**未转义**——转义由渲染方按 markup
+              需要施加，在这里做会让本函数没法被别的渲染方式复用
+
+    副作用：无（纯函数）。
+    """
+    out: list[tuple[ReportLineKind, str]] = []
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if index == 0 and stripped:
+            out.append((ReportLineKind.TITLE, line))
+            continue
+        if not stripped:
+            out.append((ReportLineKind.BLANK, line))
+            continue
+        if stripped[0] in _ITEM_BULLETS:
+            out.append((ReportLineKind.ITEM, line))
+            continue
+        if len(line) - len(line.lstrip(" ")) >= _DETAIL_INDENT:
+            out.append((ReportLineKind.DETAIL, line))
+            continue
+        out.append((ReportLineKind.SECTION, line))
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# 面板选项的序号与高亮指示符（tui-display 扩展 F23/F24）
+# ---------------------------------------------------------------------------
+# 当前高亮项的前缀。与用户消息的前缀**是同一个符号**，这不是冲突而是收敛
+# （F29）：两处从不同时出现在同一区域，语义也确实同源——「这是你 / 这是你选的」。
+SELECTED_MARK = ">"
+# 未选中项的前缀。**必须与 `SELECTED_MARK + " "` 等宽**，否则高亮在选项之间移动
+# 时整列文字会左右抖一格。
+_UNSELECTED_MARK = " " * (len(SELECTED_MARK) + 1)
+
+
+def numbered_prompt(index: int, text: str, selected: bool) -> str:
+    """
+    把一个可选项拼成「指示符 + 序号 + 文本」。
+
+    ## 为什么要序号（F23）
+
+    对齐 Claude Code：带序号的选项可以**直接按数字键选中**，不必先用方向键
+    把高亮移过去再回车。四个选项的确认面板因此从「最多按四次方向键 + 回车」
+    变成「按一个键」。
+
+    ## 为什么要非颜色的指示符（F24）
+
+    改造前「当前是哪一项」**只靠背景色**表达。配色异常的终端（或截图、
+    或端到端驱动设施抓到的纯文本）里那个信息就整个丢了。`>` 让它脱离颜色
+    也能读出来。
+
+    :param index: 序号，从 1 开始。**只由调用方对可选项递增**——表头与详情行
+        这类 `disabled` 的行不占号，否则按 `2` 会落到一行说明文字上
+    :param text: 选项文本，**可以已经是 markup**（三个面板都往里塞
+        `[dim]…[/dim]` 的说明）
+    :returns: 形如 `"> 1. 本次放行"` / `"  2. 本会话放行"`
+
+    副作用：无（纯函数）。
+
+    ⚠ **本函数不转义**：传进来的文本有的已是 markup，在这里转义会把那些样式
+    标签打成字面量。纯文本的转义责任在调用方——三个面板的 `show_*` 里，
+    每一处嵌入自由文本（工具名、问题、会话标题）的地方都已各自 `escape` 过。
+    """
+    mark = f"{SELECTED_MARK} " if selected else _UNSELECTED_MARK
+    return f"{mark}{index}. {text}"
+
+
+# 工具名 → 标题展示标签。**定义在 `tools/display.py`**，这里只是别名。
+#
+# 单一来源是必须的：`subagents/runner.py` 给活动区渲染子 Agent 的最近调用时
+# 用的是同一张表，而它**不能** import 本模块（会撞循环导入，见 display.py 的
+# docstring）。两处各写一份的话，同一个工具会在主对话与活动区显示成两个名字。
+_TOOL_LABELS = TOOL_LABELS
+
+
+# 委派工具的特例（spec F12 第 2 条）。这三个字符串必须与 `tools/run_agent.py`
+# 的 `parameters` 对得上：`agent` 是角色名、`task` 是任务陈述。
+#
+# ⚠ **这一支刻意留在本模块、不下沉到 `tools/display.py`**：它要用到
+# `BRANCH_AGENT_NAME`，而 display.py import `subagents.tasks` 会成环。
+# 子 Agent 侧不受影响——`run_agent` 在 `GLOBAL_DENIED_TOOLS` 里，它调不到。
+_DELEGATE_TOOL = "run_agent"
+_DELEGATE_LABEL_KEY = "agent"
+_DELEGATE_VALUE_KEY = "task"
+
+
+def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tuple[str, str]":
+    """
+    解析一次工具调用在界面上的标题：`标签(括号内文本)`。
+
+    ## 为什么不再显示「键=值」列表（spec F12）
+
+    改造前是 `Task(name=explorer, task=调研权限层…)`。`name=` `task=` 这些**键名**
+    对用户零信息量——它们是给模型看的参数结构；而真正有用的那个值被键名挤占了
+    本就不多的横向空间，往往正好在关键处被截断。改成只显示一个主参数的值之后，
+    同样的宽度里能看清「在对什么东西做什么」。
+
+    ## 三条分支，顺序固定
+
+    1. **委派特例**（本函数自己处理）：`run_agent` 的标签取**角色名**、括号里放
+       **任务描述**，于是委派的工具行与活动区那条终态留痕行**天然同形**——
+       用户在两个时刻看到的是同一个东西，不用在脑子里做一次对应（这也是
+       Claude Code 的做法：把 agent 类型当标签）。角色名缺席（分支式委派）
+       时用占位名。
+    2 与 3（已声明主参数 / 回退键值对摘要）由 `tools/display.resolve_call_parts`
+    判定——那份是**纯文本**内核，`subagents/runner.py` 给活动区渲染时用的是
+    同一份。本函数只在它外面加一层**转义**。
+
+    :param tool_call: `provider.base.ToolCall`，提供 `name` 与 `arguments`
+    :param primary_args: `{工具名: 主参数键名}`，由 `app.on_mount` 从工具注册中心
+        建一次（工具集启动后不变）。为 None / 空字典时**全部走兜底分支**，
+        因此非 DeepSeek Provider（拿不到注册中心）下行为与改造前逐字一致
+    :returns: `(标签, 括号内文本)`，**两者都已经过本模块的 `escape`**，可直接拼进
+        markup
+
+    副作用：无（纯函数）。
+
+    ⚠ **转义在这里做，不能推给调用方。** F12 让**主参数的原始值**直接进入标题
+    （不再被 `键=值` 的格式包裹），而路径、命令、URL、任务描述全是可能含字面
+    `[` 的自由文本。漏一次转义就是布局阶段 `MarkupError`、整个应用退出，
+    没有任何 try/except 兜得住。
+    """
+    name = str(getattr(tool_call, "name", "") or "")
+    raw = getattr(tool_call, "arguments", None)
+    args = raw if isinstance(raw, dict) else {}
+
+    # ── 分支 1：委派特例 ──
+    #
+    # ⚠ 附加条件 `and args`：参数**还没到**（`tool_pending` 阶段 `arguments` 是
+    # None）时不走这一支。否则「角色名缺席 → 用分支占位名」那条规则会把一次
+    # 普通的角色委派在参数生成期显示成 `(branch)`——那是**错的信息**，
+    # 比显示内部名更糟。等 `tool_start` 带着参数到达时它自然转成角色名。
+    if name == _DELEGATE_TOOL and args:
+        role = str(args.get(_DELEGATE_LABEL_KEY) or "").strip() or BRANCH_AGENT_NAME
+        return escape(role), escape(clip_value(args.get(_DELEGATE_VALUE_KEY) or ""))
+
+    label, inner = resolve_call_parts(tool_call, primary_args)
+    return escape(label), escape(inner)
 
 
 class ToolCallWidget(Static):
@@ -310,9 +552,11 @@ class ToolCallWidget(Static):
 
     四种视觉状态：
     - 参数生成中：橘色，"● 标签 参数生成中… Ns"（pending=True 时的初始态，见下）
-    - 执行中：橘色，显示 "● 标签(参数摘要) 执行中… Ns"，N 由主线程定时器每秒刷新
-    - 成功：绿色 "● 标签(参数摘要) 完成 (Ns)" + 下方 "⎿ 结果摘要"
-    - 失败：红色 "● 标签(参数摘要) 失败 (Ns)" + 下方 "⎿ 错误摘要"
+    - 执行中：橘色，显示 "● 标签(主参数) 执行中… Ns"，N 由主线程定时器每秒刷新
+    - 成功：绿色 "● 标签(主参数) 完成 [(Ns)]" + 下方 "⎿ 结果块"
+    - 失败：红色 "● 标签(主参数) 失败 [(Ns)]" + 下方 "⎿ 错误块"
+
+    终态的耗时括号**不足一秒时整个不出现**（F13，见 `_elapsed_suffix`）。
 
     **为什么需要「参数生成中」这一态**：写文件类调用的参数里塞着整份文件内容，
     模型生成这段 JSON 可能要几十秒，而真正的写盘往往只花几毫秒。若只有「执行中」态，
@@ -323,27 +567,41 @@ class ToolCallWidget(Static):
     因此即使 Worker 正阻塞在工具执行/并发等待中，耗时显示仍持续更新（spec F14/N3）。
     """
 
-    # 执行中橘色 / 成功绿色 / 失败红色 / "⎿ 摘要" 分支行灰色（次级信息）
+    # 执行中橘色 / 成功绿色 / 失败红色
     _COLOR_RUNNING = "#FFA500"
     _COLOR_OK = "#5FD75F"
     _COLOR_FAIL = "#FF5F5F"
-    _COLOR_BRANCH = "#808080"
+    # 分支行的灰色**不在这里定义**：它与活动区、命令报告共用模块级的
+    # `SECONDARY_COLOR`（F14 / AC12）。此处保留同名别名只是为了不改动既有调用点，
+    # 取值必须继续指向那一处，别改回字面量。
+    _COLOR_BRANCH = SECONDARY_COLOR
 
-    def __init__(self, tool_call, pending: bool = False) -> None:
+    def __init__(self, tool_call, pending: bool = False, primary_args: "Optional[dict]" = None) -> None:
         """
         :param tool_call: provider.base.ToolCall，提供工具名与参数用于展示
         :param pending: True 表示「模型还在生成调用参数」，此时 tool_call.arguments
                         通常为 None，本行先只显示工具名；等 TOOL_START 到达时由
                         begin_running() 补上参数摘要并转入执行态
+        :param primary_args: `{工具名: 主参数键名}`（F12）。由 `HistoryView` 透传，
+                             缺省 None → 标题全部走键值对摘要，形态与改造前一致
         """
         super().__init__(markup=True)
         self._pending = pending
         self._name = tool_call.name
-        # 标题展示标签：内部名映射为易读动词式（未登记则回退原名）
-        self._label = escape(_TOOL_LABELS.get(self._name, self._name))
-        self._args_summary = summarize_args(tool_call.arguments)
+        self._primary_args = primary_args or {}
+        self._label, self._args_summary = resolve_call_title(tool_call, self._primary_args)
         self._start = 0.0
         self._timer = None  # set_interval 返回的定时器，finish 时停止
+        # ── 终态的完整素材（F41）──
+        # 组件**保留全文**，折叠只发生在渲染那一刻。存半截的话展开就没得展了，
+        # 而那正是改造前「只取首行截到 80 字符」的问题所在。
+        self._finished = False
+        self._ok = True
+        self._summary = ""
+        self._diff = None
+        self._final_elapsed = 0
+        # 全局展开开关的本地副本，由 `set_expanded` 广播进来（见 app.action_toggle_expand）
+        self._expanded = False
 
     def on_mount(self) -> None:
         """挂载后记录起始时刻、立即渲染 0s，并启动每秒刷新的主线程定时器。"""
@@ -377,7 +635,9 @@ class ToolCallWidget(Static):
         :param tool_call: 参数已完整的同一次调用（id 与本行一致）
         """
         self._pending = False
-        self._args_summary = summarize_args(tool_call.arguments)
+        # 标签也要重算：委派工具在 pending 阶段还不知道派给哪个角色，
+        # 参数到齐后标签才从内部名转成角色名（F12 分支 1）。
+        self._label, self._args_summary = resolve_call_title(tool_call, self._primary_args)
         self._start = monotonic()
         self._render_running()
 
@@ -403,8 +663,12 @@ class ToolCallWidget(Static):
 
         由 TUI 的 Worker 通过 call_from_thread 在主线程调用，线程安全。
 
-        :param ok: 工具是否成功（决定绿/红与图标）
-        :param summary: 结果摘要文本（已由调用方取首行/截断）
+        本方法只**记下终态素材**，画由 `_render_finished` 负责——两者分开是为了
+        让 `set_expanded` 能在任何时候重画同一行（F41 的展开/收回）。
+
+        :param ok: 工具是否成功（决定绿/红）
+        :param summary: 结果摘要文本，**可以是多行全文**（折叠交给渲染，见
+                        `BRANCH_LINE_LIMIT`）
         :param diff: 可选的 tools.diff.DiffView。改文件类工具会带上它，
                      此时在状态行下方追加渲染一个彩色 diff 块；其它工具留空。
 
@@ -412,24 +676,104 @@ class ToolCallWidget(Static):
         """
         if self._timer is not None:
             self._timer.stop()
-        elapsed = self._elapsed()
-        color = self._COLOR_OK if ok else self._COLOR_FAIL
-        result = "完成" if ok else "失败"
-        # 统一为两行式：第一行 "● 标题 完成/失败 (Ns)"，第二行起为 "⎿ ..." 分支。
+        self._final_elapsed = self._elapsed()
+        self._finished = True
+        self._ok = ok
+        self._summary = summary or ""
+        self._diff = diff
+        self._render_finished()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        接收全局展开开关的广播（`Ctrl+O`，见 `app.action_toggle_expand`）。
+
+        只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下状态即可，
+        等它 `finish` 时自然按新状态渲染。
+
+        :param expanded: 展开为真、折叠为假
+
+        副作用：可能原地重绘本行。
+        """
+        if self._expanded == expanded:
+            return
+        self._expanded = expanded
+        if self._finished:
+            self._render_finished()
+
+    def _branch_block(self) -> RichText:
+        """
+        把结果摘要渲染成分支块：首行带 `⎿`，续行缩进对齐，超限时折叠。
+
+        折叠时**保留前 `BRANCH_LINE_LIMIT` 行**并在末尾追加「… +N 行（Ctrl+O 展开）」。
+        为什么写出确切的 N 而不是一个「更多」：改造前只取首行、且**没有任何迹象
+        表明还有别的**——用户既不知道被省了什么，也没法展开。数字本身就是那个迹象。
+
+        用 `RichText` 纯文本而不是 markup：结果摘要来自工具输出原文，
+        含 `[` 是常态，纯文本渲染天然免转义（与本类既有做法一致）。
+        """
+        lines = self._summary.split("\n")
+        # 去掉尾部空行：命令输出几乎都以换行结尾，留着会白占一行折叠额度
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            lines = [""]
+
+        hidden = 0
+        if not self._expanded and len(lines) > BRANCH_LINE_LIMIT:
+            hidden = len(lines) - BRANCH_LINE_LIMIT
+            lines = lines[:BRANCH_LINE_LIMIT]
+
+        rendered = [BRANCH_PREFIX + lines[0]]
+        rendered.extend(BRANCH_CONT_INDENT + line for line in lines[1:])
+        if hidden:
+            rendered.append(f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}")
+        return RichText("\n".join(rendered), style=self._COLOR_BRANCH)
+
+    def _render_finished(self) -> None:
+        """
+        画终态（成功/失败）。`finish` 与 `set_expanded` 共用这一处。
+
+        统一为两段式：第一行 `● 标题 完成/失败 [(Ns)]`，其下是 `⎿` 分支块。
+        """
+        color = self._COLOR_OK if self._ok else self._COLOR_FAIL
+        result = "完成" if self._ok else "失败"
+        diff = self._diff
         if diff is not None and diff.rows:
-            # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要更贴近改动语义），
-            # 分支由 render_diff_block 产出（首行 "⎿ Added.../removed..." 概要 + 彩色 diff 行）。
-            header = f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) {result} ({elapsed}s)[/]"
-            self.update(RichGroup(RichText.from_markup(header), render_diff_block(diff)))
-        else:
-            # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"，分支展示单行结果摘要。
-            # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
-            # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
-            title = self._label if self._pending else f"{self._label}({self._args_summary})"
-            header = f"[{color}]● {title} {result} ({elapsed}s)[/]"
-            branch = RichText("  ⎿  ", style=self._COLOR_BRANCH)
-            branch.append(summary, style=self._COLOR_BRANCH)
-            self.update(RichGroup(RichText.from_markup(header), branch))
+            # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要
+            # 更贴近改动语义），分支由 render_diff_block 产出。
+            header = (
+                f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) "
+                f"{result}{self._elapsed_suffix()}[/]"
+            )
+            self.update(
+                RichGroup(
+                    RichText.from_markup(header),
+                    render_diff_block(diff, expanded=self._expanded),
+                )
+            )
+            return
+        # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"。
+        # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
+        # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
+        title = self._label if self._pending else f"{self._label}({self._args_summary})"
+        header = f"[{color}]● {title} {result}{self._elapsed_suffix()}[/]"
+        self.update(RichGroup(RichText.from_markup(header), self._branch_block()))
+
+    def _elapsed_suffix(self) -> str:
+        """
+        终态的耗时后缀，**不足一秒时返回空串**（tui-display 扩展 F13）。
+
+        改造前每一行都挂着 `(0s)`。绝大多数工具调用是毫秒级的
+        （实测 `write_file` 从 `tool_start` 到 `tool_result` 只隔 2 毫秒），
+        那个恒为零的括号是纯噪音，还会把真正跑了很久的那几行淹掉——
+        一屏十个 `(0s)` 里夹着一个 `(43s)`，反而不显眼了。
+
+        ⚠ **只管终态。** 执行中的实时计时（`_render_running`）一字不动：
+        那是那段时间里界面上唯一的活体信号，从 0s 开始涨正是它的价值所在。
+        """
+        if self._final_elapsed < 1:
+            return ""
+        return f" ({self._final_elapsed}s)"
 
 
 # `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
@@ -482,6 +826,44 @@ class HistoryView(ScrollableContainer):
     Static 组件引用，TUI 层的 Worker 在收到每个 StreamChunk 后调用
     update_widget() 原地更新该组件内容，实现逐字显示效果。
     """
+
+    # `{工具名: 主参数键名}`（F12）。由 `app.on_mount` 从工具注册中心建一次并调
+    # `set_primary_args` 灌进来——工具集在启动之后不再变化，故只建一份。
+    #
+    # 缺省空字典是**零回归的关键**：拿不到注册中心时（非 DeepSeek Provider）
+    # 它一直是空的，`resolve_call_title` 全部走键值对摘要兜底，工具行的形态
+    # 与改造前逐字一致。
+    _primary_args: dict = {}
+
+    # 全局展开开关的本地副本（`Ctrl+O`，F5/F41）。
+    #
+    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：展开之后新产生的
+    # 每一行都要按展开态画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
+    # 又是折叠的——现象是「这个开关时灵时不灵」，而那比没有开关更让人困惑。
+    _expanded: bool = False
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        接收全局展开开关，**记下来并广播给已挂载的工具行**（F5/F41）。
+
+        :param expanded: 展开为真、折叠为假
+
+        副作用：改自身状态；重绘全部已定色的工具行。
+        """
+        self._expanded = expanded
+        for widget in self.query(ToolCallWidget):
+            widget.set_expanded(expanded)
+
+    def set_primary_args(self, mapping: dict) -> None:
+        """
+        接收「工具名 → 主参数键名」映射（F12）。
+
+        :param mapping: 由工具注册中心导出的一次性快照
+
+        副作用：只影响**此后**新建的工具行；已经画好的行不重绘
+        （启动时机决定了它总是在第一条消息之前被调用，实际不会出现半新半旧）。
+        """
+        self._primary_args = dict(mapping or {})
 
     def compose(self) -> ComposeResult:
         # 内层 Vertical 作为消息列表容器，便于统一清空（remove_children）
@@ -591,7 +973,7 @@ class HistoryView(ScrollableContainer):
 
         :returns: 新建的 Static 组件，内容初始为带思考图标的空字符串
         """
-        return self._add_widget("[dim italic]💭 [/dim italic]")
+        return self._add_widget(f"[dim italic]{THINKING_MARK} [/dim italic]")
 
     def update_widget(self, widget: Static, markup: str) -> None:
         """
@@ -638,36 +1020,117 @@ class HistoryView(ScrollableContainer):
         :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
         :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
         """
-        return self._mount_widget(ToolCallWidget(tool_call, pending=pending))
+        widget = ToolCallWidget(
+            tool_call, pending=pending, primary_args=self._primary_args
+        )
+        # 新行也要跟上当前的展开态（见 `set_expanded` 里那条注释）。
+        widget.set_expanded(self._expanded)
+        return self._mount_widget(widget)
 
     def append_system(self, text: str) -> None:
-        """追加一条系统提示消息，以灰色菱形 ◆ 为前缀（用于斜杠命令反馈）。"""
-        self._add_widget(f"[dim]◆ {escape(text)}[/dim]")
+        """
+        追加一条**提示级**系统行：暗色、**无前缀**（tui-display 扩展 F19）。
+
+        四级里最低的一档，用于「记忆已更新」「上下文已压缩」「Skill 已激活」
+        这类**误读代价为零**的消息。
+
+        ⚠ 改造前它带一个 `◆` 前缀，本轮去掉，两个理由：
+        ① `◆` 不在 F29 收敛后的符号白名单里；
+        ② F21 明确要求**提示级与事件级之间只差亮度**——留着前缀的话两者会
+        差两样东西（亮度 + 有没有符号），而那个符号本身不表达任何用户能用上的
+        信息（每条系统行都有它，等于没有）。
+        """
+        self._add_widget(f"[dim]{escape(text)}[/dim]")
+
+    def append_event(self, text: str) -> None:
+        """
+        追加一条**事件级**系统行：正常亮度、无前缀（tui-display 扩展 F19）。
+
+        用于「子 Agent 完成」「自动唤起」「会话已恢复」这类**真的发生了一件事**
+        的消息。改造前它们与「记忆已更新」走同一条 `[dim]` 通道，于是一屏里
+        最要紧的那条和最可忽略的那条长得一模一样。
+
+        与提示级只差亮度是**刻意的**（F21）：误读这两者的代价为零——把一条
+        「记忆已更新」当成事件，不会导致任何错误决策。真正会让人做错决定的是
+        漏看警告与错误，而那两级由**文字前缀**承担，脱离颜色也认得出。
+        """
+        self._add_widget(escape(text))
+
+    def append_report(self, text: str) -> None:
+        """
+        追加一段**分级渲染**的命令报告（tui-display 扩展 F15/F16/F17）。
+
+        改造前 `/agents` `/skills` 这类多行报告整段走 `append_system` 的 `[dim]`
+        通道——段落标题、条目、次级信息在视觉上完全等价，读起来是一堵均匀的
+        暗色墙。这里按 `classify_report` 判出的层级分别施加亮度与强调。
+
+        四级的样式取值理由：
+
+        - **首行**：加粗 + 强调色。它承担「这是一次命令的结果，不是 AI 说的话」
+          这个判断（F17）。⚠ **刻意不发前缀符号**——按 F29 收敛后的词汇表，
+          `●` 专属于工具行与活动行，为报告再造一个图形会让符号表重新变杂；
+        - **段落标题**：正常亮度 + 加粗；
+        - **条目**：正常亮度；
+        - **次级信息**：暗色（与工具行的分支、活动区的子行同一个
+          `SECONDARY_COLOR`，三处单一来源）。
+
+        :param text: 报告全文（多行，纯文本）
+
+        ⚠ 报告里嵌着路径、错误消息、任务标题与模型产出的结论——全是可能含
+        字面 `[` 的自由文本，必须逐行经本模块的 `escape`。
+
+        副作用：往历史区挂一个组件并滚到底。
+        """
+        rendered: list[str] = []
+        for kind, line in classify_report(text):
+            safe = escape(line)
+            if kind is ReportLineKind.TITLE:
+                rendered.append(f"[bold #7AEEFF]{safe}[/bold #7AEEFF]")
+            elif kind is ReportLineKind.SECTION:
+                rendered.append(f"[bold]{safe}[/bold]")
+            elif kind is ReportLineKind.DETAIL:
+                rendered.append(f"[{SECONDARY_COLOR}]{safe}[/{SECONDARY_COLOR}]")
+            else:
+                # ITEM 与 BLANK 都用正常亮度原样输出——条目行本身就是主干内容，
+                # 加任何强调都会与段落标题打架。
+                rendered.append(safe)
+        self._add_widget("\n".join(rendered))
 
     def append_error(self, text: str) -> None:
-        """追加一条错误消息，以红色粗体显示（用于 API 错误或网络异常）。"""
-        self._add_widget(f"[bold red]● 错误：{escape(text)}[/bold red]")
+        """
+        追加一条**错误级**系统行：红色粗体 + 文字前缀「错误：」（F19/F21）。
+
+        ⚠ 改造前它带一个 `●`，本轮去掉——按 F29 收敛后的词汇表，
+        `●` 专属于工具行与活动行，让它同时表示「一条错误」会稀释掉那个语义。
+        """
+        self._add_widget(f"[bold red]{ERROR_PREFIX}{escape(text)}[/bold red]")
 
     def append_warning(self, text: str) -> None:
         """
-        追加一条**醒目**的警告消息（橙色粗体，与确认面板同色系，c12）。
-
-        与 `append_system` 的差别只有一个：那条是 `[dim]`（比正文更暗），这条是
-        `[bold #FFA500]`。
+        追加一条**警告级**系统行：橙色粗体 + 文字前缀「警告：」（F19/F21）。
 
         ## 为什么需要它
 
-        今天唯一的用户是**项目级 Hook 的启动提示**——那是本项目里唯一一段
+        最早的用户是**项目级 Hook 的启动提示**——那是本项目里唯一一段
         「可能来自别人的仓库、且会被直接执行」的内容，它的可读性就是那道防线的强度。
         用 `append_system` 渲染的话，这条警告会比普通提示**更不显眼**（dim），
         方向正好反了（人眼评审时发现）。
 
-        **不加前缀符号**：调用方传进来的文本自带 `⚠`，widget 再加一个会重复。
+        ## 为什么前缀是**文字**而不是一个图形（F21）
+
+        这一条曾设计成「每级各发一个前缀符号（`·` / `◆` / `▲` / `×`）」，
+        **已推翻**。Claude Code 不给严重级别发图形，它靠颜色 + 文字本身
+        （`Error:`）；自创四个图形是「符号越加越杂」的来源，而符号一多，
+        每个的语义就都记不住了。
+
+        文字前缀还兑现了一件图形做不到的事：**脱离颜色也能辨认**。
+        截图、配色异常的终端、端到端驱动抓到的纯文本里，颜色都可能丢失，
+        而「警告：」三个字不会。
 
         ⚠ 与本类其它方法同理，文本必须经 `escape` —— 那是 `tui/widgets.py` 自己的
         版本，绝不能换成 `rich.markup.escape`（落单的 `[` 会被它放过并在布局阶段崩）。
         """
-        self._add_widget(f"[bold #FFA500]{escape(text)}[/bold #FFA500]")
+        self._add_widget(f"[bold #FFA500]{WARNING_PREFIX}{escape(text)}[/bold #FFA500]")
 
     def clear_all(self) -> None:
         """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
@@ -689,24 +1152,31 @@ class HistoryView(ScrollableContainer):
         return Static(RichGroup(label, RichMarkdown(content)))
 
     @staticmethod
-    def _build_tool_record_widget(tool_call, result_summary: str) -> Static:
+    def _build_tool_record_widget(
+        tool_call, result_summary: str, primary_args: "Optional[dict]" = None
+    ) -> Static:
         """
         构造一条「历史工具调用记录」的简化静态行（回放场景）。
 
-        两行式：绿色 "● 标签(参数摘要)" + 灰色 "⎿ 结果首行摘要"。
+        两行式：绿色 "● 标签(主参数)" + 灰色 "⎿ 结果首行摘要"。
         刻意**不复用 ToolCallWidget**：它的 on_mount 会启动每秒计时器并重绘「执行中」
         状态——回放时 finish() 与挂载的时序无保证，终态会被 on_mount 覆盖且定时器
         永不停止（泄漏）。历史记录也没有耗时数据，简化行语义更贴切。
 
+        ⚠ **标题必须与实时工具行同口径**（都走 `resolve_call_title`）。
+        各拼一次的话，`/resume` 回放出来的工具行会与刚跑过的那条长得不一样——
+        与 `_build_user_widget` 那个成对维护点是同一类问题。
+
         :param tool_call: provider.base.ToolCall（提供工具名与参数）
         :param result_summary: 已截断的结果摘要（build_replay_items 产出）
+        :param primary_args: `{工具名: 主参数键名}`（F12）
         """
-        label = escape(_TOOL_LABELS.get(tool_call.name, tool_call.name))
-        # 标题行走 markup（label 与 summarize_args 的产出都已 escape，安全）；
+        label, inner = resolve_call_title(tool_call, primary_args)
+        # 标题行走 markup（resolve_call_title 的两个产出都已 escape，安全）；
         # 分支行用 RichText 纯文本拼接——结果摘要来自工具输出原文，可能含 "["，
         # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
-        header = f"[{ToolCallWidget._COLOR_OK}]● {label}({summarize_args(tool_call.arguments)})[/]"
-        branch = RichText(f"  ⎿  {result_summary}", style=ToolCallWidget._COLOR_BRANCH)
+        header = f"[{ToolCallWidget._COLOR_OK}]● {label}({inner})[/]"
+        branch = RichText(f"{BRANCH_PREFIX}{result_summary}", style=ToolCallWidget._COLOR_BRANCH)
         return Static(RichGroup(RichText.from_markup(header), branch))
 
     def render_history(self, messages) -> None:
@@ -733,10 +1203,165 @@ class HistoryView(ScrollableContainer):
             elif kind == "assistant":
                 widgets.append(self._build_assistant_widget(item[1]))
             elif kind == "tool":
-                widgets.append(self._build_tool_record_widget(item[1], item[2]))
+                widgets.append(
+                    self._build_tool_record_widget(item[1], item[2], self._primary_args)
+                )
         if widgets:
             container.mount(*widgets)
         self._scroll_to_latest()
+
+
+def format_duration(seconds: float) -> str:
+    """
+    把秒数渲染成人读的时长：`43s` / `1m 12s`。
+
+    不足一分钟只写秒——`0m 43s` 里那个零毫无信息量。
+
+    副作用：无（纯函数）。
+    """
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m {total % 60}s"
+
+
+def format_tokens(tokens: int) -> str:
+    """
+    把 token 数渲染成人读的量级：`820 tokens` / `28.5k tokens`。
+
+    上千就换成 `k`：活动行的横向空间很紧，而这个数字要的是**量级**
+    （「烧得快不快」），不是精确值。
+
+    副作用：无（纯函数）。
+    """
+    value = max(0, int(tokens))
+    if value < 1000:
+        return f"{value} tokens"
+    return f"{value / 1000:.1f}k tokens"
+
+
+def format_activity_cost(row) -> str:
+    """
+    渲染一条活动行的三个数字（tui-display 扩展 F2/F3/F6）。
+
+    :param row: `subagents.tasks.ActivityRow`
+    :returns: 形如 `23s · ↑3.1k tokens · 8 次调用`（运行中）
+              或 `14 次调用 · 28.5k tokens · 1m 12s`（终态）
+
+    ## 为什么两种顺序不同
+
+    运行中把**耗时排在最前**——它是唯一每秒都在跳的数字，用户扫一眼就是想确认
+    「它还活着」。终态把**调用次数排在最前**——那时耗时已经不重要了，用户要的
+    是「这次委派花了多少」。
+
+    ## 为什么这是一个共用的纯函数（F6）
+
+    终态的这串数字要在**两个地方**出现：活动区那条即将淡出的终态行，
+    与历史区那条永久留痕。spec 明确要求两处**同源同口径**——各拼一次的话，
+    一次改动只改一处不报错，用户会看到同一个任务的成本在两个地方对不上，
+    而那种不一致最难解释。
+
+    副作用：无（纯函数）。
+    """
+    duration = format_duration(row.seconds)
+    tokens = format_tokens(row.tokens)
+    calls = f"{row.tool_calls} 次调用"
+    if row.status is TaskStatus.RUNNING:
+        return f"{duration} · ↑{tokens} · {calls}"
+    return f"{calls} · {tokens} · {duration}"
+
+
+class ActivityView(Vertical):
+    """
+    子 Agent 活动区（tui-display 扩展 A 组，F1–F6）。
+
+    位于历史区**下方**、各交互面板与输入框**上方**的一块独立区域。
+    「有正在运行的任务」或「有尚未淡出的终态行」时出现，两者都没有时
+    **整块隐藏且不占布局空间**。
+
+    ## 它解决的问题
+
+    改造前，子 Agent 派出去之后是几分钟的静默——唯一的活体信号是状态栏角落
+    那个 `子Agent:2` 计数。用户无从判断它是在干活还是卡住了。
+
+    ## 为什么数据靠轮询而不是推送（F4 / N1）
+
+    本项目**已经因为「在加锁临界区里做跨线程调度」死锁过四次**。子 Agent 跑在
+    独立线程上，任何「跑完一步就通知界面」的设计都要跨线程，而跨线程调度一旦
+    与持锁相遇就是确定性死锁（Textual 的 `call_from_thread` 是阻塞式的）。
+    轮询从结构上消掉这一整类问题：**主线程**每 0.5 秒去任务表读一份不可变快照，
+    没有任何一条边是从子 Agent 线程指向界面的。
+
+    复用既有的子 Agent 轮询节拍、**不新增定时器**，因此空闲会话的开销与改造前
+    完全一致。
+
+    ## 它只观测，不操作（F10）
+
+    区内没有取消或任何改变任务状态的入口。取消仍走 `/agents cancel`，
+    全量信息仍看 `/agents`——**活动区给概览，`/agents` 给全量**。
+
+    ## 展开（F5）
+
+    默认折叠，每个任务一行。`Ctrl+O` 切换**整个区域**的展开态，展开时每条任务
+    下方列出它内部最近若干次工具调用。⚠ 快捷键**不引入焦点切换**——活动区
+    任何时候都不抢焦点，输入框与四个面板的键位体系一字不动。
+    """
+
+    # 缺省隐藏，避免依赖外部 App CSS 才能初始隐藏（与四个面板同一做法）。
+    DEFAULT_CSS = "ActivityView { display: none; }"
+
+    # 状态 → 颜色。运行中橘色（与工具行的「执行中」同色系，语义都是「还在跑」），
+    # 完成绿、失败与取消红。
+    _STATUS_COLORS = {
+        TaskStatus.RUNNING: "#FFA500",
+        TaskStatus.COMPLETED: "#5FD75F",
+        TaskStatus.FAILED: "#FF5F5F",
+        TaskStatus.CANCELLED: "#FF5F5F",
+    }
+
+    def update_rows(self, rows, expanded: bool = False) -> None:
+        """
+        整块重绘活动区。
+
+        :param rows: `ActivityRow` 元组（`conversation.subagent_activity()` 的产出）
+        :param expanded: 展开态则在每行下方列出最近的工具调用
+
+        **整块重绘而不是增量 diff**：行数以并发上限（5）为界，重绘一次比算差异
+        便宜，而且不会错——增量更新要维护「哪一行对应哪个任务」的映射，
+        那是一类典型的、出错后表现为「数字串行」的 bug。
+
+        无行时 `display = False`，Textual 会连带收回它占的布局空间（F1）。
+
+        ⚠ **一切文本必须经本模块的 `escape`**：队员名来自模型给的参数、
+        角色名来自用户写的角色定义文件、工具文本里含路径与命令。落单的 `[`
+        会在布局阶段抛 `MarkupError`，没有任何 try/except 兜得住，整个应用退出。
+
+        副作用：移除并重建全部子组件；改自身可见性。
+        """
+        self.remove_children()
+        if not rows:
+            self.display = False
+            return
+
+        lines: list[str] = []
+        for row in rows:
+            color = self._STATUS_COLORS.get(row.status, SECONDARY_COLOR)
+            lines.append(
+                f"[{color}]● {escape(row.display_name)} "
+                f"{STATUS_LABELS.get(row.status, row.status.value)} "
+                f"({format_activity_cost(row)})[/]"
+            )
+            if expanded:
+                for brief in row.recent_tools:
+                    lines.append(
+                        f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(brief)}[/]"
+                    )
+        # 末行给出快捷键提示——不写的话没人知道还能展开。
+        hint = "Ctrl+O 收回" if expanded else "Ctrl+O 展开"
+        lines.append(f"[{SECONDARY_COLOR}]  {hint}[/]")
+
+        self.mount(Static("\n".join(lines), markup=True))
+        self.display = True
 
 
 class CommandHighlighter(Highlighter):
@@ -943,6 +1568,32 @@ class InputBar(Input):
 _MODE_DEFAULT_MARKUP = "[dim]\\[DEFAULT][/dim]"
 _MODE_PLAN_MARKUP = "[bold #00D7D7]\\[PLAN][/bold #00D7D7]"
 
+# 「再按一次 Ctrl+C 退出」的提示文本（tui-display 扩展 F31）。
+#
+# 它**不进聊天区**：那是对话内容的地方，而这条提示是一个**只活两秒的瞬时状态**，
+# 留在历史里等于给每一次误按都攒下一条永久噪音。状态栏才是「当前是什么状态」
+# 该待的地方——窗口一过它自己消失，什么痕迹都不留。
+#
+# ⚠ 它是**独立组件**（`StatusHint`），不是状态栏文本的一段。
+#
+# 原因是 `StatusBar` 整块 `text-align: right`：把提示拼进那串文本，它只会落在
+# **右对齐块的最左边**——也就是随其余各段的总长度在屏幕中间某处浮动，
+# 而不是贴着状态栏的左边缘。要真的贴左，这一行必须拆成左右两个区
+# （`StatusHint` 靠左 + `StatusBar` 靠右），与 Claude Code 底部那一行同构。
+#
+# 用**灰色**（`dim`）而不是橘色，同样对齐 Claude Code 的同款提示。
+#
+# ⚠ 这条与状态栏其余高亮段的取舍**方向相反**，别顺手统一：橘色在本项目里有确定
+# 语义——「需要用户留意的状态」（放行档、上下文预警、确认面板），那些是**用户没
+# 主动做什么、但情况变了**，所以要抢注意力。而这条提示是用户**刚刚按下一个键**的
+# 直接回应，他的视线本来就在等反馈，不需要抢；用橘色反而会让真正该抢注意力的
+# 那三处贬值——一个界面上醒目的东西越多，醒目就越不值钱。
+#
+# 刻意不加任何图形符号——F29 的符号白名单里没有为提示级新造的记号，
+# 脱离颜色也能辨认的唯一依靠就是文字本身（灰色下这点尤其要紧）。
+QUIT_HINT_TEXT = "再按一次 Ctrl+C 退出"
+_QUIT_HINT_MARKUP = f"[dim]{QUIT_HINT_TEXT}[/dim]"
+
 
 def compose_status_text(
     provider: str,
@@ -1006,9 +1657,33 @@ def compose_status_text(
     return text + " "
 
 
+class StatusHint(Static):
+    """
+    状态栏那一行的**左区**：贴着左边缘的瞬时提示位（tui-display 扩展 F31）。
+
+    目前只有一种内容——「再按一次 Ctrl+C 退出」。做成一个组件而不是
+    `compose_status_text` 里的一段，是因为 `StatusBar` 整块右对齐，
+    拼进去的东西只能贴在右对齐块的左边、随其余各段长度浮动（详见
+    `QUIT_HINT_TEXT` 上方的说明）。
+
+    与右区的分工：**左区是「刚发生了什么」，右区是「现在是什么状态」**。
+    将来若还有同类瞬时提示，落点在这里而不是往右区那串里塞。
+    """
+
+    def set_quit_hint(self, active: bool) -> None:
+        """
+        挂出或撤下退出提示。
+
+        :param active: 是否处在「按了一次 Ctrl+C」的有效期内
+
+        幂等：重复传同一个值只是重画同样的内容，无副作用。
+        """
+        self.update(_QUIT_HINT_MARKUP if active else "")
+
+
 class StatusBar(Static):
     """
-    底部状态栏，实时展示当前会话的关键状态信息。
+    底部状态栏的**右区**，实时展示当前会话的关键状态信息。
 
     显示格式：[protocol] model | 思考模式：X | [DEFAULT]/[PLAN] | 权限模式：X | MCP：… | 上下文：…
     模式命令执行后（以及每轮流式结束时），App 层会调用 update_status() 刷新显示；
@@ -1060,7 +1735,90 @@ class StatusBar(Static):
         )
 
 
-class ConfirmPanel(OptionList):
+class NumberedPanel(OptionList):
+    """
+    三个可选面板（确认 / 澄清 / 会话）的共用底座（tui-display 扩展 E 组）。
+
+    它只做两件事，**不碰任何交互契约**（F27/N8）：
+
+    1. **给可选项编号**（F23）——序号只分配给真正可选的行；表头与详情行这类
+       `disabled` 的**不占号**，否则按 `2` 会落到一行说明文字上；
+    2. **让当前高亮项带一个非颜色的指示符**（F24）——改造前「当前是哪一项」
+       只靠背景色表达，而颜色在截图、配色异常的终端、端到端驱动抓到的纯文本里
+       都可能丢失。
+
+    ## 为什么抽成基类而不是在三个面板里各写一遍
+
+    序号与指示符必须**三处一致**，否则用户在确认面板学会的「按 2」到了会话面板
+    就不灵。而且 `watch_highlighted` 这类 Textual 钩子写错一次就会自激
+    （见下），三份实现意味着三次犯错的机会。
+
+    ## `watch_highlighted` 为什么不会自激
+
+    它用 `replace_option_prompt_at_index` 只换那一行的**提示文本**，
+    **不动 `highlighted` 本身**，因此不会触发第二次 watch。
+    换成「清空重建选项」的写法就会自激（重建会重置高亮 → 再次触发）。
+    """
+
+    def _reset_choices(self) -> None:
+        """清空选项与编号表。每次 `show_*` 的第一件事。"""
+        self.clear_options()
+        # `[(选项下标, 未加前缀的展示文本)]`，按可选顺序。序号即它在本表里的位置 + 1。
+        self._choices: "list[tuple[int, str]]" = []
+
+    def _add_static(self, markup: str) -> None:
+        """加一行**不可选**的行（表头、详情、URL 补充行）——不占序号。"""
+        self.add_option(Option(markup, disabled=True))
+
+    def _add_choice(self, option_id: "Optional[str]", markup: str) -> int:
+        """
+        加一个可选项，自动带上序号与高亮指示符。
+
+        :param option_id: `OptionList.OptionSelected` 里回传的标识
+        :param markup: 该项的展示内容（**可以已经是 markup**）
+        :returns: 该项在 `OptionList` 里的下标
+
+        副作用：往选项列表追加一项，并登记进编号表。
+        """
+        index = self.option_count
+        number = len(self._choices) + 1
+        # 建的时候一律按「未选中」画；真正的高亮由 `watch_highlighted` 铺上去。
+        self.add_option(Option(numbered_prompt(number, markup, False), id=option_id))
+        self._choices.append((index, markup))
+        return index
+
+    def choice_index(self, number: int) -> "Optional[int]":
+        """
+        序号（从 1 起）→ 该项在 `OptionList` 里的下标；越界返回 None。
+
+        数字键选中走这条（F23）。
+        """
+        if 1 <= number <= len(self._choices):
+            return self._choices[number - 1][0]
+        return None
+
+    def watch_highlighted(self, highlighted: "Optional[int]") -> None:
+        """
+        高亮变化时，把指示符从旧行挪到新行（F24）。
+
+        ⚠ 用 `replace_option_prompt_at_index` 而不是重建选项：那个方法
+        **不改 `highlighted`**，因此不会触发第二次 watch。重建会重置高亮，
+        进而再次触发本方法——一个安静的无限循环。
+
+        整段包 try/except：这是 Textual 的 watch 钩子，跑在**主线程的消息泵**上，
+        异常逃逸会打断整个界面；而它的职责只是「换一个前缀」，
+        失败的最坏后果是指示符没跟上，不值得为它拆掉应用。
+        """
+        try:
+            for number, (index, markup) in enumerate(self._choices, start=1):
+                self.replace_option_prompt_at_index(
+                    index, numbered_prompt(number, markup, index == highlighted)
+                )
+        except Exception:  # noqa: BLE001 —— 见上：装饰性更新绝不打断界面
+            pass
+
+
+class ConfirmPanel(NumberedPanel):
     """
     工具执行前的内联确认面板（取代旧的模态弹窗 ConfirmScreen）。
 
@@ -1087,9 +1845,53 @@ class ConfirmPanel(OptionList):
     # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
     DEFAULT_CSS = "ConfirmPanel { display: none; }"
 
-    # 表头与两个可选项在 OptionList 中的索引（表头 disabled 不可选）
+    # 表头在 OptionList 中的索引（表头 disabled 不可选）
     _HEADER_INDEX = 0
-    _YES_INDEX = 1  # 「执行」：默认高亮项，回车即执行
+
+    # 工具行标题用的主参数映射（F12），由 `app.on_mount` 灌进来。
+    # 缺省空字典 → 退回键值对摘要，与改造前逐字一致。
+    _primary_args: dict = {}
+
+    # 全局展开开关的本地副本（`Ctrl+O`，F5/F41）。
+    #
+    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：展开之后新产生的
+    # 每一行都要按展开态画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
+    # 又是折叠的——现象是「这个开关时灵时不灵」，而那比没有开关更让人困惑。
+    _expanded: bool = False
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        接收全局展开开关，**记下来并广播给已挂载的工具行**（F5/F41）。
+
+        :param expanded: 展开为真、折叠为假
+
+        副作用：改自身状态；重绘全部已定色的工具行。
+        """
+        self._expanded = expanded
+        for widget in self.query(ToolCallWidget):
+            widget.set_expanded(expanded)
+
+    def set_primary_args(self, mapping: dict) -> None:
+        """接收「工具名 → 主参数键名」映射（F12），与 `HistoryView` 同一份。"""
+        self._primary_args = dict(mapping or {})
+
+    def _add_choices(self, items) -> None:
+        """
+        批量加可选项：`[(id, 主文本, 说明)]`。
+
+        说明用暗色跟在主文本后面——它是次级信息，与主文本同亮度会让每一行
+        都在争注意力，而用户真正要读的只有那几个动词。
+        """
+        first = None
+        for option_id, label, detail in items:
+            markup = f"{label}  [dim]{detail}[/dim]" if detail else label
+            index = self._add_choice(option_id, markup)
+            if first is None:
+                first = index
+        # 默认高亮第一个可选项。**用实际下标而不是写死的 1**：URL 类请求会在
+        # 表头后面插几行补充说明（web_fetch 扩展 F9），写死会落到一行 disabled
+        # 的说明文字上。
+        self._first_choice = first
 
     class Cancelled(TextualMessage):
         """用户按 Esc 取消确认时发出，由 App 视为拒绝执行。"""
@@ -1158,18 +1960,23 @@ class ConfirmPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见。
         """
-        args_summary = summarize_args(tool_call.arguments, max_len=200)
+        # 工具名与参数走 B 组的主参数口径（F12）：确认面板上显示
+        # `Write(docs/notes.md)` 而不是 `write_file(path=docs/notes.md, con…)`。
+        # 用户是靠这一行决定放不放行的，键名在这里同样只占地方。
+        label, inner = resolve_call_title(tool_call, self._primary_args)
+        if not self._primary_args or not inner:
+            # 没有主参数映射（非 DeepSeek Provider）时退回宽松的键值对摘要。
+            # ⚠ 这里的上限是 **200 而不是工具行的 60**：面板这一行是人在回路的
+            # 判断依据，按工具行的宽度截会把关键信息切掉（web_fetch 扩展 F9
+            # 记过这个坑：地址被截断意味着攻击者只要把恶意部分放在第 31 个字符
+            # 之后，这一层就形同虚设）。
+            inner = summarize_args(tool_call.arguments, max_len=200)
         # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
         reason = f"  [dim]· {escape(decision.reason)}[/dim]" if decision is not None else ""
-        safe_name = escape(str(tool_call.name))
-        self.clear_options()
-        # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航
-        self.add_option(
-            Option(
-                f"[#FFA500]⚠ 确认执行：{safe_name}({args_summary})[/#FFA500]{reason}",
-                disabled=True,
-            )
-        )
+        self._reset_choices()
+        # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航。
+        # `⚠` 去掉（F28）——「确认执行」四个字 + 橘色分隔线已经说清了它的性质。
+        self._add_static(f"[#FFA500]确认执行  {label}({inner})[/#FFA500]{reason}")
         # URL 类专用补充行（web_fetch 扩展 F9）。
         #
         # **为什么需要它**：上面那行走 summarize_args，它把每个参数值截到 30 字符，
@@ -1183,14 +1990,21 @@ class ConfirmPanel(OptionList):
         # AttributeError 属于「没有任何 try/except 兜得住」的那一类。
         if decision is not None and getattr(decision, "kind", "") == "url":
             for line in self._url_detail_lines(tool_call, decision):
-                self.add_option(Option(line, disabled=True))
-        self.add_option(Option("✅ 本次放行  [dim]仅执行本次[/dim]", id="yes"))
-        self.add_option(Option("🟢 本会话放行  [dim]本会话内相同调用不再询问[/dim]", id="yes_session"))
-        self.add_option(Option("💾 永久放行  [dim]写入本地配置，重启仍生效[/dim]", id="yes_permanent"))
-        self.add_option(Option("❌ 拒绝  [dim]拒绝并让模型据此调整[/dim]", id="no"))
+                self._add_static(line)
+        # 四个可选项带序号（F23），用户可以直接按数字键选中。
+        # 改造前这里是四个彩色 emoji（`✅ 🟢 💾 ❌`）——四种颜色反而盖过了
+        # 「哪个是当前选中」这个唯一重要的信息。语义现在由序号 + 文字承担。
+        self._add_choices(
+            [
+                ("yes", "本次放行", "仅执行本次"),
+                ("yes_session", "本会话放行", "本会话内相同调用不再询问"),
+                ("yes_permanent", "永久放行", "写入本地配置，重启仍生效"),
+                ("no", "拒绝", "让模型据此调整                    Esc"),
+            ]
+        )
         self.display = True
         # 默认高亮「本次放行」，回车即执行（与 / 命令面板一致的顺手体验）
-        self.highlighted = self._YES_INDEX
+        self.highlighted = self._first_choice
 
     def show_prompt(self, title: str, yes_label: str, no_label: str) -> None:
         """
@@ -1205,12 +2019,11 @@ class ConfirmPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见。
         """
-        self.clear_options()
-        self.add_option(Option(f"[#FFA500]{escape(title)}[/#FFA500]", disabled=True))
-        self.add_option(Option(yes_label, id="yes"))
-        self.add_option(Option(no_label, id="no"))
+        self._reset_choices()
+        self._add_static(f"[#FFA500]{escape(title)}[/#FFA500]")
+        self._add_choices([("yes", yes_label, ""), ("no", no_label, "Esc")])
         self.display = True
-        self.highlighted = self._YES_INDEX
+        self.highlighted = self._first_choice
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
@@ -1221,7 +2034,7 @@ class ConfirmPanel(OptionList):
         self.post_message(self.Cancelled())
 
 
-class ClarifyPanel(OptionList):
+class ClarifyPanel(NumberedPanel):
     """
     Plan Mode 需求澄清面板（spec F12）。
 
@@ -1264,24 +2077,26 @@ class ClarifyPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见。
         """
-        self.clear_options()
-        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过
-        self.add_option(Option(f"[#7AEEFF]❓ {escape(question)}[/#7AEEFF]", disabled=True))
+        self._reset_choices()
+        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过。
+        # `❓` 去掉（F28）——问句本身加上青色分隔线已经说清它是个提问。
+        self._add_static(f"[#7AEEFF]{escape(question)}[/#7AEEFF]")
 
-        first_selectable: int | None = None
+        first_selectable: "int | None" = None
         for idx, opt in enumerate(options):
-            # 概述行：可选，id 为该候选项下标（字符串）
+            # 概述行：可选、带序号，id 为该候选项下标（字符串）。
             # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
-            #     故不再额外加「⭐ 推荐」前缀，避免重复提示。
-            option_index = self.option_count  # 加入前的位置即本概述行的索引
-            self.add_option(Option(escape(opt.summary), id=str(idx)))
+            #     故不再额外加「推荐」前缀，避免重复提示。
+            option_index = self._add_choice(str(idx), escape(opt.summary))
             if first_selectable is None:
                 first_selectable = option_index
-            # 详情行：disabled，仅展示，导航会跳过
-            # 不缩进，使详情与上方概述行左边缘对齐
+            # 详情行：disabled，仅展示，导航会跳过，**不占序号**（F23）——
+            # 占了的话按 `2` 会落到一行说明文字上。
+            # 缩进与上方概述行的正文左缘对齐（序号前缀占四格）。
             if opt.detail:
-                self.add_option(Option(f"[dim]{escape(opt.detail)}[/dim]", disabled=True))
+                self._add_static(f"[dim]     {escape(opt.detail)}[/dim]")
 
+        self._add_static("[dim]                                              Esc 取消[/dim]")
         self.display = True
         # 默认高亮第一个可选概述行
         if first_selectable is not None:
@@ -1296,7 +2111,7 @@ class ClarifyPanel(OptionList):
         self.post_message(self.Cancelled())
 
 
-class SessionPanel(OptionList):
+class SessionPanel(NumberedPanel):
     """
     /resume 的交互式会话选择面板（c9 交互化）。
 
@@ -1342,32 +2157,33 @@ class SessionPanel(OptionList):
 
         副作用：修改 OptionList 选项并使面板可见、重置高亮到第一个可选项。
         """
-        self.clear_options()
-        self.add_option(
-            Option(
-                "[#7AEEFF]📂 选择要恢复的会话（↑↓ 选择，回车载入，Esc 取消）[/#7AEEFF]",
-                disabled=True,
-            )
+        self._reset_choices()
+        # `📂` 与 `↑↓` 都去掉（F28/F29）：前者是装饰，后者在中文界面里写字更清楚。
+        self._add_static(
+            "[#7AEEFF]选择要恢复的会话        上下键选择，回车载入，Esc 取消[/#7AEEFF]"
         )
         first_selectable: "int | None" = None
-        for i, info in enumerate(infos, start=1):
+        for info in infos:
             when = info.last_time.strftime("%Y-%m-%d %H:%M") if info.last_time else "未知时间"
             is_current = info.session_id == current_id
             locked = info.locked and not is_current
-            # session_id / title 都可能含 "["（title 来自用户消息原文），必须 escape，
-            # 否则被 Textual markup 当标签吞掉（项目已知坑，见 CLAUDE.md 成对维护点备忘）
+            # ⚠ session_id / title 都可能含 "["（title 来自用户消息原文），必须
+            # escape，否则被 Textual markup 当标签吞掉（项目已知坑）。
+            #
+            # `🔒`→`[锁定]`、`（当前）`→`[当前]`（F28/F30）：语义由**文字**承担，
+            # 不靠一个图形。这两条本来就不可选，用户需要知道的是「为什么点不了」。
+            mark = "[锁定] " if locked else ("[当前] " if is_current else "")
             line = (
-                f"{i}. {'🔒 ' if locked else ''}{escape(info.session_id)}"
-                f"{'（当前）' if is_current else ''} · {when} · "
+                f"{escape(mark)}{escape(info.session_id)} · {when} · "
                 f"{info.message_count} 条 · [dim]{escape(info.title)}[/dim]"
             )
-            option_index = self.option_count  # 加入前的位置即本行索引
-            # 锁定/当前会话 disabled：导航自动跳过；可恢复项 id 携带完整 session_id
-            self.add_option(
-                Option(line, id=None if (locked or is_current) else info.session_id,
-                       disabled=locked or is_current)
-            )
-            if first_selectable is None and not (locked or is_current):
+            if locked or is_current:
+                # 不可选行**不占序号**（F23）——占了的话序号会跳号，
+                # 而用户按下的那个数字对应的是另一条。
+                self._add_static(f"[dim]   {line}[/dim]")
+                continue
+            option_index = self._add_choice(info.session_id, line)
+            if first_selectable is None:
                 first_selectable = option_index
         self.display = True
         # 默认高亮第一个可选会话（最近的可恢复会话，回车即载入）

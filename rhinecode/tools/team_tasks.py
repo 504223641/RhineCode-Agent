@@ -111,6 +111,8 @@ class TaskCreateTool(_BoardTool):
 
     name = "task_create"
     read_only = False
+    # 显示标题而不是 description：标题就是那一句「要做什么」
+    primary_arg = "subject"
     system_serial = True
     plan_safe = True
 
@@ -185,6 +187,8 @@ class TaskListTool(_BoardTool):
 
     name = "task_list"
     read_only = True
+    # 无主参数：它就是「列一下」，没有哪个参数值得进标题
+    primary_arg = ""
 
     description = (
         "列出共享任务清单：每条任务的编号、状态、标题、认领人、以及"
@@ -224,6 +228,7 @@ class TaskGetTool(_BoardTool):
 
     name = "task_get"
     read_only = True
+    primary_arg = "task_id"
 
     description = (
         "查看共享清单上某一条任务的完整信息："
@@ -270,7 +275,7 @@ class TaskGetTool(_BoardTool):
             if task.description:
                 lines.append(f"说明：{task.description}")
             if blockers:
-                lines.append(f"⛔ 现在被这些未完成的任务挡着：{'、'.join(blockers)}")
+                lines.append(f"现在被这些未完成的任务挡着：{'、'.join(blockers)}")
             elif task.blocked_by:
                 lines.append(f"依赖：{'、'.join(task.blocked_by)}（已全部完成）")
             else:
@@ -289,6 +294,8 @@ class TaskUpdateTool(_BoardTool):
 
     name = "task_update"
     read_only = False
+    # 显示编号而不是改了什么：一次调用可能同时改状态、认领人、依赖
+    primary_arg = "task_id"
     system_serial = True
     plan_safe = True
 

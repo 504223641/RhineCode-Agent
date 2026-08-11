@@ -610,7 +610,7 @@ class DriverCore:
         ## 轮次预算的口径
 
         预算**跨 `send` 累计**，计数取自 `recorder.turn_total()`（含 `main` /
-        `isolated:*` / `summary` / `notes` 四种作用域——子对话和摘要也花钱）。
+        `isolated:*` / `summary` / `memory` 四种作用域——子对话和摘要也花钱）。
         它在**前置检查**处生效，**挡不住单次 send 内的循环**：单次上界由产品既有的
         `MAX_ITERATIONS = 25` 兜底，故最坏烧掉 `budget + 25` 轮；
         独立模式子对话另有独立预算，实际上界更高。这是刻意接受的口径。
@@ -1025,7 +1025,7 @@ class DriverCore:
         编排一次干净的退出（**协程，只能在主线程调用**）。
 
         :param reason: 结束原因（写进记录的 session_end）
-        :param live_mode: 真实模式下额外等待自动笔记线程收敛
+        :param live_mode: 真实模式下额外等待自动记忆线程收敛
 
         ## ⚠️ 内部绝不使用 `run_on_main` 或 `call_from_thread`
 
@@ -1061,12 +1061,12 @@ class DriverCore:
             await asyncio.sleep(0.03)
 
         if live_mode:
-            # 自动笔记线程是 daemon，不 join 就会被进程退出截断。
+            # 自动记忆线程是 daemon，不 join 就会被进程退出截断。
             # 按**线程名**找而不是改产品去暴露句柄——零产品改动。
-            # 顺序天然安全：笔记钩子在产出结束事件之前触发，而忙碌态在事件流耗尽后
+            # 顺序天然安全：记忆钩子在产出结束事件之前触发，而忙碌态在事件流耗尽后
             # 才转假，故「先等忙碌态转假、再 join」不存在「线程还没起就以为收敛了」的竞态。
             for thread in threading.enumerate():
-                if thread.name == "rhine-notes":
+                if thread.name == "rhine-memory":
                     thread.join(timeout=30.0)
 
         app.exit()

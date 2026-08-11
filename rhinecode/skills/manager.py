@@ -809,7 +809,7 @@ class SkillManager:
             lines.append("（无——所有有副作用的操作都会照常弹确认面板）")
         if grant_warnings:
             lines.append("")
-            lines.extend(f"⚠ {w}" for w in grant_warnings)
+            lines.extend(f"警告：{w}" for w in grant_warnings)
 
         return "\n".join(lines)
 

@@ -167,6 +167,6 @@ class Offloader:
         return [
             CompactionNotice(
                 kind="offload",
-                message=f"📦 已把 {offloaded_count} 个大型工具结果存盘，历史仅保留预览与路径。",
+                message=f"已把 {offloaded_count} 个大型工具结果存盘，历史仅保留预览与路径。",
             )
         ]

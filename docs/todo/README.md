@@ -24,7 +24,6 @@
 | [2](2-skill-recall-eval.md) | Skill 召回率评测闭环 | `skill-recall-eval` | 中（2–4 天） | 刚改了一轮「Skill 写对了却没被加载」，但**召回率仍只能靠感觉判断**。官方有成型做法，我们的驱动设施已齐，缺「批量跑 + 统计」这一层 |
 | [3](3-delegation-trigger-eval.md) | **委派/组队的触发率** | `delegation-trigger-eval` | 中（**本轮是测量，不是改代码**） | 触发口径已于 2026-08-10 **整个反转**（从「拿不准就委派」改成对齐 Claude Code 的「默认不委派」），但**没做真实模型复测**。⚠ 原标题是「模型不会主动组队」、原第一步是「换强模型跑对照」，**两条都作废**——欠触发与过触发出自同一个模型。与第 2 条同源，评测闭环可复用 |
 | [4](4-p1b-unattended.md) | P1b 无人值守回归 | `p1b-unattended` | 大（多天） | 代码不难，**难在取样方法** —— 做不好会把偏了的取样固化成回归测试 |
-| [5](5-tui-display-overhaul.md) | **TUI 显示体系改造** | `tui-display-overhaul` | 大（**必须走 /spec**） | 起点是「子 Agent 干活时界面上什么都看不到」，但用户要的范围是**所有显示的地方**对齐 Claude Code。方案已定（独立活动区），地基已查实（三个数字全现成、走轮询绕开死锁），⚠ **其余显示面只有一张待盘点清单** |
 
 **一组同源事项，建议成对处理**：`2 + 3` 都是**触发率**的评测问题
 （第 2 条建好的闭环，第 3 条能直接复用）。⚠ 第 3 条现在是**双向**的
@@ -41,7 +40,6 @@
 | --- | --- | --- |
 | 甲 | **1**（web-search） | 绝大部分是**新增文件**（`web/search.py` / `web/search_manager.py` / `tools/web_search.py`），只在 `config.py` / `bootstrap.py` / `tests/e2e/host.py` 三处末尾追加 |
 | 乙 | **3 第一步 → 2 → 3 后续** | 3 的第一步（两栏对照测量）**零代码**，可与甲同时跑；2 建好统计闭环后 3 才有量化依据，故这条线**内部串行**、整体与甲并行 |
-| 丙 | **5**（tui-display-overhaul） | 全在 `tui/` 与 `subagents/tasks.py`，与甲乙两条**零重叠**，可独立并行。⚠ 但它自己范围大、要走 /spec，别和别的事混在一个 session 里 |
 
 **⚠ 2 与 4 不要同时做**：两者都在 `tests/e2e/` 里施工——4 要改控制通道那五个
 成对维护文件（`protocol.py` / `control.py` / `host.py` / `client.py` /
@@ -99,6 +97,20 @@
 
 ## 已完成（已从本文件夹移除）
 
+- ~~TUI 显示体系改造~~ —— `tui-display-overhaul` 分支，文档落在
+  `docs/extensions/tui-display/`（不占章节号：`CLAUDE.md` 的能力表没多一行，
+  改的是既有 TUI 层如何呈现**已有**能力）。
+  起点是「子 Agent 干活时界面上什么都看不到」，最后做成八组 44 个任务。
+  原 todo 里那句「⚠ 其余显示面只有一张待盘点清单」由 spec 的第一步兑现——
+  逐个读过 `tui/widgets.py`、`tui/app.py`、`subagents/tasks.py`、
+  `subagents/report.py`、`team/render.py`、`commands/builtins.py` 之后，
+  七个显示面里有六个要改、状态栏与历史区只做去 emoji。
+  ⚠ 有两处**与原 todo 的判断不同**，值得记下：① 活动区的三个数字里
+  「工具调用次数」原判断是「现成的」，实际**不存在**，要在运行器消费
+  `TOOL_RESULT` 时新数（口径也定在那里：被权限拒绝的调用只产 `TOOL_RESULT`，
+  同样烧了预算，该计入）；② 「内容贴底往上长」原以为要动 `anchor()`，
+  实测只需 `HistoryView > Vertical` 加一行 `min-height: 100%`——`anchor()`
+  一个字没动，它那段带实测证据的注释原样保留。
 - ~~`Esc` 不取消正在跑的子 Agent~~ —— `subagent-cancel-semantics` 分支，PR #27，
   按用户拍板的**方案 A** 实现：**语义一字未改**（`Esc` 仍然只停主对话，
   C13「委派永不阻塞」的契约原样成立），只是按下时会明确告诉用户

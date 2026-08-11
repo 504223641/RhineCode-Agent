@@ -159,6 +159,13 @@ def main() -> None:
     # 五步顺序与理由见 bootstrap.build_app 里的 cleanup）。
     try:
         result.app.run()
+    except KeyboardInterrupt:
+        # 兜底的兜底。正常情况下 SIGINT 会被 `RhineApp._install_sigint_guard`
+        # 接管、转成一次「按了 Ctrl+C」，走连按两次的判定；这里只覆盖它**还没装上**
+        # 或**已经卸掉**的那两个窄窗口（界面挂载前、退出收尾中）。
+        # 那两个窗口里没有界面可提示，退出是唯一合理的结果——但**不要甩回溯**：
+        # 用户按的是 Ctrl+C，不是程序出了错。
+        pass
     finally:
         result.cleanup()
 

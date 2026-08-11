@@ -117,7 +117,7 @@ class DriverFixture(unittest.IsolatedAsyncioTestCase):
         turn_budget: int = 40,
     ):
         """
-        装配一次并返回 (app, provider)。自动笔记关掉——它是不确定性来源。
+        装配一次并返回 (app, provider)。自动记忆关掉——它是不确定性来源。
 
         :param provider: 直接给一个自定义假 Provider（如「故意很慢」的那种）。
 
@@ -136,7 +136,7 @@ class DriverFixture(unittest.IsolatedAsyncioTestCase):
             provider_factory=lambda cfg: self.provider,
             exclude_tools=EXCLUDED,
         )
-        self.result.manager.memory_manager.notes_enabled = False
+        self.result.manager.memory_manager.memories_enabled = False
         if plan_mode:
             self.result.manager.plan_mode = True
         self.turn_budget = turn_budget
@@ -621,8 +621,13 @@ class PanelAnswerTest(DriverFixture):
             # ① 应答前两个前置态都成立
             self.assertTrue(snap["panel_visible"])
             self.assertEqual(snap["focused"], "ConfirmPanel")
-            # 面板原文取自 0 号 disabled 表头，且是**含 markup 标记的原始字符串**
-            self.assertIn("write_file", panel["display"])
+            # 面板原文取自 0 号 disabled 表头，且是**含 markup 标记的原始字符串**。
+            #
+            # ⚠ 表头现在走 B 组的主参数口径（tui-display 扩展 F12）：显示
+            # `Write(x.txt)` 而不是内部名 + 键值对。判据跟着改成**展示标签**
+            # ——它才是用户实际看到的字；option 的 id 那条断言（下面）
+            # 才是契约，那个一字未动。
+            self.assertIn("Write(x.txt)", panel["display"])
             self.assertIn("[dim]", panel["display"], "原文保留 markup 标记，不做渲染")
             # 可选项四个，且不含任何 disabled 项（表头已被跳过）
             self.assertEqual(
@@ -920,15 +925,15 @@ class FinalTextRecordedTest(DriverFixture):
 
 class MemoryNotifyRecordedTest(DriverFixture):
     """
-    **回归护栏**：笔记更新的低打扰通知必须产出 `ui_message` 事件
+    **回归护栏**：记忆更新的低打扰通知必须产出 `ui_message` 事件
     （全阶段复测观察 O5，`docs/e2e-sweep/c9.md` 发现一）。
 
     背景与 `FinalTextRecordedTest` 是同一类问题：`_notify_memory` 原先直接调
     `append_system`、绕过了 `_trace_ui_message`，于是 c9 的 AC19
-    「笔记变更时界面出现低打扰提示」在任何基于 trace 的验收里都是**盲区**——
+    「记忆变更时界面出现低打扰提示」在任何基于 trace 的验收里都是**盲区**——
     「显示了没记」与「压根没显示」在记录上完全无法区分，判据判不了。
 
-    ⚠️ 必须从**别的线程**调用：`_notify_memory` 真实运行在笔记 daemon 线程上，
+    ⚠️ 必须从**别的线程**调用：`_notify_memory` 真实运行在记忆 daemon 线程上，
     它内部靠 `call_from_thread` 把渲染调度回主线程。在主线程里直接调，
     Textual 会拒绝（那正是这个方法存在的理由），验的也就不是真实路径了。
     """
@@ -937,7 +942,7 @@ class MemoryNotifyRecordedTest(DriverFixture):
         app, _ = self.assemble([[text("好的。"), done()]])
         async with app.run_test(size=(120, 40)) as pilot:
             core = self.make_core(app, pilot, asyncio.get_running_loop())
-            await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条笔记）")
+            await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条记忆）")
 
             systems = [
                 m.get("text")
@@ -946,7 +951,7 @@ class MemoryNotifyRecordedTest(DriverFixture):
             ]
             self.assertTrue(
                 any("已更新记忆" in str(t) for t in systems),
-                "笔记通知必须产出 source=system 的 ui_message；"
+                "记忆通知必须产出 source=system 的 ui_message；"
                 f"实际只有：{systems}",
             )
             await core.shutdown_on_main("test")
@@ -956,7 +961,7 @@ class MemoryNotifyRecordedTest(DriverFixture):
         app, _ = self.assemble([[text("好的。"), done()]])
         async with app.run_test(size=(120, 40)) as pilot:
             core = self.make_core(app, pilot, asyncio.get_running_loop())
-            await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条笔记）")
+            await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条记忆）")
             await pilot.pause()
 
             self.assertIn(
@@ -987,7 +992,7 @@ class MemoryNotifyRecordedTest(DriverFixture):
 
             with mock.patch.object(app, "call_from_thread", side_effect=boom):
                 # 不应抛出——异常必须被 _notify_memory 自己吞掉
-                await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条笔记）")
+                await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条记忆）")
 
             phantom = [
                 m.get("text")

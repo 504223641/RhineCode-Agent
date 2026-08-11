@@ -7,13 +7,13 @@ MemoryManager：Memory 层唯一的编排者（c9，对标 c8 ContextManager 的
   开新档或 --continue 恢复最近会话。
 - 每次运行：提供「自定义指令」「长期记忆索引」两个系统提示槽位的内容；
   消费一次性 pending 提醒（时间跨度）；record_message 做会话追加写。
-- 自然停止后：起 daemon 线程跑笔记更新（拿锁 → 调 LLM → 写盘 → 重建索引 →
+- 自然停止后：起 daemon 线程跑记忆更新（拿锁 → 调 LLM → 写盘 → 重建索引 →
   释放锁 → notify 界面）。
 - 命令：/resume 列表与载入、/memory 只读报告。
 
 线程模型：主流程（startup / record_message / resume_*）都在 TUI 主线程或
-Worker 线程串行执行；唯一的并发点是笔记更新线程——用 in-flight 标志保证
-进程内同一时刻至多一个笔记线程（占用即跳过本轮，不排队），跨进程互斥交给
+Worker 线程串行执行；唯一的并发点是记忆更新线程——用 in-flight 标志保证
+进程内同一时刻至多一个记忆线程（占用即跳过本轮，不排队），跨进程互斥交给
 memory 目录的锁文件（F22）。
 """
 
@@ -23,28 +23,28 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from rhinecode.provider.base import BaseProvider, Message
-from rhinecode.trace import SCOPE_NOTES, NullRecorder, TraceRecorderProtocol
+from rhinecode.trace import SCOPE_MEMORY, NullRecorder, TraceRecorderProtocol
 from rhinecode.memory import lockfile
 from rhinecode.memory.instructions import LoadedInstructions, load_instructions
 from rhinecode.memory.session import SessionStore, SessionInfo
-from rhinecode.memory.notes import (
+from rhinecode.memory.memories import (
     CATEGORIES,
     CATEGORY_LABELS,
-    parse_note,
-    render_note,
+    parse_memory,
+    render_memory,
     rebuild_index,
     truncate_index,
     INDEX_MAX_LINES,
     INDEX_MAX_BYTES,
 )
-from rhinecode.memory.note_updater import (
-    NoteAction,
-    build_note_request,
-    parse_note_response,
+from rhinecode.memory.memory_updater import (
+    MemoryAction,
+    build_memory_request,
+    parse_memory_response,
 )
 
-# 笔记锁过期阈值（秒）：笔记写入是秒级临界区，10 分钟没释放必是崩溃残留（F22/F24）。
-NOTE_LOCK_STALE = 600.0
+# 记忆锁过期阈值（秒）：记忆写入是秒级临界区，10 分钟没释放必是崩溃残留（F22/F24）。
+MEMORY_LOCK_STALE = 600.0
 
 # 时间跨度提醒阈值（小时）：恢复会话时距最后一条消息超过该值则注入提醒（F11④）。
 TIME_GAP_HOURS = 24
@@ -65,7 +65,7 @@ def _format_gap(last_time: datetime) -> str:
 class MemoryManager:
     """
     记忆系统编排者。所有 Provider 都构造（RHINE.md 注入与会话存档不依赖工具），
-    笔记能力由 notes_enabled 门控（仅 DeepSeek 工具模式为 True，F21）。
+    记忆能力由 memories_enabled 门控（仅 DeepSeek 工具模式为 True，F21）。
     """
 
     def __init__(
@@ -74,16 +74,16 @@ class MemoryManager:
         model: str,
         project_root: Path,
         user_dir: Path,
-        notes_enabled: bool,
+        memories_enabled: bool,
         notify: Optional[Callable[[str], None]] = None,
         recorder: "Optional[TraceRecorderProtocol]" = None,
     ) -> None:
         """
-        :param provider: Provider（笔记 LLM 调用复用 stream_chat）
+        :param provider: Provider（记忆 LLM 调用复用 stream_chat）
         :param model: 模型名（日志/报告语义）
         :param project_root: 项目根（sessions 与项目级 memory 都在其 .rhinecode 下）
         :param user_dir: 用户级目录（~/.rhinecode）
-        :param notes_enabled: 是否启用自动笔记（仅 DeepSeek 工具模式）
+        :param memories_enabled: 是否启用自动记忆（仅 DeepSeek 工具模式）
         :param notify: 界面通知回调（TUI 挂载后注入，线程安全由 TUI 侧保证）
         :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
         """
@@ -92,12 +92,12 @@ class MemoryManager:
         self._model = model
         self._project_root = project_root
         self._user_dir = user_dir
-        self.notes_enabled = notes_enabled
-        # 界面通知回调：笔记实际变更时调用（F20）。公开属性，TUI 挂载后赋值。
+        self.memories_enabled = memories_enabled
+        # 界面通知回调：记忆实际变更时调用（F20）。公开属性，TUI 挂载后赋值。
         self.notify = notify
 
         self._session = SessionStore(project_root / ".rhinecode" / "sessions")
-        # 两级 memory 目录：scope → 目录路径（笔记写盘的唯一合法去处，N6）。
+        # 两级 memory 目录：scope → 目录路径（记忆写盘的唯一合法去处，N6）。
         self._memory_dirs = {
             "user": user_dir / "memory",
             "project": project_root / ".rhinecode" / "memory",
@@ -107,11 +107,11 @@ class MemoryManager:
         self._instructions = LoadedInstructions(text="", layers=[])
         # 一次性动态提醒（时间跨度等）：consume_pending_notice 取走即清。
         self._pending_notice: str = ""
-        # 笔记线程状态：in-flight 标志（进程内互斥）、高水位（上次审视到的消息数）、
+        # 记忆线程状态：in-flight 标志（进程内互斥）、高水位（上次审视到的消息数）、
         # 最近一次更新结果（/memory 报告用）。
-        self._note_inflight = threading.Event()
-        self._note_watermark = 0
-        self._last_note_result = "（本次会话尚未触发）"
+        self._memory_inflight = threading.Event()
+        self._memory_watermark = 0
+        self._last_memory_result = "（本次会话尚未触发）"
         # /resume 最近一次列表的缓存：让「/resume 看列表 → /resume 2 选编号」之间
         # 编号稳定，不受期间新会话出现影响。
         self._last_list: list[SessionInfo] = []
@@ -168,13 +168,13 @@ class MemoryManager:
     def _fill_history(self, session_id: str, history: list[Message]) -> str:
         """
         载入指定会话进 history（attach 成功后的共用收尾）：容错载入、原地替换、
-        时间跨度提醒登记、笔记高水位重置。
+        时间跨度提醒登记、记忆高水位重置。
 
         :returns: 恢复结果的提示文本（含坏行/丢组统计）
         """
         result = self._session.load(session_id)
         history[:] = result.messages
-        self._note_watermark = len(history)
+        self._memory_watermark = len(history)
 
         # 时间跨度提醒（F11④）：距最后一条消息超过 24 小时则登记一次性提醒，
         # 由下一次请求的动态 reminder 带给模型（不进持久历史、不被存档）。
@@ -204,9 +204,9 @@ class MemoryManager:
         """
         「长期记忆」槽位（priority 130）的内容：两级索引现读现截断（F16/F18）。
 
-        每次运行现读磁盘而非缓存——笔记线程可能在会话中途更新索引，下一条消息
+        每次运行现读磁盘而非缓存——记忆线程可能在会话中途更新索引，下一条消息
         就应看到新索引。每级各自截断（200 行 / 25KB），并带上目录路径说明，
-        让模型知道去哪里按需读笔记全文。
+        让模型知道去哪里按需读记忆全文。
 
         :returns: 拼好的索引文本；两级都没有索引时返回空串（槽位整体跳过）
         """
@@ -220,7 +220,7 @@ class MemoryManager:
             if not raw.strip():
                 continue
             parts.append(
-                f"### {label}记忆索引（笔记全文位于 {self._memory_dirs[scope]}，"
+                f"### {label}记忆索引（全文位于 {self._memory_dirs[scope]}，"
                 f"需要细节时用读文件工具按文件名读取）\n{truncate_index(raw)}"
             )
         if not parts:
@@ -248,83 +248,83 @@ class MemoryManager:
         self._session.append(msg)
 
     # ------------------------------------------------------------------ #
-    # 自动笔记（F15/F17/F20/F22）
+    # 自动记忆（F15/F17/F20/F22）
     # ------------------------------------------------------------------ #
     def on_natural_stop(self, history: list[Message]) -> None:
         """
-        Agent 循环自然停止后的笔记钩子：起 daemon 线程异步审视本轮新增对话。
+        Agent 循环自然停止后的记忆钩子：起 daemon 线程异步审视本轮新增对话。
 
-        跳过条件（都不算失败）：笔记未启用（F21）/ 上一轮笔记线程仍在跑（进程内
+        跳过条件（都不算失败）：记忆未启用（F21）/ 上一轮记忆线程仍在跑（进程内
         互斥，占用即跳过不排队）/ 高水位之后没有新增消息。
 
         副作用：置 in-flight 标志、推进高水位、启动后台线程（线程内可能调 LLM 与写盘）。
         """
-        if not self.notes_enabled:
+        if not self.memories_enabled:
             return
-        if self._note_inflight.is_set():
-            self._last_note_result = "上一轮笔记更新仍在进行，本轮跳过。"
+        if self._memory_inflight.is_set():
+            self._last_memory_result = "上一轮记忆更新仍在进行，本轮跳过。"
             return
-        new_msgs = list(history[self._note_watermark:])
+        new_msgs = list(history[self._memory_watermark:])
         if not new_msgs:
             return
-        self._note_inflight.set()
-        self._note_watermark = len(history)
+        self._memory_inflight.set()
+        self._memory_watermark = len(history)
         thread = threading.Thread(
-            target=self._update_notes, args=(new_msgs,), daemon=True, name="rhine-notes"
+            target=self._update_memories, args=(new_msgs,), daemon=True, name="rhine-memory"
         )
         thread.start()
 
-    def _update_notes(self, new_msgs: list[Message]) -> None:
+    def _update_memories(self, new_msgs: list[Message]) -> None:
         """
-        笔记更新线程体：调 LLM 拿动作 → 逐目录「拿锁 → 写盘 → 重建索引 → 释放」。
+        记忆更新线程体：调 LLM 拿动作 → 逐目录「拿锁 → 写盘 → 重建索引 → 释放」。
 
         完整临界区在本方法内闭合：拿锁的人就是写盘的人（plan 设计说明）。
-        任何异常都收敛为 _last_note_result 记录 + 静默返回（F17），绝不外抛
+        任何异常都收敛为 _last_memory_result 记录 + 静默返回（F17），绝不外抛
         （daemon 线程里未捕获异常只会打印堆栈吓到用户）。
 
         副作用：一次 LLM 调用（tools=None）；memory 目录内写/删文件；notify 回调。
         """
-        # 笔记作用域绑定（trace F2）。本方法是 daemon 线程的目标函数，所以在函数体
+        # 记忆作用域绑定（trace F2）。本方法是 daemon 线程的目标函数，所以在函数体
         # 第一行绑定一次就够——thread-local 天然把它与主对话线程隔开，不需要 `with`。
         #
         # ⚠️ **不要绑在 `on_natural_stop`**：那个方法跑在 Worker 线程上
         # （由 `_wrap_events` 调用），绑在那里会把**主对话线程**永久标成 notes，
-        # 此后用户的每一条消息都会被记成笔记作用域。
-        self._recorder.bind_scope(SCOPE_NOTES)
+        # 此后用户的每一条消息都会被记成记忆作用域。
+        self._recorder.bind_scope(SCOPE_MEMORY)
         try:
             actions = self._decide_actions(new_msgs)
             if not actions:
-                self._last_note_result = "本轮无值得记录的内容。"
+                self._last_memory_result = "本轮无值得记录的内容。"
                 return
             applied, skipped_locked = self._apply_actions(actions)
             if applied:
-                self._last_note_result = f"已更新 {applied} 条笔记。"
+                self._last_memory_result = f"已更新 {applied} 条记忆。"
                 if self.notify is not None:
-                    self.notify(f"🧠 已更新记忆（{applied} 条笔记）")
+                    self.notify(f"已更新记忆（{applied} 条）")
             elif skipped_locked:
-                self._last_note_result = "目标记忆目录正被其它实例写入，本轮跳过。"
+                self._last_memory_result = "目标记忆目录正被其它实例写入，本轮跳过。"
             else:
-                self._last_note_result = "本轮无值得记录的内容。"
-        except Exception as e:  # noqa: BLE001 —— 笔记是尽力而为的增强项，任何异常都静默（F17）
-            self._last_note_result = f"最近一次更新失败：{e}"
+                self._last_memory_result = "本轮无值得记录的内容。"
+        except Exception as e:  # noqa: BLE001 —— 记忆是尽力而为的增强项，任何异常都静默（F17）
+            self._last_memory_result = f"最近一次更新失败：{e}"
         finally:
-            self._note_inflight.clear()
+            self._memory_inflight.clear()
 
-    def _decide_actions(self, new_msgs: list[Message]) -> list[NoteAction]:
-        """调笔记 LLM 并解析动作列表；流错误抛异常交由上层记入结果。"""
-        system, req = build_note_request(
+    def _decide_actions(self, new_msgs: list[Message]) -> list[MemoryAction]:
+        """调记忆 LLM 并解析动作列表；流错误抛异常交由上层记入结果。"""
+        system, req = build_memory_request(
             new_msgs,
             self._read_index("user"),
             self._read_index("project"),
         )
         parts: list[str] = []
-        # 强制 tools=None：笔记模型在此阶段没有任何工具可用（F15/N6④）。
+        # 强制 tools=None：记忆模型在此阶段没有任何工具可用（F15/N6④）。
         for chunk in self._provider.stream_chat(req, thinking_effort="off", tools=None, system=system):
             if chunk.type == "error":
-                raise RuntimeError(chunk.content or "笔记流出错")
+                raise RuntimeError(chunk.content or "记忆流出错")
             if chunk.type == "text":
                 parts.append(chunk.content)
-        return parse_note_response("".join(parts))
+        return parse_memory_response("".join(parts))
 
     def _read_index(self, scope: str) -> str:
         """读某级索引文件全文；不存在/失败返回空串。"""
@@ -333,18 +333,18 @@ class MemoryManager:
         except OSError:
             return ""
 
-    def _apply_actions(self, actions: list[NoteAction]) -> "tuple[int, int]":
+    def _apply_actions(self, actions: list[MemoryAction]) -> "tuple[int, int]":
         """
         按 scope 分组落盘：每个目录一个锁临界区（F22）。
 
         拿不到锁 → 该目录整组跳过（非阻塞退让）；拿到后执行动作并**全量重建索引**
-        （扫目录解析全部笔记，幂等自愈），finally 释放锁。
+        （扫目录解析全部记忆，幂等自愈），finally 释放锁。
 
         :returns: (实际应用的动作数, 因锁被占跳过的动作数)
         """
         applied = 0
         skipped_locked = 0
-        by_scope: dict[str, list[NoteAction]] = {}
+        by_scope: dict[str, list[MemoryAction]] = {}
         for a in actions:
             by_scope.setdefault(a.scope, []).append(a)
 
@@ -355,7 +355,7 @@ class MemoryManager:
             except OSError:
                 continue
             lock = target_dir / ".lock"
-            if not lockfile.try_acquire(lock, NOTE_LOCK_STALE):
+            if not lockfile.try_acquire(lock, MEMORY_LOCK_STALE):
                 skipped_locked += len(group)
                 continue
             try:
@@ -368,7 +368,7 @@ class MemoryManager:
         return applied, skipped_locked
 
     @staticmethod
-    def _apply_one(target_dir: Path, action: NoteAction) -> bool:
+    def _apply_one(target_dir: Path, action: MemoryAction) -> bool:
         """
         执行单个动作。路径 = 目录 + 已过白名单校验的文件名，物理上出不了 memory 目录。
 
@@ -381,9 +381,9 @@ class MemoryManager:
                     return False
                 path.unlink()
                 return True
-            if action.note is None:
+            if action.memory is None:
                 return False
-            path.write_text(render_note(action.note), encoding="utf-8")
+            path.write_text(render_memory(action.memory), encoding="utf-8")
             return True
         except OSError:
             return False
@@ -391,22 +391,22 @@ class MemoryManager:
     @staticmethod
     def _rebuild_index_file(target_dir: Path) -> None:
         """
-        扫描目录全量重建索引文件（幂等自愈：手工增删的笔记也会被如实收录/剔除）。
+        扫描目录全量重建索引文件（幂等自愈：手工增删的记忆也会被如实收录/剔除）。
 
         跳过索引自身与解析失败的坏文件；写入失败静默（下次重建再补）。
         """
-        notes = []
+        memories = []
         try:
             for path in sorted(target_dir.glob("*.md")):
                 if path.name == INDEX_FILENAME:
                     continue
                 try:
-                    parsed = parse_note(path.read_text(encoding="utf-8"), filename=path.name)
+                    parsed = parse_memory(path.read_text(encoding="utf-8"), filename=path.name)
                 except OSError:
                     continue
                 if parsed is not None:
-                    notes.append(parsed)
-            (target_dir / INDEX_FILENAME).write_text(rebuild_index(notes), encoding="utf-8")
+                    memories.append(parsed)
+            (target_dir / INDEX_FILENAME).write_text(rebuild_index(memories), encoding="utf-8")
         except OSError:
             pass
 
@@ -455,7 +455,8 @@ class MemoryManager:
         for i, info in enumerate(infos, start=1):
             when = info.last_time.strftime("%Y-%m-%d %H:%M") if info.last_time else "未知时间"
             current = "（当前）" if info.session_id == self._session.session_id else ""
-            locked = "🔒 " if info.locked and not current else ""
+            # `🔒`→`[锁定]`（F28/F30）：语义由文字承担，不靠一个图形
+            locked = "[锁定] " if info.locked and not current else ""
             lines.append(
                 f"  {i}. {locked}{info.session_id}{current} · {when} · "
                 f"{info.message_count} 条 · {info.title}"
@@ -470,7 +471,7 @@ class MemoryManager:
         :param history: 当前历史（成功时原地替换）
         :returns: (是否成功, 提示文本)；失败时 history 保持原样
 
-        副作用：成功时切换会话锁、改写 history、重置笔记高水位、可能登记时间提醒。
+        副作用：成功时切换会话锁、改写 history、重置记忆高水位、可能登记时间提醒。
         """
         session_id = self._resolve_key(key)
         if session_id is None:
@@ -498,29 +499,29 @@ class MemoryManager:
     # 可观测与生命周期（F19/F23）
     # ------------------------------------------------------------------ #
     def memory_report(self) -> str:
-        """/memory 的只读报告（F19）：指令层、索引、笔记数、最近更新、会话与锁状态。"""
-        lines = ["🧠 记忆系统状态", "", "RHINE.md 项目指令："]
+        """/memory 的只读报告（F19）：指令层、索引、记忆数、最近更新、会话与锁状态。"""
+        lines = ["记忆系统状态", "", "RHINE.md 项目指令："]
         for layer in self._instructions.layers:
             mark = f"已加载（{layer.size} 字符）" if layer.loaded else "未找到"
             lines.append(f"  [{layer.label}] {layer.path} — {mark}")
             for err in layer.errors:
-                lines.append(f"    ⚠ {err}")
+                lines.append(f"    警告：{err}")
 
         lines.append("")
-        lines.append("自动笔记：" + ("启用" if self.notes_enabled else "未启用（仅 DeepSeek 工具模式）"))
+        lines.append("自动记忆：" + ("启用" if self.memories_enabled else "未启用（仅 DeepSeek 工具模式）"))
         for scope, label in (("user", "用户级"), ("project", "项目级")):
             target_dir = self._memory_dirs[scope]
-            counts = self._count_notes(target_dir)
+            counts = self._count_memories(target_dir)
             total = sum(counts.values())
             detail = "、".join(
                 f"{CATEGORY_LABELS[c]} {counts[c]}" for c in CATEGORIES if counts[c]
-            ) or "无笔记"
+            ) or "无记忆"
             index_path = target_dir / INDEX_FILENAME
             over = self._index_over_limit(index_path)
             index_state = ("存在" + ("，超出注入上限（已截断）" if over else "")) if index_path.is_file() else "不存在"
-            locked = "占用中" if lockfile.is_fresh(target_dir / ".lock", NOTE_LOCK_STALE) else "空闲"
+            locked = "占用中" if lockfile.is_fresh(target_dir / ".lock", MEMORY_LOCK_STALE) else "空闲"
             lines.append(f"  [{label}] {target_dir} — {total} 条（{detail}）· 索引{index_state} · 写锁{locked}")
-        lines.append(f"  最近一次自动更新：{self._last_note_result}")
+        lines.append(f"  最近一次自动更新：{self._last_memory_result}")
 
         lines.append("")
         sid = self._session.session_id or "（未开始）"
@@ -528,15 +529,15 @@ class MemoryManager:
         return "\n".join(lines)
 
     @staticmethod
-    def _count_notes(target_dir: Path) -> dict[str, int]:
-        """统计某目录四类笔记数量（坏文件不计）。"""
+    def _count_memories(target_dir: Path) -> dict[str, int]:
+        """统计某目录四类记忆数量（坏文件不计）。"""
         counts = {c: 0 for c in CATEGORIES}
         try:
             for path in target_dir.glob("*.md"):
                 if path.name == INDEX_FILENAME:
                     continue
                 try:
-                    parsed = parse_note(path.read_text(encoding="utf-8"), filename=path.name)
+                    parsed = parse_memory(path.read_text(encoding="utf-8"), filename=path.name)
                 except OSError:
                     continue
                 if parsed is not None:
@@ -558,9 +559,9 @@ class MemoryManager:
         )
 
     def on_clear(self) -> None:
-        """/clear：释放旧会话锁、开新档、笔记高水位归零（F8）。"""
+        """/clear：释放旧会话锁、开新档、记忆高水位归零（F8）。"""
         self._session.start_new()
-        self._note_watermark = 0
+        self._memory_watermark = 0
 
     def touch_session_lock(self) -> None:
         """TUI 心跳定时器：刷新会话锁 mtime（活着即新鲜，F23）。"""

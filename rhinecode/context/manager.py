@@ -336,7 +336,7 @@ class ContextManager:
         )
         return CompactionNotice(
             kind="summary",
-            message=f"🗜 已摘要早前 {len(to_summarize)} 条消息，保留近 {len(retained)} 条原文。",
+            message=f"已摘要早前 {len(to_summarize)} 条消息，保留近 {len(retained)} 条原文。",
         )
 
     def _trace_summary_failure(self, idx: int, before_count: int, reason: str) -> None:
@@ -403,7 +403,7 @@ class ContextManager:
             return CompactionNotice(
                 kind="circuit_break",
                 message=(
-                    f"⚠ 摘要连续失败 {self._summary_failures} 次，已暂停自动压缩"
+                    f"警告：摘要连续失败 {self._summary_failures} 次，已暂停自动压缩"
                     f"（{reason}）。可继续对话；/clear 或成功压缩后恢复。"
                 ),
             )
@@ -428,7 +428,7 @@ class ContextManager:
         底部状态栏用的上下文用量一行摘要（对标 MCP 的 status_line）。
 
         基于只读的 stats() 组装，不重复估算逻辑、无副作用。格式如
-        「上下文：19% · 12.3K/64K」，熔断时追加「 ⚠」提示。
+        「上下文：19% · 12.3K/64K」，熔断时追加「 已熔断」提示。
 
         :param history: 当前对话历史
         :returns: (文本, 是否高亮预警)。高亮条件：估算占比达窗口的 _WARN_RATIO，
@@ -440,7 +440,9 @@ class ContextManager:
         text = f"上下文：{percent}% · {_abbrev(s.estimated_tokens)}/{_abbrev(s.window)}"
         warn = s.estimated_tokens >= s.window * _WARN_RATIO or s.circuit_broken
         if s.circuit_broken:
-            text += " ⚠"
+            # `⚠` 换成文字（F28/F30）：状态栏是单色单行，一个符号说不清
+            # 「熔断」是什么意思，而这一段的全部作用就是让用户知道自动压缩停了
+            text += " 已熔断"
         return text, warn
 
     def usage_report(self, history: list[Message]) -> str:
@@ -452,14 +454,14 @@ class ContextManager:
         """
         s = self.stats(history)
         lines = [
-            "📊 上下文用量（近似估算）",
+            "上下文用量（近似估算）",
             f"  估算 token：{s.estimated_tokens}",
             f"  窗口上限：{s.window}",
             f"  距上限余量：{s.headroom}",
             f"  已存盘工具结果：{s.offloaded_count} 个",
         ]
         if s.circuit_broken:
-            lines.append("  ⚠ 自动摘要已熔断（连续失败），/clear 后恢复")
+            lines.append("  警告：自动摘要已熔断（连续失败），/clear 后恢复")
         return "\n".join(lines)
 
     def reset(self) -> None:

@@ -85,7 +85,11 @@ class ManagerTests(unittest.TestCase):
             report = manager.status_report()
             self.assertIn("good", report)
             self.assertIn("bad", report)
-            self.assertIn("✗", report)
+            # `✓` / `✗` 已换成文字（tui-display 扩展 F28/F30）：报告要脱离
+            # 符号也能读出「连上了」还是「失败了」，而失败那条后面本来就跟着
+            # 原因，用文字更连贯
+            self.assertIn("失败：", report)
+            self.assertIn("已连接", report)
         finally:
             manager.close_all()
 

@@ -157,7 +157,7 @@
 17  api_request          turn 2 · 消息 4 条
 19  api_response         turn 2 · 1108ms · 首字 750ms · 20 块
 20  agent_event          finished · stop_reason=completed
-22  notes/api_request    turn 1 · 消息 1 条 · 工具 0 个      ← 自动笔记，作用域独立
+22  notes/api_request    turn 1 · 消息 1 条 · 工具 0 个      ← 自动记忆，作用域独立
 24  notes/api_response   turn 1 · 891ms
 ```
 
@@ -166,9 +166,9 @@
 1. **权限管线走的是真路子**——`permission_decision write_file → ask（④模式）`：
    第④层兜底判「问用户」→ 弹面板 → 驱动器答 `once` → 才执行。**没有被绕过**。
    这是「驱动器不扩大权限面」在真实模型下的正面证据。
-2. **`notes` 作用域出现了**（seq 22–24）：真实模式**保留自动笔记**，它与主对话
+2. **`notes` 作用域出现了**（seq 22–24）：真实模式**保留自动记忆**，它与主对话
    共用同一个 Provider 但作用域独立标注——正是 P0 当初坚持要区分四种作用域的理由，
-   在这里得到实证（若不区分，笔记那两次调用会污染主对话的轮次计数）。
+   在这里得到实证（若不区分，记忆那两次调用会污染主对话的轮次计数）。
 3. **`rhine-notes` 线程已收敛**（AC24 的 live 一半）：退出后该线程不在
    `threading.enumerate()` 里，说明 `shutdown_on_main` 的 join 生效且没有超时。
 

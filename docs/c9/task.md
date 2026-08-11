@@ -1,4 +1,4 @@
-# C9 记忆系统（项目指令 · 会话存档 · 自动笔记）Tasks
+# C9 记忆系统（项目指令 · 会话存档 · 自动记忆）Tasks
 
 ## 文件清单
 
@@ -8,8 +8,8 @@
 | 新建 | `rhinecode/memory/lockfile.py` | 锁原语：原子创建/释放/心跳/过期判定 |
 | 新建 | `rhinecode/memory/instructions.py` | RHINE.md 三层加载 + @include 展开（纯函数） |
 | 新建 | `rhinecode/memory/session.py` | SessionStore：JSONL 建档/追加/扫描/载入/清理/会话锁 |
-| 新建 | `rhinecode/memory/notes.py` | 笔记 frontmatter 与索引的解析/渲染/截断（纯逻辑） |
-| 新建 | `rhinecode/memory/note_updater.py` | 笔记 LLM 的 Prompt 与响应解析 |
+| 新建 | `rhinecode/memory/notes.py` | 记忆 frontmatter 与索引的解析/渲染/截断（纯逻辑） |
+| 新建 | `rhinecode/memory/note_updater.py` | 记忆 LLM 的 Prompt 与响应解析 |
 | 新建 | `rhinecode/memory/manager.py` | MemoryManager 编排 |
 | 新建 | `rhinecode/agent/prompt/texts/init.py` | /init 内置指令文本 |
 | 修改 | `rhinecode/tools/path_guard.py` | 额外只读根目录白名单 + resolve_readable / is_readable_path |
@@ -23,7 +23,7 @@
 | 修改 | `rhinecode/tui/app.py` | notify 回调注入；会话锁心跳定时器；启动提示展示 |
 | 新建 | `tests/test_memory_lockfile.py` | 锁原语测试 |
 | 新建 | `tests/test_memory_instructions.py` | RHINE.md 加载测试 |
-| 新建 | `tests/test_memory_notes.py` | 笔记/索引纯逻辑测试 |
+| 新建 | `tests/test_memory_notes.py` | 记忆/索引纯逻辑测试 |
 | 新建 | `tests/test_memory_session.py` | 会话存档测试 |
 | 新建 | `tests/test_memory_manager.py` | 编排测试（含 note_updater 解析） |
 | 新建 | `tests/test_memory_sandbox.py` | 沙箱白名单测试 |
@@ -83,7 +83,7 @@
 
 **验证：** `python -m unittest tests.test_memory_instructions` 全绿。
 
-## T5: 笔记纯逻辑 notes.py
+## T5: 记忆纯逻辑 notes.py
 
 **文件：** `rhinecode/memory/notes.py`（新建）
 **依赖：** 无
@@ -96,7 +96,7 @@
 
 **验证：** `python -m compileall rhinecode/memory` 编译通过。
 
-## T6: 笔记纯逻辑测试
+## T6: 记忆纯逻辑测试
 
 **文件：** `tests/test_memory_notes.py`（新建）
 **依赖：** T5
@@ -137,7 +137,7 @@
 
 **验证：** `python -m unittest tests.test_memory_session` 全绿。
 
-## T9: 笔记 LLM 请求与解析 note_updater.py
+## T9: 记忆 LLM 请求与解析 note_updater.py
 
 **文件：** `rhinecode/memory/note_updater.py`（新建）
 **依赖：** T5
@@ -160,8 +160,8 @@
 4. `record_message(msg)` → `session.append(msg)`。
 5. `on_natural_stop(history)`：`notes_enabled` 为 False 或 in-flight 已置 → 返回；置标志，起 daemon 线程执行 `_update_notes(snapshot)`（`history[_note_watermark:]` 的浅拷贝，随后水位推到当前长度）。
 6. `_update_notes(new_msgs)`：build 请求 → `provider.stream_chat(..., tools=None)` 收集全文 → parse → 按 scope 分组 → 逐目录 `try_acquire(dir/".lock", 600)`，拿不到整组跳过；拿到后执行动作（add/update 写 `render_note`、delete 删文件）→ 扫描目录全部 `.md`（除索引）`parse_note` 重建索引写盘 → finally `release`；有变更时 `notify(...)`；异常记 `_last_note_result`；finally 清 in-flight 标志。
-7. `resume_list()`：渲染编号列表（含 locked 标注）；`resume_into(key, history)`：编号或 ID 定位 → attach（False 时返回占用提示）→ load → `history[:] = messages` → 超 24h 登记 pending 提醒 → 返回结果文本（含跳过坏行/丢组统计）；同时更新笔记高水位为新历史长度。
-8. `on_clear()`：release 旧锁 + `start_new()` + 高水位归零；`memory_report()`：汇总各层/索引/笔记数/最近结果/会话/锁状态；`touch_session_lock()`；`close()`。
+7. `resume_list()`：渲染编号列表（含 locked 标注）；`resume_into(key, history)`：编号或 ID 定位 → attach（False 时返回占用提示）→ load → `history[:] = messages` → 超 24h 登记 pending 提醒 → 返回结果文本（含跳过坏行/丢组统计）；同时更新记忆高水位为新历史长度。
+8. `on_clear()`：release 旧锁 + `start_new()` + 高水位归零；`memory_report()`：汇总各层/索引/记忆数/最近结果/会话/锁状态；`touch_session_lock()`；`close()`。
 9. `__init__.py` 导出 `MemoryManager`。
 
 **验证：** `python -m compileall rhinecode/memory` 编译通过。
@@ -172,13 +172,13 @@
 **依赖：** T10
 **步骤：** 用假 provider（预置响应、断言收到 `tools=None`）与临时目录断言：
 1. `parse_note_response`：合法数组解析、坏 JSON→[]、非法 filename/scope/category 项被跳过。
-2. 自然停止流程：假 provider 返回含 add 动作的 JSON → 对应目录出现笔记文件、索引重建含该条、notify 被调用、`_last_note_result` 为成功。
+2. 自然停止流程：假 provider 返回含 add 动作的 JSON → 对应目录出现记忆文件、索引重建含该条、notify 被调用、`_last_note_result` 为成功。
 3. 目录锁被占（预置新鲜 .lock）→ 该目录无新文件、不阻塞（同步调 `_update_notes` 验证）。
 4. 假 provider 抛异常 → 静默、`_last_note_result` 记录失败、in-flight 标志被清。
 5. in-flight 已置时 `on_natural_stop` 直接返回（假线程不启动）。
 6. 高水位：两次更新，第二次请求只含新增消息。
 7. `startup(resume_latest=True)`：最近会话被锁 → 顺延到下一个；全被锁/无会话 → 开新档。
-8. `memory_report()` 含 RHINE.md 层状态、笔记数、会话 ID、锁状态字样。
+8. `memory_report()` 含 RHINE.md 层状态、记忆数、会话 ID、锁状态字样。
 9. `memory_index()`：构造 >200 行索引文件 → 返回内容 ≤200 行。
 
 **验证：** `python -m unittest tests.test_memory_manager` 全绿。
@@ -271,7 +271,7 @@
 **文件：** `CLAUDE.md`
 **依赖：** T19
 **步骤：**
-1. 「当前能力」补 C9 段（三套机制 + 锁）；「架构」补 Memory 层条目与 conversation/__main__/tui 的接入描述；「常用命令」补 `--continue` 与 `/resume` `/memory` `/init`；「测试」补五个新测试文件；「安全边界」补：会话存档/笔记含对话原文勿提交、用户级 memory 只读白名单、笔记内部可信写盘。
+1. 「当前能力」补 C9 段（三套机制 + 锁）；「架构」补 Memory 层条目与 conversation/__main__/tui 的接入描述；「常用命令」补 `--continue` 与 `/resume` `/memory` `/init`；「测试」补五个新测试文件；「安全边界」补：会话存档/记忆含对话原文勿提交、用户级 memory 只读白名单、记忆内部可信写盘。
 2. 「成对维护点」备忘补一行：新增 RHINE.md 相关行为 → instructions.py + /memory 报告。
 3. 确认 `.gitignore` 覆盖 `.rhinecode/`（sessions/memory 随之忽略），不足则补。
 

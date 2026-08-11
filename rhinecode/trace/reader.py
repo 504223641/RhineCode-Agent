@@ -163,12 +163,25 @@ def _s_ui_message(r: dict) -> str:
 
 
 def _s_status_bar(r: dict) -> str:
-    return _text_of(r.get("text"), 110)
+    text = _text_of(r.get("text"), 110)
+    # 退出提示是状态栏**左区**的独立组件，不在 `text` 里（tui-display 扩展 F31）。
+    # 不进摘要行的话它等于白记——而它偏偏是「按下 Ctrl+C 之后界面有没有给反馈」
+    # 唯一的物证，本身又只在屏幕上活两秒。
+    #
+    # ⚠ 这里刻意**不引用** `tui.widgets.QUIT_HINT_TEXT`：`trace` 是只依赖标准库的
+    # 叶子包，导它会反向依赖整个 TUI 层（与 `_LAYER_NAMES` 那三份表不合一同理）。
+    if r.get("quit_hint"):
+        return f"（挂着退出提示）{text}"
+    return text
 
 
 def _s_agent_event(r: dict) -> str:
     bits = [str(r.get("event_type"))]
-    for key in ("iteration", "stop_reason", "tool_name", "result_ok", "text_length"):
+    # ⚠ 新增负载字段必须同步登记到这张表里（CLAUDE.md 的成对维护点）：
+    # 不进摘要行的字段等于白记——读时间线的人看不见它，只有 `--seq` 展开才发现
+    # 「原来早就记了」。`level` 进这里的判据是「排查时第一眼要不要看到它」：
+    # 用户说「我没看见那条通知」时，第一件要确认的就是它当时按哪一档显示的。
+    for key in ("iteration", "stop_reason", "tool_name", "result_ok", "text_length", "level"):
         if key in r:
             bits.append(f"{key}={r[key]}")
     if r.get("message"):

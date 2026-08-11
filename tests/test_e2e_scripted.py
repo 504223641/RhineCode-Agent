@@ -76,7 +76,7 @@ class ScriptedProviderTest(unittest.TestCase):
 
     def test_fallback_when_script_exhausted(self):
         """
-        剧本耗尽必须**不抛错、不挂起**：上下文摘要与自动笔记都会额外调模型，
+        剧本耗尽必须**不抛错、不挂起**：上下文摘要与自动记忆都会额外调模型，
         为它们抛错等于把一次正常的系统行为变成测试失败。
         """
         provider = ScriptedProvider([[text("唯一一轮"), done()]])
@@ -123,7 +123,7 @@ class RecordedCallTest(unittest.TestCase):
         list(provider.stream_chat([], tools=None))
 
         self.assertEqual(provider.calls[0].tool_names, {"read_file", "glob_files"})
-        # tools=None 是「本轮禁用工具」（摘要/笔记的调用就是这样），空集而不是报错
+        # tools=None 是「本轮禁用工具」（摘要/记忆的调用就是这样），空集而不是报错
         self.assertEqual(provider.calls[1].tool_names, set())
 
     def test_dynamic_reminder_reads_last_system_message(self):

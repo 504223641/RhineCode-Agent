@@ -174,7 +174,7 @@ except (ConnectionResetError, ConnectionAbortedError) as e:
 ```
 04:15:56  quit 发出（面板被强制结算）
 04:15:57  Agent Loop finished · stop_reason=completed
-04:15:59  notes 作用域的笔记请求完成
+04:15:59  notes 作用域的记忆请求完成
 04:16:27  session_end  quit · 轮次合计 3 · 用时 56.984s
 ```
 
@@ -188,11 +188,11 @@ if thread.name == "rhine-notes":
     thread.join(timeout=30.0)
 ```
 
-即等笔记线程写完再退，避免笔记文件写坏。**设计是对的**，只是「数秒内」这个措辞
+即等记忆线程写完再退，避免记忆文件写坏。**设计是对的**，只是「数秒内」这个措辞
 与 30 秒的 join 上限对不上。
 
 **建议**：把判据改成「**不挂死**：`quit` 后进程在 40 秒内退出并写出 `session_end`；
-若当轮触发了笔记更新，会等笔记线程最多 30 秒（见 `control.py` 的 `shutdown_on_main`）」。
+若当轮触发了记忆更新，会等记忆线程最多 30 秒（见 `control.py` 的 `shutdown_on_main`）」。
 
 ## 场景 6：对真实使用零影响 —— 需人眼
 

@@ -752,7 +752,7 @@ def snap_back_to_user(history: Sequence[Message], idx: int) -> Optional[int]:
 
 **子对话触达上下文上限的兜底链路（R-f，兑现 spec F21 的说明义务）**：决策 14 关闭了子对话的第二层摘要，因此超窗时的链路是——请求超限 → API 报错 → `chunk.type=="error"` → 循环产出 `ERROR` 事件（`_do_stream` 会渲染红色错误行）→ `FINISHED(STREAM_ERROR)` → 步骤 8 判定为「未产出结果」→ 步骤 10 的 `NOTICE` 给出可读原因 → 步骤 9 把同样的说明写进主历史。用户可见反馈有两处（红色错误行 + 系统提示行），历史中也留下可追溯记录。
 
-`_run_isolated_skill` 必须经 `_wrap_events` 包装返回，与 `_run()` 一致——步骤 11 的自然完成会触发 C9 笔记钩子针对主历史跑一次（F21 明确要求，不要一并关掉）。
+`_run_isolated_skill` 必须经 `_wrap_events` 包装返回，与 `_run()` 一致——步骤 11 的自然完成会触发 C9 记忆钩子针对主历史跑一次（F21 明确要求，不要一并关掉）。
 
 ### 4.10 `tui/` — 控制器、状态栏、守卫
 
@@ -859,7 +859,7 @@ InputBar 提交 "/review 最近改动"
         ├─ 子 Agent.run(子历史, RunOptions(...)) ──▶ 事件流透传到 UI（进度可见）
         ├─ 主历史 += assistant(结论)
         ├─ 未产出时额外 yield NOTICE（否则界面零反馈）
-        └─ yield FINISHED(COMPLETED) → _wrap_events 触发 C9 笔记钩子
+        └─ yield FINISHED(COMPLETED) → _wrap_events 触发 C9 记忆钩子
 ```
 
 ---

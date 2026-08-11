@@ -63,6 +63,7 @@ class LoadSkillTool(Tool):
     name = "load_skill"
     system_serial = True
     read_only = True
+    primary_arg = "name"
     # ## ⚠️ 这段描述曾经在**主动劝阻**模型加载一半的 Skill
     #
     # 原文写着「只能加载**共享模式**的 Skill；独立模式的 Skill 需要由用户主动触发」——

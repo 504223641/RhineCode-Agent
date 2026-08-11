@@ -249,7 +249,7 @@ class ScriptedProvider(BaseProvider):
 `stream_error("连接中断")` / `usage(prompt=100, completion=20)` / `done()`。
 
 **脚本耗尽的兜底**（F22）：默认 `fallback = [text("[e2e-fallback]"), done()]`。
-取这个字面量是为了可识别——上下文摘要与自动笔记都会额外调模型，
+取这个字面量是为了可识别——上下文摘要与自动记忆都会额外调模型，
 读记录时一眼能认出「这条不是脚本里写的」。
 
 **线程安全**：`calls` 会被 Agent 工作线程追加、被断言层在主/测试线程读取，
@@ -491,10 +491,10 @@ python -m tests.e2e.host --mode scripted|live
 
 - `--mode scripted`：用 `--script` 指定的脚本构造 `ScriptedProvider`；
   装配后立刻 `manager.memory_manager.notes_enabled = False`
-  （F16 裁决：确定性形态关自动笔记，它本身就是不确定性来源。
+  （F16 裁决：确定性形态关自动记忆，它本身就是不确定性来源。
   实测该属性是普通实例属性、门控点每次调用现读，赋值即生效：
   关掉时一轮对话模型被调 1 次，不关是 2 次）。
-- `--mode live`：真实配置构造真实 Provider；自动笔记**保留**，退出前等待收敛。
+- `--mode live`：真实配置构造真实 Provider；自动记忆**保留**，退出前等待收敛。
   无凭据时**明确报错退出**，不静默降级（F23）。
 
 **启动顺序（M5 的修正，顺序不可调）**：
@@ -546,9 +546,9 @@ async def shutdown_on_main(self, reason):
 **为什么两步要交织**：结算一个面板后循环可能立刻弹下一个（模型一轮发多个工具调用就是
 这样），分成「先结算 N 次、再等忙碌态转假」会在第二段又挂住。
 
-**自动笔记的收敛**（S 项已验）：线程名 `rhine-notes`、`daemon=True`，
+**自动记忆的收敛**（S 项已验）：线程名 `rhine-notes`、`daemon=True`，
 用 `threading.enumerate()` 按名字找并 `join(timeout)`，**零产品改动**。
-顺序天然安全：笔记钩子在产出结束事件**之前**触发，而忙碌态在事件流耗尽后才转假，
+顺序天然安全：记忆钩子在产出结束事件**之前**触发，而忙碌态在事件流耗尽后才转假，
 故「先等忙碌态转假、再 join 该线程」不存在「线程还没起就以为收敛了」的竞态。
 它是 daemon，不 join 就会被进程退出截断——这一步是必需的。
 
@@ -752,7 +752,7 @@ rhinecode/
 | 清理顺序 | `cleanup()` → `chdir` 回去 → `rmtree` | **实测**：Windows 下 cwd 在待删目录内时 `rmtree` 抛 WinError 32；记录文件句柄由 `cleanup` 关闭 |
 | 模型注入 | `build_app` 与 `ConversationManager` 各一个 `provider_factory`，由前者透传 | 一个接缝同时覆盖主 Provider 与换模型旁路（F20/F21），Provider 抽象一行不动 |
 | 危险工具处理 | 装配时 `exclude_tools` 摘除，位置在 `startup` **之后** | 真实模式下调什么工具由模型决定，唯一闸门是可能误判的应答者，摘掉是唯一硬保证；放在 `startup` 之前会让合法工作区 fail-fast（实测） |
-| 自动笔记 | scripted 关、live 保留并 join `rhine-notes` 线程 | 它是不确定性来源，与「可复现」冲突；但也是被验收对象，live 下不能关。按线程名等待，零产品改动 |
+| 自动记忆 | scripted 关、live 保留并 join `rhine-notes` 线程 | 它是不确定性来源，与「可复现」冲突；但也是被验收对象，live 下不能关。按线程名等待，零产品改动 |
 | 轮次预算 | 跨 send 累计，`send` 前置检查；单次上界靠产品既有 25 轮兜底 | 不为它增加第四处产品改动；最坏 `budget + 25`，口径写明避免被当成硬顶 |
 | `trace_seq` 来源 | 记录末条可解析事件的 `seq` | 不新增产品接口；「成功落盘才推进序号」使二者等价 |
 | 代码版本标识 | 路径+大小+mtime 的哈希 | 快；误报（多重启一次）比漏报（以为改生效了）安全。代价已在 §3.5 写明 |
@@ -786,7 +786,7 @@ rhinecode/
 | F13 观察面基于记录 | `DriverCore.observe`（读记录文件，不遍历控件；末行半截丢弃） |
 | F14 退出与强制结算 | `shutdown_on_main` 的交织循环 + `cleanup` |
 | F15 预置 | `seeding`，在校验之后、装配之前执行 |
-| F16 独立工作区 + 收敛裁决 | `sandbox` + `host` 的 mode 分支（scripted 关笔记 / live 等收敛） |
+| F16 独立工作区 + 收敛裁决 | `sandbox` + `host` 的 mode 分支（scripted 关记忆 / live 等收敛） |
 | F17 独立用户级目录 | `host` 自建临时目录并传 `build_app(user_dir=…)` |
 | F18 连跑不污染 | P0 的 `cleanup` 复位 + `sandbox` 的三步清理 |
 | F19 确定性形态无外部连接 | 假模型 + 空 MCP 配置 + `exclude_tools` 摘掉联网只读工具 |

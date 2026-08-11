@@ -144,7 +144,7 @@ class WebFetchManager:
         :raises RuntimeError: 流中出现 error 块
 
         **`tools=None` 是硬约束**（spec F15）：抽取阶段模型在物理上无法调用任何工具。
-        与 C8 摘要、C9 笔记同源。
+        与 C8 摘要、C9 记忆同源。
 
         ⚠️ `with` 必须包住**整个 for 循环**而不只是 `stream_chat(...)` 那一行：
         `stream_chat` 是生成器函数，调用它只是造出生成器对象、函数体一行都没跑；

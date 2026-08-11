@@ -79,6 +79,16 @@ class _Harness:
     def show_message(self, text: str) -> None:
         self.messages.append(text)
 
+    def show_event(self, text: str) -> None:
+        """
+        事件级通道（tui-display 扩展 F19）。
+
+        自动唤起的两条提示都改走它了——「这段是我不在的时候程序自己跑的」
+        是本项目里最不该被渲染成 dim 的消息之一。这里与 `show_message` 收进
+        同一个列表：本文件验的是**说没说**与**说了什么**，不是用哪一档说。
+        """
+        self.messages.append(text)
+
     def _start_stream_worker(self, gen) -> None:
         self.started.append(gen)
 

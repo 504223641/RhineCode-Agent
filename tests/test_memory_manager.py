@@ -1,4 +1,4 @@
-"""MemoryManager 编排单测（c9 T11 / AC14–AC18/AC21 相关），用假 provider 断言笔记请求不带工具。"""
+"""MemoryManager 编排单测（c9 T11 / AC14–AC18/AC21 相关），用假 provider 断言记忆请求不带工具。"""
 
 import json
 import time
@@ -7,9 +7,9 @@ import tempfile
 from pathlib import Path
 
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk
-from rhinecode.memory.manager import MemoryManager, NOTE_LOCK_STALE, INDEX_FILENAME
-from rhinecode.memory.note_updater import parse_note_response
-from rhinecode.memory.notes import INDEX_MAX_LINES
+from rhinecode.memory.manager import MemoryManager, MEMORY_LOCK_STALE, INDEX_FILENAME
+from rhinecode.memory.memory_updater import parse_memory_response
+from rhinecode.memory.memories import INDEX_MAX_LINES
 from rhinecode.memory import lockfile
 
 
@@ -52,37 +52,37 @@ class ManagerTestBase(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _manager(self, provider=None, notes_enabled=True) -> MemoryManager:
+    def _manager(self, provider=None, memories_enabled=True) -> MemoryManager:
         return MemoryManager(
             provider or FakeProvider(["[]"]),
             "test-model",
             self.project,
             self.user_dir,
-            notes_enabled=notes_enabled,
+            memories_enabled=memories_enabled,
         )
 
     def _wait_notes_done(self, mgr: MemoryManager, timeout: float = 5.0) -> None:
-        """等待笔记后台线程结束（in-flight 标志清除）。"""
+        """等待记忆后台线程结束（in-flight 标志清除）。"""
         deadline = time.time() + timeout
-        while mgr._note_inflight.is_set():
+        while mgr._memory_inflight.is_set():
             if time.time() > deadline:
-                self.fail("笔记线程超时未结束")
+                self.fail("记忆线程超时未结束")
             time.sleep(0.01)
 
 
 class ParseResponseTest(unittest.TestCase):
-    """parse_note_response 的宽松解析与防注入（T11 步骤 1）。"""
+    """parse_memory_response 的宽松解析与防注入（T11 步骤 1）。"""
 
     def test_valid_array(self) -> None:
-        actions = parse_note_response("前置解释\n" + _action_json() + "\n后置")
+        actions = parse_memory_response("前置解释\n" + _action_json() + "\n后置")
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].op, "add")
-        self.assertEqual(actions[0].note.category, "project")
+        self.assertEqual(actions[0].memory.category, "project")
 
     def test_bad_json_returns_empty(self) -> None:
-        self.assertEqual(parse_note_response("不是 JSON"), [])
-        self.assertEqual(parse_note_response("[{未闭合"), [])
-        self.assertEqual(parse_note_response(""), [])
+        self.assertEqual(parse_memory_response("不是 JSON"), [])
+        self.assertEqual(parse_memory_response("[{未闭合"), [])
+        self.assertEqual(parse_memory_response(""), [])
 
     def test_illegal_items_skipped(self) -> None:
         data = json.dumps([
@@ -94,13 +94,13 @@ class ParseResponseTest(unittest.TestCase):
              "name": "x", "summary": "y", "category": "不存在"},         # 非法 category
             {"op": "delete", "scope": "user", "filename": "ok-note.md"},  # 合法 delete
         ])
-        actions = parse_note_response(data)
+        actions = parse_memory_response(data)
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].op, "delete")
 
 
 class NotesFlowTest(ManagerTestBase):
-    """自然停止 → 笔记落盘 → 索引重建 → 通知（T11 步骤 2–6）。"""
+    """自然停止 → 记忆落盘 → 索引重建 → 通知（T11 步骤 2–6）。"""
 
     def test_natural_stop_writes_note_and_index(self) -> None:
         provider = FakeProvider([_action_json("project", "arch-note.md")])
@@ -113,17 +113,17 @@ class NotesFlowTest(ManagerTestBase):
         mgr.on_natural_stop(history)
         self._wait_notes_done(mgr)
 
-        # 笔记请求不带工具（F15/N6④）
+        # 记忆请求不带工具（F15/N6④）
         self.assertEqual(len(provider.calls), 1)
         self.assertIsNone(provider.calls[0]["tools"])
-        # 项目级目录出现笔记文件与索引
+        # 项目级目录出现记忆文件与索引
         note_path = self.project / ".rhinecode" / "memory" / "arch-note.md"
         self.assertTrue(note_path.exists())
         index = (self.project / ".rhinecode" / "memory" / INDEX_FILENAME).read_text(encoding="utf-8")
         self.assertIn("arch-note", index)
         # 通知与结果记录
         self.assertEqual(len(notices), 1)
-        self.assertIn("已更新", mgr._last_note_result)
+        self.assertIn("已更新", mgr._last_memory_result)
         # 正常写入完成后锁被释放（AC21）
         self.assertFalse((self.project / ".rhinecode" / "memory" / ".lock").exists())
 
@@ -132,11 +132,11 @@ class NotesFlowTest(ManagerTestBase):
         mgr = self._manager(provider)
         target = self.project / ".rhinecode" / "memory"
         target.mkdir(parents=True)
-        lockfile.try_acquire(target / ".lock", NOTE_LOCK_STALE)  # 模拟另一实例持锁
+        lockfile.try_acquire(target / ".lock", MEMORY_LOCK_STALE)  # 模拟另一实例持锁
 
-        mgr._update_notes([Message(role="user", content="x")])  # 同步调用便于断言
+        mgr._update_memories([Message(role="user", content="x")])  # 同步调用便于断言
         self.assertFalse((target / "arch-note.md").exists())
-        self.assertIn("跳过", mgr._last_note_result)
+        self.assertIn("跳过", mgr._last_memory_result)
 
     def test_provider_error_silently_recorded(self) -> None:
         provider = FakeProvider([])
@@ -144,15 +144,15 @@ class NotesFlowTest(ManagerTestBase):
         mgr = self._manager(provider)
         mgr.on_natural_stop([Message(role="user", content="x")])
         self._wait_notes_done(mgr)
-        self.assertIn("失败", mgr._last_note_result)
-        self.assertFalse(mgr._note_inflight.is_set())  # 标志已清，不影响后续轮次
+        self.assertIn("失败", mgr._last_memory_result)
+        self.assertFalse(mgr._memory_inflight.is_set())  # 标志已清，不影响后续轮次
 
     def test_inflight_skips_round(self) -> None:
         mgr = self._manager()
-        mgr._note_inflight.set()  # 模拟上一轮仍在跑
+        mgr._memory_inflight.set()  # 模拟上一轮仍在跑
         mgr.on_natural_stop([Message(role="user", content="x")])
-        self.assertEqual(mgr._note_watermark, 0)  # 高水位未推进（本轮未消费）
-        self.assertIn("跳过", mgr._last_note_result)
+        self.assertEqual(mgr._memory_watermark, 0)  # 高水位未推进（本轮未消费）
+        self.assertIn("跳过", mgr._last_memory_result)
 
     def test_watermark_only_new_messages_sent(self) -> None:
         provider = FakeProvider(["[]", "[]"])
@@ -172,7 +172,7 @@ class NotesFlowTest(ManagerTestBase):
 
     def test_notes_disabled_noop(self) -> None:
         provider = FakeProvider([_action_json()])
-        mgr = self._manager(provider, notes_enabled=False)
+        mgr = self._manager(provider, memories_enabled=False)
         mgr.on_natural_stop([Message(role="user", content="x")])
         time.sleep(0.05)
         self.assertEqual(provider.calls, [])  # 完全不调 LLM（F21）
@@ -290,7 +290,7 @@ class ObservabilityTest(ManagerTestBase):
         report = mgr.memory_report()
         self.assertIn("RHINE.md 项目指令", report)
         self.assertIn("项目根", report)
-        self.assertIn("自动笔记", report)
+        self.assertIn("自动记忆", report)
         self.assertIn("当前会话", report)
         self.assertIn("写锁", report)
         self.assertIn("最近一次自动更新", report)

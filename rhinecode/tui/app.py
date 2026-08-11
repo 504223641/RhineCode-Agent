@@ -18,15 +18,20 @@ RhineApp 是 TUI 层的核心，负责：
   call_from_thread 在主线程弹面板、用 threading.Event 阻塞 Worker 等待用户选择（不死锁，N2）。
 """
 
+import asyncio
+import signal
 import threading
+from time import monotonic
 from typing import Optional
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.events import Key
+from textual.containers import Horizontal
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
-from rhinecode.subagents.tasks import STATUS_LABELS
+from rhinecode.subagents.tasks import STATUS_LABELS, TaskManager
 from rhinecode.commands import (
     CommandDispatcher,
     CommandRegistry,
@@ -47,6 +52,18 @@ from rhinecode.hooks import HookEventType
 #
 # ⚠ 新增交互种类时要在这里加一行；漏改不报错，只是那种面板弹出时
 # `kind` 会退回内部标识，用户按文档写的条件匹配不上。
+# 系统行的四个档位（tui-display 扩展 F19）。
+#
+# 用字符串常量而不是枚举，与 `AgentEvent.level` 同一条理由：这个值要跨过
+# agent 层原样进 trace 负载，而 trace 是只依赖标准库的叶子包。
+#
+# ⚠ **不留「默认丢进提示级」的兜底**（F20）：本组的全部价值就在于把「重要的」
+# 从「可忽略的」里分出来，留兜底等于没分。每个调用点都必须明确挑一档——
+# `_LEVEL_CHANNELS` 里查不到的取值会当场 KeyError，而不是静默降级。
+LEVEL_NOTICE = "notice"
+LEVEL_EVENT = "event"
+LEVEL_WARNING = "warning"
+
 _NOTIFY_KINDS = {
     "confirm": "awaiting_confirm",
     "clarify": "awaiting_clarify",
@@ -61,8 +78,9 @@ from rhinecode.trace import (
     full_text,
 )
 from rhinecode.tui.widgets import (
-    HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
-    SessionPanel, compose_status_text,
+    ActivityView,
+    HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
+    ClarifyPanel, SessionPanel, compose_status_text,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
     # 「流式累积」意味着任何一帧都是在**任意位置**被截断的模型自由文本，
@@ -74,7 +92,45 @@ from rhinecode.tui.widgets import (
     # 「两个未闭合括号」的用例）；换成安全版是因为输入性质相同——
     # 任意模型文本 × 任意截断点，没有理由赌它撞不上。
     escape,
+    format_activity_cost,
+    THINKING_MARK,
 )
+
+
+def _subagent_finish_text(record) -> str:
+    """
+    子 Agent 结束时写进历史区的那**一条**记录（tui-display 扩展 F6/F7）。
+
+    :param record: `subagents.tasks.TaskRecord`
+    :returns: 两行文本——首行是「谁 · 什么结局 · 花了多少」，次行说明结论的去向
+
+    ## ⚠ F6 的「历史永久痕」与 F7 的「完成通知」是**同一行**
+
+    写成两行不报错，只是每个子 Agent 在历史区留下**重复的两条**——用户会
+    以为它跑了两次。所以这里只有一个产出点，活动区那条终态行是它的短期镜像，
+    数秒后消失。
+
+    ## 成本数字为什么绕道 `TaskManager.row_of`
+
+    spec F6 要求活动区终态行与这条留痕的成本数字**同源同口径**。两边各自
+    从 `TaskRecord` 上取字段拼一遍的话，一次口径改动只改一处不报错，
+    而两个数字都「看起来对」、只是不相等——那种不一致最难解释。
+
+    ## 次行为什么对失败也说「交给 AI」
+
+    因为那是**事实**：失败与取消的任务同样会被 `take_deliverables` 取走，
+    它们的「结论」是一段可读的失败说明。不交给模型的话，模型发起的委派会
+    石沉大海，它永远等不到回音、也无从判断该不该重试。
+
+    副作用：无（纯函数）。
+    """
+    row = TaskManager.row_of(record)
+    return (
+        f"{row.display_name} "
+        f"{STATUS_LABELS.get(record.status, record.status.value)} "
+        f"({format_activity_cost(row)})\n"
+        f"  结论将在下一轮对话中自动交给 AI。"
+    )
 
 
 class RhineApp(App):
@@ -91,6 +147,30 @@ class RhineApp(App):
     - StatusBar：固定 1 行，展示 Provider / 模型 / 思考模式 / 计划模式
     """
 
+    # ---------------------------------------------------------------- #
+    # 键位（tui-display 扩展 F31/F32/F5）
+    # ---------------------------------------------------------------- #
+    # ⚠ **两条 `priority=True` 是实测确认必需的，别去掉。**
+    #
+    # - `ctrl+q`：退出行为**来自 Textual 自己**（`App` 内置一条
+    #   `ctrl+q → quit` 的 priority 绑定），不是本项目的代码。要取消它，
+    #   覆盖的那条也必须是 priority，否则内置那条先赢。
+    # - `ctrl+c`：`Input` 自带 `ctrl+c → copy`，不用 priority 的话输入框聚焦时
+    #   我们的动作根本不触发——而输入框聚焦正是绝大多数时间的状态。
+    #
+    # `ctrl+o` 不需要 priority：没有任何组件占用它。
+    BINDINGS = [
+        Binding("ctrl+q", "noop", "", show=False, priority=True),
+        Binding("ctrl+c", "request_quit", "", show=False, priority=True),
+        Binding("ctrl+o", "toggle_expand", "", show=False),
+    ]
+
+    # 两次 `Ctrl+C` 之间的最长间隔（秒）。超过就当成「第一次」重新计数。
+    #
+    # 取 2 秒：短到不会让「几分钟前误按过一次」在此刻突然生效，
+    # 长到够人看清提示再按第二下。
+    QUIT_CONFIRM_SECONDS = 2.0
+
     CSS = """
     Screen {
         layout: vertical;
@@ -100,9 +180,53 @@ class RhineApp(App):
         border: solid #7AEEFF 60%;
         padding: 0 1;
     }
-    /* 内容容器随消息增长，超出 HistoryView 高度时触发父容器滚动 */
+    /*
+     * 内容容器随消息增长，超出 HistoryView 高度时触发父容器滚动。
+     *
+     * `min-height: 100%` 是 tui-display 扩展 F39/F40 的**全部实现**——
+     * 一行 CSS 同时兑现「内容短时贴顶」与「内容长时跟随最新」两件事。
+     *
+     * ## 它解决的是什么
+     *
+     * `HistoryView.on_mount` 里的 `anchor()` 让视口粘在底部。内容比视口长时
+     * 这正是要的；但内容**短于**视口时，锚点会产生一个**负的滚动偏移**，
+     * 把两条消息整个推到视口底部，上方留一大片空白——用户看到的是
+     * 「对话从下往上长」。实测（视口 13 行、内容 2 行）：
+     *
+     *     HistoryView       region=(y=0, height=13)   scroll_y=-9
+     *     #history-messages region=(y=10, height=2)   ← 落在第 10、11 行
+     *
+     * 让内容容器**至少和视口一样高**之后，"内容短于视口" 这个前提就不成立了：
+     * 容器被撑到满高，锚点把它按到底 == 按在顶（`scroll_y` 由 -9 变 0），
+     * 消息自然从第一行开始排。内容超过视口时容器高度由 `height: auto` 接管，
+     * 跟随最新的行为逐字不变（实测 `scroll_y == max_scroll_y`）。
+     *
+     * ⚠ **不要改成删掉 `anchor()`。** 那个调用是带实测证据加进去的
+     * （理由见 `HistoryView.on_mount` 的 docstring：不用它时 `scroll_end()`
+     * 取到的是**加新组件之前**的 `max_scroll_y`，每次都停在「差最后一条消息」
+     * 的位置）。两个需求必须同时满足，而这一行 CSS 让它们不再互相冲突。
+     */
     HistoryView > Vertical {
         height: auto;
+        min-height: 100%;
+    }
+    /*
+     * 子 Agent 活动区（tui-display 扩展 F1）。
+     *
+     * `display: none` 是缺省态——不使用子 Agent 的用户永远看不到它，
+     * 布局与改造前逐字一致（F9 零回归）。可见性由 `ActivityView.update_rows`
+     * 按「有没有行」切换。
+     *
+     * 顶部分隔线用灰色而不是主题青：它是**观测区**不是交互区，
+     * 与下面那几个等着人应答的面板必须在视觉上分得开。
+     */
+    ActivityView {
+        height: auto;
+        max-height: 12;
+        display: none;
+        border: none;
+        border-top: tall #808080 60%;
+        padding: 0 1;
     }
     CommandPanel {
         height: auto;
@@ -149,9 +273,28 @@ class RhineApp(App):
         border: solid #7AEEFF 60%;
         margin-top: 0;
     }
-    StatusBar {
+    /* 底部状态栏那一行拆成左右两个区（tui-display 扩展 F31）。
+       背景色挂在**行容器**上而不是任一子组件上——挂在子组件上的话，
+       左区 `width: auto` 在没内容时宽度为 0，那一小段底色会跟着消失，
+       表现为状态栏左边缘缺一块。 */
+    #status-row {
         height: 1;
         background: #7AEEFF 20%;
+    }
+    /* 左区：贴着左边缘的瞬时提示（「再按一次 Ctrl+C 退出」）。
+       `width: auto` 让它在没提示时不占位，右区照常铺满整行。 */
+    StatusHint {
+        width: auto;
+        height: 1;
+        color: $text;
+        text-align: left;
+    }
+    /* 右区：常驻状态。`width: 1fr` 吃掉剩余宽度，再右对齐——
+       这样右区那串的位置**不随左区有没有提示而移动**（会移动的话，
+       每次误按 Ctrl+C 整条状态栏都会抖一下）。 */
+    StatusBar {
+        width: 1fr;
+        height: 1;
         color: $text;
         text-align: right;
     }
@@ -202,19 +345,44 @@ class RhineApp(App):
         # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
         # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
         self._last_subagent_count = 0
+        # 全局展开开关（tui-display 扩展 F5/F41，`Ctrl+O`）。
+        # **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
+        # verbose 语义，两个键会让用户记两套。
+        self._expanded = False
+        # 上一次按下 `Ctrl+C` 的时刻（`time.monotonic`）。
+        # 初值取一个足够久远的负数，保证第一次按下必然走「提示」那一支。
+        self._last_quit_request = -1e9
+        # SIGINT 守卫的两个字段（见 `_install_sigint_guard`）。
+        # `_sigint_previous` 存原处理器用于卸载时还原；`_sigint_loop` 存事件循环，
+        # 信号处理器靠它把动作**排队**回事件循环而不是就地执行。
+        self._sigint_previous = None
+        self._sigint_loop: Optional[asyncio.AbstractEventLoop] = None
+        # 退出提示的显示态与它的到期定时器（F31）。
+        # ⚠ **判定的依据始终是上面那个时间戳，不是这个标志**——它只负责「显示」。
+        # 反过来（拿标志当判据）会让定时器的调度抖动变成退出行为的抖动。
+        self._quit_hint_active = False
+        self._quit_hint_timer = None
 
     def compose(self) -> ComposeResult:
         """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
         yield HistoryView()
+        # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
+        #
+        # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
+        # 放历史区上方的话，它空转时会白占两行，而且位置会随历史区滚动跳动。
+        yield ActivityView()
         yield CommandPanel(self._command_registry)
         yield ConfirmPanel()
         yield ClarifyPanel()
         yield SessionPanel()
         yield InputBar(
             self._command_registry,
-            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，Ctrl+Q 退出",
+            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，连按两次 Ctrl+C 退出",
         )
-        yield StatusBar()
+        # 状态栏是**一行两个区**：左区贴左边缘放瞬时提示，右区右对齐放常驻状态
+        # （F31，对齐 Claude Code 底部那一行）。合成一个组件做不到「贴左」——
+        # 右对齐块里的最左边会随其余各段长度在屏幕中间浮动。
+        yield Horizontal(StatusHint(), StatusBar(), id="status-row")
 
     def on_mount(self) -> None:
         """
@@ -228,9 +396,22 @@ class RhineApp(App):
         self._manager.clarify_callback = self._clarify
         self._manager.approve_plan_callback = self._approve_plan
 
+        # 工具行标题的主参数映射（tui-display 扩展 F12）。
+        #
+        # **只建一次**：工具集在启动装配完成之后不再变化（MCP 运行期重载只增删
+        # 远端工具，而远端工具一律没有 `primary_arg`，映射里本来就没有它们）。
+        # 必须排在 `render_history` **之前**——`--continue` 恢复出来的历史里
+        # 有工具行，晚一步的话首屏那批会用空映射画成键值对形态，与其后新产生的
+        # 行长得不一样，而这在界面上只表现为「上下两截风格不同」。
+        primary_args = self._manager.primary_arg_map()
+        self.query_one(HistoryView).set_primary_args(primary_args)
+        # 确认面板也要（E 组做完的样子里那句「工具名也走 B 组的主参数口径」）：
+        # 用户就是靠面板上那一行决定放不放行的，键名在那里同样只占地方。
+        self.query_one(ConfirmPanel).set_primary_args(primary_args)
+
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
-        # 2. 笔记通知回调：笔记线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；
+        # 2. 记忆通知回调：记忆线程（非主线程）触发，必须经 call_from_thread 调回主线程渲染；
         # 3. 会话锁心跳：每 2 分钟 touch 一次，保证「进程活着锁就新鲜」（过期阈值 10 分钟）。
         # --continue 启动恢复对齐（c9 交互化）：若启动时已恢复出历史（history 非空），
         # 先把整段历史回放到聊天区，再显示启动提示——与 /resume 面板载入后的体验一致。
@@ -273,6 +454,86 @@ class RhineApp(App):
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
 
+        # SIGINT 守卫必须在这里装（见下面那个方法的说明）。
+        self._install_sigint_guard()
+
+    # ------------------------------------------------------------------ #
+    # SIGINT 守卫（tui-display 扩展 F31 的兜底）
+    # ------------------------------------------------------------------ #
+
+    def _install_sigint_guard(self) -> None:
+        """
+        接管 `SIGINT`，让它走与 `Ctrl+C` **同一条**连按两次的判定。
+
+        ## 为什么需要这层兜底：`Ctrl+C` 有两条完全不同的抵达路径
+
+        终端把 `Ctrl+C` 交给程序的方式取决于**控制台输入模式**：
+
+        - 关掉 `ENABLE_PROCESSED_INPUT` 时（Textual 启动时正是这么设的），
+          它只是一个**普通按键**——`0x03` 字节进输入流，走 BINDINGS 那条
+          `ctrl+c → request_quit`，连按两次的判定生效；
+        - 开着 `ENABLE_PROCESSED_INPUT` 时，控制台改为向进程组发
+          `CTRL_C_EVENT`，Python 的**默认处理器**在主线程抛 `KeyboardInterrupt`
+          ——它会直接把 `app.run()` 掀翻，**一次按下就退出**，而且是带回溯的
+          难看退出，`request_quit` 里的计数一个字都读不到。
+
+        第二条路径在本项目里是**可达**的：控制台输入模式是**整个控制台共享**的
+        属性，不是每个进程各一份。`run_command` 用 `shell=True` 起
+        `cmd.exe`，子进程完全可能改掉这个模式且不还原干净；再加上终端复用、
+        SSH、以及外部程序直接投递 `CTRL_C_EVENT` 等情形，都会让后续的
+        `Ctrl+C` 突然从「按键」变成「信号」。用户看到的现象就是
+        **平时要按两下，偶尔一下就退了**。
+
+        所以这里不去猜是哪种情形，直接把两条路径**收敛到同一个判定**上：
+        信号来了也当成一次 `Ctrl+C` 按下，该提示提示、该退出退出。
+
+        ## 实现上的两个要点
+
+        1. **信号处理器里不做任何实际工作**，只 `call_soon_threadsafe` 把
+           `action_request_quit` 排进事件循环。Python 的信号处理器是在主线程的
+           字节码边界上被插进来执行的，可能打断任意一段代码——在那里直接碰
+           Textual 的组件树等于在不确定的时机重入 UI；
+        2. **失败一律静默**（`signal.signal` 只能在主线程调，某些嵌入场景会抛
+           `ValueError`）。守卫装不上时行为退回今天的样子，不该反过来让程序起不来。
+
+        副作用：安装进程级 SIGINT 处理器，在 `on_unmount` 还原。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            self._sigint_previous = signal.signal(signal.SIGINT, self._on_sigint)
+            self._sigint_loop = loop
+        except (ValueError, OSError, RuntimeError):  # noqa: BLE001 —— 见上：装不上就退回原行为
+            self._sigint_previous = None
+            self._sigint_loop = None
+
+    def _on_sigint(self, signum, frame) -> None:
+        """
+        `SIGINT` 处理器：把它转成一次「按了 `Ctrl+C`」。
+
+        :param signum: 信号编号（未使用，签名由 `signal.signal` 规定）
+        :param frame: 被打断的栈帧（未使用，同上）
+
+        ⚠ **只排队、不执行**。理由见 `_install_sigint_guard` 的要点 1。
+        """
+        loop = self._sigint_loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self.action_request_quit)
+        except RuntimeError:
+            # 循环已经关了（退出竞态）。此时程序本来就在收尾，忽略即可。
+            pass
+
+    def on_unmount(self) -> None:
+        """还原 SIGINT 处理器，避免把进程级状态留给退出之后的代码。"""
+        if self._sigint_previous is not None:
+            try:
+                signal.signal(signal.SIGINT, self._sigint_previous)
+            except (ValueError, OSError, RuntimeError):  # noqa: BLE001 —— 还原失败不该阻断退出
+                pass
+            self._sigint_previous = None
+        self._sigint_loop = None
+
     def _show_busy_hint(self, text: str) -> None:
         """
         显示一次「当前不能提交」的提示（c11 T55）。
@@ -295,13 +556,13 @@ class RhineApp(App):
 
     def _notify_memory(self, text: str) -> None:
         """
-        笔记更新的低打扰通知（c9 F20）。运行在笔记 daemon 线程，
+        记忆更新的低打扰通知（c9 F20）。运行在记忆 daemon 线程，
         用 call_from_thread 把渲染调度回主线程（Textual 线程安全要求）。
 
         **埋点位置刻意排在 call_from_thread 之后**（全阶段复测观察 O5）。
 
         原先这里直接调 `append_system`、绕过了 `_trace_ui_message`，后果是
-        c9 的 AC19「笔记变更时界面出现低打扰提示」在**任何**基于 trace 的验收里
+        c9 的 AC19「记忆变更时界面出现低打扰提示」在**任何**基于 trace 的验收里
         都是盲区——记录里没有这条 `ui_message`，而「显示了没记」与「压根没显示」
         （notify 为 None，或下面这个 except 把异常吞了）在 trace 上完全无法区分。
 
@@ -352,13 +613,24 @@ class RhineApp(App):
             subagent_status=self._subagent_status_segment(),
         )
         self.query_one(StatusBar).update_status(**status_args)
+        # 左区（F31）在这里一并刷新，而不是只在按下 Ctrl+C 时改一次。
+        # 好处是「显示态的唯一真相是 `_quit_hint_active`」——任何一条刷新路径
+        # 都会把左区拉回与它一致，不会出现某条路径重画了右区却漏掉左区。
+        self.query_one(StatusHint).set_quit_hint(self._quit_hint_active)
         # 为什么记「组装后的文本」而不是九个散字段（trace F15）：用户真正看到的
         # 那行文本是 compose_status_text 在 update_status 内部拼出来的，只记字段
         # 的话「文本快照」这个承诺不成立（比如某个字段的渲染分支写错了，
         # 记录里看不出来）。compose_status_text 是纯函数、零副作用，多调一次没成本。
+        # `quit_hint` 与 `text` 并列而不是拼进 `text`：左区是**独立组件**，
+        # 拼进去的话记录里那行会与用户看到的右区文本对不上。
+        # ⚠ 漏记它的后果是「按下 Ctrl+C 之后界面到底有没有给反馈」在记录上
+        # 完全无法判断——而这条提示本来就只活两秒，事后没有第二处可查。
         self._recorder.emit_lazy(
             TraceEventType.STATUS_BAR,
-            lambda: {"text": full_text(compose_status_text(**status_args))},
+            lambda: {
+                "text": full_text(compose_status_text(**status_args)),
+                "quit_hint": self._quit_hint_active,
+            },
         )
 
     # ------------------------------------------------------------------ #
@@ -395,6 +667,59 @@ class RhineApp(App):
         """显示本地命令结果或错误（系统行）。"""
         self._trace_ui_message("system", text)
         self.query_one(HistoryView).append_system(text)
+
+    @staticmethod
+    def _history_channel(history_view: HistoryView, level: str):
+        """
+        级别 → 历史区的对应渲染方法（tui-display 扩展 F19/F20）。
+
+        :param history_view: 历史区组件
+        :param level: `LEVEL_NOTICE` / `LEVEL_EVENT` / `LEVEL_WARNING` 之一
+        :returns: 可直接交给 `call_from_thread` 的绑定方法
+
+        ⚠ **未知取值当场 `KeyError`，刻意不给兜底**（F20）。留一个
+        「认不出就按提示级」的默认分支，等于让任何一处拼错的级别静默退回最暗的
+        那一档——而本组的全部价值就在于把「重要的」从「可忽略的」里分出来。
+        宁可在开发期炸掉，也不要在生产里悄悄降级。
+
+        错误级不在这张表里：它有独立的 `append_error`，且只由 `ERROR` 事件产出，
+        不经级别分发。
+        """
+        return {
+            LEVEL_NOTICE: history_view.append_system,
+            LEVEL_EVENT: history_view.append_event,
+            LEVEL_WARNING: history_view.append_warning,
+        }[level]
+
+    def show_event(self, text: str) -> None:
+        """
+        显示一条**事件级**系统行（tui-display 扩展 F19）。
+
+        与 `show_message` 的唯一差别是亮度：那条 `[dim]`，这条正常亮度。
+        用于「真的发生了一件事」的消息（子 Agent 完成、自动唤起、会话已恢复），
+        与「记忆已更新」这类可忽略的提示分开。
+
+        埋点仍记 `source="system"`——**刻意不新增 source 取值**，
+        与 `show_warning` / `show_report` 同口径。
+
+        副作用：产出一条 `ui_message` 埋点；往历史区挂一个组件。
+        """
+        self._trace_ui_message("system", text)
+        self.query_one(HistoryView).append_event(text)
+
+    def show_report(self, text: str) -> None:
+        """
+        显示一段**分级渲染**的命令报告（tui-display 扩展 F15）。
+
+        埋点仍记 `source="system"`——**刻意不新增一种 source 取值**，
+        与 `show_warning` 同口径：trace 那边的 source 词汇是断言与阅读器共用的
+        契约，为一个样式差异扩充它不划算，而「界面上出现过这段文本」才是这条
+        埋点的价值所在。
+
+        副作用：产出一条 `ui_message` 埋点；往历史区挂一个组件。
+        """
+        self._trace_ui_message("system", text)
+        self.query_one(HistoryView).append_report(text)
 
     def show_warning(self, text: str) -> None:
         """
@@ -498,12 +823,9 @@ class RhineApp(App):
         try:
             finished = self._manager.drain_subagent_notifications()
             for record in finished:
-                self.show_message(
-                    f"子 Agent {record.agent_name}[{record.task_id}] "
-                    f"{STATUS_LABELS.get(record.status, record.status.value)}"
-                    f"（{record.turns} 轮 · {record.duration_seconds:.1f}s）"
-                    f"——结论将在下一轮对话中自动交给 AI。"
-                )
+                # 事件级：真的发生了一件事，而且它带着这次委派的全部成本。
+                # 与「记忆已更新」共用一条 dim 通道正是改造前最刺眼的问题。
+                self.show_event(_subagent_finish_text(record))
             running = self._manager.running_subagent_count()
             if finished or running != self._last_subagent_count:
                 self._last_subagent_count = running
@@ -512,11 +834,31 @@ class RhineApp(App):
             # **不新增 set_interval** —— 空闲会话的 CPU 占用与 C13/C14 完全相同
             # （spec N6 的落实方式，见 spec 里那段措辞修订）。
             for notice in self._manager.team_drain_notices():
-                self.show_message(notice)
+                # 事件级：协作侧的降级/状态变化，用户需要知道但无需动作
+                self.show_event(notice)
+            # tui-display 扩展 F4：活动区的数据也搭这趟车。
+            # **不新增定时器**——空闲会话的开销必须与改造前一致。
+            self._refresh_activity()
             self._maybe_auto_wake()
         except Exception:
             # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断定时器。
             pass
+
+    def _refresh_activity(self) -> None:
+        """
+        把子 Agent 活动区刷成任务表当前的样子（tui-display 扩展 F4/N7）。
+
+        由 `_poll_subagents` 在**主线程**调用，与完成通知共用同一个 0.5 秒节拍。
+
+        ⚠ **本方法只做纯内存读取与组件更新**（N7）：不做 IO、不发请求、
+        不调 `call_from_thread`。它跑在每 0.5 秒都会执行的路径上，
+        往里加任何一件慢事都会让整个界面卡顿。
+
+        副作用：重绘活动区组件。
+        """
+        self.query_one(ActivityView).update_rows(
+            self._manager.subagent_activity(), self._expanded
+        )
 
     def _maybe_auto_wake(self) -> None:
         """
@@ -549,7 +891,7 @@ class RhineApp(App):
             # ⚠ 只提示一次：本方法每 0.5 秒被调一次，不设标志会刷满整屏。
             if not self._auto_wake_limit_notified:
                 self._auto_wake_limit_notified = True
-                self.show_message(
+                self.show_event(
                     f"队友还在发消息，但自动唤起已达上限"
                     f"（连续 {self._manager.team_auto_wake_limit()} 次）——"
                     f"先停下来等你回来。说句话就能继续。"
@@ -559,8 +901,10 @@ class RhineApp(App):
         count = self._manager.team_bump_auto_wake()
         limit = self._manager.team_auto_wake_limit()
         # F21：用户回来时要能一眼看出「这段是我不在的时候程序自己跑的」。
-        self.show_message(
-            f"⟳ 自动唤起（第 {count}/{limit} 次）——队友发来了消息，"
+        # 事件级：用户回来时要能一眼看出「这段是我不在的时候程序自己跑的」。
+        # `⟳` 去掉（F28）——「自动唤起」四个字本身已经说清了，符号不添信息。
+        self.show_event(
+            f"自动唤起（第 {count}/{limit} 次）——队友发来了消息，"
             f"主对话在你不在场时自行处理。"
         )
         self._start_stream_worker(self._manager.run_auto_wake())
@@ -570,9 +914,18 @@ class RhineApp(App):
         self._refresh_status()
 
     def clear_conversation(self) -> None:
-        """清空对话：领域侧清历史/开新档 + 界面侧清聊天区（确认文本由命令层显示）。"""
+        """
+        清空对话：领域侧清历史/开新档 + 界面侧清聊天区（确认文本由命令层显示）。
+
+        活动区一并清空（tui-display 扩展 F8）。⚠ 这不是「顺手也清一下」：
+        `/clear` 会取消还在跑的子 Agent 并开新的会话代，那些任务的行留在活动区里
+        就是**在展示一段已经不存在的对话的状态**。领域侧下一轮轮询也会把它们
+        滤掉（它们随即转终态、再过几秒淡出），但那中间有半秒到几秒的窗口，
+        用户会在一个刚清空的界面上看到上一段对话的残影。
+        """
         self._manager.clear()
         self.query_one(HistoryView).clear_all()
+        self.query_one(ActivityView).update_rows(())
 
     def compact_context(self) -> None:
         """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
@@ -740,9 +1093,204 @@ class RhineApp(App):
             return
         panel.show_for(event.prefix)
 
+    # ------------------------------------------------------------------ #
+    # 键位动作（tui-display 扩展 F31/F32/F5）
+    # ------------------------------------------------------------------ #
+
+    def action_noop(self) -> None:
+        """
+        什么都不做——用来**吃掉** `Ctrl+Q`（F31）。
+
+        退出行为来自 Textual 自带的 priority 绑定，不覆盖是去不掉的。
+        绑到一个空动作上，按下去就真的什么都不发生。
+        """
+
+    def action_toggle_expand(self) -> None:
+        """
+        全局展开开关（`Ctrl+O`，F5/F41）。
+
+        **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
+        verbose 语义。两个键会让用户记两套，而这两处展开的是同一类东西
+        （「刚才具体做了什么」）。
+
+        ⚠ **不引入焦点切换**：本动作只重绘，不 `focus()` 任何组件。
+        活动区任何时候都不抢焦点，输入框与四个面板的键位体系一字不动（F5）。
+
+        副作用：重绘活动区与当前挂着的工具行。
+        """
+        self._expanded = not self._expanded
+        self._refresh_activity()
+        # 历史区自己记下展开态并广播给已挂载的行——**不要在这里直接遍历组件**：
+        # 那样只覆盖「此刻挂着的」，展开之后新产生的行又会是折叠的。
+        self.query_one(HistoryView).set_expanded(self._expanded)
+
+    def action_request_quit(self) -> None:
+        """
+        `Ctrl+C`：**连按两次**才退出（F31/F32）。
+
+        ⚠ **本方法是两条路径共同的落点**：按键（BINDINGS）与 `SIGINT`
+        （`_on_sigint`）。判定只有这一份，两条路径因此不可能给出不同的结果
+        ——写成两套的话，「按键要两下、信号一下就退」这种偏差在界面上完全看不出来。
+
+        ## 三条分支，顺序固定
+
+        1. **屏幕上有选中文本 → 复制，且不计数**；
+        2. 距上次按下 ≤ `QUIT_CONFIRM_SECONDS` → 退出；
+        3. 否则记下时间戳，并在**状态栏最左侧**挂出「再按一次 Ctrl+C 退出」
+           （见 `_arm_quit_hint`）。
+
+        ## 为什么复制这一支必须存在
+
+        C2 那条护栏（`Ctrl+C` 不得绑定退出）的理由是「**`Ctrl+C` 用于复制场景**」。
+        而 Textual 里 `Screen` 与 `Input` **各有一条** `ctrl+c → copy` 绑定，
+        两条都是 `priority=False`——**都会被我们上面那条 priority 绑定盖掉**。
+        不做分流的话，「Ctrl+C 复制」这个今天真实可用的功能会整个消失，
+        而那正是当年写下那条护栏时指的东西。
+
+        两处选中来源**缺一不可**（实测确认是两套独立机制）：
+        鼠标在历史区拖选走 `screen.get_selected_text()`，
+        输入框内 Shift+方向键选中走焦点组件的 `selected_text`。
+
+        ## 「不计数」是这条设计的要害
+
+        连续复制五次，一次都不会靠近退出。反过来（复制也计入双击）会让
+        「连按两次复制」意外退出程序——那个方向更糟。
+
+        **已知代价（接受）**：屏幕上有选中内容时按两次得到的是「复制两次」，
+        不会退出；想退出需先清掉选中。相比「复制两次就退出」，这个方向更安全。
+
+        副作用：可能复制到剪贴板、可能改状态栏并起一个定时器、可能退出应用。
+        """
+        if self._copy_selection_if_any():
+            return
+
+        now = monotonic()
+        if now - self._last_quit_request <= self.QUIT_CONFIRM_SECONDS:
+            self.exit()
+            return
+
+        self._last_quit_request = now
+        self._arm_quit_hint()
+
+    def _arm_quit_hint(self) -> None:
+        """
+        在状态栏最左侧挂出退出提示，并安排它在有效期结束时自己消失（F31）。
+
+        ## 为什么是状态栏而不是聊天区
+
+        这条提示是一个**只活两秒的瞬时状态**，不是对话内容。写进聊天区的话，
+        每一次误按都会在历史里留下一条永久噪音，而它在两秒后就已经**不再成立**
+        ——历史区里躺着一句「再按一次就退出」，可那时按一次根本不会退，
+        提示本身变成了错的。状态栏是「当前是什么状态」该待的地方：窗口一过
+        自己消失，什么痕迹都不留。
+
+        ## 到期与判定的关系
+
+        定时器与判定共用同一个 `QUIT_CONFIRM_SECONDS`，所以提示在屏幕上的存续期
+        **就是**连按有效期：看得见提示 = 现在按第二下能退出，提示没了 = 得重新按。
+
+        ⚠ 但**判定的依据始终是 `_last_quit_request` 这个时间戳，不是显示标志**。
+        定时器的调度有抖动（事件循环忙的时候会晚几毫秒），拿标志当判据等于把
+        这点抖动变成退出行为的抖动；而反过来（时间戳判定 + 标志只管显示）
+        最坏也只是提示多挂了几毫秒，没有任何行为后果。
+
+        ## 重复按下的处理
+
+        每次都先**取消**上一个定时器再起新的。不取消的话，第一次按下起的那个
+        定时器会在第二次按下之后的某个时刻把提示清掉——用户明明刚按过一下，
+        提示却提前消失了，看上去像窗口缩短了。
+
+        副作用：改状态栏显示态，起一个 `QUIT_CONFIRM_SECONDS` 后触发的定时器。
+        """
+        if self._quit_hint_timer is not None:
+            self._quit_hint_timer.stop()
+        self._quit_hint_active = True
+        self._refresh_status()
+        self._quit_hint_timer = self.set_timer(
+            self.QUIT_CONFIRM_SECONDS, self._expire_quit_hint
+        )
+
+    def _expire_quit_hint(self) -> None:
+        """有效期结束：撤下状态栏上的退出提示（F31）。"""
+        self._quit_hint_timer = None
+        if not self._quit_hint_active:
+            return
+        self._quit_hint_active = False
+        self._refresh_status()
+
+    def _copy_selection_if_any(self) -> bool:
+        """
+        屏幕上有选中文本就复制它，返回是否复制过。
+
+        :returns: True 表示本次 `Ctrl+C` 是一次复制，**不该计入双击**
+
+        整段 try/except：剪贴板在某些终端里不可用，而复制失败不该妨碍
+        「再按一次就退出」这条主路径。
+        """
+        try:
+            focused = self.focused
+            selected = getattr(focused, "selected_text", "") if focused else ""
+            if not selected:
+                selected = self.screen.get_selected_text() or ""
+            if not selected:
+                return False
+            self.copy_to_clipboard(selected)
+            return True
+        except Exception:  # noqa: BLE001 —— 见上：复制失败不阻断退出路径
+            return False
+
+    def _handle_digit_choice(self, event: Key) -> bool:
+        """
+        面板挂起时，把 `1`–`9` 当成「选中第 N 项」（tui-display 扩展 F23）。
+
+        :param event: 按键事件
+        :returns: 是否已消化本次按键。False 表示按原有路径继续处理
+
+        ## 三条不生效的情形，每一条都不能少
+
+        1. **没有面板挂起** —— 数字照常落进输入框（AC18c）。这是最要紧的一条：
+           拦错了的话用户再也打不出带数字的消息；
+        2. **可见的面板不是那三个之一** —— 命令补全面板从不取得焦点，
+           它的候选也不该被数字键选中；
+        3. **序号越界** —— 面板只有四项时按 `7` 什么都不该发生，
+           尤其不能环绕到第 1 项（那会让人误选）。
+
+        ⚠ **不新增结算路径**：命中后把高亮移过去，再调 OptionList 原生的
+        `action_select()`，走回车那条既有路径。另造一条的话，「按 2」与
+        「移过去按回车」会慢慢分叉，而分叉出来的那条没有护栏。
+
+        副作用：命中时移动面板高亮并触发一次选择结算。
+        """
+        if not (len(event.key) == 1 and event.key.isdigit() and event.key != "0"):
+            return False
+        panel = self._active_choice_panel()
+        if panel is None:
+            return False
+        index = panel.choice_index(int(event.key))
+        if index is None:
+            return False
+        event.stop()
+        panel.highlighted = index
+        panel.action_select()
+        return True
+
+    def _active_choice_panel(self):
+        """
+        当前挂着的可选面板（确认 / 澄清 / 会话），没有则 None。
+
+        ⚠ 判据用 `display` 而不是「有没有待决交互」：会话面板走的是另一条路径
+        （主线程发起、无 Worker 阻塞等待，见 `_settle_session`），
+        用 `_pending_interaction` 判会把它整个漏掉。
+        """
+        for panel_type in (ConfirmPanel, ClarifyPanel, SessionPanel):
+            panel = self.query_one(panel_type)
+            if panel.display:
+                return panel
+        return None
+
     def on_key(self, event: Key) -> None:
         """
-        处理特殊按键：运行中取消、命令面板导航。
+        处理特殊按键：面板数字键直选、运行中取消、命令面板导航。
 
         优先级：
         1. 有交互待决（确认/澄清/审批）或会话选择面板展示中 → 交给被聚焦的面板自身的
@@ -750,6 +1298,20 @@ class RhineApp(App):
         2. 流式运行中 → Esc 触发取消当前 Agent 循环（spec F9）。
         3. 命令面板可见 → Up/Down 移动高亮、Esc 隐藏（焦点始终保持在 InputBar）。
         """
+        # 0. 数字键直选（tui-display 扩展 F23）。
+        #
+        # ⚠ **必须排在下面那条「交互待决 → return」守卫之前**，否则永远走不到
+        # ——面板挂起正是它唯一该生效的时候。
+        #
+        # 它**不新增任何结算路径**：把高亮移过去，再调 OptionList 原生的
+        # `action_select()`，走的仍是回车那条既有的
+        # `on_option_list_option_selected`。另造一条结算路径的话，
+        # 「按 2」与「移过去按回车」会慢慢分叉，而分叉出来的那条没有护栏。
+        #
+        # 无面板时不拦截（AC18c）：数字照常落进输入框。
+        if self._handle_digit_choice(event):
+            return
+
         # 1. 交互待决 / 会话选择面板展示中：让面板自己处理（它们各有 escape 绑定，
         #    上下键与回车由获得焦点的 OptionList 原生消化），不在此拦截
         if self._pending_interaction is not None or self._session_panel_active:
@@ -777,8 +1339,11 @@ class RhineApp(App):
                 # 否则用户以为已经停了，而后台还在烧 token、还在往项目里写。
                 remaining = self._manager.request_cancel()
                 if remaining:
-                    self.show_message(
-                        f"已请求取消当前回合。⚠ 仍有 {remaining} 个子 Agent 在后台运行"
+                    # 警告级：后台还在烧 token、非隔离的那些还在往主项目根写。
+                    # 这是四级里最需要脱离颜色也认得出的一条，故走文字前缀通道。
+                    # 句中的 `⚠` 去掉——widget 已在行首加「警告：」（F21/F28）。
+                    self.show_warning(
+                        f"已请求取消当前回合。仍有 {remaining} 个子 Agent 在后台运行"
                         f"——Esc 只停主对话，不会停它们。"
                         f"要一并停止请用 /agents cancel all。"
                     )
@@ -983,7 +1548,7 @@ class RhineApp(App):
         本方法运行在独立线程，所有 UI 操作通过 call_from_thread() 调度到主线程。
 
         渲染策略：
-        - PROGRESS：进入新一轮——重置正文/思考占位组件，使新一轮文本另起新块；第 2 轮起追加一行提示
+        - PROGRESS：进入新一轮——重置正文/思考占位组件，使新一轮文本另起新块
         - THINKING / TEXT：增量更新对应占位组件（思考灰色斜体、正文 Markdown）
         - TOOL_PENDING：模型刚开始生成该调用的参数（可能持续几十秒）——立刻建一行
           橘色「参数生成中… Ns」，这是那段时间里界面上唯一的活体信号
@@ -1059,12 +1624,19 @@ class RhineApp(App):
                     )
 
                 if etype == AgentEventType.PROGRESS:
+                    # ⚠ `reset_text_widgets()` **必须保留**：它负责让新一轮的正文
+                    # 另起一块。删掉会让相邻两轮的正文粘在一起，看起来像一段话。
+                    #
+                    # 这里原本还追加一行「🔄 第 N 轮」（tui-display 扩展 F42 已删除）。
+                    # 那是 Agent Loop 的**内部结构**，对用户没有任何可操作信息，
+                    # 而一次十几轮的运行会因此多出十几行，把真正有内容的工具行挤下去。
+                    # Claude Code 没有对应物。「循环仍在推进」这件事由工具行本身
+                    # 与子 Agent 活动区表达，都比一个轮次序号具体。
+                    #
+                    # 删之前查过 trace 与 e2e 判据有无依赖它产出的那条 `ui_message`
+                    # （task.md 的 T1）：结论是**无依赖**——全部「第 N 轮」字样要么是
+                    # 注释，要么是测试自造的剧本文本或 JSONL 夹具。
                     reset_text_widgets()
-                    # 第 2 轮起显示一行进度提示，标示循环在自主推进
-                    if event.iteration >= 2:
-                        line = f"🔄 第 {event.iteration} 轮"
-                        self._trace_ui_message("system", line)
-                        self.call_from_thread(history_view.append_system, line)
 
                 elif etype == AgentEventType.THINKING:
                     if thinking_widget is None:
@@ -1073,7 +1645,7 @@ class RhineApp(App):
                     self.call_from_thread(
                         history_view.update_widget,
                         thinking_widget,
-                        f"[dim italic]💭 {escape(''.join(thinking_chunks))}[/dim italic]",
+                        f"[dim italic]{THINKING_MARK} {escape(''.join(thinking_chunks))}[/dim italic]",
                     )
 
                 elif etype == AgentEventType.TEXT:
@@ -1131,19 +1703,27 @@ class RhineApp(App):
                     )
 
                 elif etype == AgentEventType.FINISHED:
-                    line = self._finish_line(event.stop_reason, event.message)
+                    level, line = self._finish_line(event.stop_reason, event.message)
                     if line:
                         self._trace_ui_message("system", line)
-                        self.call_from_thread(history_view.append_system, line)
+                        self.call_from_thread(
+                            self._history_channel(history_view, level), line
+                        )
 
                 elif etype == AgentEventType.ERROR:
                     self._trace_ui_message("error", event.message)
                     self.call_from_thread(history_view.append_error, event.message)
 
                 elif etype == AgentEventType.NOTICE:
-                    # 系统级提示（c8：上下文压缩发生等），以系统行展示，不影响正文/工具渲染。
+                    # 系统级提示，按**事件自带的档位**分发（tui-display 扩展 F19/F22）。
+                    #
+                    # 档位由产出方声明（见 `AgentEvent.level`）：上下文压缩这类
+                    # 走提示级，子 Agent 结论送达这类走事件级。界面无法从文本
+                    # 本身判断哪条要紧——两者都只是一句陈述句。
                     self._trace_ui_message("system", event.message)
-                    self.call_from_thread(history_view.append_system, event.message)
+                    self.call_from_thread(
+                        self._history_channel(history_view, event.level), event.message
+                    )
 
                 elif etype == AgentEventType.HISTORY:
                     # 会话恢复成功（c9 /resume 交互化）：清屏并整体回放历史快照。
@@ -1152,6 +1732,12 @@ class RhineApp(App):
                     reset_text_widgets()
                     tool_widgets.clear()
                     self.call_from_thread(history_view.render_history, event.messages)
+                    # 活动区同样属于「上一段对话的状态」（tui-display 扩展 F8）。
+                    # `/resume` 与 `/clear` 是同一类切换：`cancel_all_for_session_switch`
+                    # 会取消在跑的子 Agent 并开新会话代，那些行不该跨到新对话里。
+                    self.call_from_thread(
+                        self.query_one(ActivityView).update_rows, ()
+                    )
         finally:
             # **作用域泄漏的唯一可靠防护**，必须是 finally 的第一行（trace T42）。
             #
@@ -1239,47 +1825,71 @@ class RhineApp(App):
         tool_widgets.clear()
 
     @staticmethod
-    def _finish_line(stop_reason, message: str) -> str:
+    def _finish_line(stop_reason, message: str) -> "tuple[str, str]":
         """
         把循环结束原因转成一行系统提示（自然完成返回空串，不打扰用户）。
 
         :param stop_reason: StopReason
         :param message: 循环附带的补充说明（如有则优先使用）
-        :returns: 要展示的系统行；空串表示不展示
+        :returns: `(级别, 文本)`；文本为空串表示不展示
+
+        ## 为什么级别在这里定，而不是让调用方猜（tui-display 扩展 F20）
+
+        六种结束原因分成两档，判据是「用户看到之后要不要做点什么」：
+
+        - **事件级**——「已取消」「计划未执行」是**用户自己刚做的决定**的回执，
+          他知道发生了什么，不需要被醒目提示；
+        - **警告级**——迭代上限、未知工具、流错误都是**任务没做完就停了**，
+          用户多半要重试或改写请求。漏看这三条会让人以为任务成功了。
+
+        改造前六种全走同一条 `[dim]` 通道，最要紧的三条与最平常的三条长得
+        一模一样。emoji（`⏹` `⚠`）一并去掉：警告级由 widget 统一加「警告：」
+        文字前缀（F21/F28），留着会变成「警告：⚠ …」。
         """
         if stop_reason == StopReason.COMPLETED:
-            return ""
+            return LEVEL_NOTICE, ""
         if stop_reason == StopReason.USER_CANCELLED:
-            return "⏹ 已取消"
+            return LEVEL_EVENT, "已取消"
         if stop_reason == StopReason.PLAN_REJECTED:
-            return "⏹ 计划未执行"
+            return LEVEL_EVENT, "计划未执行"
         if stop_reason == StopReason.MAX_ITERATIONS:
-            return "⚠ " + (message or "已达迭代上限，自动停止")
+            return LEVEL_WARNING, message or "已达迭代上限，自动停止"
         if stop_reason == StopReason.UNKNOWN_TOOL:
-            return "⚠ " + (message or "连续调用未知工具，已停止")
+            return LEVEL_WARNING, message or "连续调用未知工具，已停止"
         if stop_reason == StopReason.STREAM_ERROR:
-            return "⏹ 因流错误已停止"
-        return ""
+            return LEVEL_WARNING, "因流错误已停止"
+        return LEVEL_NOTICE, ""
 
     @staticmethod
     def _summarize_result(res) -> str:
         """
-        把工具结果压缩为单行摘要，用于工具行的终态展示。
+        取工具结果在工具行上要展示的文本。
 
-        优先使用工具自带的 summary；否则回退到取 output 首个非空行并截断。
+        优先使用工具自带的 `summary`（那是工具作者亲手写的一句话概括，
+        比机器截出来的首行准确得多）；没有时回退到 `output` **全文**。
+
+        ## 为什么不再截断（tui-display 扩展 F41）
+
+        改造前这里取首个非空行、截到 80 字符。于是一次 `grep` 命中 23 处，
+        用户只看得到第一处，**而且没有任何迹象表明还有别的**——既不知道被省了
+        什么，也没法展开。
+
+        现在把「省略」整个交给展示层：`ToolCallWidget` 收全文、按
+        `BRANCH_LINE_LIMIT` 折叠、并在末行如实写出「… +N 行（Ctrl+O 展开）」。
+        职责因此清楚了一层——**这里负责取内容，那里负责决定画多少**。
+
+        ⚠ 不截断**不等于**无界（N5）：组件那边有行数上限，且 `output` 本身在
+        工具侧已受各自的上限约束（如 `run_command` 的前 30 + 后 10 行）。
 
         :param res: tools.base.ToolResult
-        :returns: 单行摘要
+        :returns: 展示文本，可能是多行
         """
         if getattr(res, "summary", ""):
             return res.summary
         text = (res.output or "").strip()
         if not text:
             return "（无输出）" if res.ok else "（无错误信息）"
-        first_line = text.splitlines()[0]
-        if len(first_line) > 80:
-            first_line = first_line[:80] + "…"
-        return first_line
+        return text
 
     # ------------------------------------------------------------------ #
     # 三类用户交互回调（均在 Worker 线程被调用，阻塞等待主线程选择）
@@ -1396,10 +2006,12 @@ class RhineApp(App):
         self.query_one(CommandPanel).hide()
         panel = self.query_one(ConfirmPanel)
         # 计划全文可能很长，已作为聊天记录中的普通助手消息展示；这里仅询问是否进入执行阶段。
+        # 三个 emoji 全部去掉（F28）：橘色分隔线已经表达「这是要你决定的事」，
+        # 两个选项的语义由序号 + 动词承担（面板自己加序号，见 NumberedPanel）。
         panel.show_prompt(
-            "📋 计划已就绪，是否开始执行？",
-            "✅ 开始执行  [dim]写文件/改文件/运行命令仍会逐个确认[/dim]",
-            "❌ 暂不执行  [dim]停止本次执行[/dim]",
+            "计划已就绪，是否开始执行？",
+            "开始执行  [dim]写文件/改文件/运行命令仍会逐个确认[/dim]",
+            "暂不执行  [dim]停止本次执行[/dim]",
         )
         panel.focus()
 

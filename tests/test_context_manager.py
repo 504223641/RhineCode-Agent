@@ -210,10 +210,12 @@ class StatusLineTest(unittest.TestCase):
         for _ in range(MAX_SUMMARY_FAILURES):
             cm._do_summary(_big_history())
         self.assertTrue(cm._circuit_broken)
-        # 即便窗口极大（用量占比很低），熔断本身也应高亮并带 ⚠
+        # 即便窗口极大（用量占比很低），熔断本身也应高亮并带上标记。
+        # ⚠ 标记由 `⚠` 改成文字「已熔断」（tui-display 扩展 F28/F30）：
+        # 状态栏是单色单行，一个符号说不清「熔断」是什么意思。
         text, warn = cm.status_line([Message(role="user", content="hi")])
         self.assertTrue(warn)
-        self.assertIn("⚠", text)
+        self.assertIn("已熔断", text)
 
 
 if __name__ == "__main__":

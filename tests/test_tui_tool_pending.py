@@ -40,6 +40,7 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 
 from textual.app import App, ComposeResult
@@ -378,6 +379,11 @@ class PendingWidgetTest(unittest.IsolatedAsyncioTestCase):
         否则最终定色显示的 "(Ns)" 会把「模型生成参数」乃至「用户盯着确认面板发呆」
         的时间一并算进去——一次 2 毫秒的写盘可能显示成 "(600s)"，而那个数字的语义
         一直是工具执行耗时。
+
+        ⚠ **判据形态在 tui-display 扩展 F13 之后变了，意图没变。** 那一版起
+        「终态耗时不足一秒就整个不写括号」，所以这里的正向判据由「显示 (0s)」
+        改成「一个耗时括号都不出现」——两者说的是同一件事：那 600 秒没有被
+        算进执行耗时。反证（`assertNotIn("600")`）原样保留，它才是这条的分辨力所在。
         """
         tc = ToolCall(id="c1", name="write_file", arguments={"path": "a.txt"})
         app = _Harness()
@@ -397,8 +403,11 @@ class PendingWidgetTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             text = _text_of(widget)
-            self.assertIn("(0s)", text)
             self.assertNotIn("600", text)
+            self.assertIsNone(
+                re.search(r"\(\d+s\)", text),
+                f"耗时不足一秒的终态不该出现任何耗时括号，实际：{text!r}",
+            )
 
     async def test_finish_while_pending_omits_empty_parens(self) -> None:
         """

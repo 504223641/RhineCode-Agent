@@ -11,7 +11,7 @@ Trace 层最底层：事件类型枚举、作用域常量、截断与脱敏纯�
   类似飞机的黑匣子。它与 c9 的「会话存档」不同——存档记的是「给模型看的对话历史」，
   trace 记的是「程序内部实际做了什么」（发了什么请求、权限怎么判的、工具跑了多久）。
 - **作用域（scope）**：一条事件属于哪一条对话。同一个进程里同时存在多条对话
-  （主对话、Skill 独立模式子对话、上下文摘要、自动笔记），不区分的话时间线会串味。
+  （主对话、Skill 独立模式子对话、上下文摘要、自动记忆），不区分的话时间线会串味。
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class TraceEventType(str, Enum):
 # - SCOPE_SUMMARY：c8 第二层的 LLM 摘要调用。它与主对话**共用同一个 Provider 实例**，
 #   若不区分，摘要请求会被算进主对话的轮次计数，读 trace 时会看到「用户只说了一句话，
 #   却发了两轮请求」的假象。
-# - SCOPE_NOTES：c9 的自动笔记调用。同样共用 Provider 实例，而且它跑在**独立的
+# - SCOPE_MEMORY：c9 的自动记忆调用。同样共用 Provider 实例，而且它跑在**独立的
 #   daemon 线程**上，可能与用户的下一条消息并发——不区分就会两条对话的事件交错。
 # - SCOPE_WEB_EXTRACT：web_fetch 扩展的抽取调用（把抓回的正文按提问压成答案）。
 #   同样共用 Provider 实例。不区分的话，一次抓取会在时间线上显示成「模型自己多发了
@@ -92,7 +92,7 @@ class TraceEventType(str, Enum):
 # 能不加就不加。
 SCOPE_MAIN = "main"
 SCOPE_SUMMARY = "summary"
-SCOPE_NOTES = "notes"
+SCOPE_MEMORY = "memory"
 SCOPE_WEB_EXTRACT = "web_extract"
 
 
@@ -249,6 +249,10 @@ def agent_event_payload(event: Any) -> dict:
     text = getattr(event, "text", None)
     iteration = getattr(event, "iteration", None)
     message = getattr(event, "message", None)
+    # tui-display 扩展 F19：NOTICE 的展示档位。缺省的 `"notice"` 不写进负载
+    # （下面的稀疏过滤会滤掉），只有被明确抬到 `"event"` 时才留下一条痕迹
+    # ——记录里因此能看出「这条提示当时是按要紧的那档显示的」。
+    level = getattr(event, "level", None)
 
     payload = {
         "event_type": event_type,
@@ -261,6 +265,7 @@ def agent_event_payload(event: Any) -> dict:
         "result_ok": getattr(tool_result, "ok", None),
         # 只记长度，不记正文——正文由 api_response 承载
         "text_length": len(text) if text else None,
+        "level": level if level and level != "notice" else None,
     }
     return {k: v for k, v in payload.items() if v is not None}
 
@@ -288,7 +293,7 @@ __all__ = [
     "TraceEventType",
     "SCOPE_MAIN",
     "SCOPE_SUMMARY",
-    "SCOPE_NOTES",
+    "SCOPE_MEMORY",
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
     "subagent_scope",

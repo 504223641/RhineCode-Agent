@@ -133,7 +133,7 @@ class IsolatedTestBase(unittest.TestCase):
         sm.startup()
         mgr = ConversationManager(provider, _config(), registry, skill_manager=sm)
         mgr.approve_plan_callback = lambda _p: True
-        # 默认关掉 c9 的自动笔记钩子：它在自然停止时起一个 daemon 线程，
+        # 默认关掉 c9 的自动记忆钩子：它在自然停止时起一个 daemon 线程，
         # 用**同一个**假 Provider 再发一次 tools=None 的请求。那条请求会混进
         # provider.calls，让「断言每轮请求都带工具」之类的用例随线程调度时快时慢
         # 地失败（单跑绿、全量跑红）。需要验证钩子的用例自己覆盖回去。
@@ -433,7 +433,7 @@ class SubAgentDrivingTest(IsolatedTestBase):
         self.assertIsNot(a, c)
 
     def test_natural_stop_triggers_memory_hook(self) -> None:
-        """事件流经 _wrap_events → 自然完成时触发 c9 笔记钩子（F21）。"""
+        """事件流经 _wrap_events → 自然完成时触发 c9 记忆钩子（F21）。"""
         hits = []
         mgr = self._manager()
         mgr.memory_manager.on_natural_stop = lambda h: hits.append(len(h))

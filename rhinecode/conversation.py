@@ -34,6 +34,7 @@ from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
+from rhinecode.tools.display import primary_arg_map
 from rhinecode.tools.registry import ToolRegistry
 # c14：协调层定位存盘/存档/角色目录与环境信息，一律是主项目根——
 # 主对话的工作目录是不变量（spec F4），隔离只发生在子 Agent 那一侧。
@@ -215,7 +216,7 @@ class ConversationManager:
                          逐字一致。改成必选会把回归面从零推到五个测试文件
                          （`test_review_fixes` / `test_resume_replay` / `test_skill_isolated` /
                          `test_skill_sandbox` / `test_memory_*` 都直接构造本类且都不传它）。
-                         给定时，用户级项目指令 / 笔记索引 / Skill 目录 / 权限规则四类内容
+                         给定时，用户级项目指令 / 记忆索引 / Skill 目录 / 权限规则四类内容
                          一并改从该目录读取，使装配层能在临时目录里跑一次完整装配而不读
                          真实主目录（trace spec F23）。
         :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`——
@@ -300,7 +301,7 @@ class ConversationManager:
             )
 
         # 记忆系统编排者（c9）：所有 Provider 都构造——RHINE.md 注入与会话存档不依赖
-        # 工具能力；自动笔记由 notes_enabled 门控（仅工具模式，F21）。
+        # 工具能力；自动记忆由 memories_enabled 门控（仅工具模式，F21）。
         # user_dir 已在构造函数开头解析成 self._user_dir（权限层要先用），此处直接复用
         user_dir = self._user_dir
         self.memory_manager = MemoryManager(
@@ -308,10 +309,10 @@ class ConversationManager:
             config.model,
             main_project_root(),
             user_dir,
-            notes_enabled=self._tools_enabled,
+            memories_enabled=self._tools_enabled,
             recorder=self._recorder,
         )
-        # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级笔记全文。
+        # 用户级记忆目录加入只读白名单（F18）：模型可按索引 read_file 用户级记忆全文。
         # 注册本身无副作用（写类判定不受影响），无条件执行即可。
         register_read_root(user_dir / "memory")
 
@@ -503,7 +504,7 @@ class ConversationManager:
         同时重置上下文压缩器的会话级状态（估算锚点、熔断计数、已存盘幂等集合，c8 F15）——
         历史清空后旧锚点与熔断态都不再适用，必须一并归零。
         c9：会话存档随之「开新档」——旧存档保留不动、后续消息写入新文件（F8），
-        笔记高水位一并归零。
+        记忆高水位一并归零。
         c11：已激活的 Skill 一并卸载（F11）——激活态属于「当前这段对话」，
         历史都清空了，还留着 SOP 注入与工具集收窄会让下一句话的行为莫名其妙。
 
@@ -702,6 +703,7 @@ class ConversationManager:
         副作用：可能发起摘要 LLM 调用并原地重构 self.history。
         """
         notice = self._context_manager.manual_compact(self.history)
+        # 提示级：用户自己敲的 /compact，这只是回执（tui-display 扩展 F19）
         yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
         yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
 
@@ -747,6 +749,8 @@ class ConversationManager:
                 yield AgentEvent(
                     type=AgentEventType.NOTICE,
                     message=f"已取消 {cancelled} 个为上一个会话发起的子 Agent。",
+                    # 事件级：用户敲的是 /resume，未必预料到还会取消掉几个子 Agent
+                    level="event",
                 )
             # c15 F25：协作状态同理——花名册、共享清单、未读消息都属于会话 A。
             # ⚠ 必须排在取消**之后**：清空会唤醒待命队员让它们的线程退出，
@@ -770,8 +774,10 @@ class ConversationManager:
         if ok and self._context_manager is not None:
             self._context_manager.reset()
             for notice in self._context_manager.before_request(self.history):
+                # 提示级：上下文压缩是后台常规动作
                 yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
-        yield AgentEvent(type=AgentEventType.NOTICE, message=message)
+        # 事件级：会话恢复成功 —— 界面刚整个换了一段历史，这是本次操作的结论
+        yield AgentEvent(type=AgentEventType.NOTICE, message=message, level="event")
         yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED)
 
     def mcp_status_line(self) -> "str | None":
@@ -818,6 +824,25 @@ class ConversationManager:
         """`/skills prompt` 的只读注入内容报告。"""
         registered = self._registry.names() if self._registry else frozenset()
         return self.skill_manager.prompt_report(registered)
+
+    def primary_arg_map(self) -> dict:
+        """
+        导出「工具名 → 主参数键名」映射，供工具行决定括号里显示什么
+        （tui-display 扩展 F12）。
+
+        :returns: `{工具名: 主参数键名}`；只收**声明过**的工具。
+            未启用工具能力（非 DeepSeek Provider）时返回空字典——展示层据此
+            全部走键值对摘要兜底，形态与改造前逐字一致
+
+        由 `RhineApp.on_mount` **只调一次**：工具集在启动装配完成之后不再变化
+        （MCP 运行期重载只增删远端工具，而远端工具一律没有 `primary_arg`）。
+
+        为什么走协调层而不是让 TUI 直接摸 `ToolRegistry`：依赖方向是
+        TUI → conversation → tools，反过来会让展示层认识工具注册中心。
+
+        副作用：无（只读快照）。
+        """
+        return primary_arg_map(self._registry)
 
     def skill_status_segment(self) -> Optional[str]:
         """状态栏的 Skill 段（形如 `Skill:2`）；无激活时 None，状态栏随之隐藏该段。"""
@@ -928,7 +953,7 @@ class ConversationManager:
     def _prepend_notice(
         message: str, events: Iterator[AgentEvent]
     ) -> Iterator[AgentEvent]:
-        """在一个事件流最前面插一条 NOTICE，其余原样透传。"""
+        """在一个事件流最前面插一条 NOTICE，其余原样透传（提示级）。"""
         yield AgentEvent(type=AgentEventType.NOTICE, message=message)
         yield from events
 
@@ -1225,6 +1250,26 @@ class ConversationManager:
             return ()
         return self.subagent_service.tasks.drain_notifications()
 
+    def subagent_activity(self) -> tuple:
+        """
+        取活动区要画的那几行（tui-display 扩展 F1/F4）。
+
+        :returns: `ActivityRow` 元组；服务未启用时为**空元组**——界面据此把整块
+            隐藏且不占布局空间，于是不使用子 Agent 的用户界面表现与改造前
+            逐字一致（F9 零回归）
+
+        由 TUI 在**主线程**调用，与 `drain_subagent_notifications` 同一个
+        0.5 秒节拍（F4 明确要求**不新增定时器**：空闲会话的开销必须与改造前
+        一致）。**只读，不取走任何东西**——与上面那条「取走即置位」的消费线
+        刻意不同，活动区每一轮都要重新看到同样的行。
+
+        ⚠ **不新增任何从子 Agent 线程到界面的推送通道**（N1）。本项目已因
+        「加锁临界区内做跨线程调度」死锁四次，轮询从结构上消掉这一整类问题。
+        """
+        if self.subagent_service is None:
+            return ()
+        return self.subagent_service.tasks.activity_rows()
+
     def _run_forked_skill(
         self, spec: SkillSpec, arguments: str, display: str, record: bool = True
     ) -> Iterator[AgentEvent]:
@@ -1399,9 +1444,11 @@ class ConversationManager:
         # 第 6 步拦下了全部 FINISHED，而 TUI 对 COMPLETED 的收尾行**不渲染任何东西**。
         # 不补这条，用户按 Esc 取消后界面会完全没有反应，像是卡住了。
         if failed:
-            yield AgentEvent(type=AgentEventType.NOTICE, message=conclusion)
+            # 事件级：这是用户按 Esc / 计划被拒之后界面上**唯一**的反应，
+            # 走 dim 通道会让它淹在别的提示里，看起来仍像卡住了
+            yield AgentEvent(type=AgentEventType.NOTICE, message=conclusion, level="event")
 
-        # ── 10. 自然完成收尾：让 _wrap_events 触发 c9 的笔记钩子（F21）──
+        # ── 10. 自然完成收尾：让 _wrap_events 触发 c9 的记忆钩子（F21）──
         yield AgentEvent(
             type=AgentEventType.FINISHED, stop_reason=StopReason.COMPLETED
         )
@@ -1566,7 +1613,7 @@ class ConversationManager:
         project_root = str(main_project_root())
         env = collect_environment(self._config, project_root)
         # c9：把 RHINE.md 拼接结果与记忆索引填进 110/130 槽位（两者都可能为空串，
-        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，笔记线程会话中途
+        # 为空时槽位整体跳过，输出与 c8 一致）。索引现读现截断，记忆线程会话中途
         # 更新后，下一条消息就能看到新索引。
         # c11：第一阶段 Skill 清单填进 140 稳定槽位（进前缀缓存）；
         # 已激活正文不在这里填——它必须每轮重算，走下面 dynamic_provider 的动态通道。
@@ -1838,8 +1885,8 @@ class ConversationManager:
         ## 自然停止钩子（c9）
 
         看到 FINISHED 且停止原因为 COMPLETED（自然完成）时，先触发 MemoryManager
-        的异步笔记更新再透传——钩子只是「起一个 daemon 线程」，本身不阻塞事件流。
-        其它停止原因（取消/出错/迭代上限）不触发笔记：非自然结束的对话大概率
+        的异步记忆更新再透传——钩子只是「起一个 daemon 线程」，本身不阻塞事件流。
+        其它停止原因（取消/出错/迭代上限）不触发记忆：非自然结束的对话大概率
         不完整，不值得沉淀。
         """
         # **只记录起点、不在这里授予**（F12）。授予发生在 Skill 被**触发**的那一刻

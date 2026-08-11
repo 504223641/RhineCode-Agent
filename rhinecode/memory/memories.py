@@ -1,7 +1,7 @@
 """
-笔记与索引的纯逻辑（c9 F14/F16）：格式转换，零 IO 决策。
+记忆与索引的纯逻辑（c9 F14/F16）：格式转换，零 IO 决策。
 
-一条笔记 = 一个带 frontmatter 的 Markdown 文件：
+一条记忆 = 一个带 frontmatter 的 Markdown 文件：
 
     ---
     name: prefer-chinese-comments
@@ -15,15 +15,15 @@
 - frontmatter 用手写的宽松解析而非引入 YAML 库解析——字段只有三个扁平的
   `key: value`，宽松逐行解析足够，且**未知字段忽略**（spec N5 向前兼容：
   旧版本能读新版本写的文件）比严格 schema 更重要。
-- 索引文件是「每条笔记占一行」的 Markdown 列表，重建式生成（扫目录 → 全量渲染），
-  不做增量编辑——重建幂等、天然自愈（手工删了笔记文件，下次重建索引自动同步）。
+- 索引文件是「每条记忆占一行」的 Markdown 列表，重建式生成（扫目录 → 全量渲染），
+  不做增量编辑——重建幂等、天然自愈（手工删了记忆文件，下次重建索引自动同步）。
 - 200 行 / 25KB 截断（spec F16）只发生在**注入**时，索引文件本身保持完整。
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
-# 四类笔记（spec F14）：用户偏好 / 纠正反馈 / 项目知识 / 参考资料。
+# 四类记忆（spec F14）：用户偏好 / 纠正反馈 / 项目知识 / 参考资料。
 CATEGORIES = ("preference", "feedback", "project", "reference")
 
 # 分类的中文标签（/memory 报告与索引展示用）。
@@ -40,12 +40,12 @@ INDEX_MAX_BYTES = 25 * 1024
 
 
 @dataclass
-class Note:
+class Memory:
     """
-    一条笔记的内存形态。
+    一条记忆的内存形态。
 
-    :param filename: 笔记文件名（如 prefer-chinese-comments.md），不含目录
-    :param name: 笔记标识（frontmatter 的 name）
+    :param filename: 记忆文件名（如 prefer-chinese-comments.md），不含目录
+    :param name: 记忆标识（frontmatter 的 name）
     :param summary: 一行摘要（索引里的钩子，供模型判断要不要读全文）
     :param category: 四类之一（CATEGORIES）
     :param body: 正文（frontmatter 之后的内容）
@@ -58,9 +58,9 @@ class Note:
     body: str = ""
 
 
-def parse_note(text: str, filename: str = "") -> Optional[Note]:
+def parse_memory(text: str, filename: str = "") -> Optional[Memory]:
     """
-    宽松解析一个笔记文件的文本。
+    宽松解析一个记忆文件的文本。
 
     执行流程：
     1. 找 frontmatter：首个非空行必须是 `---`，到下一个 `---` 为止；
@@ -69,7 +69,7 @@ def parse_note(text: str, filename: str = "") -> Optional[Note]:
     4. 其余内容为正文。
 
     :param text: 文件全文
-    :param filename: 文件名（回填到 Note.filename，便于索引渲染）
+    :param filename: 文件名（回填到 Memory.filename，便于索引渲染）
     :returns: Note；格式坏 / 缺必填字段 / 非法分类 → None（调用方跳过该文件）
 
     副作用：无。
@@ -103,29 +103,29 @@ def parse_note(text: str, filename: str = "") -> Optional[Note]:
         return None
 
     body = "\n".join(lines[end + 1:]).strip()
-    return Note(filename=filename, name=name, summary=summary, category=category, body=body)
+    return Memory(filename=filename, name=name, summary=summary, category=category, body=body)
 
 
-def render_note(note: Note) -> str:
+def render_memory(memory: Memory) -> str:
     """
-    把 Note 渲染为磁盘文本（与 parse_note 往返一致）。
+    把 Memory 渲染为磁盘文本（与 parse_memory 往返一致）。
 
     副作用：无。
     """
     return (
         "---\n"
-        f"name: {note.name}\n"
-        f"summary: {note.summary}\n"
-        f"category: {note.category}\n"
+        f"name: {memory.name}\n"
+        f"summary: {memory.summary}\n"
+        f"category: {memory.category}\n"
         "---\n"
         "\n"
-        f"{note.body.strip()}\n"
+        f"{memory.body.strip()}\n"
     )
 
 
-def rebuild_index(notes: list[Note]) -> str:
+def rebuild_index(memories: list[Memory]) -> str:
     """
-    由笔记列表全量重建索引文本：首行标题 + 每条一行。
+    由记忆列表全量重建索引文本：首行标题 + 每条一行。
 
     行格式：`- {name}（{filename}）[分类] — {summary}`——name 是标识、filename 是
     模型按需读全文的路径线索、summary 是判断相关性的钩子（spec F16）。
@@ -133,7 +133,7 @@ def rebuild_index(notes: list[Note]) -> str:
     副作用：无。
     """
     lines = ["# 记忆索引", ""]
-    for n in notes:
+    for n in memories:
         label = CATEGORY_LABELS.get(n.category, n.category)
         lines.append(f"- {n.name}（{n.filename}）[{label}] — {n.summary}")
     return "\n".join(lines) + "\n"

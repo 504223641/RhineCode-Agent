@@ -60,6 +60,9 @@ from rhinecode.subagents.report import render_report
 from rhinecode.subagents.runner import ParentSnapshot, SubAgentRuntime
 from rhinecode.subagents.service import DelegateOutcome, SubAgentService
 from rhinecode.subagents.tasks import (
+    ACTIVITY_LINGER_SECONDS,
+    ACTIVITY_RECENT_LIMIT,
+    ActivityRow,
     BRANCH_AGENT_NAME,
     KIND_BRANCH,
     KIND_ROLE,
@@ -77,6 +80,9 @@ __all__ = [
     "AgentSource",
     "AgentLoadError",
     "ShadowedAgent",
+    "ActivityRow",
+    "ACTIVITY_RECENT_LIMIT",
+    "ACTIVITY_LINGER_SECONDS",
     "TaskRecord",
     "TaskStatus",
     "TaskManager",

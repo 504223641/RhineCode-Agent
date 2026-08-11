@@ -86,7 +86,7 @@ def _agent_block(
             "（每次委派在独立的 Git 工作目录中运行，成果经分支交付）"
         )
     for warning in spec.warnings:
-        lines.append(f"    ⚠ {warning}")
+        lines.append(f"    警告：{warning}")
     return lines
 
 

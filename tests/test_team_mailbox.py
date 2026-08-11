@@ -46,7 +46,7 @@ class SendTest(unittest.TestCase):
         self.assertFalse(self.mailbox.send("worker-a", "worker-b", "   ").ok)
 
     def test_sending_to_self_rejected(self) -> None:
-        """通常是模型把「记笔记」误当成「发消息」，所以文案要指路去任务清单。"""
+        """通常是模型把「给自己留个记录」误当成「发消息」，所以文案要指路去任务清单。"""
         result = self.mailbox.send("worker-a", "worker-a", "备忘")
         self.assertFalse(result.ok)
         self.assertIn("任务清单", result.reason)

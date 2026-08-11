@@ -16,7 +16,7 @@ Trace 层：跨阶段的行为记录设施（**测试设施，不是产品功能
 from rhinecode.trace.models import (
     REDACTED,
     SCOPE_MAIN,
-    SCOPE_NOTES,
+    SCOPE_MEMORY,
     SCOPE_WEB_EXTRACT,
     SCOPE_SUMMARY,
     TraceEventType,
@@ -38,7 +38,7 @@ __all__ = [
     "TraceEventType",
     "SCOPE_MAIN",
     "SCOPE_SUMMARY",
-    "SCOPE_NOTES",
+    "SCOPE_MEMORY",
     "SCOPE_WEB_EXTRACT",
     "isolated_scope",
     "subagent_scope",

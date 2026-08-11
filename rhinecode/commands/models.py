@@ -202,6 +202,32 @@ class CommandController(Protocol):
         """显示本地命令结果或错误提示（系统行）。"""
         ...
 
+    def show_event(self, text: str) -> None:
+        """
+        显示一条**事件级**系统行（tui-display 扩展 F19）。
+
+        与 `show_message` 只差亮度：那条是「可忽略的提示」，这条是「真的发生了
+        一件事」。四级里另外两级各有独立通道（`show_warning` / 错误行），
+        故本协议只需补这一个。
+        """
+        ...
+
+    def show_report(self, text: str) -> None:
+        """
+        显示一段**多行报告**（`/agents` `/skills` `/hooks` 等的产出）。
+
+        与 `show_message` 的差别只在**呈现**：那条把整段包进一个暗色块，
+        于是段落标题、条目、次级信息在视觉上完全等价——一份 `/agents` 报告
+        读起来是一堵均匀的暗色墙。本通道按行判定层级后分级渲染
+        （tui-display 扩展 F15/F16）。
+
+        ⚠ **各报告的文本产出函数一字不改**：分级完全在展示层靠「行的形状」
+        推断。那些产出函数是纯函数，且有大量逐字断言的护栏钉着。
+
+        单行的普通提示继续走 `show_message`，不要改到这条来。
+        """
+        ...
+
     def send_user_message(
         self,
         content: str,

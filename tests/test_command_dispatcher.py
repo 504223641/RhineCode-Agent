@@ -33,6 +33,19 @@ class FakeController:
     def show_message(self, text: str) -> None:
         self.calls.append(("show_message", text))
 
+    def show_event(self, text: str) -> None:
+        self.calls.append(("show_event", text))
+
+    def show_report(self, text: str) -> None:
+        """
+        报告专用通道（tui-display 扩展 F15）。
+
+        ⚠ 记成**另一个动作名**而不是并进 `show_message`：C 组的全部价值就在于
+        「报告与普通提示各行其道」，桩件把两者合成一个的话，把某条报告误改回
+        `show_message`（或反过来）在测试上完全看不出来。
+        """
+        self.calls.append(("show_report", text))
+
     def send_user_message(self, content: str, display_content=None) -> None:
         self.calls.append(("send_user_message", content, display_content))
 

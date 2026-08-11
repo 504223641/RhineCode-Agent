@@ -193,9 +193,15 @@ class NonUtf8ConsoleTest(ReaderTestBase):
     """
     真实现场重演：Windows 控制台（代码页 GBK）读一份含 emoji 的记录。
 
-    记录里的 `ui_message` 正文天然带 emoji（🔄「第 N 轮」、📦「已存盘」），
-    而整条时间线是**一次性** print 出去的——GBK 编不了其中任何一个字符，
-    就会让**整份记录一行都读不出来**，而不是少显示一个字符。
+    记录里的 `ui_message` 正文可能带 emoji，而整条时间线是**一次性** print
+    出去的——GBK 编不了其中任何一个字符，就会让**整份记录一行都读不出来**，
+    而不是少显示一个字符。
+
+    ⚠ 下面的夹具用的是**改造前**的产品文案（🔄「第 N 轮」、📦「已存盘」）。
+    tui-display 扩展之后界面上不再产出表情符号（F28），但本用例照样有效、
+    也**必须保留**——trace 正文里的 emoji 还可以从别处来（被读过的文件内容、
+    命令输出、用户自己打的字），而那些是记录器管不着的。夹具刻意不跟着改成
+    新文案：这条验的是「编码兜底」，与产品当下发什么字无关。
 
     现场报错（`G:\\Rhine-test\\web-tool-test` 的记录，2026-07-29）：
         UnicodeEncodeError: 'gbk' codec can't encode character '\\U0001f504'
@@ -453,9 +459,9 @@ class WebExtractScopeTest(unittest.TestCase):
         self.assertEqual(SCOPE_WEB_EXTRACT, "web_extract")
 
     def test_distinct_from_other_scopes(self) -> None:
-        from rhinecode.trace import SCOPE_MAIN, SCOPE_NOTES, SCOPE_SUMMARY, SCOPE_WEB_EXTRACT
+        from rhinecode.trace import SCOPE_MAIN, SCOPE_MEMORY, SCOPE_SUMMARY, SCOPE_WEB_EXTRACT
 
-        scopes = {SCOPE_MAIN, SCOPE_SUMMARY, SCOPE_NOTES, SCOPE_WEB_EXTRACT}
+        scopes = {SCOPE_MAIN, SCOPE_SUMMARY, SCOPE_MEMORY, SCOPE_WEB_EXTRACT}
         self.assertEqual(len(scopes), 4, "作用域取值必须互不相同，否则 --scope 过滤会串")
 
 
