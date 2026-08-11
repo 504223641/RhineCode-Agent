@@ -142,6 +142,57 @@ class DeliveryModuleTests(unittest.TestCase):
         self.assertIn("应该可以", text)
 
 
+class HardeningStatementsTests(unittest.TestCase):
+    """
+    prompt-hardening 在四个既有模块里补的关键语句逐条钉住。
+
+    和 DeliveryModuleTests 同一个理由：这些都是「看着像废话、精简时容易被顺手删」
+    的行为约束，删了不报错、测试照绿，只是某个行为悄悄退回默认值。断言用「意思」
+    而非整句原文，避免调措辞就碎测试。
+    """
+
+    def _module(self, priority: int) -> str:
+        from rhinecode.agent.prompt.modules import fixed_modules
+
+        matched = [m for m in fixed_modules() if m.priority == priority]
+        self.assertEqual(len(matched), 1, f"priority={priority} 应恰好一个模块")
+        return matched[0].content
+
+    def test_ask_criterion_is_operable(self) -> None:
+        """任务模式(30)：把「何时问用户」从「无法确定」改成可操作判据。
+
+        判据核心是「不同解读导向实质不同的工作」+ 阻塞式提问只留给「猜错就白做」。
+        """
+        text = self._module(30)
+        self.assertIn("不同的解读", text)
+        self.assertIn("实质不同的", text)
+        self.assertIn("白做", text)  # 阻塞式提问的收窄条件
+
+    def test_correction_has_measure(self) -> None:
+        """语气(60)：纠错分寸——判据是「会不会改变用户的代码/结论/决策」。"""
+        text = self._module(60)
+        self.assertIn("纠错", text)
+        self.assertIn("决策", text)
+        self.assertIn("道歉", text)  # 明确禁止反复道歉/复盘
+
+    def test_context_summary_is_disclosed(self) -> None:
+        """系统约束(20)：告诉模型「历史会被摘要」，别提前收尾。"""
+        text = self._module(20)
+        self.assertIn("摘要", text)
+        self.assertIn("提前收尾", text)
+
+    def test_parallel_tools_is_hard_worded(self) -> None:
+        """工具使用(50)：并行是硬要求（「就…全部发出」），不是软建议（「可…」）。
+
+        并且补了「被拒绝不要绕过重试」这条 Harness 事实。
+        """
+        text = self._module(50)
+        self.assertIn("并行执行", text)
+        self.assertIn("一个个串起来", text)  # 明确反对串行
+        self.assertIn("被拒绝", text)
+        self.assertIn("绕过", text)
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_render_contains_fields(self) -> None:
         """AC2：环境信息 render 含工作目录、平台、日期、Git 分支、模型等字段。"""
