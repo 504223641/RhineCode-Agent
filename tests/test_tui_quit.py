@@ -67,13 +67,13 @@ class SingleCtrlCTest(unittest.IsolatedAsyncioTestCase):
 
         ⚠ 文案必须写明是**退出**——`Esc` 才是取消当前回合，两者不能混淆。
         """
-        from rhinecode.tui.widgets import QUIT_HINT_TEXT, StatusBar
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT, StatusHint
 
         app, _ = _make_app()
         async with app.run_test() as pilot:
             await pilot.press("ctrl+c")
             await pilot.pause()
-            self.assertIn(QUIT_HINT_TEXT, app.query_one(StatusBar).render().markup)
+            self.assertIn(QUIT_HINT_TEXT, app.query_one(StatusHint).render().markup)
 
     async def test_the_hint_stays_out_of_the_chat_area(self) -> None:
         """
@@ -104,9 +104,9 @@ class QuitHintLifetimeTest(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _status_text(app) -> str:
-        from rhinecode.tui.widgets import StatusBar
+        from rhinecode.tui.widgets import StatusHint
 
-        return app.query_one(StatusBar).render().markup
+        return app.query_one(StatusHint).render().markup
 
     async def test_hint_disappears_when_the_window_expires(self) -> None:
         """
@@ -152,44 +152,133 @@ class QuitHintLifetimeTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNot(app._quit_hint_timer, first_timer, "应当换了一个新定时器")
             self.assertIn(QUIT_HINT_TEXT, self._status_text(app))
 
-    def test_the_hint_is_dim_and_leftmost(self) -> None:
+    async def test_the_hint_is_dim(self) -> None:
         """
-        提示是**灰色**、且排在**最左**（对齐 Claude Code）。
+        提示是**灰色**（对齐 Claude Code），刻意不用橘色。
 
-        两条都容易在后续改动里静默漂走，而且都不报错：
-
-        - **灰色**：状态栏其余高亮段用的是橘色（放行档 / 上下文预警），
-          顺手统一过去看着更「一致」，实际是把语义搞混了——橘色的意思是
-          「你没做什么但情况变了」，而这条是用户刚按下一个键的直接回应。
-          醒目的东西越多，醒目就越不值钱；
-        - **最左**：它是瞬时的，接在尾部会被按需出现的 MCP / 上下文 / Skill /
-          子 Agent 各段挤出视线——恰恰在它唯一有用的那两秒里看不见。
+        橘色在本项目里有确定语义——「用户没主动做什么、但情况变了」
+        （放行档 / 上下文预警 / 确认面板），那些要抢注意力。而这条是用户刚按下
+        一个键的直接回应，视线本来就在等它。顺手「统一」成橘色看着更一致，
+        实际是把语义搞混，还会让真正该抢注意力的那三处贬值。
         """
-        from rhinecode.tui.widgets import QUIT_HINT_TEXT, compose_status_text
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT
 
-        markup = compose_status_text("deepseek", "deepseek-chat", "off", quit_hint=True)
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            markup = self._status_text(app)
+            self.assertIn(f"[dim]{QUIT_HINT_TEXT}[/dim]", markup)
+            self.assertNotIn("#FFA500", markup, "刻意不用橘色——那是「需要留意」的专用色")
 
-        self.assertIn(f"[dim]{QUIT_HINT_TEXT}[/dim]", markup)
-        self.assertNotIn("#FFA500", markup, "刻意不用橘色——那是「需要留意」的专用色")
-        self.assertLess(
-            markup.index(QUIT_HINT_TEXT),
-            markup.index("deepseek"),
-            "提示必须排在第一段（provider）之前",
-        )
-
-    def test_no_hint_means_the_bar_is_byte_for_byte_unchanged(self) -> None:
+    async def test_the_hint_hugs_the_left_edge(self) -> None:
         """
-        **反证**：不在有效期内时，状态栏与加这个字段之前逐字一致。
+        **本条是用户那句「贴着状态栏最左边」的判据**。
 
-        没有这条，「提示段永远挂着、只是内容为空」也能让上面那条通过——而那会
-        在每一行状态栏最左边留一个多余的 ` | `，用户天天看得见。
+        ⚠ 它防的不是「排在第一段之前」——早先那版就是那么写的，判据过了而屏幕上
+        并没有贴左：`StatusBar` 整块 `text-align: right`，拼进那串文本的提示只会落在
+        **右对齐块的最左边**，也就是随其余各段的总长度在屏幕中间浮动。
+        所以判据必须落在**布局坐标**上：左区的起点 x 必须是 0，且右区排在它右边。
         """
-        args = ("deepseek", "deepseek-chat", "off")
-        from rhinecode.tui.widgets import QUIT_HINT_TEXT, compose_status_text
+        from rhinecode.tui.widgets import QUIT_HINT_TEXT, StatusBar, StatusHint
 
-        plain = compose_status_text(*args)
-        self.assertEqual(compose_status_text(*args, quit_hint=False), plain)
-        self.assertNotIn(QUIT_HINT_TEXT, plain)
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+
+            hint = app.query_one(StatusHint)
+            bar = app.query_one(StatusBar)
+            self.assertEqual(hint.region.x, 0, "提示必须贴着状态栏左边缘")
+            self.assertGreater(hint.region.width, 0, "有提示时左区不该是零宽")
+            self.assertGreaterEqual(bar.region.x, hint.region.right, "右区应排在左区之后")
+            self.assertNotIn(
+                QUIT_HINT_TEXT,
+                bar.render().markup,
+                "提示不该同时出现在右区那串里",
+            )
+
+            # **合成之后**再验一次：底行第 0 列起就是提示本身。
+            #
+            # 上面那几条看的是「布局把左区摆在了 x=0」，这条看的是「那一格里
+            # 真的画着提示」——两者不等价：给左区来一句 `width: 1fr` 或
+            # `text-align: right`，region.x 照样是 0，字却被推到中间去了，
+            # 而那正是这次要修的形态。
+            bottom = app.screen._compositor.render_strips()[-1].text
+            self.assertTrue(
+                bottom.startswith(QUIT_HINT_TEXT),
+                f"底行应当以提示开头，实际是 {bottom!r}",
+            )
+
+    async def test_no_hint_means_the_left_region_takes_no_space(self) -> None:
+        """
+        **反证**：不在有效期内时左区零宽，右区那串与没有这个功能之前逐字一致。
+
+        没有这条，「左区永远挂着、只是内容为空」也能让上面两条通过——而那会在
+        状态栏左边留一块永久的空白，把右区整体往右挤，用户天天看得见。
+        """
+        from textual.content import Content
+
+        from rhinecode.tui.widgets import StatusBar, StatusHint, compose_status_text
+
+        app, manager = _make_app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one(StatusHint).region.width, 0, "没提示时左区应零宽")
+            # ⚠ 比 `.plain` 而不是 `.markup`：`render()` 会把 markup 重新序列化一遍，
+            # 途中 `\[` 这类转义写法会被归一（`\[DEFAULT]` → `[DEFAULT]`）。
+            # 比 markup 会失败在与判据无关的转义形态上，而用户看到的是 plain。
+            expected = Content.from_markup(
+                compose_status_text(
+                    provider=app._config.protocol,
+                    model=app._config.model,
+                    thinking_effort=manager.thinking_effort,
+                    plan_mode=manager.plan_mode,
+                    permission_mode=manager.permission_mode_value,
+                    mcp_status=manager.mcp_status_line(),
+                    context_status=None,
+                    context_warn=False,
+                    skill_status=manager.skill_status_segment(),
+                    subagent_status=None,
+                )
+            ).plain
+            self.assertEqual(
+                app.query_one(StatusBar).render().plain,
+                expected,
+                "右区那串不该因为这个功能多出任何字符",
+            )
+
+    async def test_the_right_region_does_not_move_when_the_hint_appears(self) -> None:
+        """
+        提示出现与消失时，**右区那串的位置一格都不能动**。
+
+        右区若用 `width: auto`（或让左右两区共同居中之类），提示一挂出来整条
+        状态栏就会横向抖一下——每次误按 `Ctrl+C` 抖一次，而这是纯粹的视觉噪音。
+        `width: 1fr` + 右对齐让右区的右边缘钉死在屏幕右边，与左区无关。
+
+        ⚠ **终端宽度必须给够**（这里 120 列）。窄到装不下「提示 + 整串状态」时，
+        右区被挤窄、那串会被裁掉尾部——那是**已登记的代价**（只持续两秒），
+        不是这条判据要管的东西。用缺省 80 列跑会失败在那个无关的边界上。
+        """
+        from rich.cells import cell_len
+
+        app, _ = _make_app()
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            before = app.screen._compositor.render_strips()[-1].text.rstrip()
+
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            after = app.screen._compositor.render_strips()[-1].text.rstrip()
+
+            # ⚠ 必须用 `cell_len` 而不是 `len`：中文是**双宽**字符，一个字占两格。
+            # 拿字符数当列号会得出「右端移动了 6 格」这种结论，而屏幕上两次都在
+            # 第 119 列——判据本身错了，却看着像发现了一个 bug。
+            self.assertEqual(
+                cell_len(before),
+                cell_len(after),
+                "右区右边缘应当钉死在屏幕右边——两次底行的右端必须对齐",
+            )
 
     async def test_copying_does_not_show_the_hint(self) -> None:
         """有选中文本时那一下是复制，状态栏不该挂出退出提示。"""

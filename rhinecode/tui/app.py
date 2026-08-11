@@ -27,6 +27,7 @@ from typing import Optional
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import Key
+from textual.containers import Horizontal
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
@@ -78,8 +79,8 @@ from rhinecode.trace import (
 )
 from rhinecode.tui.widgets import (
     ActivityView,
-    HistoryView, InputBar, StatusBar, CommandPanel, ConfirmPanel, ClarifyPanel,
-    SessionPanel, compose_status_text,
+    HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
+    ClarifyPanel, SessionPanel, compose_status_text,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
     # 「流式累积」意味着任何一帧都是在**任意位置**被截断的模型自由文本，
@@ -272,9 +273,28 @@ class RhineApp(App):
         border: solid #7AEEFF 60%;
         margin-top: 0;
     }
-    StatusBar {
+    /* 底部状态栏那一行拆成左右两个区（tui-display 扩展 F31）。
+       背景色挂在**行容器**上而不是任一子组件上——挂在子组件上的话，
+       左区 `width: auto` 在没内容时宽度为 0，那一小段底色会跟着消失，
+       表现为状态栏左边缘缺一块。 */
+    #status-row {
         height: 1;
         background: #7AEEFF 20%;
+    }
+    /* 左区：贴着左边缘的瞬时提示（「再按一次 Ctrl+C 退出」）。
+       `width: auto` 让它在没提示时不占位，右区照常铺满整行。 */
+    StatusHint {
+        width: auto;
+        height: 1;
+        color: $text;
+        text-align: left;
+    }
+    /* 右区：常驻状态。`width: 1fr` 吃掉剩余宽度，再右对齐——
+       这样右区那串的位置**不随左区有没有提示而移动**（会移动的话，
+       每次误按 Ctrl+C 整条状态栏都会抖一下）。 */
+    StatusBar {
+        width: 1fr;
+        height: 1;
         color: $text;
         text-align: right;
     }
@@ -359,7 +379,10 @@ class RhineApp(App):
             self._command_registry,
             placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，连按两次 Ctrl+C 退出",
         )
-        yield StatusBar()
+        # 状态栏是**一行两个区**：左区贴左边缘放瞬时提示，右区右对齐放常驻状态
+        # （F31，对齐 Claude Code 底部那一行）。合成一个组件做不到「贴左」——
+        # 右对齐块里的最左边会随其余各段长度在屏幕中间浮动。
+        yield Horizontal(StatusHint(), StatusBar(), id="status-row")
 
     def on_mount(self) -> None:
         """
@@ -588,17 +611,26 @@ class RhineApp(App):
             # 运行中的子 Agent 数（c13）：为 0 时给 None，状态栏隐藏该段——
             # 没用委派的用户看到的状态栏与 c12 逐字一致。
             subagent_status=self._subagent_status_segment(),
-            # 「再按一次 Ctrl+C 退出」（F31）：只在那 2 秒有效期内为真。
-            quit_hint=self._quit_hint_active,
         )
         self.query_one(StatusBar).update_status(**status_args)
+        # 左区（F31）在这里一并刷新，而不是只在按下 Ctrl+C 时改一次。
+        # 好处是「显示态的唯一真相是 `_quit_hint_active`」——任何一条刷新路径
+        # 都会把左区拉回与它一致，不会出现某条路径重画了右区却漏掉左区。
+        self.query_one(StatusHint).set_quit_hint(self._quit_hint_active)
         # 为什么记「组装后的文本」而不是九个散字段（trace F15）：用户真正看到的
         # 那行文本是 compose_status_text 在 update_status 内部拼出来的，只记字段
         # 的话「文本快照」这个承诺不成立（比如某个字段的渲染分支写错了，
         # 记录里看不出来）。compose_status_text 是纯函数、零副作用，多调一次没成本。
+        # `quit_hint` 与 `text` 并列而不是拼进 `text`：左区是**独立组件**，
+        # 拼进去的话记录里那行会与用户看到的右区文本对不上。
+        # ⚠ 漏记它的后果是「按下 Ctrl+C 之后界面到底有没有给反馈」在记录上
+        # 完全无法判断——而这条提示本来就只活两秒，事后没有第二处可查。
         self._recorder.emit_lazy(
             TraceEventType.STATUS_BAR,
-            lambda: {"text": full_text(compose_status_text(**status_args))},
+            lambda: {
+                "text": full_text(compose_status_text(**status_args)),
+                "quit_hint": self._quit_hint_active,
+            },
         )
 
     # ------------------------------------------------------------------ #

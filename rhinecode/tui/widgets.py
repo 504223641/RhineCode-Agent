@@ -1574,7 +1574,14 @@ _MODE_PLAN_MARKUP = "[bold #00D7D7]\\[PLAN][/bold #00D7D7]"
 # 留在历史里等于给每一次误按都攒下一条永久噪音。状态栏才是「当前是什么状态」
 # 该待的地方——窗口一过它自己消失，什么痕迹都不留。
 #
-# 用**灰色**（`dim`）而不是橘色，对齐 Claude Code 的同款提示。
+# ⚠ 它是**独立组件**（`StatusHint`），不是状态栏文本的一段。
+#
+# 原因是 `StatusBar` 整块 `text-align: right`：把提示拼进那串文本，它只会落在
+# **右对齐块的最左边**——也就是随其余各段的总长度在屏幕中间某处浮动，
+# 而不是贴着状态栏的左边缘。要真的贴左，这一行必须拆成左右两个区
+# （`StatusHint` 靠左 + `StatusBar` 靠右），与 Claude Code 底部那一行同构。
+#
+# 用**灰色**（`dim`）而不是橘色，同样对齐 Claude Code 的同款提示。
 #
 # ⚠ 这条与状态栏其余高亮段的取舍**方向相反**，别顺手统一：橘色在本项目里有确定
 # 语义——「需要用户留意的状态」（放行档、上下文预警、确认面板），那些是**用户没
@@ -1599,7 +1606,6 @@ def compose_status_text(
     context_warn: bool = False,
     skill_status: "str | None" = None,
     subagent_status: "str | None" = None,
-    quit_hint: bool = False,
 ) -> str:
     """
     组装状态栏的 Content markup 文本（纯函数，c10 抽出便于单测）。
@@ -1648,20 +1654,36 @@ def compose_status_text(
     # 与 MCP / Skill 两段「None 即隐藏」同构——没用委派的用户状态栏与 c12 一致。
     if subagent_status is not None:
         text += f" | {escape(str(subagent_status))}"
-    # 退出提示段（F31）：**排在最左**，与其余各段的取舍方向相反。
-    #
-    # 其余各段都是「常驻状态」，按稳定程度从左往右排；这一段是**瞬时**的，
-    # 而瞬时的东西挂在尾部会被 MCP / 上下文 / Skill / 子 Agent 这些按需出现的段
-    # 挤到用户视线之外——恰恰在它唯一有用的那两秒里看不见。放最左则位置固定，
-    # 不管其余哪几段出现，它永远在同一个地方。
-    if quit_hint:
-        text = f" {_QUIT_HINT_MARKUP} |{text}"
     return text + " "
+
+
+class StatusHint(Static):
+    """
+    状态栏那一行的**左区**：贴着左边缘的瞬时提示位（tui-display 扩展 F31）。
+
+    目前只有一种内容——「再按一次 Ctrl+C 退出」。做成一个组件而不是
+    `compose_status_text` 里的一段，是因为 `StatusBar` 整块右对齐，
+    拼进去的东西只能贴在右对齐块的左边、随其余各段长度浮动（详见
+    `QUIT_HINT_TEXT` 上方的说明）。
+
+    与右区的分工：**左区是「刚发生了什么」，右区是「现在是什么状态」**。
+    将来若还有同类瞬时提示，落点在这里而不是往右区那串里塞。
+    """
+
+    def set_quit_hint(self, active: bool) -> None:
+        """
+        挂出或撤下退出提示。
+
+        :param active: 是否处在「按了一次 Ctrl+C」的有效期内
+
+        幂等：重复传同一个值只是重画同样的内容，无副作用。
+        """
+        self.update(_QUIT_HINT_MARKUP if active else "")
 
 
 class StatusBar(Static):
     """
-    底部状态栏，实时展示当前会话的关键状态信息。
+    底部状态栏的**右区**，实时展示当前会话的关键状态信息。
 
     显示格式：[protocol] model | 思考模式：X | [DEFAULT]/[PLAN] | 权限模式：X | MCP：… | 上下文：…
     模式命令执行后（以及每轮流式结束时），App 层会调用 update_status() 刷新显示；
@@ -1680,7 +1702,6 @@ class StatusBar(Static):
         context_warn: bool = False,
         skill_status: "str | None" = None,
         subagent_status: "str | None" = None,
-        quit_hint: bool = False,
     ) -> None:
         """
         刷新状态栏显示内容（文本组装见 compose_status_text 纯函数）。
@@ -1697,8 +1718,6 @@ class StatusBar(Static):
         :param skill_status: 已激活 Skill 摘要（如 "Skill:2"）；为 None 时不展示该段（c11）。
         :param subagent_status: 运行中的子 Agent 摘要（如 "子Agent:2"）；
                                 为 None（无任务在跑）时不展示该段（c13）。
-        :param quit_hint: 是否处在「按了一次 Ctrl+C」的有效期内（F31）。
-                          为真时最左侧挂出退出提示，窗口一过由 App 侧复位。
         """
         self.update(
             compose_status_text(
@@ -1712,7 +1731,6 @@ class StatusBar(Static):
                 context_warn,
                 skill_status,
                 subagent_status,
-                quit_hint,
             )
         )
 

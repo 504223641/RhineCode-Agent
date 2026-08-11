@@ -188,7 +188,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增 MCP 传输方式 → `mcp/transport.py`（`Transport` 子类）+ `mcp/manager.py` `_build_transport`（按 `kind` 分支）
 - 新增斜杠命令 → 只需 `commands/builtins.py` 登记一条 `CommandSpec` + 处理函数 + 测试（c10 单一注册来源；补全/帮助/高亮自动生效）
 - 新增 `ModeTarget` / `ReportTarget` 枚举值 → `commands/models.py`（枚举）+ `tui/app.py` `switch_mode`/`query_report`（分支，未知值明确抛错）+ `conversation.py`（对应领域方法）
-- 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单
+- 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单。
+  ⚠ **状态栏那一行是左右两个区**（tui-display F31）：`StatusHint`（贴左边缘，瞬时提示）+ `StatusBar`（右对齐，常驻状态），装在 `#status-row` 里。**常驻状态一律进右区**；只有「刚发生了什么」这类瞬时提示才进左区，且**不能拼进 `compose_status_text`** ——右区整块 `text-align: right`，拼进去只会落在右对齐块的最左边、随其余各段长度在屏幕中间浮动，**判据写成「排在第一段之前」会全绿而屏幕上并不贴左**（真踩过）。左区新增内容要同步 `_refresh_status` 里那行 `set_quit_hint` 同位置的刷新，以及 trace 负载里与 `text` 并列的那个布尔字段（左区不在 `text` 里，漏记等于那两秒的界面反馈没有任何物证）
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
 - **活动区终态行与历史区完成通知的成本数字必须同源（tui-display）** → 两处都经
   `subagents/tasks.py` 的 `TaskManager.row_of` 取快照、再交给
@@ -320,7 +321,7 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 （展开后列出每个队员最近的工具调用）与历史区里被折叠的长工具结果 / diff 块。
 它**不改变焦点**（tui-display 扩展 F5/F41）。
 
-**退出是连按两次 `Ctrl+C`**（tui-display 扩展 F31）：第一次在**状态栏最左侧**
+**退出是连按两次 `Ctrl+C`**（tui-display 扩展 F31）：第一次**贴着状态栏左边缘**
 挂出「再按一次 Ctrl+C 退出」（**灰色**，对齐 Claude Code；**不进聊天区**——那是
 只活两秒的瞬时状态，不是对话内容。⚠ 刻意不用橘色：橘色专指「用户没主动做什么、
 但情况变了」，而这条是按键的直接回应），两秒内没有第二下就自动复位、提示随之撤下。**提示的存续期就是
