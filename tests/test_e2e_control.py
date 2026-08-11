@@ -621,8 +621,13 @@ class PanelAnswerTest(DriverFixture):
             # ① 应答前两个前置态都成立
             self.assertTrue(snap["panel_visible"])
             self.assertEqual(snap["focused"], "ConfirmPanel")
-            # 面板原文取自 0 号 disabled 表头，且是**含 markup 标记的原始字符串**
-            self.assertIn("write_file", panel["display"])
+            # 面板原文取自 0 号 disabled 表头，且是**含 markup 标记的原始字符串**。
+            #
+            # ⚠ 表头现在走 B 组的主参数口径（tui-display 扩展 F12）：显示
+            # `Write(x.txt)` 而不是内部名 + 键值对。判据跟着改成**展示标签**
+            # ——它才是用户实际看到的字；option 的 id 那条断言（下面）
+            # 才是契约，那个一字未动。
+            self.assertIn("Write(x.txt)", panel["display"])
             self.assertIn("[dim]", panel["display"], "原文保留 markup 标记，不做渲染")
             # 可选项四个，且不含任何 disabled 项（表头已被跳过）
             self.assertEqual(
