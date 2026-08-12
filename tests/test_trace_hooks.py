@@ -914,6 +914,9 @@ class AllTypesTest(TraceHookBase):
             },
             T.TEAM_MEMBER: {"name": "worker-a", "event": "idle", "detail": ""},
             T.AUTO_WAKE: {"count": 1, "limit": 5, "trigger": "main"},
+            # tui-activity-fold 界面两类
+            T.UI_TOOL_BATCH: {"summary": "搜索内容 3 次 · 读取 2 个文件", "calls": 5},
+            T.UI_DETAIL_LEVEL: {"level": 1},
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():
