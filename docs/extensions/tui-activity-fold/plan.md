@@ -86,6 +86,13 @@ def compose_batch_summary(
 
 def running_verb(tool_name: str) -> str:
     """运行中的进行时文案，如「搜索中…」（F5）。"""
+
+def resolve_full_title(tool_call) -> tuple[str, str]:
+    """
+    档 2 专用的完整标题（F11）：与既有 `resolve_call_parts` 同形，但
+    **每个值都不截断**，且列出**全部**参数而非只列主参数。
+    产出仍是纯文本、未转义（转义是渲染方的事，本模块的既有约定）。
+    """
 ```
 
 ### 详细度档位（`tui/widgets.py` 模块级常量）
