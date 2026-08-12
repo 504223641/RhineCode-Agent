@@ -123,7 +123,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 | 层 | 路径 | 职责 | ⚠ 致命不变量 |
 | --- | --- | --- | --- |
-| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现 `CommandController` 协议。**子 Agent 活动区**（主线程轮询，`ActivityView`）、**系统行四级分级**、**命令报告分级渲染**、面板序号与数字键直选、连按两次 `Ctrl+C` 退出（tui-display 扩展） | **markup 转义必须用 `tui/widgets.py` 的 `escape`**，绝不用 rich 那版——落单的 `[` 会在布局阶段主线程抛 `MarkupError`，**没有 try/except 兜得住，整个 app 退出**。**另一条**：活动区的数据一律**主线程轮询**，绝不新增从子 Agent 线程到界面的推送——本项目已因「加锁临界区内做跨线程调度」死锁四次 |
+| TUI | `tui/` | Textual 界面；Worker 消费 AgentEvent 逐块渲染；实现 `CommandController` 协议。**子 Agent 活动区**（主线程轮询，`ActivityView`）、**系统行四级分级**、**命令报告分级渲染**、面板序号与数字键直选、连按两次 `Ctrl+C` 退出（tui-display 扩展）；**工具活动批次归并**（`ToolBatchWidget`）、**三级信息密度**（`Ctrl+O` 三档循环）、**回合状态行**（`StatusLine`，全界面唯一的动画定时器）（tui-activity-fold 扩展） | **markup 转义必须用 `tui/widgets.py` 的 `escape`**，绝不用 rich 那版——落单的 `[` 会在布局阶段主线程抛 `MarkupError`，**没有 try/except 兜得住，整个 app 退出**。**第二条**：活动区的数据一律**主线程轮询**，绝不新增从子 Agent 线程到界面的推送——本项目已因「加锁临界区内做跨线程调度」死锁四次。**第三条**：新增组件的字段名先在 `Static` 实例上 `hasattr` 查一遍——撞上 Textual 的 `MessagePump` 内部字段（`_render` / `_closed` / `_running` …）**一律不报错**，只表现为「界面上东西凭空少了」，见成对维护点 |
 | Commands | `commands/` | 斜杠命令注册与分发（纯逻辑，不依赖 Textual） | `_specs` 是两个列表的只读拼接，**写入必须直接操作其中之一**——对属性 append 不报错也不生效 |
 | 协调层 | `conversation.py` | TUI 与 Agent/Provider 的中转；历史、权限引擎、四类回调、上下文/记忆/Skill 接线 | 预授权**先取令牌再授予**；`clear()` 与 `_resume_stream` 两处必须清空 Skill 激活态 |
 | Agent | `agent/` | ReAct 循环、事件类型、流式收集、结构化系统提示 | `dynamic` 是**每轮求值**的 callable，改回取值型会让两阶段加载失效；trace 埋点一律走 `_safe_emit` 漏斗 |
@@ -200,17 +200,48 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
   一处；写成两行同样不报错，只是每个子 Agent 在历史区留下重复的两条，
   用户会以为它跑了两次。护栏见 `tests/test_e2e_activity.py::FinishTraceTest`
   （断言该任务名在历史区**恰好出现一次**）
-- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 六个：
-  `●`（发生了一件事——工具行、活动行，状态靠**颜色**区分）、`⎿`（从属于上一行）、
-  `>`（你，或当前选中——用户消息前缀与面板高亮指示符**刻意合一**）、
-  `·`（行内分隔，不作行首前缀）、`↑`（token 计数）、`✻`（思考块）。
+- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 九个：
+  `●`（发生了一件事——工具行、活动行、批次聚合行，状态靠**颜色**区分）、
+  `⎿`（从属于上一行）、`>`（当前选中——面板高亮指示符）、
+  `·`（行内分隔，不作行首前缀）、`↑`（token 计数）、`✻`（思考块）、
+  以及 tui-activity-fold 新增的旋转标记三帧 `◇` `◈` `◆`（状态行动画）。
   **不在表内的一律不用**，包括为消息分级发明的图形——警告与错误靠**文字前缀**
   （「警告：」「错误：」），那是它们脱离颜色也能辨认的唯一依靠。
   改动要同步三处：本表、`tests/test_tui_symbols.py` 的 `WHITELIST`、
   以及那份扫描覆盖的模块清单。⚠ 扫描**刻意不管注释与发给模型的提示词**
   （`skills/render.py` / `subagents/render.py` / `team/render.py` 的
   `render_team_brief` 等）——那些是 prompt 不是界面，措辞是真实模型验收
-  反复调过的，为一条排版约束去动它们是拿行为回归换看不见的整洁
+  反复调过的，为一条排版约束去动它们是拿行为回归换看不见的整洁。
+
+  ⚠️ **两条 tui-activity-fold 登记时发现的问题，尚未处理**：
+  ① **`◈` 一符两用**——它既是**用户消息行的前缀**（`#99FFFF` 青色粗体），
+  又是状态行旋转标记的第二、四帧（`#7AEEFF` 主题青）。两处都在行首、
+  两种青色几乎分不出，而状态行就在输入框上方、离用户消息不远。
+  ② **本表此前写「`>` 是用户消息前缀」与代码不符**——代码里一直是 `◈`。
+  之所以长期没被发现：扫描区间原本**不覆盖 Geometric Shapes 区块**，
+  于是白名单里最常用的 `●` 与实际在用的 `◈` 都从没被护栏管过
+  （那张表声称管六个，实际只管得到三个）。区间已在本轮补上
+- **新增 TUI 组件前先在 `Static` 实例上 `hasattr` 查一遍字段名（tui-activity-fold）**
+  → Textual 的 `MessagePump` 在实例上放了一批下划线字段，撞名**一律不报错**、
+  只表现为「界面上东西凭空少了」。本轮撞了三个：**`_render`**（它要返回 Visual，
+  被覆盖后返回 None，合成器抛 `'NoneType' has no attribute 'render_strips'`，
+  抛在**布局阶段主线程**、业务栈上没有任何线索）、**`_closed`**（标记「消息泵已关停」，
+  拿它存业务状态会让 Textual 把整个节点从 DOM 清理掉，组件连同子节点一起消失）、
+  **`_running`**（同类，预检时抓到，未踩）。
+  ⚠ `vars(cls)` 查不出来——它们是 `__init__` 里设的**实例属性**，
+  必须 `hasattr(Static("x"), name)` 才看得见
+- **归并分组表与白名单合一（tui-activity-fold F2）** → `tools/display.py` 的
+  `FOLD_GROUPS` 一张表同时回答「哪些工具参与批次归并」与「归到哪组、用什么量词」。
+  **刻意不按 `Tool.read_only` 派生**：那个标志的语义是「无副作用、可并发」，
+  与「这是一次检索操作」不等价（`load_skill` 不写文件却改变会话能力，
+  MCP 工具语义未知）。**未登记的一律独立成行**是偏严方向——遗漏只是少折叠一行
+  （看得见、有人会问），反过来则会让有副作用的工具被静默藏进聚合行。
+  这条同时是折叠的安全依据：**被折叠的永远只是「读」**
+- **`ToolCallWidget.finish` 的 `summary` 与 `detail` 是两份内容，不是一份的长短版
+  （tui-activity-fold F12）** → 前者是工具自报的规模描述（折叠/逐条档显示），
+  后者是输出原文（最详细一档显示）。**只填一份不报错**，只是展开到最详细一档时
+  看到的仍是那句规模描述——「展开」等于没展开。取值在 `app.py` 的
+  `_result_summary` / `_result_detail` 两处
 - **工具行的「建行 / 定色」必须成对**，且 `_do_stream` 的 `tool_widgets` 表**只装还没定色的行**：`TOOL_PENDING` 建行、`TOOL_START` 复用（`get` 后 `begin_running`）、`TOOL_RESULT` **必须 `pop`**、`finally` 里 `_settle_unfinished_tools` 收尾剩下的。**把 `pop` 写成 `get` 不报错**：已经定成绿色「完成」的行会在收尾时被再收一次、覆写成「失败 · 未执行」——用户看到的是「明明写成功了却显示没执行」，而调用栈上什么线索都没有。护栏见 `tests/test_tui_tool_pending.py::DoStreamWiringTest`（含这条覆写的反证）
 - **`ToolCallWidget` 的 `(Ns)` 语义是「工具执行耗时」** → `begin_running` 必须重置 `_start`。漏了不报错，只是把「模型生成参数」与「用户盯着确认面板发呆」的时间一并算进去，一次 2 毫秒的写盘可能显示成 `(600s)`
 - 新增 RHINE.md 层级或记忆目录 → `memory/instructions.py` / `memory/manager.py`（加载逻辑）+ `/memory` 报告（`memory_report`）+（涉及模型按需读取时）`path_guard` 只读白名单注册（`conversation.py`）
