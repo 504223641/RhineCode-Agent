@@ -43,7 +43,10 @@ from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 from rhinecode.tools.display import (
     TOOL_LABELS,
     clip_value,
+    compose_batch_summary,
     resolve_call_parts,
+    resolve_full_title,
+    running_verb,
     summarize_args_plain,
 )
 
@@ -344,6 +347,65 @@ EXPAND_HINT = "（Ctrl+O 展开）"
 # 这样「统一来源」这件事本身不改变任何一处的既有观感。
 SECONDARY_COLOR = "#808080"
 
+# 界面主题色。取自 CSS 里 HistoryView / InputBar 的边框与命令面板的分隔线，
+# 三处本来就是同一个值，这里给它一个名字供 markup 侧引用。
+# ⚠ 改这个值要连同 `app.py` 的 CSS 一起改，否则状态行会与边框脱色。
+THEME_COLOR = "#7AEEFF"
+
+# ---------------------------------------------------------------------------
+# 详细度档位（tui-activity-fold 扩展 F8/F9/F10）
+# ---------------------------------------------------------------------------
+# 三档循环取代改造前的布尔开关：
+#   0 折叠  批次只显示一行聚合语
+#   1 逐条  批次展开为逐次调用；单条仍受结果行数上限约束
+#   2 全文  单条显示完整参数与输出原文
+#
+# ⚠ **用整数而不是两个布尔。** 两个布尔能表达四种状态，其中一种是非法的
+# （「不展开批次，却展开单条」）——而非法状态迟早会被某条路径构造出来，
+# 到时候表现为「折叠着的批次里露出半截原文」，没有任何报错。
+DETAIL_FOLDED = 0
+DETAIL_ITEMS = 1
+DETAIL_FULL = 2
+DETAIL_CYCLE = (DETAIL_FOLDED, DETAIL_ITEMS, DETAIL_FULL)
+
+# 聚合行末尾常驻的提示，内容是**按下去会到哪一档**（F10）。
+#
+# 三态循环本身难以预期（用户记不住按第三下会发生什么），因此不靠记忆——
+# 屏幕上始终写着下一步。这也是为什么它是「展开 / 看全文 / 收起」这种
+# **动作**措辞，而不是「档 1 / 档 2 / 档 3」这种状态编号。
+NEXT_LEVEL_HINT = {
+    DETAIL_FOLDED: "（Ctrl+O 展开）",
+    DETAIL_ITEMS: "（Ctrl+O 看全文）",
+    DETAIL_FULL: "（Ctrl+O 收起）",
+}
+
+# ---------------------------------------------------------------------------
+# 回合状态行的旋转标记（tui-activity-fold 扩展 F16/F16a）
+# ---------------------------------------------------------------------------
+# 四帧循环：空心菱形 → 含心菱形 → 实心菱形 → 含心菱形。
+# 由用户指定「菱形向外扩散」并在真实终端逐候选预览后选定。
+#
+# ⚠ **两条硬约束**：
+# 1. **四帧的显示宽度必须两两相等。** 不等的话每换一帧就把整行文字左右推一下，
+#    整行看起来在抖，比没有动画更糟。护栏见 `tests/test_tui_status_line.py`。
+# 2. 四个字形都已登记进符号白名单（`tests/test_tui_symbols.py`）。
+#
+# ⚠ **一条已知风险，本轮明确接受**：这组字形属 Unicode「模糊宽度」
+# （East Asian Width = Ambiguous）。Rich 的 `cell_len` 按 **1 格**计算，
+# 而终端在中日韩环境下**可能画成 2 格**——两者不一致会让该行后续内容错位。
+# 用户已在真实终端预览全部候选后选定此方案，故接受；实装后须真机复核。
+#
+# **若真机复核发现错位，退路是换成全「中性宽度」的字形组**（Rich 与终端
+# 两侧都算 1 格、不存在分歧），下面两组均已实测可用：
+#     ("⬩", "⟐", "✥", "⟐")   中心小菱形恒在、外框三级外扩
+#     ("✢", "✣", "✤", "✥")   同族四变体、笔画风格最统一
+# **换字形只需替换这张表，不动任何结构**——记下这条是因为没有它的话，
+# 下一个人遇到错位会误以为要重做整个状态行。
+SPINNER_FRAMES = ("◇", "◈", "◆", "◈")
+# 帧间隔（秒）。太快让人眼疲劳，太慢则失去「还活着」的提示作用。
+# 刻意是常量而非配置项——本轮不引入新的配置面。
+SPINNER_INTERVAL = 0.15
+
 # 系统行分级里两个高档位的**文字**前缀（tui-display 扩展 F19/F21）。
 #
 # 用文字而不是图形，是为了让它们**脱离颜色也能辨认**：截图、配色异常的终端、
@@ -585,7 +647,13 @@ class ToolCallWidget(Static):
         :param primary_args: `{工具名: 主参数键名}`（F12）。由 `HistoryView` 透传，
                              缺省 None → 标题全部走键值对摘要，形态与改造前一致
         """
-        super().__init__(markup=True)
+        # ⚠ 必须给一个**初始内容**（空串）而不是留空。留空时 renderable 是 None，
+        # 而本组件进入批次容器之后，挂载时序变了——Textual 可能在 `on_mount`
+        # 跑之前先渲染一次，于是在合成器里抛
+        # `AttributeError: 'NoneType' has no attribute 'render_strips'`。
+        # 那是**布局阶段主线程**的异常，业务调用栈上没有任何线索。
+        # 改造前它直接挂在历史区、总是先 on_mount 再渲染，所以一直没暴露。
+        super().__init__("", markup=True)
         self._pending = pending
         self._name = tool_call.name
         self._primary_args = primary_args or {}
@@ -600,8 +668,19 @@ class ToolCallWidget(Static):
         self._summary = ""
         self._diff = None
         self._final_elapsed = 0
-        # 全局展开开关的本地副本，由 `set_expanded` 广播进来（见 app.action_toggle_expand）
-        self._expanded = False
+        # 全局详细度档位的本地副本，由 `set_detail_level` 广播进来
+        # （见 app.action_toggle_expand）。改造前是个布尔 `_expanded`，
+        # 三档循环之后换成整数——理由见模块级 `DETAIL_CYCLE` 的注释。
+        self._detail_level = DETAIL_FOLDED
+        # ── 归并（tui-activity-fold A 组）──
+        # 保留原始调用：**最详细一档要重算标题**（完整参数、不截断），
+        # 而 `_args_summary` 是构造时就算好的截断版。
+        self._tool_call = tool_call
+        # 所属批次（可能为 None——不可归并的工具独立成行）。
+        # ⚠ 回调只在主线程内直接发生，不新增任何跨线程通道。
+        self._batch: "Optional[ToolBatchWidget]" = None
+        # 最详细一档显示的输出原文；空则回退显示 `_summary`
+        self._detail = ""
 
     def on_mount(self) -> None:
         """挂载后记录起始时刻、立即渲染 0s，并启动每秒刷新的主线程定时器。"""
@@ -638,7 +717,12 @@ class ToolCallWidget(Static):
         # 标签也要重算：委派工具在 pending 阶段还不知道派给哪个角色，
         # 参数到齐后标签才从内部名转成角色名（F12 分支 1）。
         self._label, self._args_summary = resolve_call_title(tool_call, self._primary_args)
+        # 最详细一档要按**当前**参数重算完整标题，故原始调用也要更新
+        self._tool_call = tool_call
         self._start = monotonic()
+        # 告诉所属批次「这一类活儿开始了」，让聚合行切到对应的进行时文案（F5）
+        if self._batch is not None:
+            self._batch.note_running(self._name, self._args_summary)
         self._render_running()
 
     def _elapsed(self) -> int:
@@ -657,48 +741,109 @@ class ToolCallWidget(Static):
             f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
         )
 
-    def finish(self, ok: bool, summary: str, diff=None) -> None:
+    def finish(self, ok: bool, summary: str, diff=None, detail: str = "") -> None:
         """
         结束计时并切换到成功/失败终态。
 
         由 TUI 的 Worker 通过 call_from_thread 在主线程调用，线程安全。
 
         本方法只**记下终态素材**，画由 `_render_finished` 负责——两者分开是为了
-        让 `set_expanded` 能在任何时候重画同一行（F41 的展开/收回）。
+        让 `set_detail_level` 能在任何时候重画同一行（展开/收回）。
+
+        ## 为什么结果文本收两份
+
+        `summary` 是工具自报的**规模描述**（「读取 234 行 · 12.3 KB」），
+        `detail` 是**输出原文**。两者服务不同档位：折叠与逐条档要的是前者
+        （一眼看清做了多大一件事），最详细一档要的是后者（核对具体内容）。
+
+        改造前只收一份且优先取 summary，于是**展开之后看到的仍是那句规模描述**
+        ——「展开」等于没展开。这是 tui-activity-fold 自检时发现的缺口。
 
         :param ok: 工具是否成功（决定绿/红）
-        :param summary: 结果摘要文本，**可以是多行全文**（折叠交给渲染，见
+        :param summary: 结果的规模描述，**可以是多行**（折叠交给渲染，见
                         `BRANCH_LINE_LIMIT`）
         :param diff: 可选的 tools.diff.DiffView。改文件类工具会带上它，
                      此时在状态行下方追加渲染一个彩色 diff 块；其它工具留空。
+        :param detail: 输出原文，仅最详细一档显示；**为空时该档回退显示 summary**
 
-        副作用：停止计时定时器，原地更新本行内容。
+        副作用：停止计时定时器，原地更新本行内容，并回调所属批次重算聚合语。
         """
         if self._timer is not None:
             self._timer.stop()
         self._final_elapsed = self._elapsed()
         self._finished = True
+        self._detail = detail or ""
         self._ok = ok
         self._summary = summary or ""
         self._diff = diff
         self._render_finished()
+        # 回调所属批次重算聚合语（计数与失败数都可能变）。
+        # ⚠ 在 `_render_finished` **之后**：本行先把自己画对，再让批次去读
+        # 已经落定的状态——反过来的话批次读到的是上一轮的成败。
+        if self._batch is not None:
+            self._batch.note_finished(self._name, ok)
 
-    def set_expanded(self, expanded: bool) -> None:
+    @property
+    def batch(self) -> "Optional[ToolBatchWidget]":
         """
-        接收全局展开开关的广播（`Ctrl+O`，见 `app.action_toggle_expand`）。
+        本行所属的批次；**独立成行时为 None**。
 
-        只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下状态即可，
-        等它 `finish` 时自然按新状态渲染。
+        `HistoryView.set_detail_level` 靠它区分「批次内的子行」（档位由批次转发）
+        与「独立行」（直接下发），避免重复重绘。
+        """
+        return self._batch
 
-        :param expanded: 展开为真、折叠为假
+    @property
+    def primary_text(self) -> str:
+        """
+        本次调用的主参数值（纯文本、未转义），供所属批次做从属行显示。
+
+        与标题括号里的是同一份内容——批次的从属行与展开后的工具行标题
+        因此不会出现「同一次调用，两处显示的参数不一样」。
+        """
+        return self._args_summary
+
+    def set_batch(self, batch: "Optional[ToolBatchWidget]") -> None:
+        """
+        登记所属批次（tui-activity-fold A 组）。
+
+        登记之后，本行每次进入执行态或定色都会回调批次重算聚合语。
+
+        ⚠ **回调只在主线程内直接发生**——`begin_running` 与 `finish` 本身
+        就是 Worker 经 `call_from_thread` 调进主线程的，因此这条链上
+        **不新增任何跨线程通道**（本项目已因「加锁临界区内做跨线程调度」死锁四次）。
+
+        :param batch: 所属批次；不可归并的工具独立成行，传 None
+        """
+        self._batch = batch
+
+    def set_detail_level(self, level: int) -> None:
+        """
+        接收全局详细度档位的广播（`Ctrl+O`，见 `app.action_toggle_expand`）。
+
+        只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下档位即可，
+        等它 `finish` 时自然按新档位渲染。
+
+        :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
 
         副作用：可能原地重绘本行。
         """
-        if self._expanded == expanded:
+        if self._detail_level == level:
             return
-        self._expanded = expanded
+        self._detail_level = level
         if self._finished:
             self._render_finished()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        **薄封装**，保留供回放路径与既有测试使用（它们只认「展开 / 收起」两态）。
+
+        映射：展开 → 最详细一档；收起 → 折叠档。
+        新代码请直接用 `set_detail_level`。
+
+        :param expanded: 展开为真、折叠为假
+        """
+        self.set_detail_level(DETAIL_FULL if expanded else DETAIL_FOLDED)
 
     def _branch_block(self) -> RichText:
         """
@@ -711,7 +856,11 @@ class ToolCallWidget(Static):
         用 `RichText` 纯文本而不是 markup：结果摘要来自工具输出原文，
         含 `[` 是常态，纯文本渲染天然免转义（与本类既有做法一致）。
         """
-        lines = self._summary.split("\n")
+        # 档位决定读哪一份素材（tui-activity-fold F12）：
+        # 最详细一档读**输出原文**，其余读工具自报的那句规模描述。
+        # `_detail` 为空时回退——脚本化 Provider 与回放路径都可能只给 summary。
+        source = self._detail if (self._detail_level == DETAIL_FULL and self._detail) else self._summary
+        lines = source.split("\n")
         # 去掉尾部空行：命令输出几乎都以换行结尾，留着会白占一行折叠额度
         while lines and not lines[-1].strip():
             lines.pop()
@@ -719,7 +868,7 @@ class ToolCallWidget(Static):
             lines = [""]
 
         hidden = 0
-        if not self._expanded and len(lines) > BRANCH_LINE_LIMIT:
+        if self._detail_level != DETAIL_FULL and len(lines) > BRANCH_LINE_LIMIT:
             hidden = len(lines) - BRANCH_LINE_LIMIT
             lines = lines[:BRANCH_LINE_LIMIT]
 
@@ -757,7 +906,7 @@ class ToolCallWidget(Static):
             self.update(
                 RichGroup(
                     RichText.from_markup(header),
-                    render_diff_block(diff, expanded=self._expanded),
+                    render_diff_block(diff, expanded=self._detail_level == DETAIL_FULL),
                 )
             )
             return
@@ -783,6 +932,255 @@ class ToolCallWidget(Static):
         if self._final_elapsed < 1:
             return ""
         return f" ({self._final_elapsed}s)"
+
+
+class ToolBatchWidget(Vertical):
+    """
+    一批**连续的只读检索调用**在历史区的呈现（tui-activity-fold 扩展 A 组）。
+
+    ## 它解决什么
+
+    改造前每次工具调用各占屏幕两行且全部累积：一次「读一下项目」发 20 次
+    `Read`/`Glob`/`Grep`，历史区净增 40 行，把真正要读的结论淹掉了。
+    本组件把这样一批调用收成**一行聚合语**，默认折叠。
+
+    ## 两种形态，按「封闭与否」切换
+
+    - **未封闭**（还可能有新调用进来）：`● 搜索中…` + 从属行显示当前调用的参数
+    - **已封闭**：`● 搜索内容 3 次 · 读取 2 个文件` + 档位提示
+
+    ⚠ **运行期间的形态与最终调用数量无关。** 批次的规模只有封闭时才知道——
+    第一次 `Read` 发出去时，无从预知后面还会不会有第二次。因此
+    「按数量选形态」这件事在运行中做不到，也不该做。
+
+    ## 谁来封闭它
+
+    `HistoryView._mount_widget`：往历史区挂**任何非工具行内容**（正文、思考、
+    系统行）时封闭当前批次。规则是「历史区里出现了别的东西 = 这批调用结束了」。
+
+    ## 三个不变量
+
+    1. **一切嵌入的纯文本必须过本模块的 `escape`。** 主参数值来自工具参数，
+       含方括号是常态，落单的 `[` 会在布局阶段的主线程抛 `MarkupError`，
+       没有任何 try/except 兜得住。
+    2. **状态变更方法只在主线程内被调用**（`ToolCallWidget.finish` 本身就是
+       经 `call_from_thread` 到主线程的），本类**不新增任何跨线程通道**。
+    3. **本类不参与 `tool_widgets` 表的登记与摘除。** Worker 侧仍持有
+       `ToolCallWidget` 引用、仍按原口径 `pop`，批次只改变那个组件挂在哪。
+    """
+
+    # ⚠ **必须自带 `height: auto`。** 容器类组件在没有任何 CSS 规则命中时，
+    # 渲染路径会走到 `Widget._render()` 并在合成器里抛
+    # `AttributeError: 'NoneType' object has no attribute 'render_strips'`
+    # ——抛在**布局阶段的主线程**，业务调用栈上没有任何线索。
+    #
+    # 实测：一个原生 `Vertical` 放进没有 CSS 的 App 里同样会崩，
+    # 而 `ActivityView`（同样继承 Vertical）一直正常，是因为 `app.py` 的 CSS
+    # 里给了它规则。把规则写成 `DEFAULT_CSS` 而不是加进 `app.py`，
+    # 是为了让本组件**在任何宿主里都能独立工作**——单测与端到端驱动都会
+    # 在裸 App 里实例化它。
+    DEFAULT_CSS = """
+    ToolBatchWidget {
+        height: auto;
+        width: 1fr;
+    }
+    """
+
+    def __init__(self, detail_level: int = DETAIL_FOLDED) -> None:
+        """
+        :param detail_level: 建立时的详细度档位，由 `HistoryView` 按全局档位传入
+                             （新批次必须跟上当前档位，否则展开状态下新产生的
+                             批次会是折叠的）
+        """
+        super().__init__()
+        # [(工具名, 是否成功)]，按发生时序；第二项 None 表示尚未产生结果
+        self._entries: "list[tuple[str, Optional[bool]]]" = []
+        self._closed = False
+        self._detail_level = detail_level
+        # 未封闭态显示的两段：进行时文案 + 当前调用的主参数值
+        self._running_text = ""
+        self._running_arg = ""
+        # 聚合行。**在构造时就建好**（而不是 compose 里），这样 `attach` 无论
+        # 在挂载前后被调用，都能先把它放进容器的第一位——见 `_ensure_summary`。
+        self._summary_widget = Static("", markup=True)
+        # 单次调用时聚合行下方要保留的那条从属行（F4）——多次时为空
+        self._single_arg = ""
+
+    def compose(self) -> ComposeResult:
+        """
+        聚合行随容器一起就位；工具行由 `attach` 动态挂载在它下面。
+
+        ⚠ **必须用 `compose` 交付聚合行，不能在 `attach` 里 `mount`。**
+        `HistoryView.add_tool_widget` 挂完批次会**紧接着**调 `attach`，
+        而此时容器自身的挂载还没落地——往一个未挂载的容器里 `mount`，
+        实测会让**整个批次容器从 DOM 里消失**（挂一条系统行之后
+        `#history-messages` 的子节点里就只剩那条系统行了）。
+        `compose` 在挂载时同步执行，天然没有这个时序问题。
+        """
+        yield self._summary_widget
+
+    def on_mount(self) -> None:
+        """挂载后立即画一次，避免出现一瞬间的空行。"""
+        self._repaint()
+
+    @property
+    def closed(self) -> bool:
+        """本批次是否已封闭（封闭后不再接受新的工具行）。"""
+        return self._closed
+
+    @property
+    def call_count(self) -> int:
+        """本批次已纳入的调用次数（供测试与埋点用）。"""
+        return len(self._entries)
+
+    def attach(self, widget: "ToolCallWidget", tool_name: str) -> None:
+        """
+        把一条工具行纳入本批次。
+
+        :param widget: 已建好但尚未挂载的工具行
+        :param tool_name: 内部工具名（用于聚合计数，非展示标签）
+
+        副作用：把 widget 挂进本容器、登记 entry、给 widget 装上回指本批次的引用、
+        并按当前档位设定它的可见性。
+        """
+        self._entries.append((str(tool_name or ""), None))
+        widget.set_batch(self)
+        widget.set_detail_level(self._detail_level)
+        self.mount(widget)
+        # 档 0 下子行整体不可见——折叠的全部意义就在这里
+        widget.display = self._detail_level != DETAIL_FOLDED
+        # 单次时聚合行下面要显示这一次调用的参数（F4），先记下来
+        self._single_arg = widget.primary_text
+        self._repaint()
+
+    def note_running(self, tool_name: str, primary_value: str) -> None:
+        """
+        某次调用进入执行态：更新未封闭态显示的进行时文案与从属行（F5）。
+
+        并发时**后到的覆盖先到的**——从属行的语义是「最近开始的那一个」。
+
+        :param tool_name: 内部工具名
+        :param primary_value: 该次调用的主参数值（已是纯文本，未转义）
+        """
+        self._running_text = running_verb(tool_name)
+        self._running_arg = primary_value or ""
+        self._single_arg = self._running_arg or self._single_arg
+        self._repaint()
+
+    def note_finished(self, tool_name: str, ok: bool) -> None:
+        """
+        某次调用定色：把对应 entry 的成败落定并重算聚合语。
+
+        按工具名从后往前找**第一个尚未落定**的条目——同一个批次里同名调用
+        可能有多次，从后往前配对与「后发起的先完成」这种并发形态更吻合，
+        且无论配到哪一个，聚合计数的结果都相同（计数只看总数与失败数）。
+
+        :param tool_name: 内部工具名
+        :param ok: 该次调用是否成功
+        """
+        name = str(tool_name or "")
+        for i in range(len(self._entries) - 1, -1, -1):
+            entry_name, entry_ok = self._entries[i]
+            if entry_name == name and entry_ok is None:
+                self._entries[i] = (entry_name, bool(ok))
+                break
+        self._repaint()
+
+    def close(self) -> None:
+        """
+        封闭本批次：形态从进行时切到完成时，此后不再接受新行。
+
+        **幂等**——`_mount_widget` 每挂一条非工具行内容就会调它一次，
+        而连续几条系统行是常态。
+
+        副作用：重绘聚合行。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._repaint()
+
+    def set_detail_level(self, level: int) -> None:
+        """
+        接收全局档位广播（`Ctrl+O`）。
+
+        档 0 → 子工具行整体隐藏，只留聚合行；档 1/2 → 显示子行并把档位逐个转发。
+
+        :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
+
+        副作用：改子组件的可见性、转发档位、重绘聚合行。
+        """
+        if level == self._detail_level:
+            return
+        self._detail_level = level
+        visible = level != DETAIL_FOLDED
+        for child in self.query(ToolCallWidget):
+            child.display = visible
+            child.set_detail_level(level)
+        self._repaint()
+
+    def summary_text(self) -> str:
+        """
+        当前聚合语的**纯文本**（未转义、不含档位提示），供埋点与测试使用。
+
+        单独抽出来是为了让 trace 负载与界面显示同源——各拼一遍的话，
+        记录里的聚合语与用户看到的会悄悄不一致。
+        """
+        if not self._closed:
+            return self._running_text
+        return compose_batch_summary(self._entries)
+
+    def _has_failure(self) -> bool:
+        """本批次里是否有已落定的失败调用（F6）。"""
+        return any(ok is False for _name, ok in self._entries)
+
+    def _repaint(self) -> None:
+        """
+        画聚合行。两态分支见类 docstring。
+
+        ⚠ 所有纯文本都过 `escape`：主参数值与聚合语都可能含字面 `[`。
+
+        ## ⚠ 为什么开头要挡一道「聚合行挂上了没」
+
+        `HistoryView.add_tool_widget` 挂完批次会**紧接着**调 `attach`，而容器
+        自身的 `compose` 此刻还没执行——聚合行那个 `Static` 尚未挂载。
+        对未挂载的组件调 `update()` 会让**整个批次容器在下一次布局时从 DOM 里
+        掉出去**：实测现象是挂一条系统行之后 `#history-messages` 的子节点里
+        只剩那条系统行，批次连同它的工具行一起凭空消失，且**不报任何错**。
+
+        挡掉之后不会丢内容——`on_mount` 会在挂载完成时补画一次，
+        而那时读到的是最新状态。
+        """
+        if not self._summary_widget.is_mounted:
+            return
+        color = ToolCallWidget._COLOR_FAIL if self._has_failure() else ToolCallWidget._COLOR_OK
+
+        if not self._closed:
+            # 未封闭：进行时 + 当前调用的参数。**不显示耗时**——那由状态行统一
+            # 承担（F5），两处各显示一份会让用户去比对两个不相等的数字。
+            head = self._running_text or "执行中…"
+            lines = [f"[{ToolCallWidget._COLOR_RUNNING}]● {escape(head)}[/]"]
+            if self._running_arg:
+                lines.append(
+                    f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._running_arg)}[/]"
+                )
+            self._summary_widget.update("\n".join(lines))
+            return
+
+        # 已封闭：聚合语 + 档位提示
+        summary = compose_batch_summary(self._entries)
+        hint = NEXT_LEVEL_HINT.get(self._detail_level, "")
+        lines = [
+            f"[{color}]● {escape(summary)}[/]"
+            f"[{SECONDARY_COLOR}]  {escape(hint)}[/]"
+        ]
+        # F4：只有一次调用时，聚合行下方保留一条从属行放主参数值——
+        # 单次时那个信息放得下，不给是纯损失；多次时十个文件名塞不进一行。
+        if len(self._entries) == 1 and self._single_arg:
+            lines.append(
+                f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._single_arg)}[/]"
+            )
+        self._summary_widget.update("\n".join(lines))
 
 
 # `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
@@ -844,24 +1242,68 @@ class HistoryView(ScrollableContainer):
     # 与改造前逐字一致。
     _primary_args: dict = {}
 
-    # 全局展开开关的本地副本（`Ctrl+O`，F5/F41）。
+    # 全局详细度档位的本地副本（`Ctrl+O`，三档循环）。
     #
-    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：展开之后新产生的
-    # 每一行都要按展开态画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
+    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：切档之后新产生的
+    # 每一行都要按当前档位画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
     # 又是折叠的——现象是「这个开关时灵时不灵」，而那比没有开关更让人困惑。
-    _expanded: bool = False
+    _detail_level: int = DETAIL_FOLDED
+
+    # 归并分组表（tui-activity-fold F2），由 `set_fold_groups` 灌进来。
+    # 缺省空字典同样是**零回归的关键**：拿不到它时一个工具都不可归并，
+    # 每次调用照旧独立成行，形态与改造前逐字一致。
+    _fold_groups: dict = {}
+
+    # 当前尚未封闭的批次。None 表示「此刻没有正在收集的批次」。
+    # ⚠ 类属性写 None（不可变）是安全的：赋值 `self._current_batch = x` 会创建
+    # 实例属性，不会串到别的实例上。写成可变对象才会有那个坑。
+    _current_batch: "Optional[ToolBatchWidget]" = None
+
+    def set_detail_level(self, level: int) -> None:
+        """
+        接收全局详细度档位，**记下来并广播给已挂载的批次与独立工具行**。
+
+        :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
+
+        副作用：改自身状态；重绘全部批次与已定色的工具行。
+        """
+        self._detail_level = level
+        # 先发给批次——它会把档位转发给自己的子行，并按档位控制它们的可见性。
+        for batch in self.query(ToolBatchWidget):
+            batch.set_detail_level(level)
+        # 再发给**不在任何批次里**的独立工具行（写文件 / 执行命令 / 委派 / Skill）。
+        # 批次内的子行刚才已由批次转发过，这里跳过，免得重复重绘。
+        for widget in self.query(ToolCallWidget):
+            if widget.batch is None:
+                widget.set_detail_level(level)
 
     def set_expanded(self, expanded: bool) -> None:
-        """
-        接收全局展开开关，**记下来并广播给已挂载的工具行**（F5/F41）。
+        """**薄封装**，保留供既有调用方使用（它们只认「展开 / 收起」两态）。"""
+        self.set_detail_level(DETAIL_FULL if expanded else DETAIL_FOLDED)
 
-        :param expanded: 展开为真、折叠为假
-
-        副作用：改自身状态；重绘全部已定色的工具行。
+    def set_fold_groups(self, mapping: dict) -> None:
         """
-        self._expanded = expanded
-        for widget in self.query(ToolCallWidget):
-            widget.set_expanded(expanded)
+        接收「哪些工具参与批次归并」的映射（tui-activity-fold F2）。
+
+        :param mapping: 由工具注册中心导出的一次性快照
+                        （见 `tools.display.fold_group_map`）
+
+        副作用：只影响**此后**新建的工具行。
+        ⚠ 与 `set_primary_args` 同理，**必须在历史回放之前**调用——`--continue`
+        恢复出来的历史里有工具行，晚一步的话首屏那批会用空表画成独立行，
+        与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
+        """
+        self._fold_groups = dict(mapping or {})
+
+    def _close_batch(self) -> None:
+        """
+        封闭当前批次（若有）。**幂等**——连续挂几条系统行是常态。
+
+        调用点只有一个：`_mount_widget` 挂载非工具行内容时。
+        """
+        if self._current_batch is not None:
+            self._current_batch.close()
+            self._current_batch = None
 
     def set_primary_args(self, mapping: dict) -> None:
         """
@@ -927,9 +1369,28 @@ class HistoryView(ScrollableContainer):
         `ToolCallWidget`（调用方要拿它调 `begin_running` / `finish`），
         写死父类会让那个承诺在类型上退化成「某个 Static」。
 
-        :param widget: 任意 Static 子类实例（普通消息行 / 用户消息行 / 工具行）
+        ## ⚠ 本方法同时是**批次封闭的唯一判定点**（tui-activity-fold F1）
+
+        挂载**任何非工具行内容**（AI 正文、思考块、系统行、通知、用户消息）
+        之前先封闭当前批次。规则一句话：
+        **「历史区里出现了别的东西」就是「这批工具调用结束了」。**
+
+        为什么判定放在这里而不是去监听 `TEXT` 事件：这里是历史区一切内容的
+        **必经之路**，规则因此简单到不可能漏。监听事件的写法要在 app 层枚举
+        所有断开时机（正文 / 思考 / 各类系统行 / 通知 / 恢复回放…），
+        漏一处就会出现「一个批次跨越了中间那段正文」——而那在界面上表现为
+        时序错乱：聚合行说的事情，一部分发生在它上面那段话之前，一部分之后。
+
+        ⚠ **确认面板不在此列**，因此不会断开批次（AC2）：四个交互面板都是
+        `compose` 里的独立组件，弹出时不往历史区挂任何东西。这不是特意写的
+        判断，是既有布局结构的自然结果。
+
+        :param widget: 任意 Static 子类实例（普通消息行 / 用户消息行 / 工具行 / 批次）
         :returns: 原样返回该组件（流式场景下供后续 update_widget 使用）
         """
+        # 工具行与批次容器本身不封闭批次——前者要进批次，后者就是批次。
+        if not isinstance(widget, (ToolCallWidget, ToolBatchWidget)):
+            self._close_batch()
         container = self.query_one("#history-messages", Vertical)
         container.mount(widget)
         # 每次新增消息后自动滚动到底部，保持用户视角始终看到最新内容
@@ -1025,6 +1486,17 @@ class HistoryView(ScrollableContainer):
         收到 tool_start 时对返回的引用调用 begin_running() 补参数并转执行态，
         收到 tool_result 时再调用 finish() 定色。两阶段共用同一行，不新建第二行。
 
+        ## 两条分流（tui-activity-fold F2）
+
+        - **可归并**（只读检索类）：进当前批次；没有正在收集的批次就先新建一个。
+        - **不可归并**（写文件 / 执行命令 / 委派 / 加载 Skill / 未登记的一切）：
+          先封闭当前批次，再按改造前的方式独立挂进历史区。
+
+        ⚠ **返回值口径一字不变**：无论走哪条分流，返回的都是 `ToolCallWidget`，
+        Worker 侧仍持它调 `begin_running` / `finish`、仍按原口径从 `tool_widgets`
+        表里 `pop`。批次**只改变这个组件挂在哪**，不参与那张表的登记与摘除
+        ——「建行/定色必须成对」那条既有不变量因此原样成立。
+
         :param tool_call: provider.base.ToolCall，用于初始化展示内容
         :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
         :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
@@ -1032,8 +1504,25 @@ class HistoryView(ScrollableContainer):
         widget = ToolCallWidget(
             tool_call, pending=pending, primary_args=self._primary_args
         )
-        # 新行也要跟上当前的展开态（见 `set_expanded` 里那条注释）。
-        widget.set_expanded(self._expanded)
+        name = str(getattr(tool_call, "name", "") or "")
+        if name in self._fold_groups:
+            batch = self._current_batch
+            if batch is None or batch.closed:
+                batch = ToolBatchWidget(self._detail_level)
+                self._current_batch = batch
+                self._mount_widget(batch)
+            # 档位由 `attach` 一并设定（它还要按档位决定子行可见性），
+            # 因此这里不再单独调 set_detail_level。
+            batch.attach(widget, name)
+            self._scroll_to_latest()
+            return widget
+
+        # 不可归并：独立成行，形态与改造前逐字一致。
+        # `_mount_widget` 会顺手封闭当前批次（它不是工具行？——它是，所以
+        # 那条判断放不了行，这里显式封闭）。
+        self._close_batch()
+        # 新行也要跟上当前的档位（见 `set_detail_level` 里那条注释）。
+        widget.set_detail_level(self._detail_level)
         return self._mount_widget(widget)
 
     def append_system(self, text: str) -> None:
@@ -1142,8 +1631,15 @@ class HistoryView(ScrollableContainer):
         self._add_widget(f"[bold #FFA500]{WARNING_PREFIX}{escape(text)}[/bold #FFA500]")
 
     def clear_all(self) -> None:
-        """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
+        """
+        清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。
+
+        ⚠ 必须一并把 `_current_batch` 置空：`remove_children` 已经把批次容器
+        从 DOM 里删掉了，但这里还攥着一个指向已删除组件的引用——下一次
+        可归并的调用会往那个「幽灵批次」里 `mount`，界面上什么都不出现。
+        """
         self.query_one("#history-messages", Vertical).remove_children()
+        self._current_batch = None
 
     # ------------------------------------------------------------------ #
     # 会话历史回放（c9 /resume 交互化）
