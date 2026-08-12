@@ -359,7 +359,11 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             text = _text_of(widget)
-            self.assertIn("完成", text)
+            # tui-activity-fold F7 起**成功态不再写「完成」二字**（绿色已经把状态
+            # 说完了）。断言换成「标签仍在」，本用例量的东西不变——它验的是
+            # 「不足一秒时没有那个括号」，与状态词无关。
+            self.assertIn("Read", text)
+            self.assertNotIn("完成", text)
             self.assertNotIn("(0s)", text)
             self.assertNotIn("0s", text)
 

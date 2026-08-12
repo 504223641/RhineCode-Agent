@@ -553,7 +553,14 @@ class DoStreamWiringTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(rows), 1, "pending 与 start 必须共用一行")
         text = text_of(rows[0])
-        self.assertIn("完成", text)
+        # tui-activity-fold F7 起**成功态不再写「完成」二字**（绿色已经把状态
+        # 说完了），原来的 `assertIn("完成")` 因此失效。
+        #
+        # 换成两条合起来等价的判据：**结果摘要出现了**（说明 `finish` 正常走完、
+        # 拿到了 ToolResult），且**没有任何失败字样**。这一行真正要证明的是
+        # 「它没有被 finally 里的收尾逻辑覆写成失败·未执行」，两条都指着它。
+        self.assertIn("新建", text)
+        self.assertNotIn("失败", text)
         self.assertNotIn("未执行", text)
         self.assertIn("x.txt", text)
 

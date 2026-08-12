@@ -736,13 +736,22 @@ class ToolCallWidget(Static):
         统一为两段式：第一行 `● 标题 完成/失败 [(Ns)]`，其下是 `⎿` 分支块。
         """
         color = self._COLOR_OK if self._ok else self._COLOR_FAIL
-        result = "完成" if self._ok else "失败"
+        # 成功态**不写「完成」二字**（tui-activity-fold F7）：绿色已经把状态说完了，
+        # 文字重复一遍只是多占宽度、多一处视觉停顿。
+        #
+        # ⚠ **失败态的「失败」必须保留。** 它是这一行脱离颜色之后**唯一**还能
+        # 辨认状态的依靠——截图、配色异常的终端、端到端驱动抓到的纯文本里，
+        # 颜色全都可能丢失。这个不对称是刻意的：成功是常态（可以安静），
+        # 失败要抢注意力（必须写出来）。
+        #
+        # 前导空格并进本变量而不是留在 f-string 里，否则成功态会拖一个尾部空格。
+        result = "" if self._ok else " 失败"
         diff = self._diff
         if diff is not None and diff.rows:
             # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要
             # 更贴近改动语义），分支由 render_diff_block 产出。
             header = (
-                f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) "
+                f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))})"
                 f"{result}{self._elapsed_suffix()}[/]"
             )
             self.update(
@@ -756,7 +765,7 @@ class ToolCallWidget(Static):
         # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
         # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
         title = self._label if self._pending else f"{self._label}({self._args_summary})"
-        header = f"[{color}]● {title} {result}{self._elapsed_suffix()}[/]"
+        header = f"[{color}]● {title}{result}{self._elapsed_suffix()}[/]"
         self.update(RichGroup(RichText.from_markup(header), self._branch_block()))
 
     def _elapsed_suffix(self) -> str:
