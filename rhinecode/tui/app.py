@@ -81,6 +81,8 @@ from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
     ClarifyPanel, SessionPanel, compose_status_text,
+    # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
+    DETAIL_CYCLE, DETAIL_FOLDED,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
     # 「流式累积」意味着任何一帧都是在**任意位置**被截断的模型自由文本，
@@ -345,10 +347,14 @@ class RhineApp(App):
         # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
         # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
         self._last_subagent_count = 0
-        # 全局展开开关（tui-display 扩展 F5/F41，`Ctrl+O`）。
-        # **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
-        # verbose 语义，两个键会让用户记两套。
-        self._expanded = False
+        # 全局详细度档位（`Ctrl+O`）。**一个键同时管活动区与历史区**——
+        # 对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套。
+        #
+        # tui-activity-fold 起从布尔改成**三档循环**（折叠 → 逐条 → 全文）：
+        # 批次归并之后「展开」有了两层含义（把批次摊成逐条 / 把单条摊成原文），
+        # 一个布尔表达不了。⚠ 用整数而不是两个布尔——后者能表达一种非法状态
+        # （「不展开批次却展开单条」），而非法状态迟早会被某条路径构造出来。
+        self._detail_level = DETAIL_FOLDED
         # 上一次按下 `Ctrl+C` 的时刻（`time.monotonic`）。
         # 初值取一个足够久远的负数，保证第一次按下必然走「提示」那一支。
         self._last_quit_request = -1e9
@@ -861,8 +867,11 @@ class RhineApp(App):
 
         副作用：重绘活动区组件。
         """
+        # 活动区只有折叠 / 展开两态（tui-activity-fold F13：**不为它造第三档**）。
+        # 「逐条」与「全文」对它而言表现一致——它展开后列的是最近的工具调用，
+        # 那些本来就没有「更详细」的第二层可展。
         self.query_one(ActivityView).update_rows(
-            self._manager.subagent_activity(), self._expanded
+            self._manager.subagent_activity(), self._detail_level != DETAIL_FOLDED
         )
 
     def _maybe_auto_wake(self) -> None:
@@ -1112,22 +1121,33 @@ class RhineApp(App):
 
     def action_toggle_expand(self) -> None:
         """
-        全局展开开关（`Ctrl+O`，F5/F41）。
+        全局详细度档位，**三档循环**（`Ctrl+O`）：折叠 → 逐条 → 全文 → 折叠。
 
-        **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
-        verbose 语义。两个键会让用户记两套，而这两处展开的是同一类东西
-        （「刚才具体做了什么」）。
+        **一个键同时管活动区与历史区**——对齐 Claude Code 的全局 verbose 语义。
+        两个键会让用户记两套，而这两处展开的是同一类东西（「刚才具体做了什么」）。
+
+        ## 三档各是什么
+
+        | 档 | 历史区 | 活动区 |
+        | --- | --- | --- |
+        | 折叠 | 批次只显示一行聚合语 | 每个子 Agent 一行 |
+        | 逐条 | 批次摊成逐次调用，单条结果仍受行数上限 | 列出最近的工具调用 |
+        | 全文 | 单条显示完整参数与输出原文 | **与逐条一致**（F13：活动区没有第三档） |
+
+        ⚠ 三态循环本身难以预期（用户记不住按第三下会怎样），因此**不靠记忆**
+        ——批次的聚合行末尾常驻一句提示，写的是**按下去会到哪一档**。
 
         ⚠ **不引入焦点切换**：本动作只重绘，不 `focus()` 任何组件。
         活动区任何时候都不抢焦点，输入框与四个面板的键位体系一字不动（F5）。
 
-        副作用：重绘活动区与当前挂着的工具行。
+        副作用：重绘活动区与历史区的批次与工具行。
         """
-        self._expanded = not self._expanded
+        index = DETAIL_CYCLE.index(self._detail_level) if self._detail_level in DETAIL_CYCLE else 0
+        self._detail_level = DETAIL_CYCLE[(index + 1) % len(DETAIL_CYCLE)]
         self._refresh_activity()
-        # 历史区自己记下展开态并广播给已挂载的行——**不要在这里直接遍历组件**：
-        # 那样只覆盖「此刻挂着的」，展开之后新产生的行又会是折叠的。
-        self.query_one(HistoryView).set_expanded(self._expanded)
+        # 历史区自己记下档位并广播给已挂载的批次与工具行——**不要在这里直接
+        # 遍历组件**：那样只覆盖「此刻挂着的」，切档之后新产生的又会是折叠的。
+        self.query_one(HistoryView).set_detail_level(self._detail_level)
 
     def action_request_quit(self) -> None:
         """
@@ -1704,7 +1724,11 @@ class RhineApp(App):
                         self.call_from_thread(widget.begin_running, tc)
                     # 改文件类工具会在 res.diff 带上结构化差异，传给工具行渲染彩色 diff 块
                     self.call_from_thread(
-                        widget.finish, res.ok, self._summarize_result(res), getattr(res, "diff", None)
+                        widget.finish,
+                        res.ok,
+                        self._result_summary(res),
+                        getattr(res, "diff", None),
+                        self._result_detail(res),
                     )
 
                 elif etype == AgentEventType.FINISHED:
@@ -1866,9 +1890,9 @@ class RhineApp(App):
         return LEVEL_NOTICE, ""
 
     @staticmethod
-    def _summarize_result(res) -> str:
+    def _result_summary(res) -> str:
         """
-        取工具结果在工具行上要展示的文本。
+        取工具结果的**规模描述**，供折叠档与逐条档展示。
 
         优先使用工具自带的 `summary`（那是工具作者亲手写的一句话概括，
         比机器截出来的首行准确得多）；没有时回退到 `output` **全文**。
@@ -1880,7 +1904,7 @@ class RhineApp(App):
         什么，也没法展开。
 
         现在把「省略」整个交给展示层：`ToolCallWidget` 收全文、按
-        `BRANCH_LINE_LIMIT` 折叠、并在末行如实写出「… +N 行（Ctrl+O 展开）」。
+        `BRANCH_LINE_LIMIT` 折叠、并在末行如实写出「… +N 行」。
         职责因此清楚了一层——**这里负责取内容，那里负责决定画多少**。
 
         ⚠ 不截断**不等于**无界（N5）：组件那边有行数上限，且 `output` 本身在
@@ -1894,6 +1918,40 @@ class RhineApp(App):
         text = (res.output or "").strip()
         if not text:
             return "（无输出）" if res.ok else "（无错误信息）"
+        return text
+
+    @staticmethod
+    def _result_detail(res) -> str:
+        """
+        取工具结果的**输出原文**，只供最详细一档展示（tui-activity-fold F12）。
+
+        ## 为什么必须与 `_result_summary` 分成两个函数
+
+        改造前只有一个取值函数，且**优先返回 `summary`**——于是展开到最详细
+        一档时，用户看到的仍是那句「读取 1902 行 · 78.4 KB」。
+        「展开」等于没展开，因为 `output` 原文压根没传到组件手里。
+
+        ## ⚠ 取 `output` 而不是 `full_output`
+
+        有些工具会主动裁剪输出（`run_command` 保留前 30 + 后 10 行，
+        完整原文另存 `full_output`）。这里**刻意取裁剪后的那份**：
+        展开成完整原文会让一次测试套件输出撑爆历史区，而那正是 spec F12
+        明确否掉的。
+
+        代价是「展开了也看不到全部」，因此**被裁剪时就地补一句说明**——
+        判定与措辞都收在这一个函数里，组件侧不必多一个参数。
+        多一个布尔参数就多一处「传了但没用」或「用了但没传」的可能。
+
+        :param res: tools.base.ToolResult
+        :returns: 输出原文；被裁剪过时末尾附一行说明。无输出时返回空串
+                  （组件据此回退显示规模描述）
+        """
+        text = (res.output or "").strip()
+        if not text:
+            return ""
+        # `full_output` 非空即说明工具主动裁剪过（见 `tools/base.py` 的成对维护点）
+        if getattr(res, "full_output", ""):
+            text += "\n（输出已由工具裁剪，完整原文见行为记录）"
         return text
 
     # ------------------------------------------------------------------ #

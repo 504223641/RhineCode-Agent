@@ -918,9 +918,38 @@ class ToolCallWidget(Static):
         # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"。
         # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
         # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
-        title = self._label if self._pending else f"{self._label}({self._args_summary})"
-        header = f"[{color}]● {title}{result}{self._elapsed_suffix()}[/]"
+        header = f"[{color}]● {self._title_text()}{result}{self._elapsed_suffix()}[/]"
         self.update(RichGroup(RichText.from_markup(header), self._branch_block()))
+
+    def _title_text(self) -> str:
+        """
+        按当前档位产出标题（**已转义**，可直接嵌进 markup）。
+
+        ## 两份内容，不是一份的长短版（tui-activity-fold F11）
+
+        - 折叠 / 逐条档：`标签(主参数值)`——挑一个最有辨识度的值给人扫读，
+          其余参数不显示，长值截断。
+        - 最详细一档：`标签(键: 值, 键: 值…)`——**列全部参数、每个值都不截断**。
+
+        改造前展开态沿用构造时算好的截断标题，于是「展开」了却看不到被截掉的
+        部分——那正是本方法要解决的问题。
+
+        ⚠ 仍处 pending 的行不写括号：参数还没生成完，写成 `Write()`
+        像是「调用无参数」而不是「参数没来得及生成」。
+
+        ⚠ **转义只做一次。** `self._label` 与 `self._args_summary` 来自
+        `resolve_call_title`，那个函数**已经转义过**；而 `resolve_full_title`
+        是 `tools/display` 的纯文本内核、**未转义**，必须在这里补上。
+        搞反任一边都会出问题：漏转会在布局阶段抛 `MarkupError` 并拆掉整个应用，
+        重复转会让用户看到字面的 `\\[`。
+        """
+        if self._pending:
+            return self._label
+        if self._detail_level == DETAIL_FULL:
+            label, inner = resolve_full_title(self._tool_call)
+            # 参数为空时退回只写标签，避免出现一个空括号
+            return f"{escape(label)}({escape(inner)})" if inner else escape(label)
+        return f"{self._label}({self._args_summary})"
 
     def _elapsed_suffix(self) -> str:
         """

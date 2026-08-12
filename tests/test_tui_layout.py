@@ -404,7 +404,7 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
 
 class SummarizeResultTest(unittest.TestCase):
     """
-    T14：`_summarize_result` 交出全文，把「省略」整个交给展示层。
+    T14：`_result_summary` 交出全文，把「省略」整个交给展示层。
 
     职责因此分成两层——**这里负责取内容，组件负责决定画多少**。改造前
     两件事挤在一处：取首行、截到 80 字符，于是内容在到达组件之前就没了，
@@ -418,22 +418,22 @@ class SummarizeResultTest(unittest.TestCase):
     def test_tool_provided_summary_still_wins(self) -> None:
         """工具自带的 summary 优先级不变——那是作者亲手写的概括。"""
         self.assertEqual(
-            RhineApp._summarize_result(self._res(output="一大堆", summary="命中 23 处")),
+            RhineApp._result_summary(self._res(output="一大堆", summary="命中 23 处")),
             "命中 23 处",
         )
 
     def test_full_output_is_handed_over_intact(self) -> None:
         text = "\n".join(f"第 {i} 行" for i in range(30))
-        self.assertEqual(RhineApp._summarize_result(self._res(output=text)), text)
+        self.assertEqual(RhineApp._result_summary(self._res(output=text)), text)
 
     def test_long_single_line_is_not_clipped_at_80(self) -> None:
         """改造前这里截到 80 字符，组件那边再想展开也没有内容可展。"""
         line = "x" * 500
-        self.assertEqual(RhineApp._summarize_result(self._res(output=line)), line)
+        self.assertEqual(RhineApp._result_summary(self._res(output=line)), line)
 
     def test_empty_output_wording_depends_on_success(self) -> None:
-        self.assertEqual(RhineApp._summarize_result(self._res(ok=True)), "（无输出）")
-        self.assertEqual(RhineApp._summarize_result(self._res(ok=False)), "（无错误信息）")
+        self.assertEqual(RhineApp._result_summary(self._res(ok=True)), "（无输出）")
+        self.assertEqual(RhineApp._result_summary(self._res(ok=False)), "（无错误信息）")
 
 
 class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
@@ -501,13 +501,18 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
 
 class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
     """
-    T39：`Ctrl+O` 是**一个**全局开关，同时管活动区与历史区的工具行。
+    T39：`Ctrl+O` 是**一个**全局键，同时管活动区与历史区。
 
     对齐 Claude Code 的全局 verbose 语义。两个键会让用户记两套，而这两处
     展开的是同一类东西（「刚才具体做了什么」）。
+
+    ⚠ **tui-activity-fold 起它是三档循环**（折叠 → 逐条 → 全文 → 折叠），
+    不再是两态开关。批次归并之后「展开」有了两层含义：把批次摊成逐条、
+    把单条摊成原文。**逐条档的单条结果仍受行数上限约束**——那一档要的是
+    「这一批都调了什么」，不是每条的内容。
     """
 
-    async def test_toggle_broadcasts_to_mounted_tool_rows(self) -> None:
+    async def test_cycle_goes_folded_items_full_folded(self) -> None:
         from tests.test_command_tui import _make_app
 
         app, _ = _make_app()
@@ -517,28 +522,37 @@ class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             widget.finish(True, "\n".join(f"第 {i} 行" for i in range(20)))
             await pilot.pause()
-            self.assertIn("+15 行", _text_of(widget))
+            self.assertIn("+15 行", _text_of(widget), "起点是折叠档")
 
+            # 第一下 → 逐条档：批次摊开了，但**单条结果仍受行数上限**
             await pilot.press("ctrl+o")
             await pilot.pause()
-            self.assertNotIn("+15 行", _text_of(widget), "工具行也该跟着展开")
-            self.assertIn("第 19 行", _text_of(widget))
+            self.assertIn("+15 行", _text_of(widget), "逐条档的单条结果仍要折叠")
 
+            # 第二下 → 全文档：这才看得到原文
             await pilot.press("ctrl+o")
             await pilot.pause()
-            self.assertIn("+15 行", _text_of(widget), "再按一次要收回")
+            self.assertNotIn("+15 行", _text_of(widget))
+            self.assertIn("第 19 行", _text_of(widget), "全文档要看得到最后一行")
+
+            # 第三下 → 回到折叠，循环闭合
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            self.assertIn("+15 行", _text_of(widget), "按满三下必须回到起点")
 
     async def test_rows_finished_after_the_toggle_respect_it(self) -> None:
         """
-        **顺序反证**：先按 `Ctrl+O`、后定色的行，也要按展开态画。
+        **顺序反证**：先切档、后定色的行，也要按当前档位画。
 
-        只广播给「当前挂着的行」而不记下全局状态的话，展开之后新产生的每一行
+        只广播给「当前挂着的行」而不记下全局档位的话，切档之后新产生的每一行
         又会是折叠的——用户会以为开关时灵时不灵。
         """
         from tests.test_command_tui import _make_app
 
         app, _ = _make_app()
         async with app.run_test(size=(120, 40)) as pilot:
+            # 按两下到全文档（一下只到逐条档，那一档看不到原文）
+            await pilot.press("ctrl+o")
             await pilot.press("ctrl+o")
             await pilot.pause()
 
