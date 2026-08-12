@@ -396,7 +396,13 @@ class PendingWidgetTest(unittest.IsolatedAsyncioTestCase):
             widget._start -= 600
             widget._render_running()
 
-            self.assertIn("600s", _text_of(widget))
+            # ⚠ **判据形态在 tui-activity-fold F19 之后又变了一次，意图仍没变。**
+            # 那一版起**运行中不再显示秒数**（统一由底部的回合状态行承担一处
+            # 总耗时），所以这个数已经读不到界面文本上了。改成直接问组件
+            # 「你认为过了多久」——量的是同一件事：起点确实被拨到了 600 秒前。
+            self.assertGreaterEqual(widget._elapsed(), 600)
+            # 顺带钉住 F19 本身：那 600 秒不该出现在运行中的工具行上
+            self.assertNotIn("600", _text_of(widget))
 
             widget.begin_running(tc)
             widget.finish(True, "新建 · 1 行 · 2 B")

@@ -41,6 +41,7 @@ from rhinecode.memory.session import SessionInfo
 from rhinecode.subagents.tasks import BRANCH_AGENT_NAME, STATUS_LABELS, TaskStatus
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 from rhinecode.tools.display import (
+    SEGMENT_SEP,
     TOOL_LABELS,
     clip_value,
     compose_batch_summary,
@@ -688,11 +689,31 @@ class ToolCallWidget(Static):
         self._detail = ""
 
     def on_mount(self) -> None:
-        """挂载后记录起始时刻、立即渲染 0s，并启动每秒刷新的主线程定时器。"""
+        """
+        挂载后记录起始时刻并立即渲染一次。
+
+        ## 为什么这里**没有**每秒刷新的定时器（tui-activity-fold F19）
+
+        改造前每一行都自持一个 `set_interval(1.0)` 来滚动「执行中… Ns」。
+        并发执行五个只读工具时，屏幕上就有五个数字各自在跳——它们表达的是
+        同一件事（「还在跑」），却占了五份注意力。
+
+        现在这件事统一由**底部的回合状态行**（`StatusLine`）承担：
+        全界面同时至多一个该类定时器，显示的是**本回合总耗时**。
+
+        ⚠ **这个改动依赖状态行先存在**（实现期为此把本任务从 A 组挪到了 C 组
+        之后）。tui-display 曾有一条反证护栏专门保护这里的秒数，理由是
+        「那是参数生成期界面上唯一的活体信号」——那条需求仍然成立，
+        只是承载者从工具行换成了状态行。**在状态行做好之前撤掉它，
+        `write_file` 的参数生成期（模型吐整份文件内容，可能几十秒）
+        会退回到一个完全静止的窗口**，而写文件不参与归并、折叠救不了它。
+
+        ⚠ **终态的耗时不受影响。** `finish` 时用 `monotonic() - self._start`
+        一次性算出即可，那从来不需要定时器——定时器只是为了让**运行中**的
+        数字每秒变一下。
+        """
         self._start = monotonic()
         self._render_running()
-        # 每秒刷新一次耗时显示；定时器运行在主线程事件循环，不占用 Worker
-        self._timer = self.set_interval(1.0, self._render_running)
 
     @property
     def pending(self) -> bool:
@@ -735,15 +756,19 @@ class ToolCallWidget(Static):
         return int(monotonic() - self._start)
 
     def _render_running(self) -> None:
-        """以橘色渲染进行中状态（按阶段选文案），显示当前已耗时。"""
+        """
+        以橘色渲染进行中状态（按阶段选文案）。
+
+        ⚠ **不显示秒数**（tui-activity-fold F19/AC20）：运行中的时间统一由
+        底部的回合状态行显示**一处总耗时**。「这一行还在跑」由橘色 + 文案
+        表达，不需要每行各带一个数字来证明。
+        """
         if self._pending:
             # 参数还没到，写不出参数摘要，故不带括号——写成 "Write()" 像是无参调用。
-            self.update(
-                f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中… {self._elapsed()}s[/]"
-            )
+            self.update(f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中…[/]")
             return
         self.update(
-            f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
+            f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中…[/]"
         )
 
     def finish(self, ok: bool, summary: str, diff=None, detail: str = "") -> None:
@@ -1325,15 +1350,36 @@ class HistoryView(ScrollableContainer):
         """
         self._fold_groups = dict(mapping or {})
 
+    # 批次封闭时的回调（`(聚合语, 调用数) -> None`），由 `app.on_mount` 注入。
+    # 缺省是个空实现——历史区不认识行为记录器，装配不到时它照常工作。
+    _on_batch_closed = None
+
+    def set_batch_closed_hook(self, callback) -> None:
+        """
+        登记「批次封闭」的回调，供上层产出行为记录（tui-activity-fold N7）。
+
+        ⚠ 走回调而不是让本组件直接持有记录器：历史区是纯展示层，
+        认识 `trace` 会让依赖方向倒过来。
+        """
+        self._on_batch_closed = callback
+
     def _close_batch(self) -> None:
         """
         封闭当前批次（若有）。**幂等**——连续挂几条系统行是常态。
 
         调用点只有一个：`_mount_widget` 挂载非工具行内容时。
         """
-        if self._current_batch is not None:
-            self._current_batch.close()
-            self._current_batch = None
+        batch = self._current_batch
+        if batch is None:
+            return
+        batch.close()
+        self._current_batch = None
+        if self._on_batch_closed is not None:
+            # 埋点整段兜异常：观测设施绝不能反过来打断被观测的界面
+            try:
+                self._on_batch_closed(batch.summary_text(), batch.call_count)
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_primary_args(self, mapping: dict) -> None:
         """
@@ -2192,6 +2238,151 @@ def compose_status_text(
     if subagent_status is not None:
         text += f" | {escape(str(subagent_status))}"
     return text + " "
+
+
+class StatusLine(Static):
+    """
+    本回合的**活体状态行**（tui-activity-fold 扩展 C 组，F14–F19）。
+
+    位于各交互面板**下方**、输入框**上方**，形如：
+
+        ◈ 处理中… (12s · ↑ 2.1k · esc 中断)
+
+    ## 它与底部另外两个区的分工
+
+    | 区 | 装什么 | 生命周期 |
+    | --- | --- | --- |
+    | `#status-row` 右区（`StatusBar`） | **配置态**：provider / 模型 / 权限档 | 常驻 |
+    | `#status-row` 左区（`StatusHint`） | 瞬时提示（「再按一次 Ctrl+C 退出」） | 两秒 |
+    | **本组件** | **本回合活体态**：还在跑、跑了多久、烧了多少 | 一次运行 |
+
+    ⚠ **它不进历史区。** 「跑了 12 秒」这条信息几秒后就过期，
+    写进历史等于往对话里灌过期数据。运行一结束就整个隐藏、不占布局。
+
+    ## 为什么它是全界面唯一的动画定时器
+
+    改造前每个工具行各自持一个每秒刷新的定时器，并发执行五个只读工具时
+    屏幕上就有五个数字各自在跳——它们表达的是同一件事（「还在跑」），
+    却占了五份注意力。现在统一由本组件承担。
+    """
+
+    # ⚠ 字段名避开了 Textual 内部名。本轮已经撞过两次（`_render` 与 `_closed`），
+    # 两次都**不报错**、只是界面上东西凭空少了。`_running` 同样是
+    # `MessagePump` 的内部字段，**不要拿它存「是否在运行」**。
+    def __init__(self) -> None:
+        super().__init__("", markup=True)
+        self._start_time = 0.0
+        self._tokens = 0
+        self._frame_index = 0
+        self._phase = "处理中…"
+        self._interruptible = True
+        self._spin_timer = None
+        self.display = False
+
+    def start(self) -> None:
+        """
+        开始一次运行：清零计数、显示自身、启动帧定时器。
+
+        **幂等**——重复调用只是重新起算（`_set_streaming(True)` 在异常路径上
+        可能被调两次）。
+
+        副作用：改自身可见性、起一个主线程定时器。
+        """
+        self._start_time = monotonic()
+        self._tokens = 0
+        self._frame_index = 0
+        self._phase = "处理中…"
+        self._interruptible = True
+        self.display = True
+        if self._spin_timer is None:
+            self._spin_timer = self.set_interval(SPINNER_INTERVAL, self._tick)
+        self._repaint()
+
+    def stop(self) -> None:
+        """
+        运行结束：停定时器、隐藏自身。**幂等**。
+
+        `display = False` 之后 Textual 会连带收回它占的布局空间——
+        空闲时的界面与改造前逐字一致（AC24 零回归）。
+        """
+        if self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+        self.display = False
+
+    def add_tokens(self, count: int) -> None:
+        """
+        累加本回合的 token 用量。
+
+        ⚠ **它是跳变式更新，不是持续滚动**（F17）：Provider 协议只在**每轮
+        流末尾**产出一次用量。这与耗时那一段的节奏不同，是**已知且如实记录**
+        的行为，不是缺陷。
+
+        :param count: 本轮的 token 数；非正数忽略
+        """
+        if count and count > 0:
+            self._tokens += int(count)
+            self._repaint()
+
+    def set_phase(self, phase: str, interruptible: bool = True) -> None:
+        """
+        切换阶段词与中断提示的可见性。
+
+        :param phase: 阶段文案（如「处理中…」「等待确认」）
+        :param interruptible: 假 → **不显示中断提示**（F18）。确认面板弹出期间
+            用它：面板有自己的取消方式，两套提示同屏会误导
+
+        ⚠ **不重置 `_start_time`。** F18 要求面板等待期间耗时继续累计——
+        那段时间确实在这次回合内，用户等了多久就是等了多久。
+        """
+        self._phase = phase or "处理中…"
+        self._interruptible = interruptible
+        self._repaint()
+
+    def _tick(self) -> None:
+        """定时器回调：推进一帧并重绘（主线程内，不涉及任何跨线程调度）。"""
+        self._frame_index = (self._frame_index + 1) % len(SPINNER_FRAMES)
+        self._repaint()
+
+    def _cost_segments(self) -> "list[str]":
+        """
+        括号里那几段：耗时 / token / 中断提示。**渲染与纯文本产出共用这一处**
+        ——各拼一遍的话，记录里的状态行与用户看到的会悄悄不一致。
+
+        无数据的段**整段隐藏**（与状态栏各段的既有做法一致）：
+        没消耗 token 时不写 `↑ 0 tokens`，不可中断时不写 `esc 中断`。
+        """
+        segments = [f"{int(monotonic() - self._start_time)}s"]
+        if self._tokens:
+            segments.append(f"↑{format_tokens(self._tokens)}")
+        if self._interruptible:
+            segments.append("esc 中断")
+        return segments
+
+    def _current_frame(self) -> str:
+        """当前这一帧的旋转标记。"""
+        return SPINNER_FRAMES[self._frame_index % len(SPINNER_FRAMES)]
+
+    def compose_text(self) -> str:
+        """产出状态行的**纯文本**（不含颜色标记），供测试与埋点使用。"""
+        return f"{self._current_frame()} {self._phase} ({SEGMENT_SEP.join(self._cost_segments())})"
+
+    def _repaint(self) -> None:
+        """
+        重绘。旋转标记取主题青（与历史区/输入框边框同色）——
+        同色是刻意的：它表达「状态行属于界面框架，不属于对话内容」。
+
+        ⚠ 方法名不叫 `_render`：那是 Textual 用来产出 Visual 的内部方法，
+        覆盖它会让合成器抛 `'NoneType' has no attribute 'render_strips'`
+        （本轮真实踩过，见 `ToolBatchWidget` 的注释）。
+        """
+        if not self.display:
+            return
+        body = SEGMENT_SEP.join(self._cost_segments())
+        self.update(
+            f"[{THEME_COLOR}]{self._current_frame()}[/] {escape(self._phase)}"
+            f"[{SECONDARY_COLOR}] ({escape(body)})[/]"
+        )
 
 
 class StatusHint(Static):

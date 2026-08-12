@@ -80,7 +80,7 @@ from rhinecode.trace import (
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
-    ClarifyPanel, SessionPanel, compose_status_text,
+    ClarifyPanel, SessionPanel, StatusLine, compose_status_text,
     # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
     DETAIL_CYCLE, DETAIL_FOLDED,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
@@ -270,6 +270,21 @@ class RhineApp(App):
         padding: 0 1;
         background: $boost;
     }
+    /*
+     * 回合状态行（tui-activity-fold F14）。
+     *
+     * 与四个交互面板**同构**：`height: auto` + `display: none`，
+     * 按需出现、缺省不占布局。也就是说这不是一种新的布局形态，
+     * 是第五个同类组件——`HistoryView` 与 `#status-row` 的样式一行不动，
+     * F39/F40 那条带实测证据的 `min-height: 100%` 不在改动面内。
+     *
+     * 可见性由组件自己的 `start()` / `stop()` 切换，不写在这里。
+     */
+    StatusLine {
+        height: auto;
+        display: none;
+        padding: 0 1;
+    }
     InputBar {
         height: 3;
         border: solid #7AEEFF 60%;
@@ -381,6 +396,13 @@ class RhineApp(App):
         yield ConfirmPanel()
         yield ClarifyPanel()
         yield SessionPanel()
+        # 回合状态行（tui-activity-fold F14）：各面板**下方**、输入框**上方**。
+        #
+        # 位置贴着输入框——用户视线本来就在那里，而它回答的正是「现在还在跑吗」。
+        # ⚠ 它与 `#status-row` 刻意分开：那一行装的是**配置态**（provider /
+        # 模型 / 权限档，常驻），这一行是**本回合活体态**（只在运行中存在）。
+        # 合并会让「常驻状态」与「瞬时状态」争同一块地方。
+        yield StatusLine()
         yield InputBar(
             self._command_registry,
             placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，连按两次 Ctrl+C 退出",
@@ -419,6 +441,9 @@ class RhineApp(App):
         # `--continue` 恢复出来的历史里有工具行，晚一步的话首屏那批会用空表
         # 画成独立行，与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
         self.query_one(HistoryView).set_fold_groups(self._manager.fold_group_map())
+        # 批次封闭的行为记录（tui-activity-fold N7/AC26）。走回调注入而不是让
+        # 历史区直接持有记录器——它是纯展示层，认识 trace 会让依赖方向倒过来。
+        self.query_one(HistoryView).set_batch_closed_hook(self._trace_tool_batch)
 
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
@@ -667,6 +692,23 @@ class RhineApp(App):
         self._recorder.emit_lazy(
             TraceEventType.UI_MESSAGE,
             lambda: {"source": source, "text": full_text(text)},
+        )
+
+    def _trace_tool_batch(self, summary: str, calls: int) -> None:
+        """
+        记一条 `ui_tool_batch`：一批工具调用归并成了一行（tui-activity-fold N7）。
+
+        由 `HistoryView` 在批次封闭时回调。**记的是聚合语原文与调用数**——
+        前者是用户真正看到的那句话（与界面同源，见 `ToolBatchWidget.summary_text`），
+        后者是「归并有没有生效」的直接依据：排查「怎么还是一行一行地铺」时，
+        看到 `1 次调用` 就知道批次根本没攒起来。
+
+        :param summary: 聚合语纯文本（未转义）
+        :param calls: 本批次纳入的调用次数
+        """
+        self._recorder.emit_lazy(
+            TraceEventType.UI_TOOL_BATCH,
+            lambda: {"summary": full_text(summary), "calls": calls},
         )
 
     def show_user_input(self, text: str) -> None:
@@ -940,6 +982,22 @@ class RhineApp(App):
         self._manager.clear()
         self.query_one(HistoryView).clear_all()
         self.query_one(ActivityView).update_rows(())
+        self._reset_display_state()
+
+    def _reset_display_state(self) -> None:
+        """
+        会话切换后的界面复位（tui-activity-fold F20）：撤下状态行、档位回默认。
+
+        ⚠ **`/clear` 与 `/resume` 两条路径共用这一处。** 各写一遍的话，
+        必然出现「清空能复位、恢复不能」这种一半对的状态，而那在界面上
+        表现为「上一段对话的展开档位莫名其妙地留着」。
+
+        状态行本应已由 `_set_streaming(False)` 收掉，这里再兜一次——
+        会话切换可能发生在一次运行的异常路径上。
+        """
+        self.query_one(StatusLine).stop()
+        self._detail_level = DETAIL_FOLDED
+        self.query_one(HistoryView).set_detail_level(DETAIL_FOLDED)
 
     def compact_context(self) -> None:
         """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
@@ -1144,6 +1202,10 @@ class RhineApp(App):
         """
         index = DETAIL_CYCLE.index(self._detail_level) if self._detail_level in DETAIL_CYCLE else 0
         self._detail_level = DETAIL_CYCLE[(index + 1) % len(DETAIL_CYCLE)]
+        self._recorder.emit_lazy(
+            TraceEventType.UI_DETAIL_LEVEL,
+            lambda level=self._detail_level: {"level": level},
+        )
         self._refresh_activity()
         # 历史区自己记下档位并广播给已挂载的批次与工具行——**不要在这里直接
         # 遍历组件**：那样只覆盖「此刻挂着的」，切档之后新产生的又会是折叠的。
@@ -1487,11 +1549,21 @@ class RhineApp(App):
 
         与 c3 不同：忙碌期间不禁用输入框（保持焦点，使运行中 Esc 取消可靠路由到 on_key），
         新一轮的并发提交由 on_input_bar_input_submitted 的 _stream_active 守卫拦截。
+
+        ⚠ **回合状态行挂在这一处**（tui-activity-fold F14）：它是「一次运行的
+        开始与结束」在本文件里唯一的判定点，异常路径也必经此处（`_do_stream`
+        的 `finally` 里那次复位）。另立一处判定必然与它漂移，
+        而漂移的表现是「跑完了状态行还赖着不走」或「跑着跑着它自己没了」。
         """
         self._stream_active = active
         if active:
             # 进入流式：复位提示标志，本轮可以再提示一次。
             self._busy_hint_shown = False
+        status_line = self.query_one(StatusLine)
+        if active:
+            status_line.start()
+        else:
+            status_line.stop()
         if not active:
             self.query_one(InputBar).focus()
 
@@ -1731,6 +1803,20 @@ class RhineApp(App):
                         self._result_detail(res),
                     )
 
+                elif etype == AgentEventType.USAGE:
+                    # 本轮 token 用量累加到状态行（tui-activity-fold F15/F17）。
+                    #
+                    # ⚠ **这个事件每轮只在流末尾到达一次**（Provider 协议限制：
+                    # OpenAI 兼容协议的 `include_usage` 在流的最后额外发一块
+                    # usage）。因此状态行上的 token 是**跳变式**更新，
+                    # 而不是像耗时那样持续滚动——这是**已知且如实记录**的行为，
+                    # 验收时别误判成「数字不动 = 坏了」（AC16）。
+                    total = getattr(event.usage, "total_tokens", 0) or 0
+                    if total:
+                        self.call_from_thread(
+                            self.query_one(StatusLine).add_tokens, total
+                        )
+
                 elif etype == AgentEventType.FINISHED:
                     level, line = self._finish_line(event.stop_reason, event.message)
                     if line:
@@ -1767,6 +1853,10 @@ class RhineApp(App):
                     self.call_from_thread(
                         self.query_one(ActivityView).update_rows, ()
                     )
+                    # 展开档位同样属于「上一段对话的状态」（tui-activity-fold
+                    # F20）。与 `/clear` 共用同一处复位——各写一遍必然出现
+                    # 「清空能复位、恢复不能」这种一半对的状态。
+                    self.call_from_thread(self._reset_display_state)
         finally:
             # **作用域泄漏的唯一可靠防护**，必须是 finally 的第一行（trace T42）。
             #
@@ -1978,6 +2068,13 @@ class RhineApp(App):
         self._pending_interaction = box
         # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
         self._busy_hint_shown = False
+        # 状态行切到等待语义并**撤下中断提示**（tui-activity-fold F18）：
+        # 面板有自己的取消方式，两套提示同屏会误导用户去按 Esc。
+        # ⚠ 耗时**继续累计**——那段等待确实在这次回合内，用户等了多久就是多久。
+        # 三类交互（确认 / 澄清 / 审批）共用本入口，改这一处即可。
+        self.call_from_thread(
+            self.query_one(StatusLine).set_phase, "等待确认", False
+        )
         self.call_from_thread(show_fn)
         # c12 `notification`：面板**已经弹出之后**才分发。
         #
@@ -1991,6 +2088,10 @@ class RhineApp(App):
             message=display or f"等待用户{kind}",
         )
         box["event"].wait()
+        # 面板结算：状态行回到运行语义、恢复中断提示（F18）。
+        # 放在 `wait()` 之后、埋点之前——此刻用户已经做完决定，Agent Loop
+        # 即将继续跑，界面上就该重新显示「按 Esc 可以中断」。
+        self.call_from_thread(self.query_one(StatusLine).set_phase, "处理中…", True)
         result = box["result"]
         # 交互埋点（trace F14）：埋在**阻塞等待返回之后**（即结算时刻），
         # 一次交互恰好一条。埋在弹出时会记不到 result，而「用户选了什么」

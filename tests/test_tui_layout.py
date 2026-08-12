@@ -381,13 +381,27 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("(3s)", _text_of(widget))
 
-    async def test_running_timer_is_untouched(self) -> None:
+    async def test_pending_phase_is_still_visible(self) -> None:
         """
-        **反证**：执行中的实时计时不受影响。
+        **反证（tui-activity-fold 起改写，不是删除）**：参数生成期必须仍有活体信号。
 
-        那是模型生成参数 / 等确认面板的那段时间里界面上唯一的活体信号，
-        从 0s 开始涨正是它的价值所在。把 F13 的规则误加到那边，用户会重新
-        看到一个几十秒完全静止的窗口——正是 tool_pending 那条护栏当初要解决的问题。
+        ## 这条需求的来历与它现在的承载者
+
+        原判据是「工具行显示 `参数生成中… 0s`，秒数在涨」。理由是：那是模型
+        生成参数（写文件类调用可能吐几十秒）/ 等确认面板的那段时间里，
+        **界面上唯一的活体信号**——没有它，用户看到的是一个完全静止的窗口，
+        无从判断程序是在干活还是卡住了。
+
+        tui-activity-fold F19 把**运行中的秒数**从工具行撤走了，因为并发执行
+        五个只读工具时屏幕上会有五个数字各自在跳。但**需求本身没有变**，
+        只是承载者换成了底部的回合状态行（一处总耗时 + 旋转标记）。
+
+        因此这条护栏改写为两半：
+        1. 工具行仍然明确写出**它处在哪个阶段**（这里）；
+        2. 活体信号（会动的东西）由 `test_tui_status_line.py` 钉住。
+
+        ⚠ **不要把这条删掉**：删了之后「参数生成中」这个阶段词消失也没人发现，
+        而那正是 tool_pending 那条护栏当初要解决的问题。
         """
         app = _ToolHarness()
         async with app.run_test(size=(120, 40)) as pilot:
@@ -399,7 +413,9 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
 
             text = _text_of(widget)
             self.assertIn("参数生成中", text)
-            self.assertIn("0s", text)
+            # F19/AC20：运行中的秒数已收敛到状态行，工具行上不该再有
+            self.assertNotIn("0s", text)
+            self.assertIsNone(widget._timer, "工具行不得再自持每秒刷新的定时器")
 
 
 class SummarizeResultTest(unittest.TestCase):

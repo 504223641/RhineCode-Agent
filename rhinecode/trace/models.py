@@ -68,6 +68,8 @@ class TraceEventType(str, Enum):
     TEAM_TASK = "team_task"                      # c15：共享任务清单的一次变更
     TEAM_MEMBER = "team_member"                  # c15：队员状态流转（注册/待命/唤醒/退场）
     AUTO_WAKE = "auto_wake"                      # c15：主对话的一次自动唤起
+    UI_TOOL_BATCH = "ui_tool_batch"              # tui-activity-fold：一批工具调用归并成一行
+    UI_DETAIL_LEVEL = "ui_detail_level"          # tui-activity-fold：展开档位的切换
 
 
 # ---------------------------------------------------------------------------

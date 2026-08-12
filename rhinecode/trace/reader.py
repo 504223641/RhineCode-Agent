@@ -352,6 +352,28 @@ def _s_auto_wake(r: dict) -> str:
     )
 
 
+def _s_ui_tool_batch(r: dict) -> str:
+    """
+    一批工具调用归并成一行（tui-activity-fold）。
+
+    摘要行给**聚合语原文 + 调用数**：前者是用户真正看到的那句话，
+    后者是「归并有没有生效」的直接依据——排查「怎么还是一行一行地铺」时，
+    看到 `1 次调用` 就知道批次根本没攒起来。
+    """
+    return f"{r.get('summary', '')} · {r.get('calls', 0)} 次调用"
+
+
+def _s_ui_detail_level(r: dict) -> str:
+    """
+    展开档位的一次切换（tui-activity-fold）。
+
+    档位用**名字**而不是数字：读时间线的人不必记 0/1/2 分别是什么。
+    """
+    names = {0: "折叠", 1: "逐条", 2: "全文"}
+    level = r.get("level")
+    return f"切到「{names.get(level, level)}」档"
+
+
 def _s_worktree_settle(r: dict) -> str:
     """
     结束时的去留决定（c14）。
@@ -403,6 +425,8 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.TEAM_TASK.value: _s_team_task,
     TraceEventType.TEAM_MEMBER.value: _s_team_member,
     TraceEventType.AUTO_WAKE.value: _s_auto_wake,
+    TraceEventType.UI_TOOL_BATCH.value: _s_ui_tool_batch,
+    TraceEventType.UI_DETAIL_LEVEL.value: _s_ui_detail_level,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」
