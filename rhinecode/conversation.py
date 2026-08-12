@@ -34,7 +34,7 @@ from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
-from rhinecode.tools.display import primary_arg_map
+from rhinecode.tools.display import fold_group_map, primary_arg_map
 from rhinecode.tools.registry import ToolRegistry
 # c14：协调层定位存盘/存档/角色目录与环境信息，一律是主项目根——
 # 主对话的工作目录是不变量（spec F4），隔离只发生在子 Agent 那一侧。
@@ -843,6 +843,25 @@ class ConversationManager:
         副作用：无（只读快照）。
         """
         return primary_arg_map(self._registry)
+
+    def fold_group_map(self) -> dict:
+        """
+        导出「哪些工具参与历史区的批次归并」（tui-activity-fold F2）。
+
+        与上面的 `primary_arg_map` **同构**：同一个注册中心、同样只读、
+        同样由 `RhineApp.on_mount` 只调一次（工具集在启动装配完成之后不再变化）。
+
+        :returns: `{工具名: (组标识, 量词模板)}`；只收**当前真正注册了**且在
+            `FOLD_GROUPS` 白名单里的工具。未启用工具能力（非 DeepSeek Provider）
+            时返回空字典——展示层据此让每次调用都独立成行，形态与改造前逐字一致
+
+        ⚠ 归并只发生在**只读检索类**工具上（读文件 / 查找文件 / 搜索内容 /
+        抓取网页）。写文件、执行命令、委派子 Agent、加载 Skill 一律不在表内，
+        因此**被折叠的永远只是「读」**——这是折叠不藏重要信息的结构性依据。
+
+        副作用：无（只读快照）。
+        """
+        return fold_group_map(self._registry)
 
     def skill_status_segment(self) -> Optional[str]:
         """状态栏的 Skill 段（形如 `Skill:2`）；无激活时 None，状态栏随之隐藏该段。"""

@@ -127,18 +127,41 @@ SPINNER_INTERVAL = 0.15                  # 秒/帧（F16a，常量不可配置�
 
 ### 1. `ToolBatchWidget`（新，`tui/widgets.py`）
 
-**职责**：装一批连续的可归并工具行，按档位决定露多少。
+**职责**：代表一批连续的可归并工具行，按档位决定露多少。
 
-**结构**：`Vertical` 容器，内含一个聚合行 `Static` + N 个 `ToolCallWidget`。
+**结构**：⚠ **它不是容器。** 本体就是一个 `Static`——那行聚合语；
+工具行**照常挂在历史区、与它平级**，批次只持有引用来控制可见性。
+折叠时把这些工具行 `display = False`，屏幕上只剩聚合行那一行。
+
+#### 为什么不做容器（实现期修正）
+
+最自然的写法是让批次做 `Vertical`、把工具行 mount 进去。实现期试过，
+**在挂载时序上踩了一连串不报错的坑**：
+
+- `add_tool_widget` 挂完批次会**紧接着**调 `attach`，而此时容器自身的挂载
+  还没落地。往未挂载的容器 mount，实测让**整个批次连同工具行从 DOM 消失**
+  （挂一条系统行之后 `#history-messages` 里只剩那条系统行），且不报任何错。
+- 改成「先入队、`on_mount` 补挂」之后，补挂要多一轮事件循环才落地；
+  在那之前若发生一次布局（例如封闭批次触发重绘），批次照样被挤掉。
+- 期间还撞出两个同类问题：**`_render` 撞了 Textual 内部方法名**
+  （`Widget._render()` 要返回 Visual，被覆盖后返回 None，合成器抛
+  `'NoneType' has no attribute 'render_strips'`）、**对未挂载的 `Static`
+  调 `update()` 会让容器在下次布局时掉出 DOM**。
+
+平级方案从**结构上**消掉这一整类问题：DOM 上没有嵌套，也就没有嵌套的时序。
+视觉效果与「装进容器再隐藏容器」完全一致。
 
 **对外接口**：
 
 ```python
-class ToolBatchWidget(Vertical):
+class ToolBatchWidget(Static):
     def __init__(self, detail_level: int) -> None: ...
 
     def attach(self, widget: ToolCallWidget, tool_name: str) -> None:
-        """把一条工具行纳入本批次，并登记它的工具名用于聚合计数。"""
+        """
+        把一条工具行纳入本批次（登记引用与计数、设定可见性与档位）。
+        ⚠ **不挂载 widget** —— 挂载由 HistoryView 负责，两者平级。
+        """
 
     def note_running(self, tool_name: str, primary_value: str) -> None:
         """某次调用进入执行态：更新进行时文案与从属行（F5）。"""
@@ -424,6 +447,7 @@ tests/
 | `finish` 收一份还是两份结果文本 | **两份**（`summary` + `detail`） | 现状只传 summary，output 原文组件拿不到，F12 无从兑现（自检发现） |
 | 档 2 显示 `output` 还是 `full_output` | **`output`**，并注明剩余行数指向 trace | 完整原文会让一次测试套件输出撑爆历史区（spec F12 明确要求） |
 | 状态行放哪 | **新组件**，不并进 `#status-row` | 配置态 vs 回合活体态，语义与生命周期都不同 |
+| 批次是不是容器 | **不是**。`Static` + 引用列表，工具行与它平级 | 嵌套挂载踩了一连串不报错的时序坑（详见上文），平级方案从结构上消掉整类问题（实现期修正） |
 | token 是否实时 | **否**，每轮跳变 | Provider 协议限制（F17），已写进验收标准 |
 
 ---

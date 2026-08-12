@@ -401,6 +401,11 @@ NEXT_LEVEL_HINT = {
 #     ("✢", "✣", "✤", "✥")   同族四变体、笔画风格最统一
 # **换字形只需替换这张表，不动任何结构**——记下这条是因为没有它的话，
 # 下一个人遇到错位会误以为要重做整个状态行。
+# 批次尚未进入执行态时聚合行显示的兜底文案。
+# ⚠ **渲染与 `summary_text()` 必须共用它**——各写一份的话，一个刚建好的批次
+# 会出现「界面上显示『执行中…』而行为记录里是空串」这种对不上的情况。
+DEFAULT_BATCH_VERB = "执行中…"
+
 SPINNER_FRAMES = ("◇", "◈", "◆", "◈")
 # 帧间隔（秒）。太快让人眼疲劳，太慢则失去「还活着」的提示作用。
 # 刻意是常量而非配置项——本轮不引入新的配置面。
@@ -934,7 +939,7 @@ class ToolCallWidget(Static):
         return f" ({self._final_elapsed}s)"
 
 
-class ToolBatchWidget(Vertical):
+class ToolBatchWidget(Static):
     """
     一批**连续的只读检索调用**在历史区的呈现（tui-activity-fold 扩展 A 组）。
 
@@ -953,10 +958,24 @@ class ToolBatchWidget(Vertical):
     第一次 `Read` 发出去时，无从预知后面还会不会有第二次。因此
     「按数量选形态」这件事在运行中做不到，也不该做。
 
-    ## 谁来封闭它
+    ## ⚠ 为什么它**不是容器**
 
-    `HistoryView._mount_widget`：往历史区挂**任何非工具行内容**（正文、思考、
-    系统行）时封闭当前批次。规则是「历史区里出现了别的东西 = 这批调用结束了」。
+    最自然的写法是让批次做一个 `Vertical`、把工具行 mount 进去。
+    实现期试过，**在挂载时序上踩了一连串不报错的坑**：
+
+    - `HistoryView.add_tool_widget` 挂完批次会**紧接着**调 `attach`，
+      而此时容器自身的挂载还没落地。往未挂载的容器 mount，实测会让
+      **整个批次连同工具行从 DOM 里消失**（挂一条系统行之后
+      `#history-messages` 里只剩那条系统行），且不报任何错。
+    - 改成「先入队、`on_mount` 时补挂」之后，补挂要多一轮事件循环才落地；
+      在那之前若发生一次布局（例如封闭批次触发重绘），批次照样被挤掉。
+
+    现在的做法从**结构上**消掉这一整类问题：**批次只是一个 `Static`
+    （就是那行聚合语），工具行仍旧直接挂在历史区、与批次平级。**
+    批次只持有它们的引用来控制可见性。DOM 上没有嵌套，也就没有嵌套的时序。
+
+    折叠时把这些工具行 `display = False`，屏幕上就只剩聚合行那一行——
+    与「装进容器再隐藏容器」的视觉效果完全一致。
 
     ## 三个不变量
 
@@ -966,24 +985,7 @@ class ToolBatchWidget(Vertical):
     2. **状态变更方法只在主线程内被调用**（`ToolCallWidget.finish` 本身就是
        经 `call_from_thread` 到主线程的），本类**不新增任何跨线程通道**。
     3. **本类不参与 `tool_widgets` 表的登记与摘除。** Worker 侧仍持有
-       `ToolCallWidget` 引用、仍按原口径 `pop`，批次只改变那个组件挂在哪。
-    """
-
-    # ⚠ **必须自带 `height: auto`。** 容器类组件在没有任何 CSS 规则命中时，
-    # 渲染路径会走到 `Widget._render()` 并在合成器里抛
-    # `AttributeError: 'NoneType' object has no attribute 'render_strips'`
-    # ——抛在**布局阶段的主线程**，业务调用栈上没有任何线索。
-    #
-    # 实测：一个原生 `Vertical` 放进没有 CSS 的 App 里同样会崩，
-    # 而 `ActivityView`（同样继承 Vertical）一直正常，是因为 `app.py` 的 CSS
-    # 里给了它规则。把规则写成 `DEFAULT_CSS` 而不是加进 `app.py`，
-    # 是为了让本组件**在任何宿主里都能独立工作**——单测与端到端驱动都会
-    # 在裸 App 里实例化它。
-    DEFAULT_CSS = """
-    ToolBatchWidget {
-        height: auto;
-        width: 1fr;
-    }
+       `ToolCallWidget` 引用、仍按原口径 `pop`。
     """
 
     def __init__(self, detail_level: int = DETAIL_FOLDED) -> None:
@@ -992,32 +994,30 @@ class ToolBatchWidget(Vertical):
                              （新批次必须跟上当前档位，否则展开状态下新产生的
                              批次会是折叠的）
         """
-        super().__init__()
+        super().__init__("", markup=True)
+        # ⚠ **字段名前缀 `_batch_` 是刻意的，别改回 `_closed`。**
+        #
+        # Textual 的 `MessagePump`（`Static` 的基类之一）在实例上放了一个
+        # `_closed` 属性，用来标记「这个组件的消息泵已关停」。本类原先把
+        # 「批次已封闭」也存成 `self._closed`，于是 `close()` 一执行就等于
+        # 告诉 Textual「我关停了」——**它随后把整个节点从 DOM 里清理掉**，
+        # 界面上批次连同它统辖的工具行一起消失，而且**不报任何错**。
+        #
+        # 这是本轮撞上的**第二个** Textual 内部名（第一个是 `_render`，
+        # 那次的表现是合成器里抛 `'NoneType' has no attribute 'render_strips'`）。
+        # 新增字段前先在实例上 `hasattr` 查一遍，比事后二分省得多。
+        self._batch_closed = False
         # [(工具名, 是否成功)]，按发生时序；第二项 None 表示尚未产生结果
         self._entries: "list[tuple[str, Optional[bool]]]" = []
-        self._closed = False
+        # 本批次统辖的工具行。**只持引用，不做父节点**——它们挂在历史区里，
+        # 与本组件平级（见类 docstring）。
+        self._widgets: "list[ToolCallWidget]" = []
         self._detail_level = detail_level
         # 未封闭态显示的两段：进行时文案 + 当前调用的主参数值
         self._running_text = ""
         self._running_arg = ""
-        # 聚合行。**在构造时就建好**（而不是 compose 里），这样 `attach` 无论
-        # 在挂载前后被调用，都能先把它放进容器的第一位——见 `_ensure_summary`。
-        self._summary_widget = Static("", markup=True)
         # 单次调用时聚合行下方要保留的那条从属行（F4）——多次时为空
         self._single_arg = ""
-
-    def compose(self) -> ComposeResult:
-        """
-        聚合行随容器一起就位；工具行由 `attach` 动态挂载在它下面。
-
-        ⚠ **必须用 `compose` 交付聚合行，不能在 `attach` 里 `mount`。**
-        `HistoryView.add_tool_widget` 挂完批次会**紧接着**调 `attach`，
-        而此时容器自身的挂载还没落地——往一个未挂载的容器里 `mount`，
-        实测会让**整个批次容器从 DOM 里消失**（挂一条系统行之后
-        `#history-messages` 的子节点里就只剩那条系统行了）。
-        `compose` 在挂载时同步执行，天然没有这个时序问题。
-        """
-        yield self._summary_widget
 
     def on_mount(self) -> None:
         """挂载后立即画一次，避免出现一瞬间的空行。"""
@@ -1026,7 +1026,7 @@ class ToolBatchWidget(Vertical):
     @property
     def closed(self) -> bool:
         """本批次是否已封闭（封闭后不再接受新的工具行）。"""
-        return self._closed
+        return self._batch_closed
 
     @property
     def call_count(self) -> int:
@@ -1037,17 +1037,21 @@ class ToolBatchWidget(Vertical):
         """
         把一条工具行纳入本批次。
 
-        :param widget: 已建好但尚未挂载的工具行
+        ⚠ **本方法不挂载 widget**——挂载由 `HistoryView` 负责，工具行与本组件
+        在历史区里是**平级**的（理由见类 docstring：嵌套会踩挂载时序的坑）。
+        这里只登记引用与计数，并按当前档位设定它的可见性。
+
+        :param widget: 工具行（挂载与否都可以，本方法不关心）
         :param tool_name: 内部工具名（用于聚合计数，非展示标签）
 
-        副作用：把 widget 挂进本容器、登记 entry、给 widget 装上回指本批次的引用、
-        并按当前档位设定它的可见性。
+        副作用：登记 entry 与引用、给 widget 装上回指本批次的引用、
+        改 widget 的可见性与档位、重绘聚合行。
         """
         self._entries.append((str(tool_name or ""), None))
+        self._widgets.append(widget)
         widget.set_batch(self)
         widget.set_detail_level(self._detail_level)
-        self.mount(widget)
-        # 档 0 下子行整体不可见——折叠的全部意义就在这里
+        # 折叠档下工具行整体不可见——折叠的全部意义就在这里
         widget.display = self._detail_level != DETAIL_FOLDED
         # 单次时聚合行下面要显示这一次调用的参数（F4），先记下来
         self._single_arg = widget.primary_text
@@ -1095,28 +1099,31 @@ class ToolBatchWidget(Vertical):
 
         副作用：重绘聚合行。
         """
-        if self._closed:
+        if self._batch_closed:
             return
-        self._closed = True
+        self._batch_closed = True
         self._repaint()
 
     def set_detail_level(self, level: int) -> None:
         """
         接收全局档位广播（`Ctrl+O`）。
 
-        档 0 → 子工具行整体隐藏，只留聚合行；档 1/2 → 显示子行并把档位逐个转发。
+        折叠档 → 本批次统辖的工具行整体隐藏，屏幕上只留聚合行；
+        其余档位 → 显示它们并把档位逐个转发。
 
         :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
 
-        副作用：改子组件的可见性、转发档位、重绘聚合行。
+        副作用：改所辖工具行的可见性、转发档位、重绘聚合行。
         """
         if level == self._detail_level:
             return
         self._detail_level = level
         visible = level != DETAIL_FOLDED
-        for child in self.query(ToolCallWidget):
-            child.display = visible
-            child.set_detail_level(level)
+        # 遍历**引用列表**而不是 `self.query(...)`——工具行不是本组件的子节点，
+        # 它们与本组件平级地挂在历史区里（见类 docstring）。
+        for widget in self._widgets:
+            widget.display = visible
+            widget.set_detail_level(level)
         self._repaint()
 
     def summary_text(self) -> str:
@@ -1125,9 +1132,13 @@ class ToolBatchWidget(Vertical):
 
         单独抽出来是为了让 trace 负载与界面显示同源——各拼一遍的话，
         记录里的聚合语与用户看到的会悄悄不一致。
+
+        ⚠ 未封闭时的兜底文案**必须与 `_repaint` 里那句一致**。这正是「同源」
+        要防的事：渲染那边写了 `or 执行中…`、这边直接返回空串的话，
+        一个刚建好还没进执行态的批次，界面上显示「执行中…」而记录里是空。
         """
-        if not self._closed:
-            return self._running_text
+        if not self._batch_closed:
+            return self._running_text or DEFAULT_BATCH_VERB
         return compose_batch_summary(self._entries)
 
     def _has_failure(self) -> bool:
@@ -1140,31 +1151,21 @@ class ToolBatchWidget(Vertical):
 
         ⚠ 所有纯文本都过 `escape`：主参数值与聚合语都可能含字面 `[`。
 
-        ## ⚠ 为什么开头要挡一道「聚合行挂上了没」
-
-        `HistoryView.add_tool_widget` 挂完批次会**紧接着**调 `attach`，而容器
-        自身的 `compose` 此刻还没执行——聚合行那个 `Static` 尚未挂载。
-        对未挂载的组件调 `update()` 会让**整个批次容器在下一次布局时从 DOM 里
-        掉出去**：实测现象是挂一条系统行之后 `#history-messages` 的子节点里
-        只剩那条系统行，批次连同它的工具行一起凭空消失，且**不报任何错**。
-
-        挡掉之后不会丢内容——`on_mount` 会在挂载完成时补画一次，
-        而那时读到的是最新状态。
+        本组件**自己就是那行聚合语**（继承 `Static`），因此这里直接 `update`
+        自身，不存在「子组件挂没挂上」的问题——那正是不做容器换来的简化。
         """
-        if not self._summary_widget.is_mounted:
-            return
         color = ToolCallWidget._COLOR_FAIL if self._has_failure() else ToolCallWidget._COLOR_OK
 
-        if not self._closed:
+        if not self._batch_closed:
             # 未封闭：进行时 + 当前调用的参数。**不显示耗时**——那由状态行统一
             # 承担（F5），两处各显示一份会让用户去比对两个不相等的数字。
-            head = self._running_text or "执行中…"
+            head = self._running_text or DEFAULT_BATCH_VERB
             lines = [f"[{ToolCallWidget._COLOR_RUNNING}]● {escape(head)}[/]"]
             if self._running_arg:
                 lines.append(
                     f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._running_arg)}[/]"
                 )
-            self._summary_widget.update("\n".join(lines))
+            self.update("\n".join(lines))
             return
 
         # 已封闭：聚合语 + 档位提示
@@ -1180,7 +1181,7 @@ class ToolBatchWidget(Vertical):
             lines.append(
                 f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._single_arg)}[/]"
             )
-        self._summary_widget.update("\n".join(lines))
+        self.update("\n".join(lines))
 
 
 # `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
@@ -1511,15 +1512,17 @@ class HistoryView(ScrollableContainer):
                 batch = ToolBatchWidget(self._detail_level)
                 self._current_batch = batch
                 self._mount_widget(batch)
-            # 档位由 `attach` 一并设定（它还要按档位决定子行可见性），
-            # 因此这里不再单独调 set_detail_level。
+            # ⚠ 工具行**照常挂在历史区**，与批次平级——批次不是容器，
+            # 它只持引用来控制可见性（理由见 `ToolBatchWidget` 的 docstring：
+            # 嵌套挂载在时序上踩过一连串不报错的坑）。
+            self._mount_widget(widget)
+            # 档位与可见性由 `attach` 一并设定，故这里不单独调 set_detail_level。
             batch.attach(widget, name)
-            self._scroll_to_latest()
             return widget
 
         # 不可归并：独立成行，形态与改造前逐字一致。
-        # `_mount_widget` 会顺手封闭当前批次（它不是工具行？——它是，所以
-        # 那条判断放不了行，这里显式封闭）。
+        # ⚠ 显式封闭——`_mount_widget` 里那条判断放行工具行（可归并的要进批次），
+        # 所以走到这里必须自己把批次收掉。
         self._close_batch()
         # 新行也要跟上当前的档位（见 `set_detail_level` 里那条注释）。
         widget.set_detail_level(self._detail_level)

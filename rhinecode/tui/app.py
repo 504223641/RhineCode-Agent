@@ -408,6 +408,11 @@ class RhineApp(App):
         # 确认面板也要（E 组做完的样子里那句「工具名也走 B 组的主参数口径」）：
         # 用户就是靠面板上那一行决定放不放行的，键名在那里同样只占地方。
         self.query_one(ConfirmPanel).set_primary_args(primary_args)
+        # 归并分组表（tui-activity-fold F2）：哪些工具的调用会被收进一行聚合语。
+        # ⚠ 位置与上面那两行同理，**必须排在 `render_history` 之前**——
+        # `--continue` 恢复出来的历史里有工具行，晚一步的话首屏那批会用空表
+        # 画成独立行，与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
+        self.query_one(HistoryView).set_fold_groups(self._manager.fold_group_map())
 
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
