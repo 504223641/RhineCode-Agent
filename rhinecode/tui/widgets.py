@@ -861,9 +861,26 @@ class ToolCallWidget(Static):
         """
         self._batch = batch
 
+    def on_click(self, event) -> None:
+        """
+        点这一行 → 这**一次调用**在「逐条 ↔ 全文」之间切换。
+
+        与批次那一层配合成两级：点聚合行摊开这一批，点其中某一条看它的
+        完整参数与输出原文——不必为了看一次调用的细节把满屏都切到全文档。
+
+        ⚠ 仍处**折叠档**时点单条是够不着的（那时它根本不可见），
+        因此这里只在「逐条 ↔ 全文」之间切，不回落到折叠。
+
+        ⚠ `event.stop()` 的理由与批次那边相同：不拦会冒泡到可滚动的历史区。
+        """
+        event.stop()
+        nxt = DETAIL_ITEMS if self._detail_level == DETAIL_FULL else DETAIL_FULL
+        self.set_detail_level(nxt)
+
     def set_detail_level(self, level: int) -> None:
         """
-        接收全局详细度档位的广播（`Ctrl+O`，见 `app.action_toggle_expand`）。
+        接收全局详细度档位的广播（`Ctrl+O`，见 `app.action_toggle_expand`）
+        或单次点击。
 
         只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下档位即可，
         等它 `finish` 时自然按新档位渲染。
@@ -1172,9 +1189,27 @@ class ToolBatchWidget(Static):
         self._batch_closed = True
         self._repaint()
 
+    def on_click(self, event) -> None:
+        """
+        点这一行 → 这**一个**批次在「折叠 ↔ 逐条」之间切换。
+
+        `Ctrl+O` 是全局档位，管所有批次；鼠标是**单个**的——想看某一批具体
+        做了什么，不必把满屏的批次一起摊开。
+
+        ⚠ **必须 `event.stop()`**：不拦的话事件继续往上冒泡到历史区，
+        而历史区是可滚动容器，Textual 会把它当成一次滚动交互处理
+        （表现为「点一下内容跳一段」）。
+
+        ⚠ 拖拽选中文本**不会**触发本方法：Textual 只在按下与抬起落在同一处时
+        才发 `Click`，拖拽发的是 `MouseMove` + `MouseUp`。
+        """
+        event.stop()
+        nxt = DETAIL_FOLDED if self._detail_level != DETAIL_FOLDED else DETAIL_ITEMS
+        self.set_detail_level(nxt)
+
     def set_detail_level(self, level: int) -> None:
         """
-        接收全局档位广播（`Ctrl+O`）。
+        接收全局档位广播（`Ctrl+O`）或单次点击。
 
         折叠档 → 本批次统辖的工具行整体隐藏，屏幕上只留聚合行；
         其余档位 → 显示它们并把档位逐个转发。

@@ -293,3 +293,96 @@ class ResultDetailSourceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClickToExpandTest(unittest.IsolatedAsyncioTestCase):
+    """
+    鼠标点击展开（验收期新增）。
+
+    `Ctrl+O` 是**全局**档位，管所有批次；鼠标是**单个**的——想看某一批具体
+    做了什么，不必把满屏的批次一起摊开。两级配合：点聚合行摊开这一批，
+    点其中某一条看它的完整参数与输出原文。
+    """
+
+    async def test_clicking_a_batch_toggles_only_that_batch(self) -> None:
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = await prepared(app)
+            view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            await pilot.pause()
+            view.append_system("断开")
+            view.add_tool_widget(call("c2", "read_file", path="b.py"))
+            await pilot.pause()
+
+            first, second = list(view.query(ToolBatchWidget))
+            self.assertEqual(first._detail_level, DETAIL_FOLDED)
+
+            await pilot.click(first)
+            await pilot.pause()
+
+            self.assertEqual(first._detail_level, DETAIL_ITEMS, "点中的那批要摊开")
+            self.assertEqual(
+                second._detail_level, DETAIL_FOLDED, "**没点的那批不受影响**"
+            )
+
+    async def test_clicking_again_folds_it_back(self) -> None:
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = await prepared(app)
+            view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            await pilot.pause()
+            batch = view.query_one(ToolBatchWidget)
+
+            await pilot.click(batch)
+            await pilot.pause()
+            self.assertEqual(batch._detail_level, DETAIL_ITEMS)
+
+            await pilot.click(batch)
+            await pilot.pause()
+            self.assertEqual(batch._detail_level, DETAIL_FOLDED, "再点一次收回")
+
+    async def test_clicking_a_row_toggles_full_detail(self) -> None:
+        """点单条 → 逐条 ↔ 全文。折叠档下它不可见，够不着，故不回落到折叠。"""
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = await prepared(app)
+            widget = view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            await pilot.pause()
+            widget.finish(True, "读取 12 行", None, "行内容")
+
+            view.set_detail_level(DETAIL_ITEMS)
+            await pilot.pause()
+
+            await pilot.click(widget)
+            await pilot.pause()
+            self.assertEqual(widget._detail_level, DETAIL_FULL)
+
+            await pilot.click(widget)
+            await pilot.pause()
+            self.assertEqual(widget._detail_level, DETAIL_ITEMS, "再点一次回到逐条")
+
+    async def test_global_key_still_overrides_individual_clicks(self) -> None:
+        """
+        **`Ctrl+O` 仍是全局的**：点开过的单个批次，全局切档时要跟着走。
+
+        没有这条的话，「点开几个之后再按 Ctrl+O」会得到一屏各不相同的状态，
+        而那正是全局开关要避免的。
+        """
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = await prepared(app)
+            view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            await pilot.pause()
+            view.append_system("断开")
+            view.add_tool_widget(call("c2", "read_file", path="b.py"))
+            await pilot.pause()
+
+            first, second = list(view.query(ToolBatchWidget))
+            await pilot.click(first)
+            await pilot.pause()
+            self.assertNotEqual(first._detail_level, second._detail_level)
+
+            view.set_detail_level(DETAIL_FULL)
+            await pilot.pause()
+            self.assertEqual(first._detail_level, DETAIL_FULL)
+            self.assertEqual(second._detail_level, DETAIL_FULL, "全局广播要覆盖单个")
