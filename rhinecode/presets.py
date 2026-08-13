@@ -118,10 +118,16 @@ PRESET_CYCLE: dict[Preset, Preset] = {
 # 主对话的启动档在 `conversation.py` 的构造点上**显式传入**。
 DEFAULT_PRESET: Preset = Preset.AUTO
 
-# 权限档的显示名（spec F16）。
+# 权限档的显示名（spec F16）。统一是「显示名（YAML 里该写什么）」形态。
 #
-# ⚠ **`PERMISSIVE` 显示成 "auto" 是刻意的**：`auto` 预设内部就是这个档位，
-#    两处叫同一个名字，用户才不会以为它们是两回事。
+# ⚠ **`PERMISSIVE` 的显示名以 "auto" 打头是刻意的**：`auto` 预设内部就是这个
+#    档位，两处叫同一个名字，用户才不会以为它们是两回事。
+#
+# ⚠ **但后面那个 `（permissive）` 不可省。** 本表**唯一的消费者**是子 Agent 报告，
+#    而那份报告的用途正是帮用户对照自己写的角色定义——只显示 "auto" 的话，
+#    用户看到它**不知道该在 `permission_mode:` 里写什么**（YAML 里认的是
+#    `permissive`，没有 `auto` 这个取值）。三档统一带上 YAML 值，那一列就
+#    自解释了。
 #
 # ⚠ **三档必须都留着。** `/perm` 命令虽已删除，但 `STRICT` / `DEFAULT` 仍可经
 #    两条路径抵达：`permissions.yaml`，以及角色定义的 `permission_mode` 字段
@@ -130,7 +136,7 @@ DEFAULT_PRESET: Preset = Preset.AUTO
 MODE_LABELS: dict[PermissionMode, str] = {
     PermissionMode.STRICT: "严格（strict）",
     PermissionMode.DEFAULT: "默认（default）",
-    PermissionMode.PERMISSIVE: "auto",
+    PermissionMode.PERMISSIVE: "auto（permissive）",
 }
 
 

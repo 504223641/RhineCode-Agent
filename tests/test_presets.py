@@ -100,13 +100,25 @@ class ModeLabelTest(unittest.TestCase):
 
     def test_permissive_is_displayed_as_auto(self):
         """
-        放行档的显示名就是 `auto`——与预设同名是刻意的。
+        放行档的显示名以 `auto` 打头——与预设同名是刻意的。
 
-        `auto` 预设内部就是这个档位，两处叫同一个名字，用户才不会以为
-        它们是两回事（状态栏说 auto、子 Agent 报告说「放行」的话，
-        没人能确认那是不是同一个东西）。
+        `auto` 预设内部就是这个档位，叫同一个名字用户才不会以为它们是两回事
+        （显示成「放行」的话，没人能确认那和 `auto` 是不是同一个东西）。
         """
-        self.assertEqual(MODE_LABELS[PermissionMode.PERMISSIVE], Preset.AUTO.value)
+        self.assertTrue(MODE_LABELS[PermissionMode.PERMISSIVE].startswith(Preset.AUTO.value))
+
+    def test_every_label_carries_its_yaml_value(self):
+        """
+        每个显示名都要带上**在 YAML 里该写什么**。
+
+        本表唯一的消费者是子 Agent 报告，用途是帮用户对照自己写的角色定义。
+        只显示「auto」的话，用户不知道 `permission_mode:` 该填什么——YAML 里
+        认的是 `permissive`，压根没有 `auto` 这个取值。这条对三档一视同仁，
+        免得将来有人觉得中文名够用了就把括号去掉。
+        """
+        for mode in PermissionMode:
+            with self.subTest(mode=mode):
+                self.assertIn(mode.value, MODE_LABELS[mode])
 
     def test_all_three_modes_keep_a_label(self):
         """

@@ -164,8 +164,8 @@ class ConversationManager:
     _EFFORT_LABEL = {"off": "关闭", "high": "高效（high）", "max": "最强（max）"}
 
     # auto-plan 扩展：权限档的三档循环（`_PERM_CYCLE`）与显示名（`_PERM_LABEL`）
-    # 已随 `/perm` 命令一并删除。档位的显示名现在收在 `presets.MODE_LABELS`——
-    # 与状态栏共用一份，免得同一个档位在两处叫两个名字。
+    # 已随 `/perm` 命令一并删除。状态栏不再展示档位（它恒为放行档），
+    # 需要显示档位的地方（目前只有子 Agent 报告）取 `presets.MODE_LABELS`。
 
     def __init__(
         self,
