@@ -121,6 +121,7 @@ _LAYER_NAMES = {
     "hook": "⓪Hook",
     "blacklist": "①黑名单",
     "sandbox": "②沙箱",
+    "protected": "②″保护路径",
     "network": "②′网络边界",
     "rule": "③规则",
     "mode": "④模式",
@@ -140,6 +141,18 @@ def _s_permission_decision(r: dict) -> str:
     #
     # ⚠ 字段名从 `ask_downgraded` 改过来是因为被降级的不再只有 ASK。
     mark = "⚠④层已降级 " if r.get("mode_downgraded") else ""
+    # `protected_exempt` = 这次**命中了②″保护路径，但因本会话豁免而没有被升级**
+    # （protected-paths 扩展）。
+    #
+    # 进摘要行的判据与上面那条一样——「排查时第一眼要不要看到它」。
+    # 用户问「它怎么没弹面板就把 hooks.yaml 改了」时，第一件要确认的就是这个：
+    # 不标的话时间线上只剩一条 `allow（④模式）`，读的人会以为用户切到了放行档，
+    # 而真实原因是他此前在面板上点过一次「本会话放行」。
+    #
+    # 反过来「命中并升级」不需要额外标记——那条记录的 layer 就是 `protected`，
+    # 已经看得见了。
+    if r.get("protected_exempt"):
+        mark += "保护路径已豁免 "
     return (
         f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"
