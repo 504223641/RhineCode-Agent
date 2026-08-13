@@ -329,6 +329,12 @@ python -m tests.e2e.host --mode scripted --script tests.e2e.scripts:THINK_AND_RE
 python -m tests.e2e.host --mode live --idle-timeout 600          # 真实模型（需有效凭据）
 
 # ② 用瘦客户端驱动它（每次调用都是独立进程，无状态、无重试）
+#
+# ⚠ **从 Git Bash 驱动时必须 `MSYS_NO_PATHCONV=1`。** MSYS 的路径转换对「以 `/`
+#   开头的参数」无条件生效，于是 `send "/perm"` 会被改写成
+#   `send "C:/Program Files/Git/perm"`——斜杠命令**根本没送到应用**，而是当成
+#   普通消息发出去。live 模式下那是**真的花钱调一次模型**，而且模型会一本正经
+#   地解释「我无法访问那个路径」，看起来像产品出了问题。实测踩过。
 python -m tests.e2e.client hosts                 # 列出当前宿主（排障用，不需要宿主活着）
 python -m tests.e2e.client status                # 三态 / 面板原文与可选项 / 轮次 / 指纹
 python -m tests.e2e.client send "写个文件"        # 走真人提交入口（不是内部方法）
