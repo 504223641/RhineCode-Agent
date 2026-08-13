@@ -280,3 +280,171 @@ class ClipboardTest(unittest.TestCase):
         from rhinecode.tui.clipboard import copy_text
 
         self.assertFalse(copy_text(""))
+
+
+class DragDoesNotToggleTest(unittest.IsolatedAsyncioTestCase):
+    """
+    **拖选不得触发展开**（真机反馈）。
+
+    用户原话：「我选择以后会自动展开」，而展开会让原本折叠的子行变可见、
+    落进已经画好的选区，于是**复制到的内容比选中的多**。
+
+    ## 根因：Textual 判「是不是点击」不看鼠标动没动
+
+    `app.py` 里那段判定是 `if mouse_up_widget is mouse_down_widget` ——
+    只要按下与抬起落在**同一个组件**就发 `Click`。在一行之内拖着选文字，
+    抬手时那两个当然是同一个组件，于是照样发 Click。
+
+    （我在实现期的注释里写过「拖拽不会触发 Click」，**那是错的**，
+    读了 Textual 源码才发现。）
+
+    判据用 `screen.selections`：单纯点击时它是空的，拖选过就非空。
+    """
+
+    async def test_click_still_toggles(self) -> None:
+        """**正向**：没拖选时点击照常展开——别把功能一起挡掉了。"""
+        from rhinecode.provider.base import ToolCall
+        from rhinecode.tui.widgets import DETAIL_FOLDED, ToolBatchWidget
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            view = app.query_one(HistoryView)
+            view.set_fold_groups(FOLD)
+            widget = view.add_tool_widget(
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.py"})
+            )
+            await pilot.pause()
+            widget.finish(True, "读取 3 行")
+            view.append_system("封闭批次")
+            await pilot.pause()
+
+            batch = view.query_one(ToolBatchWidget)
+            self.assertEqual(batch._detail_level, DETAIL_FOLDED)
+
+            await pilot.click(batch)
+            await pilot.pause()
+            self.assertNotEqual(
+                batch._detail_level, DETAIL_FOLDED, "单纯点击必须照常展开"
+            )
+
+    async def test_drag_select_does_not_toggle(self) -> None:
+        """
+        **反证**：有选中内容时点击不展开。
+
+        这里直接把 `screen.selections` 造出来再发 Click——因为
+        `Pilot` 的鼠标序列不走 App 那段 Click 判定，模拟不出真机的时序。
+        判据本身是一样的：**有选区时那次 Click 是拖选的尾巴，不是点击**。
+
+        ⚠ 这里**直接调 `on_click`** 而不是 `pilot.click`：后者会先发 MouseDown，
+        而 MouseDown 会**清空选区**——于是造好的「刚拖选过」状态在 Click 到达
+        之前就没了，反证根本构造不出来。
+        """
+        from textual.selection import Selection
+        from rhinecode.provider.base import ToolCall
+        from rhinecode.tui.widgets import DETAIL_FOLDED, ToolBatchWidget
+
+        class _FakeClick:
+            """只需要一个 `stop()`——`on_click` 用到的就这一个方法。"""
+
+            def stop(self) -> None:
+                pass
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            view = app.query_one(HistoryView)
+            view.set_fold_groups(FOLD)
+            widget = view.add_tool_widget(
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.py"})
+            )
+            await pilot.pause()
+            widget.finish(True, "读取 3 行")
+            view.append_system("封闭批次")
+            await pilot.pause()
+
+            batch = view.query_one(ToolBatchWidget)
+            # 造一个「刚拖选过」的状态
+            app.screen.selections = {batch: Selection(None, None)}
+
+            batch.on_click(_FakeClick())
+            await pilot.pause()
+            self.assertEqual(
+                batch._detail_level,
+                DETAIL_FOLDED,
+                "拖选之后那次 Click 不该展开——展开会让子行落进已画好的选区，"
+                "复制到的内容就比选中的多",
+            )
+
+            # 反过来：清掉选区之后，同样一次 Click 必须照常展开
+            app.screen.selections = {}
+            batch.on_click(_FakeClick())
+            await pilot.pause()
+            self.assertNotEqual(
+                batch._detail_level, DETAIL_FOLDED, "没有选区时点击照常展开"
+            )
+
+
+class EveryRowKindIsSelectableTest(unittest.IsolatedAsyncioTestCase):
+    """
+    **历史区的每一种行都要能复制**（真机反馈后补的全覆盖扫描）。
+
+    前几轮是发现一处补一处：先是工具行，再是 AI 正文与回放，最后这一遍
+    扫描又抓出**思考块**——它建行时只有一个 `✻ ` 前缀、内容全靠流式灌进去，
+    而 `update_widget` 当时没同步纯文本缓存，于是拖选整段思考只能复制到
+    那个孤零零的前缀。
+
+    ⚠ 这条用例的价值在于**遍历**而不是逐个断言：将来新增一种行类型，
+    只要它复制不了，这里就当场红——不必等用户再报一次。
+    """
+
+    async def test_sweep_all_kinds(self) -> None:
+        from textual.selection import Selection
+        from rhinecode.provider.base import ToolCall
+
+        app = _Harness()
+        async with app.run_test(size=(80, 30)) as pilot:
+            view = app.query_one(HistoryView)
+            view.set_primary_args(PRIMARY)
+
+            view.append_user("用户消息")
+            thinking = view.begin_thinking_turn()
+            view.update_widget(thinking, "[dim italic]✻ 思考的内容[/dim italic]")
+            assistant = view.begin_assistant_turn()
+            view.update_ai_widget(assistant, "AI 正文")
+            view.append_system("提示级消息")
+            tool = view.add_tool_widget(
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.py"})
+            )
+            await pilot.pause()
+            tool.finish(True, "读取 3 行")
+            await pilot.pause()
+
+            whole = Selection(None, None)
+            unreachable = []
+            for child in view.query_one("#history-messages").children:
+                got = child.get_selection(whole)
+                if got is None or not got[0].strip():
+                    unreachable.append(type(child).__name__)
+
+            self.assertEqual(
+                unreachable, [], f"这些行的内容复制不走：{unreachable}"
+            )
+
+    async def test_thinking_content_survives_streaming(self) -> None:
+        """
+        思考块的**内容**（不只是前缀）要能复制。
+
+        它是流式灌进去的：建行时只有 `✻ `，内容靠 `update_widget` 反复替换。
+        纯文本缓存不跟着更新的话，复制到的就是建行那一瞬的样子。
+        """
+        from textual.selection import Selection
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            view = app.query_one(HistoryView)
+            thinking = view.begin_thinking_turn()
+            view.update_widget(thinking, "[dim italic]✻ 我在想这个问题[/dim italic]")
+            await pilot.pause()
+
+            got = thinking.get_selection(Selection(None, None))
+            self.assertIsNotNone(got)
+            self.assertIn("我在想这个问题", got[0], "思考的内容必须可复制，不能只有前缀")

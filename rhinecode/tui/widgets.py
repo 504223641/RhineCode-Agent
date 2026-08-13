@@ -892,8 +892,18 @@ class ToolCallWidget(Static):
         因此这里只在「逐条 ↔ 全文」之间切，不回落到折叠。
 
         ⚠ `event.stop()` 的理由与批次那边相同：不拦会冒泡到可滚动的历史区。
+
+        ⚠ **拖选也会发 `Click`，必须挡掉。** Textual 判定「是不是一次点击」
+        的依据是 **`MouseDown` 与 `MouseUp` 落在同一个组件**——**根本不看鼠标
+        有没有移动**（`app.py`：`if mouse_up_widget is mouse_down_widget`）。
+        于是在一行之内拖着选文字，抬手时照样发 Click，内容就被展开了。
+        用户原话：「我选择以后会自动展开」。
+
+        判据用 `screen.selections`：单纯点击时它是空的，拖选过就非空。
         """
         event.stop()
+        if self.screen.selections:
+            return
         nxt = DETAIL_ITEMS if self._detail_level == DETAIL_FULL else DETAIL_FULL
         self.set_detail_level(nxt)
 
@@ -1296,10 +1306,17 @@ class ToolBatchWidget(Static):
         而历史区是可滚动容器，Textual 会把它当成一次滚动交互处理
         （表现为「点一下内容跳一段」）。
 
-        ⚠ 拖拽选中文本**不会**触发本方法：Textual 只在按下与抬起落在同一处时
-        才发 `Click`，拖拽发的是 `MouseMove` + `MouseUp`。
+        ⚠ **拖选也会发 `Click`，必须挡掉。** Textual 判定「是不是一次点击」
+        的依据是 **`MouseDown` 与 `MouseUp` 落在同一个组件**——**根本不看鼠标
+        有没有移动**（`app.py`：`if mouse_up_widget is mouse_down_widget`）。
+        于是在一行之内拖着选文字，抬手时照样发 Click，内容就被展开了。
+        用户原话：「我选择以后会自动展开」。
+
+        判据用 `screen.selections`：单纯点击时它是空的，拖选过就非空。
         """
         event.stop()
+        if self.screen.selections:
+            return
         nxt = DETAIL_FOLDED if self._detail_level != DETAIL_FOLDED else DETAIL_ITEMS
         self.set_detail_level(nxt)
 
@@ -1680,8 +1697,15 @@ class HistoryView(ScrollableContainer):
 
         :param widget: 要更新的 Static 组件（begin_assistant_turn 等方法的返回值）
         :param markup: 新的 Rich markup 内容（完整替换，非追加）
+
+        ⚠ **必须同步纯文本缓存**（`set_plain`），否则这一行**复制到的是建行时
+        那一瞬的内容**。思考块正是这条路径：建行时只有一个 `✻ ` 前缀，
+        内容全靠这里流式灌进去——不同步的话用户拖选整段思考，
+        复制出来只有那个孤零零的前缀。实测扫出来的就是 `'✻ '`。
         """
         widget.update(markup)
+        if hasattr(widget, "set_plain"):
+            widget.set_plain(RichText.from_markup(markup).plain)
         self._scroll_to_latest()
 
     def update_ai_widget(self, widget: Static, content: str) -> None:
