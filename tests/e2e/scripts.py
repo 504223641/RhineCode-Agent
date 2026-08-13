@@ -1299,7 +1299,7 @@ def seed_protected_subagent(workspace: Path, user_dir: Path) -> None:
         {
             "description": "需要按指示修改文件时用它。",
             "tools": "read_file, write_file, edit_file",
-            "max_turns": 4,
+            "max_turns": 8,
         },
         "你按用户的要求改文件，做完后给出一段自包含的结论。",
     )
@@ -1324,7 +1324,11 @@ def seed_protected_isolated(workspace: Path, user_dir: Path) -> None:
             "description": "需要在独立工作区里做改动时用它。",
             "tools": "read_file, write_file, edit_file, glob_files",
             "isolation": "worktree",
-            "max_turns": 4,
+            # ⚠ 8 而不是 4：**真实模型验收实测**下，4 轮不够——它会花掉一两轮
+            # 给 main 发消息汇报进度，然后撞 `max_iterations` 收工（写入本身是成功的，
+            # 但任务被标成 failed，主 Agent 于是又委派一次，实测连派三次）。
+            # 脚本化剧本用 4 就够，这个值是为 live 留的余量。
+            "max_turns": 8,
         },
         "你在自己的隔离工作区里完成改动，最后给出一段自包含的结论。",
     )

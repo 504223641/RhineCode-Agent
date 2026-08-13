@@ -141,6 +141,52 @@
 
 ---
 
+## 六之二、真实模型端到端（`--mode live`，`deepseek-v4-pro`）
+
+> 用同一套驱动设施跑 `--mode live`，六个场景全部**用真实模型复跑一遍**，
+> 证据全部取自 trace。这一层验的是**脚本化验不到的东西**：模型会不会用另一个工具、
+> 会不会自己动手而不委派、被拦之后会怎么收敛。
+
+| 场景 | 真实模型下发生了什么（trace 原文） | 结论 |
+| --- | --- | --- |
+| L1 放行档写配置 | 面板弹出，表头 `确认执行 Write(.rhinecode/hooks.yaml)`，原因写明「Hook 动作会直接执行，不经权限管线」，选项 **恰为 `yes` / `yes_session` / `no` 三项** | ✅ |
+| L2 宽 allow 也盖不过 | 预置 `allow: Write(.rhinecode/**)`，`write_file → ask（②″保护路径）`，面板仍是三项 | ✅ 顺序论证的真机落点 |
+| L3 隔离子 Agent | 三个隔离队员各 `write_file → allow（④模式）`、`executed ok=True`，三个 `feature.py` 全部落在 `.rhinecode/worktrees/builder-*/`，**主项目根一个都没有** | ✅ 坑 1 的决定性反证 |
+| L4 普通改代码 | `write_file → allow（④模式）`，零面板，文件真的改了 | ✅ 不误伤 |
+| L5 本会话放行 | 第一次 `write_file → ask（②″保护路径）`；选「本会话放行」后第二次 `保护路径已豁免 edit_file → allow（④模式）`；`permissions.local.yaml` **不存在** | ✅ |
+| L6 非隔离子 Agent | 见下方那条完整因果链 | ✅ |
+
+### L6 的因果链（真实模型自己走出来的）
+
+```
+56  subagent:helper-1  edit_file    → ask（②″保护路径）
+57  subagent:helper-1  edit_file    → denied_non_interactive · 非交互，自动拒绝
+64  subagent:helper-1  write_file   → ask（②″保护路径）      ← 换了个工具重试
+65  subagent:helper-1  write_file   → denied_non_interactive
+70  subagent:helper-1  send_message → 送达 main · 写入被保护路径拦截，需主对话执行
+94  main               edit_file    → ask（②″保护路径）      ← 主对话接手，弹面板
+```
+
+`hooks.yaml` 原封不动。**子 Agent 两个写工具都被拦，然后主动发消息告诉主对话
+「这件事得你来」**——这正是期望的行为链（C15 协作 + ②″保护路径），
+而它是模型自己推出来的，不是剧本安排的。
+
+### 真实模型跑出来、脚本化跑不出来的四件事
+
+| # | 观察 | 意义 |
+| --- | --- | --- |
+| 1 | **L5 的第二次写入模型自己换用了 `edit_file`**（第一次是 `write_file`） | 豁免键是解析后的**路径**、与工具无关，所以 `write_file` 上授予的豁免对同一文件的 `edit_file` 也生效。单测只测了同工具复用，这个组合是真实模型给出来的——行为是对的（用户批准的是那个文件） |
+| 2 | **L6 第一次跑：模型委派了，同时自己也动手** | 主对话与子 Agent 并行做同一件事。两条路径都被②″拦住，说明本层不依赖「谁在做」 |
+| 3 | **L6 第一次跑：子 Agent 只读不写就收敛了**（文件不存在，读了三次放弃） | ⚠ **结果对但机制没被触发**——`hooks.yaml` 没被创建，可那不是因为本层。真实模型的场景要**先把前置条件摆好**（预置那个文件）才验得到想验的东西。第二次跑照此调整后拿到了完整链条 |
+| 4 | **`max_turns: 4` 对真实模型太低** | 隔离队员会花一两轮给 main 发消息汇报，然后撞 `max_iterations` 收工（写入本身成功、任务却标成 failed），于是主 Agent 又委派一次——实测连派三次。预置已改成 8；脚本化剧本用 4 仍然够 |
+
+### 驱动设施本身的一个坑（本轮踩到）
+
+**Git Bash 会把 `/perm` 转成 `C:/Program Files/Git/perm`。** MSYS 的路径转换对
+「以 `/` 开头的参数」无条件生效，于是斜杠命令根本没送到应用，而是当成普通消息
+**真的发给了模型**（白烧两次调用，且模型一本正经地解释「我无法访问那个路径」）。
+从 Git Bash 驱动客户端时必须 `MSYS_NO_PATHCONV=1`。
+
 ## 七、实现期对 spec / todo 的四处修正
 
 本轮对上游文档改了四处，每处都是读代码或实测发现的：
