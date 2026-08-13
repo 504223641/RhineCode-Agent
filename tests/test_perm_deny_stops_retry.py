@@ -126,6 +126,31 @@ class DenyFeedbackTextTest(unittest.TestCase):
         self.assertIn("不是技术故障", results[0].output)
         self.assertFalse(results[0].ok)
 
+    def test_the_lecture_does_not_reach_the_screen(self) -> None:
+        """
+        **那段劝阻文案只给模型看，不许铺到用户眼前**（真机反馈）。
+
+        缺 `summary` 时工具行会回退去取 `output` 全文，于是用户刚按下拒绝，
+        屏幕上立刻多出六行「不要重试、不要改参数、请立即停止本次任务的推进…」
+        ——那是写给模型的，对刚做完决定的人毫无用处，还把一次干脆的操作
+        变成一屏说教。用户原话：「不要这种提示」。
+
+        两条内容因此分家：`output` 给模型（长、带约束），`summary` 给人
+        （一句话，说清这一行为什么是红的）。
+
+        ⚠ 判据同时钉住**两个方向**：摘要要短、且**不能**把劝阻正文抄进来
+        ——只断言「非空」的话，把 output 原样赋给 summary 也会通过。
+        """
+        tool = _Writer()
+        provider = _RetryHappyProvider()
+        events = _run(provider, tool, lambda tc, t, d: False)
+        result = [e.tool_result for e in events if e.tool_result is not None][0]
+
+        self.assertTrue(result.summary, "拒绝结果必须自带一句面向人的摘要")
+        self.assertNotIn("不要重试", result.summary, "劝阻正文不许出现在界面上")
+        self.assertNotIn("\n", result.summary, "界面上那一行必须是一行")
+        self.assertIn("拒绝", result.summary)
+
 
 class DenyHardStopTest(unittest.TestCase):
     """硬约束：被拒的下一轮不发工具，模型想重试也无从下手。"""

@@ -193,16 +193,30 @@ class RhineApp(App):
         layers: base panels;
     }
     /*
-     * 四个交互面板的浮层容器（验收期修订）。
+     * 四个交互面板的浮层容器（验收期修订两次）。
      *
-     * **浮层与缩进都落在这一层**，面板自身回到普通子组件：
+     * **浮层与框线都落在这一层**，面板自身回到普通子组件：
      * - `layer` + `dock`：整块浮在历史区底部，不占常规流高度（不挤压历史区）
-     * - `padding`：把内部面板缩进到历史区边框**内侧**，不再盖掉框线
+     * - `border`（左 / 右 / 下）：**接着历史区那圈框继续画**
      *
-     * ⚠ **缩进为什么不能写在面板的 `margin` 上**：dock 组件的宽度默认是 `1fr`，
-     * 而 `1fr` 会让 `margin-right` 失效——实测面板 x 从 0 变 1（左边距生效）、
-     * 宽度仍是父容器全宽，于是右边框被顶出屏幕。左边缩了、右边没缩，
-     * 比不缩更难看。放到容器的 padding 上就没有这个问题。
+     * ## ⚠ 为什么是 border 而不是 padding（真机反馈后的第二次修订）
+     *
+     * 上一版用 `padding: 0 1` 把面板缩进到历史区框线内侧，理由是「透明背景
+     * 不会盖掉下面的框线」。**那个理由是错的**：Textual 里
+     * `background: transparent` 只让**颜色**透下来，字符照画不误——padding
+     * 那两列画的是**空格**，于是历史区的 `│` 在面板那几行被逐个擦成空白。
+     * 真机反馈：「弹出面板左右没有边框，对应历史记录左右也没有边框」。
+     *
+     * 现在改成让容器**自己画那两条竖线**（颜色与 `HistoryView` 同一个），
+     * 于是框线在视觉上是连续的一整圈，面板嵌在里面。
+     *
+     * `border-bottom` 同理：容器贴着 stage 底部，正好接管历史区的下边框那一行
+     * ——上一版靠 `margin-bottom: 1` 给那条线让位，让出来的那行在面板与框线
+     * 之间留了一道缝（「面板下面会有一点历史记录面板的空白」）。
+     *
+     * `border-top` **刻意留空**：面板自己带 `border-top: tall <各自的颜色>`，
+     * 那条线兼作「面板与历史内容的分界」，颜色还随面板类型变（确认橘、命令青）。
+     * 在这里再画一条会变成两条平行线。
      *
      * `height: auto` + 内部面板缺省 `display: none` ⇒ 空闲时这块高度为 0。
      */
@@ -210,16 +224,13 @@ class RhineApp(App):
         layer: panels;
         dock: bottom;
         height: auto;
-        /* ⚠ **缺省隐藏。** 容器带一圈 padding（把面板缩进到历史区框内），
-           而 padding 在 `height: auto` 下照样算进高度——空面板的容器仍占 1 行，
-           dock 在底部时正好压住历史区的下边框，那条框线变成一行空白。
+        /* ⚠ **缺省隐藏。** 容器自带边框，而边框在 `height: auto` 下
+           **照样算进高度**——空面板的容器仍占 1 行，dock 在底部时正好压住
+           历史区的下边框，那条框线变成一行空白。
            可见性由 `_reserve_space_for_panels` 按「有没有可见面板」切换。 */
         display: none;
-        /* 左右用 padding（一定缩内容区，不受 dock 那个 `1fr` 的影响），
-           底部用 margin——**padding 属于组件区域**，即便背景透明也会把
-           历史区的下边框那一行盖成空白；margin 不属于区域，容器整体上移。 */
-        padding: 0 1 0 1;
-        margin-bottom: 1;
+        border: solid #7AEEFF 60%;
+        border-top: none;
         background: transparent;
     }
     HistoryView {
@@ -275,6 +286,20 @@ class RhineApp(App):
         border-top: tall #808080 60%;
         padding: 0 1;
     }
+    /*
+     * 四个面板的共同外观（真机反馈后统一）。
+     *
+     * **底色一律透明**：原本用 `$boost` 给面板垫一层浅灰，想把它与历史内容
+     * 分开。但浮层容器现在自带左右框线、面板自带顶部分隔线，边界已经说清楚了；
+     * 那层灰反而在框线内侧又切出一条深浅边，看起来像面板没有贴住框
+     * （用户原话：「弹出面板的左右和下方还是有一点边距」）。
+     *
+     * **分隔线一律用主题青**：确认面板原本是橘色（想警示「需要你决定」）。
+     * 但整块面板本来就是为「需要你决定」才弹出来的，颜色不承担额外信息，
+     * 却与输入框、历史区那圈青色框线打架。橘色在本项目里已有确定含义
+     * （工具执行中 / 「情况变了」），面板顶线用它属于一符两义。
+     * 「这是有副作用的操作」由表头那行橘色文字承担，位置更贴近它说的那件事。
+     */
     CommandPanel {
         height: auto;
         max-height: 6;
@@ -283,37 +308,34 @@ class RhineApp(App):
         border: none;
         border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    /* 工具确认 / 计划审批面板：橘色分隔线警示「需要用户决定的操作」 */
     ConfirmPanel {
         height: auto;
         max-height: 8;
         display: none;
         border: none;
-        border-top: tall #FFA500 80%;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    /* Plan Mode 需求澄清面板：青色分隔线，与确认区分 */
     ClarifyPanel {
         height: auto;
         max-height: 12;
         display: none;
         border: none;
-        border-top: tall #7AEEFF 80%;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    /* /resume 会话选择面板：青色分隔线；显示全部会话，超出 15 行由 OptionList 自滚 */
     SessionPanel {
         height: auto;
         max-height: 15;
         display: none;
         border: none;
-        border-top: tall #7AEEFF 80%;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
     /*
      * 回合状态行（tui-activity-fold F14）。
@@ -337,14 +359,29 @@ class RhineApp(App):
         padding: 0 1;
     }
     /*
-     * 输入框：**边框在外层容器上，灰底只在框内那一行**（验收期修订）。
+     * 输入框：**边框在外层容器上，整块不上底色**（改了三轮，这是终态）。
      *
-     * Textual 的 `Input` 自带 `background: $surface`，而 background 会填满
-     * **整个组件区域、包括边框占的那两行**——于是青色框线是画在一片灰底上的，
-     * 灰色看起来溢出了框外。用户的原话是「只让它在框内范围显示灰色背景」。
+     * ## 为什么最后是「不上底色」
      *
-     * Textual 没有「单独给边框设背景」的属性，因此把边框挪到外层容器：
-     * 容器背景透明、只负责画框；`InputBar` 去掉自己的边框、只剩那一行灰底。
+     * 边框线画在**一整个格子**里：`─` 只占那个格子的垂直中段，其余部分露出的是
+     * **该格子的背景色**。于是只要底色与屏幕底色不同，「底色的边界」与「框线」
+     * 就永远差半个格子，差在哪一侧取决于边框那一圈用谁的背景——
+     *
+     * - 边框那圈用灰底 ⇒ 灰色比框线**往外多半格**（「灰色溢出了框」）；
+     * - 边框那圈用屏幕底色 ⇒ 框线与灰块之间**露出一圈黑**（「还是有一圈黑边」）。
+     *
+     * 两者在格子这个粒度上**不可能同时消除**。把底色整个去掉，这个矛盾就不存在了
+     * ——而且与历史区、四个面板的观感统一：全项目只用**框线**划分区域，
+     * 不用色块。
+     *
+     * ⚠ **三处必须一起透明**：容器、`InputBar` 自身（`Input` 自带
+     * `background: $surface`）、以及聚焦态的 `background-tint`
+     * （自带 `$foreground 5%`，只作用在输入行上，不关掉的话一聚焦就又多出
+     * 一层比框线亮的色块）。漏掉任何一处，那圈边就以另一种颜色回来。
+     *
+     * ⚠ **边框留在外层容器上，别挪回 `InputBar`。** 那样 `Input` 的底色与
+     * tint 会连框线那一圈一起铺，上面两条就都失效了。
+     *
      * 三行的总高度不变（容器 1 + 1 + 1），布局与改造前逐字一致。
      */
     #input-frame {
@@ -356,6 +393,11 @@ class RhineApp(App):
         height: 1;
         border: none;
         padding: 0 1;
+        background: transparent;
+    }
+    InputBar:focus {
+        background: transparent;
+        background-tint: $foreground 0%;
     }
     /* 底部状态栏那一行拆成左右两个区（tui-display 扩展 F31）。
        背景色挂在**行容器**上而不是任一子组件上——挂在子组件上的话，
@@ -1372,8 +1414,9 @@ class RhineApp(App):
                 default=0,
             )
             # 容器自身的缩进从**样式声明**取，同样不依赖布局是否算完。
-            # ⚠ 与 `#panel-dock` 的 CSS 成对：那边改了缩进，这里自动跟上。
-            spacing = dock.styles.margin.bottom + dock.styles.padding.top
+            # ⚠ 与 `#panel-dock` 的 CSS 成对：那边改了缩进/边框，这里自动跟上
+            # ——`gutter` 已经把 padding 与 border 一起算了，改用哪一种都不必动这行。
+            spacing = dock.styles.gutter.height + dock.styles.margin.height
             reserved = (panel_h + spacing) if any_visible else 0
             # 只改下边距，左右沿用原样式（padding: 0 1）
             self.query_one(HistoryView).styles.padding = (0, 1, reserved, 1)

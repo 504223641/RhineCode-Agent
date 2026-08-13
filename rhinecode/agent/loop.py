@@ -1659,7 +1659,21 @@ class Agent:
         if decision.decision == Decision.ASK:
             approved = ask(tc, tool, decision)
             if not approved:
-                res = ToolResult(ok=False, output=DENIED_BY_USER_FEEDBACK.format(name=tc.name))
+                # ⚠ **`summary` 不可省**（真机反馈）。缺它的话工具行会退回去取
+                # `output` 全文，于是那段**写给模型看**的六行劝阻文案
+                # （「不要重试、不要改参数…请立即停止本次任务的推进…」）
+                # 原样铺在用户眼前——而用户刚刚才按下拒绝，最不需要的就是
+                # 一段解释「拒绝意味着什么」的说明。
+                #
+                # 两条内容因此分家：`output` 给模型（长、带约束），
+                # `summary` 给人（一句话，说清这一行为什么是红的）。
+                # 另外两条自动拒绝分支（非交互 / 无人值守）早就是这么写的，
+                # 唯独这条漏了——三处形态必须一致。
+                res = ToolResult(
+                    ok=False,
+                    output=DENIED_BY_USER_FEEDBACK.format(name=tc.name),
+                    summary="用户拒绝了这次调用",
+                )
                 results[tc.id] = res
                 # 置位后主循环下一轮**不发工具**（硬约束，见 DENIED_BY_USER_FEEDBACK 注释）
                 ctx.user_denied = True
