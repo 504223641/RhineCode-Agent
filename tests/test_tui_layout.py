@@ -243,7 +243,15 @@ class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"命中第 {BRANCH_LINE_LIMIT - 1} 处", text)
             self.assertNotIn(f"命中第 {BRANCH_LINE_LIMIT} 处", text, "超限的行不该出现")
             self.assertIn(f"+{20 - BRANCH_LINE_LIMIT} 行", text)
-            self.assertIn("Ctrl+O", text, "必须写明怎么展开，否则用户只知道被省了")
+            # ⚠ **tui-activity-fold 验收期起，行内不再写「怎么展开」。**
+            # 那句话说的是一个**全局**快捷键，而一屏上可能有好几个折叠块——
+            # 同一句话重复四五次之后就只剩噪音了，而本轮改造的整个目的恰恰是
+            # 把重复的过程噪音压下去。发现性改由输入框占位符承担，
+            # 护栏见 `ExpandHintDiscoveryTest`。
+            #
+            # **「还剩多少行」这个数字必须留着**：它才是「被省了东西」的迹象。
+            # 改造前只取首行、连迹象都没有，那正是当初加这条用例的原因。
+            self.assertNotIn("Ctrl+O", text, "行内不再重复全局快捷键")
 
     async def test_expanded_shows_everything(self) -> None:
         app = _ToolHarness()
@@ -482,7 +490,9 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"新增第 {DIFF_ROW_LIMIT - 1} 行", text)
         self.assertNotIn(f"新增第 {DIFF_ROW_LIMIT} 行", text)
         self.assertIn(f"+{40 - DIFF_ROW_LIMIT} 行", text)
-        self.assertIn("Ctrl+O", text)
+        # 行内不再写快捷键（tui-activity-fold 验收期修订，见 BranchFoldTest 的说明）；
+        # **剩余行数必须留着**——它才是「被省了东西」的迹象
+        self.assertNotIn("Ctrl+O", text)
 
     def test_expanded_diff_shows_every_row(self) -> None:
         text = self._render(self._big_diff(40), expanded=True)
@@ -507,7 +517,7 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
         view.truncated = True
         text = self._render(view, expanded=False)
         self.assertIn("diff 已截断", text)
-        self.assertIn("Ctrl+O", text)
+        self.assertNotIn("Ctrl+O", text)
 
         # 展开之后「生成侧截断」那条仍在——它不是展开能解决的
         expanded = self._render(view, expanded=True)
@@ -583,3 +593,153 @@ class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpandHintDiscoveryTest(unittest.TestCase):
+    """
+    `Ctrl+O` 的**发现渠道**（tui-activity-fold 验收期修订）。
+
+    行内那句「（Ctrl+O 展开）」被撤掉了——它一屏出现四五次、全在说同一个
+    全局快捷键，而本轮改造的整个目的就是压掉重复的过程噪音。
+
+    ⚠ 撤掉之后，**输入框占位符成了它唯一的发现渠道**。没有这条护栏的话，
+    将来有人顺手改占位符（那一行本来就挤）就会让这个功能彻底隐形，
+    而且不会有任何测试红。
+    """
+
+    def test_placeholder_mentions_ctrl_o(self) -> None:
+        import inspect
+
+        source = inspect.getsource(RhineApp.compose)
+        self.assertIn("Ctrl+O", source, "输入框占位符必须提到 Ctrl+O")
+
+    def test_placeholder_still_mentions_the_other_keys(self) -> None:
+        """
+        **反证**：不是把别的提示挤掉换来的位置。
+
+        占位符那一行本来就挤，加东西时最容易发生的事就是挤掉别的——
+        而 `Esc` 与 `Ctrl+C` 那两条各自都有历史（前者是运行中唯一的逃生口，
+        后者是 tui-display 改键位时专门加的）。
+        """
+        import inspect
+
+        source = inspect.getsource(RhineApp.compose)
+        for key in ("Tab", "Esc", "Ctrl+C"):
+            with self.subTest(key=key):
+                self.assertIn(key, source)
+
+
+class NoJitterTest(unittest.IsolatedAsyncioTestCase):
+    """
+    **面板与状态行都不得挤压历史区**（tui-activity-fold 验收期修订）。
+
+    ## 这条测试在防什么
+
+    用户的原话是「每次出现时历史记录的窗口会抖动」——初版把状态行和四个交互
+    面板都放在常规流里，它们一出现就把 `HistoryView` 的 `1fr` 高度挤小，
+    历史区整块重排。一轮对话里状态行出现/收回各一次，面板还可能弹好几次，
+    于是屏幕一直在跳。
+
+    修法是两条不同的路：状态行**固定占一行、永不隐藏**；四个面板改走
+    **独立图层 + dock 到历史区底部**，浮起来、不占常规流高度。
+
+    ## 判据为什么是这两个数
+
+    「抖动」在代码里没有直接对应物，能量的只有**布局尺寸**。取历史区高度与
+    输入框纵坐标两个数：前者是内容区被压没被压，后者是整条底部有没有位移。
+    两个都不变，屏幕上就不会有任何东西跳。
+    """
+
+    async def _numbers(self, app) -> tuple:
+        """
+        取「历史区外框高度」与「输入框纵坐标」。
+
+        ⚠ **必须用 `outer_size` 而不是 `size`。** 前者是这个组件在屏幕上**占了
+        多大地方**（含内边距），后者只是内容区——而面板浮起来时我们会**故意**
+        给历史区加底部内边距把内容顶上去，那会让 `size` 变小。
+        拿 `size` 当判据的话，这条护栏会把「刻意的内容补偿」误判成「布局抖动」，
+        两件相反的事就分不开了。
+        """
+        view = app.query_one(HistoryView)
+        bar = app.query_one("InputBar")
+        return view.outer_size.height, bar.region.y
+
+    async def test_confirm_panel_does_not_resize_history(self) -> None:
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            before = await self._numbers(app)
+
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            during = await self._numbers(app)
+
+            panel.hide()
+            await pilot.pause()
+            after = await self._numbers(app)
+
+            self.assertEqual(
+                before, during, f"确认面板弹出不得改变布局：{before} → {during}"
+            )
+            self.assertEqual(before, after, "收起后同样不得改变")
+
+    async def test_status_line_does_not_resize_history(self) -> None:
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import StatusLine
+
+        app, _ = _make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            before = await self._numbers(app)
+
+            line = app.query_one(StatusLine)
+            line.start()
+            await pilot.pause()
+            during = await self._numbers(app)
+
+            line.stop()
+            await pilot.pause()
+            after = await self._numbers(app)
+
+            self.assertEqual(
+                before, during, f"状态行出现不得改变布局：{before} → {during}"
+            )
+            self.assertEqual(before, after)
+
+    async def test_history_gets_bottom_padding_while_a_panel_is_up(self) -> None:
+        """
+        面板浮起来之后**不能把历史区最后几行盖住**。
+
+        补偿办法是给历史区加一个等于面板高度的底部内边距，内容随之上移。
+        没有它的话，用户要看的那条工具行（「我在批准哪一次写入」）恰好被压在
+        面板下面——而那正是他此刻最需要看的东西。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            view = app.query_one(HistoryView)
+            self.assertEqual(view.styles.padding.bottom, 0, "空闲时不留白")
+
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()  # 内边距要等布局算出面板高度后的下一帧
+
+            self.assertGreater(
+                view.styles.padding.bottom,
+                0,
+                "面板浮起来时历史区必须让出等高的底部空间",
+            )
+
+            panel.hide()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(view.styles.padding.bottom, 0, "面板收起后必须还回去")

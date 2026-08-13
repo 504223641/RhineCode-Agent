@@ -113,26 +113,48 @@ class SpinnerWidthTest(unittest.TestCase):
 class LifecycleTest(unittest.IsolatedAsyncioTestCase):
     """AC16/AC17：只在运行中存在，结束即隐藏且不留痕。"""
 
-    async def test_hidden_before_any_run(self) -> None:
+    async def test_row_is_always_reserved(self) -> None:
         """
-        AC24 零回归：空闲时它不占布局，界面与改造前逐字一致。
-        """
-        app = _Harness()
-        async with app.run_test(size=(120, 40)) as pilot:
-            line = app.query_one(StatusLine)
-            self.assertFalse(line.display)
+        ⚠ **本类最要紧的一条**：这一行**永远占位、永不隐藏**。
 
-    async def test_start_shows_it_and_stop_hides_it(self) -> None:
+        初版照搬四个交互面板的做法（`display: none`，按需出现），结果每次运行
+        开始/结束都让 `HistoryView` 的 `1fr` 高度变一次、历史区内容整体重排
+        ——用户的原话是「每次出现时历史记录的窗口会抖动」。
+
+        现在改成固定占一行、空闲时画空串。**这条护栏钉住的就是「不抖」**：
+        谁把 `display` 改回按需切换，这里当场红。
+        """
         app = _Harness()
         async with app.run_test(size=(120, 40)) as pilot:
             line = app.query_one(StatusLine)
+            self.assertTrue(line.display, "空闲时也必须占位")
+
             line.start()
             await pilot.pause()
             self.assertTrue(line.display)
 
             line.stop()
             await pilot.pause()
-            self.assertFalse(line.display, "运行结束后必须整个隐藏、不占布局")
+            self.assertTrue(line.display, "结束后仍占位——消失才是抖动的来源")
+
+    async def test_idle_row_is_blank(self) -> None:
+        """占位归占位，空闲时那一行不该有任何内容。"""
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            line = app.query_one(StatusLine)
+            self.assertEqual(str(line.content).strip(), "")
+
+    async def test_start_fills_it_and_stop_blanks_it(self) -> None:
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            line = app.query_one(StatusLine)
+            line.start()
+            await pilot.pause()
+            self.assertIn("处理中", str(line.content))
+
+            line.stop()
+            await pilot.pause()
+            self.assertEqual(str(line.content).strip(), "", "结束后画空")
 
     async def test_start_and_stop_are_idempotent(self) -> None:
         """异常路径上 `_set_streaming` 可能被调两次，重复调用不得出错。"""
@@ -142,11 +164,11 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
             line.start()
             line.start()
             await pilot.pause()
-            self.assertTrue(line.display)
+            self.assertIn("处理中", str(line.content))
             line.stop()
             line.stop()
             await pilot.pause()
-            self.assertFalse(line.display)
+            self.assertEqual(str(line.content).strip(), "")
 
     async def test_nothing_lands_in_history(self) -> None:
         """

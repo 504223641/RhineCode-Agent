@@ -282,7 +282,7 @@ class _DiffBlock:
             else:  # MARK_CONTEXT：无背景，灰色前景
                 rows_out.append((f"{num}  {row.text}", dim, False))
         if hidden:
-            rows_out.append((f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}", dim, False))
+            rows_out.append((f"{BRANCH_CONT_INDENT}… +{hidden} 行", dim, False))
         # `view.truncated` 是 **diff 生成侧**（tools/diff.py）的截断标记，与本处的
         # 展示折叠是两回事：前者说「这份 diff 本身就没算全」，后者说「算全了但
         # 没画全」。两条都可能出现，故各画各的、不合并——合并会让用户以为
@@ -341,9 +341,18 @@ BRANCH_LINE_LIMIT = 5
 # 取 12 而不是 5：diff 的每一行信息量比结果行低（大半是上下文行），
 # 5 行往往连一个 hunk 都放不下。
 DIFF_ROW_LIMIT = 12
-# 折叠提示里给出的展开方式。**与 A 组共用同一个快捷键**，不为工具行另立一个
-# （F41：对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套）。
-EXPAND_HINT = "（Ctrl+O 展开）"
+# ⚠ **已停用**（tui-activity-fold 验收期修订）：行内不再写「（Ctrl+O 展开）」。
+#
+# 它原本挂在每一处被折叠的地方——每个批次聚合行、每个超长结果块、每个 diff 块。
+# 一屏上出现四五次同一句话，而它说的是**一个全局快捷键**，重复到第二次就已经
+# 没有信息量了；本轮改造的整个目的又恰恰是把重复的过程噪音压下去。
+#
+# 发现性改由**输入框占位符**承担（那里本来就列着 `/`、Tab、Esc、Ctrl+C，
+# 唯独缺 Ctrl+O）——说一次，说在用户找快捷键时会看的地方。
+#
+# 常量保留是为了让「还剩多少行」那个数字的语义有处可查：**被折叠的部分仍然
+# 如实写出行数**，只是不再附带怎么展开。
+EXPAND_HINT = ""
 # 次级信息的灰色前景。取值沿用改造前 `ToolCallWidget._COLOR_BRANCH` 的 #808080，
 # 这样「统一来源」这件事本身不改变任何一处的既有观感。
 SECONDARY_COLOR = "#808080"
@@ -369,15 +378,20 @@ DETAIL_ITEMS = 1
 DETAIL_FULL = 2
 DETAIL_CYCLE = (DETAIL_FOLDED, DETAIL_ITEMS, DETAIL_FULL)
 
-# 聚合行末尾常驻的提示，内容是**按下去会到哪一档**（F10）。
+# 档位的动作措辞。⚠ **不再挂在聚合行末尾**（tui-activity-fold 验收期修订）：
+# 那句话说的是一个**全局**快捷键，而一屏上可能有好几个批次、好几个折叠块——
+# 同一句话重复四五次，第二次起就没有信息量了，而本轮改造的整个目的恰恰是
+# 把重复的过程噪音压下去。
 #
-# 三态循环本身难以预期（用户记不住按第三下会发生什么），因此不靠记忆——
-# 屏幕上始终写着下一步。这也是为什么它是「展开 / 看全文 / 收起」这种
-# **动作**措辞，而不是「档 1 / 档 2 / 档 3」这种状态编号。
+# 发现性改由**输入框占位符**承担：说一次，说在用户找快捷键时会看的地方。
+#
+# 本表保留，供 `/help`、占位符与将来可能的状态提示复用——三档的**名字**
+# 仍然需要一处权威定义，而「展开 / 看全文 / 收起」这套**动作**措辞比
+# 「档 1 / 档 2 / 档 3」这种状态编号好懂（用户不必先知道自己在第几档）。
 NEXT_LEVEL_HINT = {
-    DETAIL_FOLDED: "（Ctrl+O 展开）",
-    DETAIL_ITEMS: "（Ctrl+O 看全文）",
-    DETAIL_FULL: "（Ctrl+O 收起）",
+    DETAIL_FOLDED: "展开",
+    DETAIL_ITEMS: "看全文",
+    DETAIL_FULL: "收起",
 }
 
 # ---------------------------------------------------------------------------
@@ -905,7 +919,7 @@ class ToolCallWidget(Static):
         rendered = [BRANCH_PREFIX + lines[0]]
         rendered.extend(BRANCH_CONT_INDENT + line for line in lines[1:])
         if hidden:
-            rendered.append(f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}")
+            rendered.append(f"{BRANCH_CONT_INDENT}… +{hidden} 行")
         return RichText("\n".join(rendered), style=self._COLOR_BRANCH)
 
     def _render_finished(self) -> None:
@@ -1222,13 +1236,12 @@ class ToolBatchWidget(Static):
             self.update("\n".join(lines))
             return
 
-        # 已封闭：聚合语 + 档位提示
+        # 已封闭：只写聚合语。
+        # ⚠ **不再附档位提示**（tui-activity-fold 验收期修订）：那句话说的是一个
+        # 全局快捷键，而一屏上可能有好几个批次——重复到第二次就没有信息量了。
+        # 发现性改由输入框占位符承担，见 `NEXT_LEVEL_HINT` 的注释。
         summary = compose_batch_summary(self._entries)
-        hint = NEXT_LEVEL_HINT.get(self._detail_level, "")
-        lines = [
-            f"[{color}]● {escape(summary)}[/]"
-            f"[{SECONDARY_COLOR}]  {escape(hint)}[/]"
-        ]
+        lines = [f"[{color}]● {escape(summary)}[/]"]
         # F4：只有一次调用时，聚合行下方保留一条从属行放主参数值——
         # 单次时那个信息放得下，不给是纯损失；多次时十个文件名塞不进一行。
         if len(self._entries) == 1 and self._single_arg:
@@ -1947,6 +1960,42 @@ class ActivityView(Vertical):
         self.display = True
 
 
+class OverlayPanel:
+    """
+    浮层面板的共用行为：**改变可见性时告诉外面一声**。
+
+    ## 为什么需要它
+
+    四个交互面板改成浮层之后（`layer: panels` + `dock: bottom`），它们不再
+    挤压历史区——这解决了抖动，但带来一个新问题：**它们会盖住历史区最后几行**，
+    而那几行往往正是用户要看的（比如「我在批准哪一次写入」的那条工具行）。
+
+    补偿办法是给历史区加一个等于面板高度的**底部内边距**，让内容上移。
+    但那要求「面板一显示/隐藏就有人来同步」，而 Textual 的 `Show` / `Hide`
+    事件**在 app 层收不到**（实测：`on_show` / `on_hide` 一次都不触发）。
+
+    因此改由面板自己在改可见性时 `post_message`。
+
+    ⚠ **四个面板必须都走 `set_visible`，不能再直接写 `self.display = ...`**。
+    漏一处不报错，只是那个面板弹出时把历史区末尾几行盖住了——而用户看到的是
+    「内容莫名其妙少了几行」，不会想到是面板压上去了。
+    """
+
+    class VisibilityChanged(TextualMessage):
+        """面板显示或隐藏了。app 据此重算历史区要让出多少底部空间。"""
+
+    def set_visible(self, visible: bool) -> None:
+        """
+        切换可见性并广播一次变化。
+
+        :param visible: 是否显示
+
+        副作用：改 `display`；向上发 `VisibilityChanged` 消息。
+        """
+        self.display = visible
+        self.post_message(self.VisibilityChanged())
+
+
 class CommandHighlighter(Highlighter):
     """
     输入框命令字段高亮器（c10 T36，spec F24）。
@@ -1984,7 +2033,7 @@ class CommandHighlighter(Highlighter):
             text.stylize(self.COMMAND_STYLE, 0, end)
 
 
-class CommandPanel(OptionList):
+class CommandPanel(OverlayPanel, OptionList):
     """
     斜杠命令提示面板（c10 起从注册表动态取候选，不再维护静态 COMMANDS 列表）。
 
@@ -2023,19 +2072,19 @@ class CommandPanel(OptionList):
         items = self._registry.complete(prefix)
         self.clear_options()
         if not items:
-            self.display = False
+            self.set_visible(False)
             return
         for item in items:
             self.add_option(
                 Option(f"{item.value}  [dim]{escape(item.description)}[/dim]", id=item.value)
             )
-        self.display = True
+        self.set_visible(True)
         # 首个候选默认高亮：Enter 即执行（与确认面板的顺手体验一致）
         self.highlighted = 0
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
 
 class InputBar(Input):
@@ -2277,38 +2326,45 @@ class StatusLine(Static):
         self._phase = "处理中…"
         self._interruptible = True
         self._spin_timer = None
-        self.display = False
+        # 「这一轮在跑吗」。⚠ **不能叫 `_running`**——那是 Textual `MessagePump`
+        # 的内部字段（本轮预检时抓到，见 `ToolBatchWidget` 里那段关于撞名的注释）。
+        self._active = False
 
     def start(self) -> None:
         """
-        开始一次运行：清零计数、显示自身、启动帧定时器。
+        开始一次运行：清零计数、启动帧定时器。
 
         **幂等**——重复调用只是重新起算（`_set_streaming(True)` 在异常路径上
         可能被调两次）。
 
-        副作用：改自身可见性、起一个主线程定时器。
+        ⚠ **不改 `display`**：本组件固定占一行、永不隐藏。空闲时画空串。
+        理由见 `app.py` 里 `StatusLine` 那段 CSS 的注释——按需出现会让
+        `HistoryView` 每轮重排两次，用户看到的是历史区在抖。
+
+        副作用：起一个主线程定时器、重绘自身。
         """
         self._start_time = monotonic()
         self._tokens = 0
         self._frame_index = 0
         self._phase = "处理中…"
         self._interruptible = True
-        self.display = True
+        self._active = True
         if self._spin_timer is None:
             self._spin_timer = self.set_interval(SPINNER_INTERVAL, self._tick)
         self._repaint()
 
     def stop(self) -> None:
         """
-        运行结束：停定时器、隐藏自身。**幂等**。
+        运行结束：停定时器、把这一行**画空**。**幂等**。
 
-        `display = False` 之后 Textual 会连带收回它占的布局空间——
-        空闲时的界面与改造前逐字一致（AC24 零回归）。
+        ⚠ 同样不改 `display`（见 `start`）。空闲时留下的是一行空白，
+        而不是一行消失——后者才是抖动的来源。
         """
         if self._spin_timer is not None:
             self._spin_timer.stop()
             self._spin_timer = None
-        self.display = False
+        self._active = False
+        self.update("")
 
     def add_tokens(self, count: int) -> None:
         """
@@ -2376,7 +2432,7 @@ class StatusLine(Static):
         覆盖它会让合成器抛 `'NoneType' has no attribute 'render_strips'`
         （本轮真实踩过，见 `ToolBatchWidget` 的注释）。
         """
-        if not self.display:
+        if not self._active:
             return
         body = SEGMENT_SEP.join(self._cost_segments())
         self.update(
@@ -2463,7 +2519,7 @@ class StatusBar(Static):
         )
 
 
-class NumberedPanel(OptionList):
+class NumberedPanel(OverlayPanel, OptionList):
     """
     三个可选面板（确认 / 澄清 / 会话）的共用底座（tui-display 扩展 E 组）。
 
@@ -2730,7 +2786,7 @@ class ConfirmPanel(NumberedPanel):
                 ("no", "拒绝", "让模型据此调整                    Esc"),
             ]
         )
-        self.display = True
+        self.set_visible(True)
         # 默认高亮「本次放行」，回车即执行（与 / 命令面板一致的顺手体验）
         self.highlighted = self._first_choice
 
@@ -2750,12 +2806,12 @@ class ConfirmPanel(NumberedPanel):
         self._reset_choices()
         self._add_static(f"[#FFA500]{escape(title)}[/#FFA500]")
         self._add_choices([("yes", yes_label, ""), ("no", no_label, "Esc")])
-        self.display = True
+        self.set_visible(True)
         self.highlighted = self._first_choice
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为拒绝执行。"""
@@ -2825,14 +2881,14 @@ class ClarifyPanel(NumberedPanel):
                 self._add_static(f"[dim]     {escape(opt.detail)}[/dim]")
 
         self._add_static("[dim]                                              Esc 取消[/dim]")
-        self.display = True
+        self.set_visible(True)
         # 默认高亮第一个可选概述行
         if first_selectable is not None:
             self.highlighted = first_selectable
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为用户取消澄清。"""
@@ -2913,14 +2969,14 @@ class SessionPanel(NumberedPanel):
             option_index = self._add_choice(info.session_id, line)
             if first_selectable is None:
                 first_selectable = option_index
-        self.display = True
+        self.set_visible(True)
         # 默认高亮第一个可选会话（最近的可恢复会话，回车即载入）
         if first_selectable is not None:
             self.highlighted = first_selectable
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 关闭面板。"""

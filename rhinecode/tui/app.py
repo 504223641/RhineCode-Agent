@@ -27,7 +27,7 @@ from typing import Optional
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import Key
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
@@ -80,7 +80,7 @@ from rhinecode.trace import (
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
-    ClarifyPanel, SessionPanel, StatusLine, compose_status_text,
+    ClarifyPanel, SessionPanel, StatusLine, OverlayPanel, compose_status_text,
     # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
     DETAIL_CYCLE, DETAIL_FOLDED,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
@@ -177,6 +177,20 @@ class RhineApp(App):
     Screen {
         layout: vertical;
     }
+    /*
+     * 历史区与四个交互面板共处的「舞台」（tui-activity-fold 验收期修订）。
+     *
+     * ⚠ **`layers` 必须声明在这里**，因为 dock 与图层都是相对**父容器**的。
+     * 面板走 `panels` 层 + `dock: bottom`，于是它们浮在历史区底部、
+     * **不占常规流的高度**——这正是「面板弹出不再挤压历史区」的全部实现。
+     *
+     * 实测（80×20 终端）：面板出现前后 `HistoryView` 高度都是 14、
+     * 输入框位置都是 17。改造前这两个数会各变一次，用户看到的就是整块在跳。
+     */
+    #stage {
+        height: 1fr;
+        layers: base panels;
+    }
     HistoryView {
         height: 1fr;
         border: solid #7AEEFF 60%;
@@ -234,6 +248,8 @@ class RhineApp(App):
         height: auto;
         max-height: 6;
         display: none;
+        layer: panels;
+        dock: bottom;
         /* 清除 OptionList 自带全方向边框，统一用顶部分隔线与主题色对齐 */
         border: none;
         border-top: tall #7AEEFF 60%;
@@ -245,6 +261,8 @@ class RhineApp(App):
         height: auto;
         max-height: 8;
         display: none;
+        layer: panels;
+        dock: bottom;
         border: none;
         border-top: tall #FFA500 80%;
         padding: 0 1;
@@ -255,6 +273,8 @@ class RhineApp(App):
         height: auto;
         max-height: 12;
         display: none;
+        layer: panels;
+        dock: bottom;
         border: none;
         border-top: tall #7AEEFF 80%;
         padding: 0 1;
@@ -265,6 +285,8 @@ class RhineApp(App):
         height: auto;
         max-height: 15;
         display: none;
+        layer: panels;
+        dock: bottom;
         border: none;
         border-top: tall #7AEEFF 80%;
         padding: 0 1;
@@ -273,16 +295,22 @@ class RhineApp(App):
     /*
      * 回合状态行（tui-activity-fold F14）。
      *
-     * 与四个交互面板**同构**：`height: auto` + `display: none`，
-     * 按需出现、缺省不占布局。也就是说这不是一种新的布局形态，
-     * 是第五个同类组件——`HistoryView` 与 `#status-row` 的样式一行不动，
-     * F39/F40 那条带实测证据的 `min-height: 100%` 不在改动面内。
+     * ⚠ **固定占一行，永不隐藏**（验收期修订）。
      *
-     * 可见性由组件自己的 `start()` / `stop()` 切换，不写在这里。
+     * 初版照搬了四个交互面板的做法（`display: none`，按需出现）。那是错的：
+     * 面板是**打断性**的（弹出时用户注意力本就在面板上），状态行是**常伴**的
+     * ——每次运行开始都要出现、结束都要收回，而每一次出现/收回都让
+     * `HistoryView` 的 `1fr` 高度变一次，历史区内容随之重排。
+     * 用户的原话是「每次出现时历史记录的窗口会抖动」。
+     *
+     * 现在它永远占这一行：**布局恒定，零抖动**。空闲时内容为空串，
+     * 屏幕上就是输入框上方的一行空白——这是刻意付的代价，
+     * 换掉的是每轮两次的整区重排。
+     *
+     * 因此这里**不能写 `display: none`**，组件那边也不再改 `display`。
      */
     StatusLine {
-        height: auto;
-        display: none;
+        height: 1;
         padding: 0 1;
     }
     InputBar {
@@ -385,17 +413,34 @@ class RhineApp(App):
         self._quit_hint_timer = None
 
     def compose(self) -> ComposeResult:
-        """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
-        yield HistoryView()
+        """
+        按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。
+
+        ## ⚠ `#stage` 这一层容器是为「面板不再挤压历史区」而加的（验收期修订）
+
+        改造前四个交互面板是常规流里的兄弟节点，一弹出就把 `HistoryView` 的
+        `1fr` 高度挤小，历史区整块重排——用户的原话是「确认面板也会导致历史
+        窗口抖动」。
+
+        现在历史区与四个面板一起放进 `#stage`，面板走**独立图层**并
+        `dock: bottom`：它们浮在历史区底部，**不占常规流的高度**。
+        实测（80×20 终端）历史区高度在面板出现前后都是 14、输入框位置都是 17。
+
+        ⚠ **`ActivityView` 刻意留在 `#stage` 外面**：它是持续显示的观测区，
+        不是打断性的，浮起来会长期遮住历史区内容。
+        """
+        with Vertical(id="stage"):
+            yield HistoryView()
+            # 四个交互面板：浮层，dock 在历史区底部（见上方说明与 CSS）
+            yield CommandPanel(self._command_registry)
+            yield ConfirmPanel()
+            yield ClarifyPanel()
+            yield SessionPanel()
         # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
         #
         # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
         # 放历史区上方的话，它空转时会白占两行，而且位置会随历史区滚动跳动。
         yield ActivityView()
-        yield CommandPanel(self._command_registry)
-        yield ConfirmPanel()
-        yield ClarifyPanel()
-        yield SessionPanel()
         # 回合状态行（tui-activity-fold F14）：各面板**下方**、输入框**上方**。
         #
         # 位置贴着输入框——用户视线本来就在那里，而它回答的正是「现在还在跑吗」。
@@ -405,7 +450,14 @@ class RhineApp(App):
         yield StatusLine()
         yield InputBar(
             self._command_registry,
-            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，连按两次 Ctrl+C 退出",
+            # ⚠ `Ctrl+O` 是 tui-activity-fold 验收期补进来的：行内的
+            # 「（Ctrl+O 展开）」提示被撤掉之后，这里成了它**唯一**的发现渠道。
+            # 撤那句话的理由是它一屏出现四五次、全在说同一个全局快捷键；
+            # 说一次、说在用户找快捷键时会看的地方，才是它该待的位置。
+            placeholder=(
+                "输入消息，/ 查看命令，Tab 补全，Ctrl+O 展开详情，"
+                "运行中按 Esc 取消，连按两次 Ctrl+C 退出"
+            ),
         )
         # 状态栏是**一行两个区**：左区贴左边缘放瞬时提示，右区右对齐放常驻状态
         # （F31，对齐 Claude Code 底部那一行）。合成一个组件做不到「贴左」——
@@ -1210,6 +1262,54 @@ class RhineApp(App):
         # 历史区自己记下档位并广播给已挂载的批次与工具行——**不要在这里直接
         # 遍历组件**：那样只覆盖「此刻挂着的」，切档之后新产生的又会是折叠的。
         self.query_one(HistoryView).set_detail_level(self._detail_level)
+
+    def on_overlay_panel_visibility_changed(
+        self, _event: "OverlayPanel.VisibilityChanged"
+    ) -> None:
+        """
+        某个浮层面板显示或隐藏了：重算历史区要让出多少底部空间。
+
+        面板改成浮层之后不再挤压历史区（那是抖动的根源），但它们会**盖住
+        历史区最后几行**——而那几行往往正是用户要看的（「我在批准哪一次写入」
+        的那条工具行就在最后）。这里给历史区补一个等于面板高度的底部内边距，
+        内容随之上移，被盖住的部分重新露出来。
+
+        ## 为什么走消息而不是在调用点同步
+
+        Textual 的 `Show` / `Hide` 事件**在 app 层收不到**（实测 `on_show` /
+        `on_hide` 一次都不触发），而面板的显示/隐藏散落在四个组件的
+        `show_for` / `hide` 里。让面板自己广播，就不必在 app 里枚举所有调用点
+        ——枚举那种写法漏一处不报错，只表现为「某个面板弹出时内容少了几行」。
+
+        副作用：改 `HistoryView` 的 `padding` 样式。
+        """
+        # 面板高度要等布局算完才知道，故推到下一帧再读
+        self.call_after_refresh(self._reserve_space_for_panels)
+
+    def _reserve_space_for_panels(self) -> None:
+        """
+        按当前可见面板的高度，设置历史区的底部内边距。
+
+        面板互斥（同时最多一个可见），但仍按总和算——多一个面板同时弹出时
+        这里不会算错，而写死「取第一个」会在那种情况下少让一块地方。
+        """
+        try:
+            # ⚠ **不能写 `self.query(OverlayPanel)`。** Textual 的类型查询按
+            # **CSS 类型名**匹配，而那套名字只收 Widget 子类——`OverlayPanel`
+            # 是个纯 mixin，不在其中，查出来恒为空（实测：面板明明可见、
+            # 查询结果 0 个，padding 永远算成 0，而且不报任何错）。
+            reserved = sum(
+                widget.outer_size.height
+                for widget in self.query("*")
+                if isinstance(widget, OverlayPanel) and widget.display
+            )
+            history = self.query_one(HistoryView)
+            # 只改下边距，左右沿用原样式（padding: 0 1）
+            history.styles.padding = (0, 1, reserved, 1)
+        except Exception:  # noqa: BLE001
+            # 布局相关的兜底：这只是「让内容别被盖住」的锦上添花，
+            # 出错时宁可少让一块地方，也不能把界面拆了。
+            pass
 
     def action_request_quit(self) -> None:
         """

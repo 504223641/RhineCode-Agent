@@ -6,8 +6,12 @@
 
 ⚠ 本文件里分量最重的是 `FoldWhitelistTest`。它遍历一张「明确不该被折叠」
 的清单逐个断言——那条清单不是随手写的，它对应 spec 的安全判据：
-**被折叠的永远只是「读」，「写」和「执行」一行都不会少。**
-将来有人往 `FOLD_GROUPS` 里顺手加一个有副作用的工具时，这里当场红。
+**能折叠的，要么无副作用，要么已被用户过目。**
+将来有人往 `FOLD_GROUPS` 里顺手加一个「结果类」工具时，这里当场红。
+
+（该判据在验收期改过一次：最初是更严的「被折叠的永远只是『读』」，
+后来 `run_command` 按用户要求加入归并——理由见 `FOLD_GROUPS` 的注释与
+`test_result_changing_tools_are_never_foldable` 的 docstring。）
 """
 
 import unittest
@@ -30,26 +34,34 @@ def call(name: str, arguments=None):
 
 
 class FoldWhitelistTest(unittest.TestCase):
-    """F2：只有只读检索类工具参与归并，其余一律独立成行。"""
+    """F2：只有「过程类」工具参与归并，「结果类」一律独立成行。"""
 
-    def test_the_four_retrieval_tools_are_foldable(self) -> None:
-        for name in ("read_file", "glob_files", "grep_content", "web_fetch"):
+    def test_process_tools_are_foldable(self) -> None:
+        for name in ("read_file", "glob_files", "grep_content", "web_fetch", "run_command"):
             with self.subTest(tool=name):
                 self.assertTrue(is_foldable(name))
 
-    def test_side_effecting_tools_are_never_foldable(self) -> None:
+    def test_result_changing_tools_are_never_foldable(self) -> None:
         """
-        **本文件最要紧的一条。** 这张清单对应 spec 的安全判据——折叠藏起来的
-        东西在定义上必须是无副作用的。
+        **本文件最要紧的一条。** 这张清单对应 spec 的安全判据。
 
-        ⚠ 若将来某一项在这里红了，先想清楚它是不是真的「读」，
-        而不是顺手把断言删掉：写文件与执行命令被静默折进聚合行，
-        用户是**看不出来**的。
+        ## 判据在验收期改过一次，现在是这条
+
+        **能折叠的，要么无副作用，要么已被用户过目。**
+
+        最初更严：「被折叠的永远只是『读』」。后来按用户要求让 `run_command`
+        参与归并（对齐 Claude Code 的 `Ran N shell commands`）——命令虽有副作用，
+        但每一条执行前都过权限管线，用户要么当场在面板上放行、要么事先写了
+        allow 规则，折叠的是「已经过目的过程」。
+
+        ⚠ **写文件与编辑文件是这条判据的边界**：它们改的是工作区内容、且带
+        diff 块，那是用户要盯着看的**结果**而非过程。若将来某一项在这里红了，
+        先想清楚它到底是「过程」还是「结果」，而不是顺手把断言删掉——
+        写文件被静默折进聚合行，用户是**看不出来**的。
         """
         forbidden = (
-            "write_file",      # 改工作区
-            "edit_file",       # 改工作区
-            "run_command",     # 执行命令，且输出本身是用户要看的内容
+            "write_file",      # 改工作区内容，且带 diff：是结果不是过程
+            "edit_file",       # 同上
             "run_agent",       # 委派：已有活动区与历史区留痕，归并会与那套冲突
             "load_skill",      # 改变整个会话可用的能力集合
             "mcp_add_server",  # 写配置并启动外部进程
@@ -61,6 +73,17 @@ class FoldWhitelistTest(unittest.TestCase):
         for name in forbidden:
             with self.subTest(tool=name):
                 self.assertFalse(is_foldable(name))
+
+    def test_run_command_is_foldable_but_write_is_not(self) -> None:
+        """
+        **这条是上面那条判据的分辨力所在。**
+
+        只断言「写文件不折叠」的话，把整张表清空也能通过；只断言「命令折叠」
+        的话，把写文件一起加进去也能通过。两条摆在一起，才钉得住那条边界
+        **恰好画在「过程 vs 结果」这里**。
+        """
+        self.assertTrue(is_foldable("run_command"), "命令已被用户过目，可折叠")
+        self.assertFalse(is_foldable("write_file"), "写入是结果，必须独立成行")
 
     def test_unknown_tool_is_not_foldable(self) -> None:
         """未登记一律不参与——偏严方向，MCP 远端工具都落这一支。"""
@@ -213,7 +236,8 @@ class FoldGroupMapTest(unittest.TestCase):
 
     def test_intersects_with_registered_tools(self) -> None:
         mapping = fold_group_map(self._Registry(["read_file", "write_file", "run_command"]))
-        self.assertEqual(set(mapping), {"read_file"})
+        # run_command 也在表内（验收期改的，见 FOLD_GROUPS 的注释）；write_file 不在
+        self.assertEqual(set(mapping), {"read_file", "run_command"})
 
     def test_excluded_tool_disappears(self) -> None:
         """被 `exclude_tools` 摘掉的工具不出现在映射里，界面侧因此不必再判断。"""
