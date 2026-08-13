@@ -191,6 +191,27 @@ class RhineApp(App):
         height: 1fr;
         layers: base panels;
     }
+    /*
+     * 四个交互面板的浮层容器（验收期修订）。
+     *
+     * **浮层与缩进都落在这一层**，面板自身回到普通子组件：
+     * - `layer` + `dock`：整块浮在历史区底部，不占常规流高度（不挤压历史区）
+     * - `padding`：把内部面板缩进到历史区边框**内侧**，不再盖掉框线
+     *
+     * ⚠ **缩进为什么不能写在面板的 `margin` 上**：dock 组件的宽度默认是 `1fr`，
+     * 而 `1fr` 会让 `margin-right` 失效——实测面板 x 从 0 变 1（左边距生效）、
+     * 宽度仍是父容器全宽，于是右边框被顶出屏幕。左边缩了、右边没缩，
+     * 比不缩更难看。放到容器的 padding 上就没有这个问题。
+     *
+     * `height: auto` + 内部面板缺省 `display: none` ⇒ 空闲时这块高度为 0。
+     */
+    #panel-dock {
+        layer: panels;
+        dock: bottom;
+        height: auto;
+        padding: 0 1 1 1;
+        background: transparent;
+    }
     HistoryView {
         height: 1fr;
         border: solid #7AEEFF 60%;
@@ -248,8 +269,6 @@ class RhineApp(App):
         height: auto;
         max-height: 6;
         display: none;
-        layer: panels;
-        dock: bottom;
         /* 清除 OptionList 自带全方向边框，统一用顶部分隔线与主题色对齐 */
         border: none;
         border-top: tall #7AEEFF 60%;
@@ -261,8 +280,6 @@ class RhineApp(App):
         height: auto;
         max-height: 8;
         display: none;
-        layer: panels;
-        dock: bottom;
         border: none;
         border-top: tall #FFA500 80%;
         padding: 0 1;
@@ -273,8 +290,6 @@ class RhineApp(App):
         height: auto;
         max-height: 12;
         display: none;
-        layer: panels;
-        dock: bottom;
         border: none;
         border-top: tall #7AEEFF 80%;
         padding: 0 1;
@@ -285,8 +300,6 @@ class RhineApp(App):
         height: auto;
         max-height: 15;
         display: none;
-        layer: panels;
-        dock: bottom;
         border: none;
         border-top: tall #7AEEFF 80%;
         padding: 0 1;
@@ -313,10 +326,26 @@ class RhineApp(App):
         height: 1;
         padding: 0 1;
     }
-    InputBar {
+    /*
+     * 输入框：**边框在外层容器上，灰底只在框内那一行**（验收期修订）。
+     *
+     * Textual 的 `Input` 自带 `background: $surface`，而 background 会填满
+     * **整个组件区域、包括边框占的那两行**——于是青色框线是画在一片灰底上的，
+     * 灰色看起来溢出了框外。用户的原话是「只让它在框内范围显示灰色背景」。
+     *
+     * Textual 没有「单独给边框设背景」的属性，因此把边框挪到外层容器：
+     * 容器背景透明、只负责画框；`InputBar` 去掉自己的边框、只剩那一行灰底。
+     * 三行的总高度不变（容器 1 + 1 + 1），布局与改造前逐字一致。
+     */
+    #input-frame {
         height: 3;
         border: solid #7AEEFF 60%;
-        margin-top: 0;
+        background: transparent;
+    }
+    InputBar {
+        height: 1;
+        border: none;
+        padding: 0 1;
     }
     /* 底部状态栏那一行拆成左右两个区（tui-display 扩展 F31）。
        背景色挂在**行容器**上而不是任一子组件上——挂在子组件上的话，
@@ -431,11 +460,16 @@ class RhineApp(App):
         """
         with Vertical(id="stage"):
             yield HistoryView()
-            # 四个交互面板：浮层，dock 在历史区底部（见上方说明与 CSS）
-            yield CommandPanel(self._command_registry)
-            yield ConfirmPanel()
-            yield ClarifyPanel()
-            yield SessionPanel()
+            # 四个交互面板装进一个浮层容器（见上方说明与 CSS）。
+            # ⚠ **缩进由容器的 padding 做，不能写在面板自己的 margin 上**：
+            # dock 组件的宽度默认是 `1fr`，而 `1fr` 会让 `margin-right` 失效
+            # ——实测面板 x 从 0 变成 1（左边距生效了）、宽度仍是父容器全宽，
+            # 于是右边框被顶出屏幕。左边缩进了、右边没缩，比不缩更难看。
+            with Vertical(id="panel-dock"):
+                yield CommandPanel(self._command_registry)
+                yield ConfirmPanel()
+                yield ClarifyPanel()
+                yield SessionPanel()
         # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
         #
         # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
@@ -448,17 +482,21 @@ class RhineApp(App):
         # 模型 / 权限档，常驻），这一行是**本回合活体态**（只在运行中存在）。
         # 合并会让「常驻状态」与「瞬时状态」争同一块地方。
         yield StatusLine()
-        yield InputBar(
-            self._command_registry,
-            # ⚠ `Ctrl+O` 是 tui-activity-fold 验收期补进来的：行内的
-            # 「（Ctrl+O 展开）」提示被撤掉之后，这里成了它**唯一**的发现渠道。
-            # 撤那句话的理由是它一屏出现四五次、全在说同一个全局快捷键；
-            # 说一次、说在用户找快捷键时会看的地方，才是它该待的位置。
-            placeholder=(
-                "输入消息，/ 查看命令，Tab 补全，Ctrl+O 展开详情，"
-                "运行中按 Esc 取消，连按两次 Ctrl+C 退出"
-            ),
-        )
+        # ⚠ 外层容器只负责画框（见 `#input-frame` 那段 CSS）：`Input` 自带的
+        # 灰底会填满含边框在内的整个区域，边框留在它自己身上时，青色框线就画在
+        # 一片灰底上、看起来灰色溢出了框外。
+        with Vertical(id="input-frame"):
+            yield InputBar(
+                self._command_registry,
+                # ⚠ `Ctrl+O` 是 tui-activity-fold 验收期补进来的：行内的
+                # 「（Ctrl+O 展开）」提示被撤掉之后，这里成了它**唯一**的发现渠道。
+                # 撤那句话的理由是它一屏出现四五次、全在说同一个全局快捷键；
+                # 说一次、说在用户找快捷键时会看的地方，才是它该待的位置。
+                placeholder=(
+                    "输入消息，/ 查看命令，Tab 补全，Ctrl+O 展开详情，"
+                    "运行中按 Esc 取消，连按两次 Ctrl+C 退出"
+                ),
+            )
         # 状态栏是**一行两个区**：左区贴左边缘放瞬时提示，右区右对齐放常驻状态
         # （F31，对齐 Claude Code 底部那一行）。合成一个组件做不到「贴左」——
         # 右对齐块里的最左边会随其余各段长度在屏幕中间浮动。
@@ -1298,10 +1336,14 @@ class RhineApp(App):
             # **CSS 类型名**匹配，而那套名字只收 Widget 子类——`OverlayPanel`
             # 是个纯 mixin，不在其中，查出来恒为空（实测：面板明明可见、
             # 查询结果 0 个，padding 永远算成 0，而且不报任何错）。
-            reserved = sum(
-                widget.outer_size.height
+            any_visible = any(
+                isinstance(widget, OverlayPanel) and widget.display
                 for widget in self.query("*")
-                if isinstance(widget, OverlayPanel) and widget.display
+            )
+            # 让出的是**整个浮层容器**占的高度（含它自己的内边距），
+            # 不是面板裸高——容器还带一圈缩进，只算面板会少让一行。
+            reserved = (
+                self.query_one("#panel-dock").outer_size.height if any_visible else 0
             )
             history = self.query_one(HistoryView)
             # 只改下边距，左右沿用原样式（padding: 0 1）

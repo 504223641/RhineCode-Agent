@@ -743,3 +743,88 @@ class NoJitterTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.pause()
             self.assertEqual(view.styles.padding.bottom, 0, "面板收起后必须还回去")
+
+
+class FrameIntegrityTest(unittest.IsolatedAsyncioTestCase):
+    """
+    边框的完整性（验收期修订）。
+
+    两条都是**肉眼看着不对、但代码上说不清哪里错**的问题，用户真机反馈：
+
+    - 「弹出面板只有上下两条线会超出历史记录框的边界，感官上不是很好」
+    - 「把 input bar 的灰色背景范围改下，只让它在框内范围显示灰色背景」
+
+    因此判据取**渲染出来的坐标与颜色**，不是样式声明——声明对了但被别的规则
+    覆盖掉，是这类问题最常见的形态。
+    """
+
+    async def test_panel_stays_inside_the_history_border(self) -> None:
+        """
+        面板浮起来时必须缩在历史区边框**内侧**，三边都不能盖住框线。
+
+        ⚠ 实现期在这里踩过一个坑：缩进原本写在面板自己的 `margin` 上，
+        而 dock 组件的宽度默认是 `1fr`，`1fr` 会让 **`margin-right` 失效**
+        ——实测面板 x 从 0 变 1（左边距生效了）、宽度仍是父容器全宽，
+        于是右边框被顶出屏幕。**左边缩了右边没缩，比不缩更难看。**
+        缩进因此挪到了浮层容器的 `padding` 上。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(70, 22)) as pilot:
+            view = app.query_one(HistoryView)
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertGreater(panel.region.x, view.region.x, "左边要留出框线")
+            self.assertLess(
+                panel.region.x + panel.region.width,
+                view.region.x + view.region.width,
+                "右边要留出框线（dock 的 1fr 会吃掉 margin-right，这条专防那个）",
+            )
+            self.assertLess(
+                panel.region.y + panel.region.height,
+                view.region.y + view.region.height,
+                "底部要留出框线",
+            )
+
+    async def test_input_grey_background_stays_inside_its_border(self) -> None:
+        """
+        输入框的灰底只在**框内那一行**，边框那两行不该是灰的。
+
+        `Input` 自带 `background: $surface`，而 background 会填满**整个组件
+        区域、包括边框占的两行**——青色框线因此画在一片灰底上，看起来灰色
+        溢出了框外。Textual 没有「单独给边框设背景」的属性，故把边框挪到
+        外层容器 `#input-frame`：容器透明只画框，输入框只剩那一行灰底。
+
+        判据读的是**合成器画出来的每一格背景色**：边框两行必须与内容行不同色。
+        """
+        from tests.test_command_tui import _make_app
+
+        app, _ = _make_app()
+        async with app.run_test(size=(70, 22)) as pilot:
+            await pilot.pause()
+            frame = app.query_one("#input-frame")
+            strips = app.screen._compositor.render_strips()
+
+            def bg_set(y: int) -> set:
+                colors = set()
+                for seg in strips[y]:
+                    if seg.style and seg.style.bgcolor:
+                        colors.add(seg.style.bgcolor.get_truecolor().hex)
+                return colors
+
+            top = bg_set(frame.region.y)
+            middle = bg_set(frame.region.y + 1)
+            bottom = bg_set(frame.region.y + frame.region.height - 1)
+
+            self.assertEqual(top, bottom, "上下框线应当同色")
+            self.assertTrue(
+                middle - top,
+                f"内容行必须有框线行没有的底色（灰底）：内容 {middle} / 框线 {top}",
+            )
