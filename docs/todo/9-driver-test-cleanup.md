@@ -94,7 +94,7 @@ async def test_xxx(self):
 ## 一键开工 Prompt
 
 ```
-读 docs/todo/8-driver-test-cleanup.md。
+读 docs/todo/9-driver-test-cleanup.md。
 
 驱动测试（tests/test_e2e_control.py 等）的 shutdown_on_main 写在用例最后一行，
 断言失败时不执行，导致工作线程醒不过来、Python 3.11 的
