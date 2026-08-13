@@ -50,7 +50,7 @@ from rhinecode.hooks.models import (
 from rhinecode.permission import blacklist
 from rhinecode.permission.network import check_hard
 from rhinecode.tools.path_guard import main_project_root
-from rhinecode.tools.run_command import decode_subprocess_output
+from rhinecode.tools.run_command import decode_subprocess_output, run_shell_captured
 
 # stdout / stderr 进 `detail` 前的截断长度。
 #
@@ -206,7 +206,9 @@ def run_command_action(
     执行步骤：
     1. **过①危险命令黑名单**。命中即返回 `ok=False`，**子进程不启动**。
     2. 负载序列化成 JSON，以 UTF-8 字节写入子进程标准输入。
-    3. 以 shell 方式在项目根运行，捕获 stdout/stderr 字节，带超时。
+    3. 以 shell 方式在项目根运行，捕获 stdout/stderr 字节，带超时——
+       **超时会杀掉整棵进程树**，`timeout` 是真的等待上限而不只是一句文案
+       （复用 `tools/run_command.py` 的 `run_shell_captured`）。
     4. **自己解码**（复用 `tools/run_command.py` 的 `decode_subprocess_output`）。
     5. 按退出码分支：0 → 试解析决策 JSON；2 → DENY（stderr 作原因）；其它 → 失败。
 
@@ -231,16 +233,19 @@ def run_command_action(
         return _finish(detail=f"命中危险命令黑名单：{hit}，未执行。")
 
     try:
-        proc = subprocess.run(
+        # ⚠ 走 `run_shell_captured` 而不是 `subprocess.run`：后者超时后只杀
+        # shell 壳层，孙子进程还握着输出管道，于是**要一直等到命令自己跑完**
+        # ——`timeout` 只改变返回的文案。而这里的等待发生在 Hook 分发路径上，
+        # 一条挂了的 `pre_tool_use` 命令能把整次工具调用拖住任意久
+        # （与 `hooks/manager.py` 那条「锁里不做动作执行」是同一隐患的两半）。
+        proc = run_shell_captured(
             action.command,
-            shell=True,
             # c14 F25：命令跑在**触发它的那个 Agent 的工作目录**里。
             # 主对话触发 → 主项目根；隔离子 Agent 触发 → 它的隔离工作区。
             # 一个检查文件的 pre_tool_use 钩子应当看到子 Agent 正在动的那个文件，
             # 而不是主项目根里的同名文件。
             cwd=str(cwd if cwd is not None else main_project_root()),
-            input=_payload_json(payload).encode("utf-8"),
-            capture_output=True,
+            stdin_bytes=_payload_json(payload).encode("utf-8"),
             timeout=action.timeout,
         )
     except subprocess.TimeoutExpired:
