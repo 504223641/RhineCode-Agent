@@ -83,6 +83,7 @@ from rhinecode.agent.events import (
 from rhinecode.permission import (
     Decision,
     DecisionResult,
+    Layer,
     PermissionEngine,
     PermissionMode,
     PermissionRequest,
@@ -1555,6 +1556,26 @@ class ConversationManager:
             req = to_request(
                 tool, tool_call.arguments, self._engine.mode, main_project_root()
             )
+            # ⚠ **②″保护路径的「本会话/永久放行」走一条完全不同的路**
+            # （protected-paths 扩展 F9）：登记进引擎里本层自己的**内存豁免集合**，
+            # **不产生任何③层规则、不写任何配置文件**。
+            #
+            # 理由：本层的升级效力不被③层消解，所以写成③层规则的话那条规则
+            # **永远不会被求值**——用户会看到「点了放行，下次还是弹」。
+            #
+            # `ALLOW_PERMANENT` 也落到这一支是**防御性**的：面板在这个场景下
+            # 压根不提供那个选项（`ConfirmPanel.show_for`），但若将来出现第二条
+            # 结算路径把它送进来，落盘会写出一条永远不被求值的规则——
+            # 正是本扩展要消灭的那个骗人的按钮。
+            #
+            # ⚠ **成对维护点**：这一支与面板那三个选项必须同步改。只改一处都不报错，
+            # 后果见 `ConfirmPanel.show_for` 里的说明。
+            if decision.layer is Layer.PROTECTED and choice in (
+                ConfirmDecision.ALLOW_SESSION,
+                ConfirmDecision.ALLOW_PERMANENT,
+            ):
+                self._engine.grant_protected_exemption(req)
+                return True
             # ⚠ 规则的**单一来源**是 adapter.to_allow_rule（web_fetch 扩展 T23）。
             #
             # 原先这里直接 f"{rule_name}({specifier})"，对命令类与路径类是对的，

@@ -57,18 +57,35 @@ class Layer(str, Enum):
       不产生 DecisionResult）
     - BLACKLIST：①危险命令黑名单
     - SANDBOX：②路径沙箱
+    - PROTECTED：②″保护路径（仅写入类；见下方的形态说明，protected-paths 扩展）
     - NETWORK：②′网络边界（仅 URL 类；硬校验 + 域名策略，web_fetch 扩展 spec F5/F6）
     - RULE：③可配置规则（也含只读简化分支的放行）
     - MODE：④权限模式兜底
 
-    ⚠ 新增枚举值时，`trace/reader.py` 的 `_LAYER_NAMES` 要跟着加一行——
-    那两份表**刻意不合一**（合一要让只依赖标准库的 trace 叶子包反向依赖本包），
-    一致性由 `tests/test_trace_reader.py` 里一条遍历本枚举的断言钉住。
+    ⚠ 新增枚举值时要同步**三份表**：`trace/reader.py` 的 `_LAYER_NAMES` 与
+    `tui/widgets.py` 的 `ConfirmPanel._LAYER_LABELS`。三份表**刻意不合一**
+    （合一要让只依赖标准库的 trace 叶子包反向依赖本包，也要让它反向依赖整个 TUI 层），
+    一致性由 `tests/test_trace_reader.py` 与 `tests/test_web_bootstrap.py` 里两条
+    遍历本枚举的断言钉住。
     """
 
     HOOK = "hook"
     BLACKLIST = "blacklist"
     SANDBOX = "sandbox"
+    # ⚠ **PROTECTED 排在这里是按「语义先后」，不是按代码执行顺序。**
+    #
+    # 它在语义上属于「边界」那一族（与②沙箱相邻：一个管「能不能出工作区」，
+    # 一个管「工作区内哪些文件改了会变天」），但**实现上不是管线里的一站**——
+    # 它是 `engine.decide` 出口处的**收紧器**：跑完既有五层拿到结论之后，
+    # 只把**非 DENY** 的结论升级为 ASK，**绝不把任何 DENY 降级**。
+    #
+    # 为什么不能做成「②之后③之前」的短路站（protected-paths spec 分歧一）：
+    # 那样会把③层的 `deny: Write(.rhinecode/hooks.yaml)` 与④层严格档的 DENY
+    # 一起吞掉，两处都是**放宽**——与本层的目标正相反。
+    #
+    # 「必须排在③之前」这句话的实质因此是：**本层的升级效力不被③层的 allow
+    # 规则消解**（一条 `allow: Write(.rhinecode/**)` 盖不过它）。
+    PROTECTED = "protected"
     NETWORK = "network"
     RULE = "rule"
     MODE = "mode"
@@ -87,6 +104,15 @@ class DecisionResult:
                  既有构造点不必改也能编译。唯一消费者是确认面板——它据此决定要不要走
                  URL 类的专用展示（完整地址不截断 + 主机名 + 命中层）。
     :param host: 本次请求的主机名（仅 url 类非空，透传自 PermissionRequest.host）。同上。
+    :param protected_exempt: **本次命中了②″保护路径，但因会话级豁免而未被升级**
+                 （protected-paths 扩展）。唯一消费者是行为记录。
+
+                 为什么只加这一个布尔、而不是「命中」与「豁免」两个：
+                 「命中并升级」这件事**已经由 `layer == "protected"` 可见**，
+                 再记一个字段是重复。看不见的只有「命中了但放过了」这一种——
+                 不记的话，时间线上只剩一条 `allow（④模式）`，读的人会以为
+                 用户切到了放行档，而实际原因是他在面板上点过一次「本会话放行」。
+                 与既有 `mode_downgraded` 是同一条理由的第二次。
 
     ⚠ **`engine.decide()` 的每一条 return 路径都必须显式填 `kind`（url 类另填 `host`）。**
     「带默认值所以既有构造点不动」只保证编译过、不保证功能对：确认面板只在判定为
@@ -99,6 +125,7 @@ class DecisionResult:
     reason: str
     kind: str = ""
     host: str = ""
+    protected_exempt: bool = False
 
 
 @dataclass(frozen=True)

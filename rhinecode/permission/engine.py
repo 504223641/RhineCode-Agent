@@ -14,12 +14,36 @@ decide(request)。decide 是纯判定——给定请求与当前状态即可复�
        └ 只读简化分支     ③未命中且是只读工具→ALLOW（不进④，spec F7）
     ④ 模式兜底           仅副作用工具、③未命中：严格→DENY / 默认→ASK / 放行→ALLOW
                            **URL 类例外：放行档降级为 ASK**（web_fetch 扩展 F7）
+
+## ②″保护路径：一个**出口处的收紧器**，不在上面那条短路序列里
+
+    _decide_core(request)  ← 上面五层，一字不动
+            ↓
+    _apply_protected(request, result)  ← 只把**非 DENY** 的结论升级为 ASK
+
+判定表（这就是全部内容）：
+
+| 条件 | 结论 |
+| --- | --- |
+| `kind != "write_path"` | 原样返回 |
+| 结论是 DENY | **原样返回**（绝不降级） |
+| 未命中保护路径 | 原样返回 |
+| 命中但已被本会话豁免 | 原样返回，置 `protected_exempt=True` |
+| 命中未豁免 | `ASK @ Layer.PROTECTED` |
+
+**为什么不做成「②之后③之前」的一站**（protected-paths spec 分歧一）：那样会把
+③层的 `deny: Write(.rhinecode/hooks.yaml)` 与④层严格档的 DENY 一起短路吞掉，
+两处都是**放宽**。「必须排在③之前」这句话的实质是「本层的升级效力不被③层的
+allow 规则消解」，而不是「代码位置在③上面」。语义与 C12 的 Hook ASK 同型。
+
+好处还有一条：`_decide_core` 是既有 body 的原样改名，因此「其余种类的请求逐字
+不变」是**结构性成立**的，不靠测试兜。
 """
 
 from pathlib import Path
 from typing import Optional
 
-from rhinecode.permission import blacklist, config, network
+from rhinecode.permission import blacklist, config, network, protected
 from rhinecode.permission.models import (
     Decision,
     DecisionResult,
@@ -77,6 +101,15 @@ class PermissionEngine:
         与 `session_rules` 同型、同求值逻辑，只是命更短——用户发出下一条消息即清空。
     :ivar mode: 当前权限模式（默认 DEFAULT，可经 /perm 运行时切换）
     :ivar load_errors: 配置加载阶段收集的可读错误（供上层提示，不阻断启动）
+    :ivar protected_exemptions: ②″保护路径的**会话级豁免**（protected-paths 扩展）。
+        存的是**解析后的绝对路径**，精确到单个文件、不扩展到目录。
+
+        ⚠ **它刻意不是一条③层规则、也刻意不落盘。** 保护路径的升级效力不被③层
+        消解，所以写成③层规则的话那条规则永远不会被求值——用户会看到「点了永久
+        放行，下次还是弹」，那比不做还糟；而落盘的豁免本身就是一份「能改变以后
+        会发生什么」的配置，绕一圈又回到本扩展要解决的原问题。
+
+        生命周期与 `session_rules` 一致：关程序即失效，不随 /clear、/resume 清空。
 
     ## 三级规则的优先级
 
@@ -114,6 +147,7 @@ class PermissionEngine:
         self.turn_rules: list[Rule] = []
         self.mode = mode
         self.load_errors: list[str] = load_errors or []
+        self.protected_exemptions: set[Path] = set()
 
     def derive(self, mode: PermissionMode) -> "PermissionEngine":
         """
@@ -131,6 +165,7 @@ class PermissionEngine:
         | `turn_rules` | **全新空列表** | 回合级预授权（Skill 的 `allowed-tools`）绑在某一次执行上，不该跟着委派跑出去（spec F17） |
         | `mode` | 取参数 | 见下 |
         | `load_errors` | 共享 | 只读，供报告展示 |
+        | `protected_exemptions` | **共享同一个集合对象** | 与 `session_rules` 同口径：用户在确认面板上对某个文件的明确授予，理应对子 Agent 也生效。共享后子 Agent 拿到的豁免仍不多于主对话，C13「能力只会更小」原样成立 |
 
         ## 为什么必须派生，而不是直接改 `self.mode`
 
@@ -161,6 +196,10 @@ class PermissionEngine:
         # 传进去的若是**空列表**（最常见的情况——没有加载错误），`or` 会取右边
         # 新建一个，共享就静默地不成立了。显式赋值让行为不依赖这个偶然性。
         derived.load_errors = self.load_errors
+        # ⚠ 与 `load_errors` 同一个坑：构造函数会给它新建一个空 `set()`，
+        # 不显式赋值的话共享**静默地不成立**——表现为「用户在主对话面板上放行过的
+        # 文件，子 Agent 仍然写不了」，而两边配置看起来一模一样。
+        derived.protected_exemptions = self.protected_exemptions
         return derived
 
     @classmethod
@@ -195,10 +234,126 @@ class PermissionEngine:
 
     def decide(self, request: PermissionRequest) -> DecisionResult:
         """
-        对一次权限请求跑完决策管线，返回最终决定。
+        对一次权限请求跑完决策管线，返回最终决定。**这是全系统唯一的判定入口。**
 
         :param request: 规范化后的权限请求（由 adapter.to_request 产出）
         :returns: DecisionResult（decision + 命中 layer + 中文 reason + kind/host）
+
+        两段：既有五层（`_decide_core`）→ ②″保护路径收紧器（`_apply_protected`）。
+        收紧器只会把结论变严，永远不会变松，因此既有的全部安全论证原样成立。
+
+        副作用：无（纯判定）。
+        """
+        return self._apply_protected(request, self._decide_core(request))
+
+    def _apply_protected(
+        self, request: PermissionRequest, result: DecisionResult
+    ) -> DecisionResult:
+        """
+        ②″保护路径收紧器（protected-paths 扩展）：写入配置类文件必须过人眼。
+
+        :param request: 本次权限请求
+        :param result: 既有五层给出的结论
+        :returns: 收紧后的结论；不适用时**原样返回传入的 result**
+
+        判定表见模块 docstring。三处要点，每一处都对应一种「写错了不报错」的形态：
+
+        ⚠ **① DENY 一律原样返回，绝不降级。** 这是本层「只收紧不放宽」的全部落点：
+        用户写下的 `deny: Write(.rhinecode/hooks.yaml)` 与严格档的兜底 DENY 都必须
+        原样保留。把它们降级成「问一下」是放宽，与本层目标正相反。
+
+        ⚠ **② 结论「非 DENY」就要换层，不能只处理 ALLOW。** 默认档下写 `hooks.yaml`
+        的既有结论是 `ASK @ Layer.MODE`。那一支若原样返回，确认面板看到的层是
+        `mode`，就会照常显示**四个**选项、含「永久放行」——用户点下去写出一条③层
+        allow 规则，而下一次那条规则又会被本层升级回 ASK。
+        **骗人的按钮原样存在，只是换了个入口。**
+
+        ⚠ **③ 本方法是 `DecisionResult` 的第二个构造出口，必须显式填 `kind` / `host`。**
+        `_decide_core` 里的 `_verdict` 闭包管不到这里。漏填的后果是确认面板的
+        URL 专用分支永不进入——虽然本层只对 write_path 生效、当前不会触发，
+        但那条不变量的价值恰恰在于「不留特例」（CLAUDE.md 成对维护点）。
+
+        副作用：无（只读 `self.protected_exemptions`）。
+        """
+        # 本层只管写入类。命令 / 读取 / glob / URL / 未映射一律原样穿过——
+        # 这一行就是 N4「其余种类的请求逐字不变」的实现。
+        if request.kind != "write_path":
+            return result
+
+        # ⚠ 见上要点①。位置也是刻意的：排在 inspect 之前，
+        # 使一次已经确定被拒的请求连保护路径判定都不必跑。
+        if result.decision is Decision.DENY:
+            return result
+
+        hit = protected.inspect(request.specifier, request.cwd)
+        if hit is None:
+            return result
+
+        # 本会话豁免命中：不升级，但把这件事记下来。
+        # 不记的话时间线上只剩一条 `allow（④模式）`，读的人会以为用户切到了放行档，
+        # 而真实原因是他此前在面板上点过一次「本会话放行」。
+        if hit.path in self.protected_exemptions:
+            return DecisionResult(
+                result.decision,
+                result.layer,
+                result.reason,
+                kind=result.kind,
+                host=result.host,
+                protected_exempt=True,
+            )
+
+        # 见上要点②：ALLOW → ASK，ASK → ASK（**层被换掉**）。
+        return DecisionResult(
+            Decision.ASK,
+            Layer.PROTECTED,
+            hit.reason,
+            kind=request.kind,
+            host=request.host,
+        )
+
+    def grant_protected_exemption(self, request: PermissionRequest) -> bool:
+        """
+        为一次请求登记②″保护路径的**会话级豁免**（用户在确认面板上选「本会话放行」）。
+
+        :param request: 本次权限请求
+        :returns: 是否真的登记了（未命中保护路径时不登记，返回 False）
+
+        接收**请求**而不是路径，是为了让「路径怎么解析成豁免键」这件事只有一处口径
+        ——协调层不必自己去调 `protected.inspect`，也就不可能跟这里算出不同的键。
+
+        豁免精确到**单个文件**，不扩展到目录：与既有确认面板「本会话放行」的最小
+        授权口径一致。目录级豁免等于一次把整个 `.rhinecode/` 交出去。
+
+        副作用：向 `protected_exemptions` 添加一项（该集合由派生实例共享）。
+        """
+        hit = protected.inspect(request.specifier, request.cwd)
+        if hit is None:
+            return False
+        self.protected_exemptions.add(hit.path)
+        return True
+
+    def is_protected_exempt(self, path: Path) -> bool:
+        """
+        某个**解析后的绝对路径**是否已被本会话豁免。
+
+        :param path: 解析后的绝对路径
+        :returns: 已豁免返回 True
+
+        供测试与将来的报告命令使用；判定路径本身不经过它（`_apply_protected`
+        直接查集合，避免多一层间接让人以为还有别的判据）。
+        """
+        return path in self.protected_exemptions
+
+    def _decide_core(self, request: PermissionRequest) -> DecisionResult:
+        """
+        既有五层决策管线（本扩展之前的 `decide`，**body 一字未改**）。
+
+        :param request: 规范化后的权限请求（由 adapter.to_request 产出）
+        :returns: DecisionResult（decision + 命中 layer + 中文 reason + kind/host）
+
+        ⚠ **不要直接调用它。** 全系统的判定入口是 `decide`——绕过它就绕过了
+        ②″保护路径收紧器，而那正是「模型改不了自己的配置」这条承诺的全部依据。
+        唯一的合法调用方是 `decide` 自己，以及验证「其余种类逐字不变」的那条对照护栏。
 
         ⚠ **每一条 return 路径都必须填 `kind`（url 类另填 `host`）。**
         「带默认值所以既有构造点不动」只保证编译过、不保证功能对：确认面板只在

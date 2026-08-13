@@ -1156,3 +1156,179 @@ FOLD_WITH_FAILURE = [
     ],
     [text("有一个文件不在，其余看完了。"), done()],
 ]
+
+
+# ===========================================================================
+# protected-paths 扩展（②″保护路径）的端到端剧本与预置
+#
+# 这组验的是**单测验不到的那一段**：真实 `build_app`、真实 TUI、真实权限管线，
+# 面板是不是真的弹出来了、上面**真的只有三个选项**、本地配置文件真的没被写过。
+#
+# ⚠ 全部要在**放行档**下跑（送两次 `/perm`：默认 → 严格 → 放行）。
+# 缺省档下普通写入本来就弹面板，那样「保护路径弹面板」这件事没有任何分辨力。
+# ===========================================================================
+
+# 往 `.rhinecode/hooks.yaml` 写一条 hook 规则。放行档下④层本会直接 ALLOW，
+# 面板弹出本身就是「②″收紧器生效了」的证据。
+PROTECTED_WRITE_CONFIG = [
+    [
+        text("我来加一条 hook 规则。"),
+        tool("write_file", {"path": ".rhinecode/hooks.yaml", "content": "rules: []\n"}),
+        done(),
+    ],
+    [text("加好了。"), done()],
+]
+
+# 同一个文件连写两次：验「本会话放行」之后第二次不再问。
+# ⚠ 两次的 `path` 必须**逐字相同**——豁免精确到单个文件，换个名字就该再问一次
+# （那正是 `test_perm_protected.ExemptTest` 里「不扩散到同目录」的真机对应物）。
+PROTECTED_WRITE_TWICE = [
+    [
+        text("先加一条。"),
+        tool("write_file", {"path": ".rhinecode/hooks.yaml", "content": "rules: []\n"}),
+        done(),
+    ],
+    [
+        text("再改一下。"),
+        tool("write_file", {"path": ".rhinecode/hooks.yaml", "content": "rules: [a]\n"}),
+        done(),
+    ],
+    [text("都写完了。"), done()],
+]
+
+# **对照组**：普通业务文件。放行档下一次面板都不该弹——
+# 少了这条就分不清「②″生效」与「这个档位本来就什么都要问」。
+PROTECTED_ORDINARY_WRITE = [
+    [
+        text("改一下源码。"),
+        tool("write_file", {"path": "src/app.py", "content": "x = 1\n"}),
+        done(),
+    ],
+    [text("改完了。"), done()],
+]
+
+# 委派一个**非隔离**子 Agent 去写配置：它非交互，判 ASK 即自动拒绝。
+# ⚠ 这是**期望行为不是误伤**——子 Agent 不该改配置。
+PROTECTED_SUBAGENT_WRITES_CONFIG = {
+    "main": [
+        [
+            text("让 helper 去加那条规则。"),
+            tool("run_agent", {
+                "type": "role",
+                "agent": "helper",
+                "name": "helper",
+                "task": "往 .rhinecode/hooks.yaml 里加一条规则",
+            }),
+            done(),
+        ],
+        # ⚠ 要多写一轮：子 Agent 的结论是在**收工前**注入主历史的，
+        # 主剧本只写到「派出去」那一轮的话，闸门等不到一个还会说话的回合。
+        [text("它没能改成。"), done()],
+        [text("收工。"), done()],
+    ],
+    "subagent:helper": [
+        [
+            text("我来写。"),
+            tool("write_file", {"path": ".rhinecode/hooks.yaml", "content": "rules: []\n"}),
+            done(),
+        ],
+        [text("写不了，权限管线把它拦下了。"), done()],
+    ],
+}
+
+# 委派一个**隔离**子 Agent 写自己工作区里的业务文件：必须照常写成。
+# ⚠ 这是**坑 1 的真机反证**——判定基准若退回主项目根，隔离工作区整个坐落在
+# `.rhinecode/worktrees/` 之下，它的每一次写入都会命中②″、被自动拒绝，
+# 表现为「子 Agent 什么都没做出来」。
+PROTECTED_ISOLATED_SUBAGENT = {
+    "main": [
+        [
+            text("让 builder 在隔离工作区里加个文件。"),
+            tool("run_agent", {
+                "type": "role",
+                "agent": "builder",
+                "name": "builder",
+                "task": "在工作区里新建 feature.py",
+            }),
+            done(),
+        ],
+        [text("它做完了。"), done()],
+        [text("收工。"), done()],
+    ],
+    # ⚠ **隔离子 Agent 的作用域仍是 `subagent:<名字>`，不是 `isolated:<名字>`。**
+    # `isolated:` 是 C11 **独立模式 Skill 子对话**的作用域，与 C14 的工作区隔离无关
+    # ——两者名字相近，写这组剧本时真踩过：键写错不报错，剧本静默走兜底
+    # （`[e2e-fallback]`），流程照样跑完、判据却什么都没验到。
+    "subagent:builder": [
+        [
+            text("我建一个文件。"),
+            tool("write_file", {"path": "feature.py", "content": "def feature():\n    pass\n"}),
+            done(),
+        ],
+        [text("已经在分支上建好 feature.py。"), done()],
+    ],
+}
+
+
+def seed_protected_plain(workspace: Path, user_dir: Path) -> None:
+    """最小预置：一个普通源码文件，不写任何权限规则。"""
+    seeding.seed_files(workspace, {"src/app.py": "x = 0\n"})
+
+
+def seed_protected_wide_allow(workspace: Path, user_dir: Path) -> None:
+    """
+    项目级 `permissions.yaml` 里一条**宽 allow** —— 顺序论证的真机落点。
+
+    ⚠ **必须用「宽 allow + 保护路径」这个形态构造，不能用「没写任何规则」。**
+    后者在③层本来就不表态，于是「②″是收紧器」与「②″是③之前的短路站」
+    两种实现结论完全相同——那种判据发现不了顺序错误。
+    这条教训是②′网络边界层付过一次学费的。
+    """
+    seed_protected_plain(workspace, user_dir)
+    seeding.seed_permissions(
+        Path(workspace) / ".rhinecode", allow=["Write(.rhinecode/**)"]
+    )
+
+
+def seed_protected_subagent(workspace: Path, user_dir: Path) -> None:
+    """一个**非隔离**角色，工具集含写入——用于验「子 Agent 改配置被自动拒绝」。"""
+    seed_protected_plain(workspace, user_dir)
+    seeding.seed_project_agent(
+        workspace,
+        "helper",
+        {
+            "description": "需要按指示修改文件时用它。",
+            "tools": "read_file, write_file, edit_file",
+            "max_turns": 8,
+        },
+        "你按用户的要求改文件，做完后给出一段自包含的结论。",
+    )
+
+
+def seed_protected_isolated(workspace: Path, user_dir: Path) -> None:
+    """
+    一个 `isolation: worktree` 的角色 + 一个真实的 Git 版本库。
+
+    版本库是**硬要求**：C14 的隔离工作区是 `git worktree add` 建出来的，
+    没有提交历史就建不起来，而创建失败**明确失败、绝不降级**（C14 F14），
+    于是这条场景会以另一个原因失败、验不到本扩展要验的东西。
+    """
+    seeding.seed_git_repo(
+        workspace,
+        [{"message": "init", "files": {"src/app.py": "x = 0\n", "README.md": "# demo\n"}}],
+    )
+    seeding.seed_project_agent(
+        workspace,
+        "builder",
+        {
+            "description": "需要在独立工作区里做改动时用它。",
+            "tools": "read_file, write_file, edit_file, glob_files",
+            "isolation": "worktree",
+            # ⚠ 8 而不是 4：**真实模型验收实测**下，4 轮不够——它会花掉一两轮
+            # 给 main 发消息汇报进度，然后撞 `max_iterations` 收工（写入本身是成功的，
+            # 但任务被标成 failed，主 Agent 于是又委派一次，实测连派三次）。
+            # 脚本化剧本用 4 就够，这个值是为 live 留的余量。
+            "max_turns": 8,
+        },
+        "你在自己的隔离工作区里完成改动，最后给出一段自包含的结论。",
+    )
