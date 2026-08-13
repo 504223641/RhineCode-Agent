@@ -5,7 +5,7 @@
 >
 > 建议分支：`c16`（从 `main` 起）
 >
-> ⚠ **盖在第 3 条（auto/plan 两 preset）之上**，必须等它做完。
+> ⚠ **盖在第 2 条（auto/plan 两 preset）之上**，必须等它做完。
 
 ## 这是章节不是扩展
 
@@ -17,7 +17,7 @@
 
 ## 目标
 
-`auto` 档下 `run_command` 与 `web_fetch` 一律放行（第 3 条做完之后的状态）。
+`auto` 档下 `run_command` 与 `web_fetch` 一律放行（第 2 条做完之后的状态）。
 本章在④层给这两类动作接上一个**独立的分类器模型**：执行前先问它一句
 「这个动作该不该跑」。
 
@@ -59,12 +59,23 @@
 ### 1. 管线位置：④层内，且只在 auto 档、只对两类 kind
 
 ```
-⓪Hook → ①黑名单 → ②沙箱 → ②″保护路径 → ②′网络 → ③规则 → 只读短路 → ④
-                                                                      ↓
-                                          auto 档 且 kind ∈ {command, url}
-                                                                      ↓
-                                                                 调分类器
+⓪Hook → ①黑名单 → ②沙箱 → ②′网络 → ③规则 → 只读短路 → ④
+                                                          ↓
+                              auto 档 且 kind ∈ {command, url}
+                                                          ↓
+                                                     调分类器
+                                                          ↓
+                                          ②″保护路径（出口收紧器，只管 write_path）
 ```
+
+⚠ **②″保护路径不是管线里的一站，是 `decide` 出口处的收紧器**
+（`_decide_core` → `_apply_protected`，见 `docs/extensions/protected-paths/spec.md`
+的「分歧一」）。本条这张图此前把它画成「②沙箱与②′网络之间的一站」，
+**那是实现前的设想稿，与落地实现不符**。
+
+对本章而言两者**互不相交**（分类器只碰 `command` / `url`，②″只碰 `write_path`），
+所以按错图实现也不会立刻出错——但下一个人会从错误的图去推理层序，
+所以这里改正过来。
 
 **排在③之后有两个好处，都别丢**：
 
@@ -127,7 +138,7 @@ classifier:
 ```
 
 - **`enabled` 缺省开**（用户定的）。关掉之后 auto 档对这两类就是一律放行，
-  即第 3 条做完时的状态——**两种形态都保留，用户自己选**。
+  即第 2 条做完时的状态——**两种形态都保留，用户自己选**。
 - **`model` 可配置，缺省用主模型**（用户定的）。留这个口子是因为
   `run_command` 是高频操作，每次多一次往返有感；将来可以换更便宜的。
 
@@ -187,16 +198,17 @@ classifier:
    （用户消息里的边界要真的起作用，这条是「只喂用户消息」这个口径的价值所在）
 4. 把 API base 指到一个不通的地址制造失败 → **弹面板**（不是拒绝、不是放行）
 5. 连续制造 3 次失败 → **熔断，界面明确提示**，之后这两类一律弹面板
-6. `classifier.enabled: false` → 回到第 3 条做完时的行为（一律放行）
+6. `classifier.enabled: false` → 回到第 2 条做完时的行为（一律放行）
 
 ## 一键开工 Prompt
 
 ```
 先 git branch --show-current，在 main 上就 git checkout -b c16。
 
-⚠ 先确认 docs/todo/3-perm-auto-plan.md 已经做完——本章盖在它之上。
+⚠ 先确认 docs/todo/2-perm-auto-plan.md 已经做完——本章盖在它之上。
+（更前面的②″保护路径层已于 2026-08-14 实现。）
 
-读 docs/todo/4-classifier.md，然后走完整 /spec，四份文档进 docs/c16/。
+读 docs/todo/3-classifier.md，然后走完整 /spec，四份文档进 docs/c16/。
 这是章节不是扩展（CLAUDE.md 能力表要多一行）。
 
 目标：auto 档下给 run_command 与 web_fetch 接一个独立的分类器模型，
@@ -220,6 +232,6 @@ classifier:
 不是断言结果）与"工具输出不进提示词"。真机验证六条，第 3 条（用户说过
 别提交就真的拦得住）与第 4 条（失败弹面板而不是放行）是分辨力所在。
 
-做完这条后把 docs/todo/4-classifier.md 删掉，
+做完这条后把 docs/todo/3-classifier.md 删掉，
 并重排 docs/todo/ 下其余文档的序号。
 ```

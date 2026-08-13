@@ -5,8 +5,10 @@
 >
 > 建议分支：`perm-auto-plan`（从 `main` 起）
 >
-> ⚠ **依赖第 2 条（保护路径层），顺序不可颠倒**，理由见「为什么必须排在 2 之后」。
-> ⚠ **第 4 条（分类器）盖在本条之上**，本条**不做**分类器——先有一个能用的
+> ✅ **前置的保护路径层已于 2026-08-14 实现**
+> （[`docs/extensions/protected-paths/`](../extensions/protected-paths/spec.md)），
+> 本条现在可以开工了。理由见「为什么必须排在保护路径层之后」。
+> ⚠ **第 3 条（分类器）盖在本条之上**，本条**不做**分类器——先有一个能用的
 > auto，分类器是之后接上去的一层。
 
 ## 目标
@@ -37,14 +39,14 @@ Claude Code 敢把 plan 并进 `Shift+Tab` 循环，是因为它退出 plan 时�
 ## `auto` 到底放行什么
 
 **`auto` 内部就是现有的 `PERMISSIVE` 档**——不新增枚举值，只改显示名。
-加上第 2 条的②″保护路径层之后，实际行为是：
+②″保护路径层已经在位（2026-08-14），因此实际行为是：
 
 | 请求形态 | auto 下 | 由哪一层决定 |
 | --- | --- | --- |
 | 读（工作区内） | 放行 | 只读短路（既有） |
 | 写（工作区内） | 放行 | ④模式兜底（既有） |
 | 写（工作区外） | **拒绝** | ②路径沙箱（既有） |
-| 写（保护路径） | **问** | ②″保护路径（第 2 条） |
+| 写（保护路径） | **问** | ②″保护路径（**已实现**） |
 | 命令 | 放行 | ④模式兜底（既有） |
 | 命令（命中危险黑名单） | **拒绝** | ①黑名单，**不可被任何配置放开**（既有） |
 | 网络 | **问** | ④对 url 类的既有例外 |
@@ -57,22 +59,27 @@ Claude Code 敢把 plan 并进 `Shift+Tab` 循环，是因为它退出 plan 时�
 评审时讨论过三种更保守的形态（已知安全命令集 / 内置 `auto_ask` 清单 /
 仅放行只读命令），**用户逐条看过之后选了「一律放行」**，理由是体验要对齐
 Claude Code 的 auto。实现时不要因为「这样不安全」而偷偷加回一份白名单——
-真正的收窄手段是第 4 条的分类器，那是**另一条 todo**，不要提前混进来。
+真正的收窄手段是第 3 条的分类器，那是**另一条 todo**，不要提前混进来。
 
 用户手里仍有两件硬工具，文档要写清楚让他知道：
 
 - `permissions.yaml` 的 `deny` 规则（③层，压得过④）
 - Hook 的 `pre_tool_use`（⓪层，排在整条管线之前）
 
-## 为什么必须排在第 2 条之后
+## 为什么必须排在保护路径层之后（已满足）
 
-第 2 条讲的是：模型能写 `.rhinecode/permissions.yaml` / `hooks.yaml` /
+保护路径层讲的是：模型能写 `.rhinecode/permissions.yaml` / `hooks.yaml` /
 `agents/` 给自己提权，而**唯一的实际拦截是默认档那次确认面板**。
 
 本条恰恰是「把那次面板去掉」。顺序反了 = 安全性净下降。
 
-⚠ 两条改**同一个文件**（`permission/engine.py`），要么串行（2 → 3），
-要么并成一轮，**不要并行**。
+✅ 已按正确顺序做完。⚠ **开工前先确认 `permission/engine.py` 里
+`_apply_protected` 那个收紧器还在**——本条要动的是同一个文件，
+而它是 auto 档下「模型改不了自己配置」的**唯一**依据。
+
+⚠ **本条落地后，保护路径层的分量会显著上升**：那时子 Agent 的生效档位
+也是 auto（能写文件、后台、并行、用户不在场），而②″是唯一挡住它写配置的东西。
+`CLAUDE.md` 安全边界「保护路径（②″）五条」的第 ③ 条已经写下这一点。
 
 ## 任务清单
 
@@ -121,7 +128,7 @@ Claude Code 的 auto。实现时不要因为「这样不安全」而偷偷加回
 
 1. auto 下连改三个文件 —— **一次面板都不弹**
 2. auto 下跑 `python -m unittest` —— **不弹**（这是本条与「acceptEdits 方案」的分野）
-3. auto 下让模型写 `.rhinecode/hooks.yaml` —— **弹面板**（第 2 条的落点）
+3. auto 下让模型写 `.rhinecode/hooks.yaml` —— **弹面板**（②″保护路径的落点）
 4. auto 下让模型跑 `rm -rf /` —— **拒绝**（①黑名单仍在，不可被档位放开）
 5. 切 plan → 提一个需求 → 确认规划阶段一个文件都没改 → 批准 → **自动回到 auto**
 
@@ -132,11 +139,11 @@ Claude Code 的 auto。实现时不要因为「这样不安全」而偷偷加回
 ```
 先 git branch --show-current，在 main 上就 git checkout -b perm-auto-plan。
 
-⚠ 先确认 docs/todo/2-perm-protected-paths.md 已经做完（或决定两条一起做）。
-顺序不可颠倒：本条让"写文件不弹面板"，而那次面板正是第 2 条那个缺口的唯一
-实际拦截。两条又改同一个文件 permission/engine.py，不要并行。
+前置的②″保护路径层已于 2026-08-14 实现（docs/extensions/protected-paths/），
+顺序已满足。⚠ 但要动的是同一个文件 permission/engine.py——开工前先确认
+_apply_protected 那个收紧器还在，它是 auto 档下"模型改不了自己配置"的唯一依据。
 
-读 docs/todo/3-perm-auto-plan.md，然后走 /spec，四份文档进
+读 docs/todo/2-perm-auto-plan.md，然后走 /spec，四份文档进
 docs/extensions/auto-plan/。
 
 目标：用户界面上只留两个模式 auto 与 plan（Shift+Tab 两态 + /mode）。
@@ -146,7 +153,7 @@ auto = PERMISSIVE 档 + 规划阶段关；plan = 只读 + 规划阶段开。
 ⚠ 别把 plan 做成 PermissionMode 值，它是阶段状态机不是兜底档位。
 ⚠ strict / default 保留在枚举里（内置 explorer/planner 声明了 strict），
 只是退出用户切换循环——手法对齐 Claude Code 的 dontAsk。
-⚠ 命令一律放行是用户明确选的，别偷偷加回白名单；真正的收窄是第 4 条的
+⚠ 命令一律放行是用户明确选的，别偷偷加回白名单；真正的收窄是第 3 条的
 分类器，那是另一条 todo。
 
 连带三件：run_command 子进程按黑名单过滤敏感环境变量（命令全放行之后
@@ -156,6 +163,6 @@ auto = PERMISSIVE 档 + 规划阶段关；plan = 只读 + 规划阶段开。
 
 验证五条都要真机跑，第 3 条（写 hooks.yaml 仍弹面板）与第 4 条
 （rm -rf / 仍被①黑名单拒绝）是两个方向的反证，不可省。
-做完这条后把 docs/todo/3-perm-auto-plan.md 删掉，
+做完这条后把 docs/todo/2-perm-auto-plan.md 删掉，
 并重排 docs/todo/ 下其余文档的序号。
 ```

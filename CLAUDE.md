@@ -81,6 +81,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 **已实现的扩展**（不占章节号，文档在 `docs/extensions/`）：
 
 - **网络访问工具 `web_fetch`** ——给一个地址与一段「要提取什么」的说明，取回正文并按提问抽取要点。它同时在权限管线里新增了**②′网络边界层**（结构性硬校验 + 域名策略），并把抓回的内容当作不可信输入对待。行为细节见 [`docs/extensions/web-fetch/`](docs/extensions/web-fetch/spec.md)。
+- **保护路径层 ②″** ——`.rhinecode/` 下的配置（`permissions.yaml` / `hooks.yaml` / `mcp.yaml` / `agents/` / `skills/` / `memory/`）与 `.git/` 的**写入必须过人眼**。它们决定「以后会发生什么」，而此前的写入没有任何特殊待遇——放行档下模型可以直接改写自己的权限配置（**持久化提权、下次启动生效**）。绕过的不是某一层，是 C11–C15 全部安全论证共同的前提「配置由人写下」。⚠ 它**不是管线里的一站而是出口处的收紧器**：只把非 DENY 的结论升级为 ASK，绝不降级任何 DENY——做成「②之后③之前」的短路站会把③层的 deny 与④严格档的 DENY 一起吞掉，两处都是放宽。行为细节见 [`docs/extensions/protected-paths/`](docs/extensions/protected-paths/spec.md)。
 - **Skill 作者期** ——对齐改造让 Skill **可导入**，这个扩展让它**可创作**。两件事：① **体检**（`skills/audit.py`，纯函数零 IO）八项检查，产出**可操作建议**（「建议改成 xxx」而非「警告：xxx」），并入 `/skills` 报告作为第四类反馈；② 内置 **`skill-creator`** 样板（目录型，带完整字段手册作随附资源），承担创作 / 适配外部 Skill / 按建议修复三种用途，全部落盘走完整权限管线。另有 **R 系列增补**专治「Skill 写对了却没被自动加载」——清单表头从「公告」改成「指令」（照 Claude Code 口径：命中就先加载、**用它替代默认做法**、用户不必点名、拿不准就加载）、修掉 `load_skill` 一处**压制加载**的过期描述、内置样板说明改**触发词前置**、清单超预算时**保名字只砍描述**。⚠️ 「模型欠触发 Skill」是**已知的系统性偏差**（Anthropic 官方指导：描述要写得「有点 pushy」），不是本项目独有的 bug。行为细节见 [`docs/extensions/skill-authoring/`](docs/extensions/skill-authoring/spec.md)。
 
 另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成二十九类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
@@ -127,7 +128,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 | Commands | `commands/` | 斜杠命令注册与分发（纯逻辑，不依赖 Textual） | `_specs` 是两个列表的只读拼接，**写入必须直接操作其中之一**——对属性 append 不报错也不生效 |
 | 协调层 | `conversation.py` | TUI 与 Agent/Provider 的中转；历史、权限引擎、四类回调、上下文/记忆/Skill 接线 | 预授权**先取令牌再授予**；`clear()` 与 `_resume_stream` 两处必须清空 Skill 激活态 |
 | Agent | `agent/` | ReAct 循环、事件类型、流式收集、结构化系统提示 | `dynamic` 是**每轮求值**的 callable，改回取值型会让两阶段加载失效；trace 埋点一律走 `_safe_emit` 漏斗 |
-| Permission | `permission/` | 五层防御的纯逻辑引擎 | 第③层规则**必须排在①黑名单②沙箱之后**——这是预授权安全性的全部依据。**②′网络边界层同理必须排在③之前**：晚于③会让一条 `allow: WebFetch(domain:*)` 在③层先行放行，`file://` 与 `127.0.0.1` 整个跳过硬校验。注意理由**不是**「白名单会失效」（那是错的，两种顺序下白名单结论相同）——正因如此，顺序护栏必须用「全域名 allow + 禁止地址」构造，实测「白名单未命中」那种形态在错序下照样通过。**另一条**：命令类规则的 deny 与 allow 用一对**语义相反**的判定（`match_command_deep` / `match_command_every_segment`），拆分口径也不同（朴素 / 认引号）——合一或对调任一处都会静默放宽权限，见「成对维护点」 |
+| Permission | `permission/` | 五层防御的纯逻辑引擎 | 第③层规则**必须排在①黑名单②沙箱之后**——这是预授权安全性的全部依据。**②′网络边界层同理必须排在③之前**：晚于③会让一条 `allow: WebFetch(domain:*)` 在③层先行放行，`file://` 与 `127.0.0.1` 整个跳过硬校验。注意理由**不是**「白名单会失效」（那是错的，两种顺序下白名单结论相同）——正因如此，顺序护栏必须用「全域名 allow + 禁止地址」构造，实测「白名单未命中」那种形态在错序下照样通过。**另一条**：命令类规则的 deny 与 allow 用一对**语义相反**的判定（`match_command_deep` / `match_command_every_segment`），拆分口径也不同（朴素 / 认引号）——合一或对调任一处都会静默放宽权限，见「成对维护点」。**第三条（②″保护路径）**：它**不是管线里的一站，是 `decide` 出口处的收紧器**（`_decide_core` → `_apply_protected`）。改成「②之后③之前」的短路站会把③层的 `deny: Write(.rhinecode/hooks.yaml)` 与④层严格档的 DENY 一起吞掉，**两处都是放宽**；而「结论非 DENY 一律换层」也不能简化成「只处理 ALLOW」——默认档那次 `ASK @ MODE` 原样返回的话，确认面板据 layer 判断仍会给出「永久放行」，用户点下去写出一条永远不会被求值的③层规则，骗人的按钮换个入口原样存在。⚠ 顺序护栏必须用「宽 allow + 保护路径」构造，且**它与「不降级」反证缺一不可**——变异实测：把收紧器改成短路站时顺序护栏**照样通过** |
 | MCP | `mcp/` | 配置、JSON-RPC、两种传输、工具适配、多 Server 编排 | stdio 的 stderr 必须后台 drain，否则 Server 写日志会把子进程写阻塞 |
 | Memory | `memory/` | 锁原语、RHINE.md 加载、会话存档、记忆与索引 | 写盘权收拢在 manager 的锁临界区内——拿锁的人就是写盘的人 |
 | Hooks | `hooks/` | Hook 规则的解析/条件求值/动作执行/分发编排 | 两条：**Hook 只能收紧不能放宽**（`HookDecision` 里没有 ALLOW，`_apply_hook_ask` 只把 ALLOW 升级为 ASK、绝不降级 DENY）——这是本章全部安全论证的依据；**加锁临界区只做纯内存读写**，动作执行、埋点、跨线程调度一律在锁外，违反会让一个 60 秒超时的命令锁死整个 manager，界面假死而调用栈上无线索 |
@@ -158,6 +159,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **给搜索类工具加逐文件过滤器（c14）** → 过滤器签名是 `(相对路径, 本次调用的工作目录)`，**第二个参数不可省**。漏掉不会报错：构造权限请求时缺参数抛 `TypeError`，被调用点外面的 `except Exception: return False`（fail-safe）吞掉，于是**所有文件都被判拒绝**、工具照常返回 ok=True 而结果为空——用户看到的是「grep 什么都搜不到」。改造期真踩过
 - **新增 worktree 行为记录事件（c14）** → `trace/models.py` 的枚举 + `trace/reader.py` 的 `SUMMARIZERS`。与既有那条同一个坑，漏后者只显示成「（未登记类型）」
 - **改动「隔离成果怎么交回来」的说法（c14）** → `worktree/render.py` 的 `render_delivery` + `tools/run_agent.py` 的 `description`。**两处必须同口径**（不要写「不要提交」/ 不要自己进工作区目录抄文件）——主 Agent 在**两个不同时刻**读到同一条约束：委派前读工具描述、委派后读交付信息，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单表头 ↔ `run_agent.description`」是**同一个坑的第三次**。真实模型实测两次撞到：主 Agent 从用户那句「我这边的改动先不提交」推断出「让子 Agent 也别提交」，成果全部搁浅、`git merge` 拿不到东西，而它照样报「已完成」。护栏见 `tests/test_worktree_render.py::ToolDescriptionSameVoiceTest`
+- **新增②″保护路径的保护范围 / 排除项（protected-paths）** → `permission/protected.py` 的 `PROTECTED_RELATIVE` / `EXCLUDED_RELATIVE` + **同文件的 `_WHY`**。⚠ **漏 `_WHY` 不报错**，只是确认面板上那行退回泛泛的兜底说法（「它决定 RhineCode 以后的行为」），用户看不出**这个文件为什么特殊**——而那正是他决定放不放行的唯一依据。⚠ **另一条**：`EXCLUDED_RELATIVE` 与 `path_guard._RUNTIME_ARTIFACT_RELATIVE` **取值恰好相同但刻意不合一**（一个是「搜索时跳过」，一个是「写入不必过人眼」）。合一的具体后果：将来出现一个「不该进搜索结果、但改了会变天」的目录时，把它加进那张表会**静默地把它从保护范围里摘掉**。两处都写了注释互相指认。⚠ **第三条**：`worktrees/` 与 `memory/` **刻意不在排除清单里**，理由写在 `EXCLUDED_RELATIVE` 上方，别当成漏改顺手补上
+- **②″保护路径的「本会话放行」是成对维护点（protected-paths）** → `tui/widgets.py` 的 `ConfirmPanel.show_for` 三选项分支 + `conversation.py` 的 `_build_ask` 豁免分支。**只改一处都不报错**：只改面板 → 不给「永久放行」了，但「本会话放行」仍写③层规则，用户点了之后下次还弹；只改协调层 → 面板仍显示一个点了没用的「永久放行」。⚠ 那条豁免**刻意只在内存、只对单个文件、关程序即失效**——落盘的豁免本身就是一份「能改变以后会发生什么」的配置，绕一圈又回到本扩展要解决的原问题
 - **新增「不该进搜索结果」的运行期产物目录** → `tools/path_guard.py` 的 `_RUNTIME_ARTIFACT_RELATIVE` 一处即可（`grep_content` 与 `glob_files` 都取 `runtime_artifact_dirs_of`）。⚠ 它与 `SKIP_DIRS` **刻意分开**：那张表按**目录名**匹配，这里必须按**路径相等**判断，否则会误伤用户自己叫 `sessions` / `context` 的业务目录。`.rhinecode/memory/` 与 `.rhinecode/agents/` **刻意不在表内**（前者是刻意写下的项目知识、后者是用户写的角色定义），`test_search_artifact_exclusion.py` 有用例钉住这个「刻意」，免得后来的人当成漏改顺手补上
 - **改动角色正文里「结论怎么回流」的说法（c13）** → 必须与 `runner._extract_conclusion` 的实际口径一致：它取的是**最后一条 assistant 消息的全文**，不是「最后一段」。三个内置角色正文 + `SUBAGENT_CONVENTIONS` 都得同口径。**说错了不报错**，只是模型照着字面理解、在结论前面写一堆过程叙述，而那些全都会被带回主对话（真实模型实测过）。护栏见 `test_subagent_builtin.py::test_body_says_the_whole_reply_is_returned`
 - **子 Agent 的产品级约定写在运行器里，不写进角色正文** → `subagents/runner.py` 的 `SUBAGENT_CONVENTIONS`。语言约定与结论长度这两条与角色是谁无关；写进内置角色正文的话，**用户自己写的角色一个都盖不到**。⚠️ 子 Agent 的系统提示只有角色正文，`RHINE.md` 里的项目约定（比如「用中文回答」）**到不了它**
@@ -458,7 +461,21 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
 4. **权限模式**（`/perm`）：严格/默认/放行，只兜底「规则未命中」的灰色地带，翻不了①②③的 deny。
 5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次/本会话/永久/拒绝）。
 
+**外加一道出口处的收紧器：②″保护路径**（protected-paths 扩展）。它不在上面那条短路序列里——`decide` 先跑完既有五层（`_decide_core`），再由 `_apply_protected` 按结果收紧：`.rhinecode/` 下的配置与 `.git/` 的**写入**，结论非 DENY 时一律升级为 ASK。见下方「保护路径（②″）五条」。
+
 被拒不终止 Agent Loop，结构化拒绝原因回灌模型。**但「用户在面板里选拒绝」是例外中的例外**：它不是技术失败而是人的决定，回灌文案（`DENIED_BY_USER_FEEDBACK`）明确要求模型停止推进、不要重试/改参数/换工具绕过，转而向用户说明意图并询问拒绝原因；且**下一轮硬性不发任何工具**（`_RoundContext.user_denied` → `tools=None`），使模型在物理上只能产出文本。软硬两道缺一不可——实测只留文案时，一个不听劝的模型会把 25 轮迭代全部烧在重试上（用户要连点 25 次拒绝），加上硬约束后 2 轮结束。护栏见 `tests/test_perm_deny_stops_retry.py`。其它注意：
+
+- **保护路径（②″，protected-paths 扩展）五条**：
+
+  ① **它绕不过，而这是结构性的。** `.rhinecode/` 下那批文件（`permissions.yaml` / `hooks.yaml` / `mcp.yaml` / `agents/` / `skills/` / `memory/` / `worktrees/`）与 `.git/` 的内容决定「以后会发生什么」。本层**不是管线里的一站，是 `decide` 出口处的收紧器**，因此**任何 allow 规则、任何权限档、任何 Skill 预授权都消解不掉它**——一条 `allow: Write(.rhinecode/**)` 命中③层放行之后，仍会在出口被升级为 ASK。**没有配置项、没有命令、没有权限档能关掉它**（与①危险命令黑名单同一性质）。
+
+  ② **它只收紧不放宽，可逐条论证。** 结论为 DENY 时一律原样返回：③层的 `deny` 与④层严格档的 DENY 都不被降级。论证形态与 C12「Hook 只能收紧不能放宽」同构——加进来之后能通过的调用集合只会变小。⚠ 做成「②之后③之前」的短路站会同时破坏这两条，**而那正是原始设计稿的写法**，实现期改掉了。
+
+  ③ **判定基准是 `request.cwd`，不是主项目根。** 因此 **C14 的隔离子 Agent 天然不受影响**（它的工作目录里没有 `.rhinecode/`），而 `.rhinecode/worktrees/` **刻意留在保护范围内**——那拦的是「主对话直接去改别人的隔离工作区」，C14 明说成果应经分支交付。⚠ **非隔离子 Agent 写配置时判 ASK，而它非交互、即自动拒绝——这是期望行为不是误伤**，别当成缺陷「修」掉。第 3 条 todo（auto 成为缺省档）落地后这一条的分量会显著上升：那时子 Agent 的生效档位也是 auto，能写文件、后台、并行、用户不在场，而本层是唯一挡住它写配置的东西。
+
+  ④ **豁免只在内存、只对单个文件、关程序即失效。** 确认面板在本层的场景下**不提供「永久放行」**——那个选项写的是③层规则，而本层不被③层消解，写下的规则**永远不会被求值**，用户会看到「点了永久放行，下次还是弹」，**那比不做还糟**（一个明确的用户决定看起来失效了）。同场景的「本会话放行」改走引擎里本层自己的豁免集合，**刻意不落盘**：落盘的豁免本身就是一份「能改变以后会发生什么」的配置，绕一圈又回到原问题。豁免**只解除本层的升级**——被豁免的路径若同时命中一条 `deny` 规则，结论仍是 DENY。
+
+  ⑤ **`run_command` 与 MCP 工具不受本层约束**（已知边界，与已知项 #4 的 OS 级沙箱同源）。`echo >> .rhinecode/hooks.yaml` 绕得过——命令串里无法区分读写，做了会让 `cat .rhinecode/hooks.yaml` 也弹面板，而变量拼接、heredoc、命令替换一律绕得过，是「看起来堵上了」。真正的堵法是第 3 条 todo 之后的分类器审查。另：本层**只管写入，不管读取**（读配置不改变「以后会发生什么」；`config.yaml` 的密钥问题另有 deny 规则这条手段）；**项目根的 `RHINE.md` 刻意不保护**（它确实是注入系统提示的指令文本，但属高频合法写入，保护它会让 `/init` 与日常更新项目说明频繁弹面板）。
 
 - 沙箱是应用层前缀校验，管得住文件工具，但管不住 `run_command` 跑起来的脚本自己用代码 open 的文件（已知边界，OS 级沙箱留待后续）。
 - `config.yaml` 可能包含真实 API Key，请勿提交到版本库；可用 `deny Read(config.yaml)` 规则进一步阻止模型读取，并阻止 grep/glob 间接泄露该文件内容或路径。
@@ -598,7 +615,9 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
 2. ~~Plan Mode 规划阶段的工具阶段强校验~~ **已于 2026-07-29 修复**：规划阶段（`plan_mode and not execution_phase`）夹带的非只读工具现在在 `_execute` 的预扫里被独立通道 `plan_blocked` 挡下并回灌「先用 present_plan 提交计划」，trace outcome 为 `plan_blocked`（与 `out_of_scope` **刻意分开**——两处过滤职责不同，回灌指引也不同）。原缺陷有真实观测样本：规划阶段那轮 `tool_names` 里没有 `run_command`，模型仍凭先验调了出来，而当时唯一的守卫只查 Skill 白名单，于是 `outcome=executed`。护栏见 `tests/test_plan_stage_guard.py`（含「放行权限模式下也挡得住」与「获批后放行」两条反证）。
 3. `write_file` / `edit_file` 的文件系统级原子写入。
 4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问——C6 的应用层黑名单+路径沙箱已覆盖命令与文件工具的常见高危场景，但管不住子进程内部的间接访问。
-5. 权限系统后续项：~~网络请求限制~~ **已于 2026-07-29 由 web_fetch 扩展兑现**（②′网络边界层：结构性硬校验 + 域名策略，见 `docs/extensions/web-fetch/`）；资源配额、审计日志仍留待后续章节。
+5. 权限系统后续项：~~网络请求限制~~ **已于 2026-07-29 由 web_fetch 扩展兑现**（②′网络边界层：结构性硬校验 + 域名策略，见 `docs/extensions/web-fetch/`）；~~模型能改写自己的权限配置~~ **已于 2026-08-14 由 protected-paths 扩展兑现**（②″保护路径收紧器，见 `docs/extensions/protected-paths/`）。资源配额、审计日志仍留待后续章节。
+
+   **②″保护路径明确没覆盖的三个缺口**（都是 spec 里写下的「不做的事」，登记在此免得将来有人以为是漏洞）：① **`run_command` 的旁路**——`echo >> .rhinecode/hooks.yaml` 绕得过，与本条已知项 #4（OS 级沙箱）同源，真正的堵法是分类器审查；② **MCP 工具**——落 `other` 分支、无路径判定，且 MCP Server 是装配期以主项目根为工作目录启动的外部进程；③ **保护清单不可配置**——用户自定义保护路径是合理需求，但那份配置本身又要被保护，且它与本层「不可被配置放开」的性质需要单独论证。
 6. 开发环境依赖固定与 CI，让 `compileall` / `unittest` 在标准环境稳定运行。
 7. MCP 后续项（C7 spec 明确不做）：Server 健康检查与自动重连、资源/提示词/采样等非工具能力、MCP 工具的细粒度权限映射与执行超时可配置化、stdio 之外的旧版 HTTP+SSE 传输、MCP 工具结果里图片/二进制内容的实际渲染。
 8. 上下文管理后续项（C8 spec 明确不做）：精确 tokenizer（当前仅「锚点+增量」近似估算）、摘要策略的机器学习/质量优化、存盘文件的清理与生命周期管理（`/clear` 只复位幂等状态、不删磁盘文件）、除窗口大小外其它阈值（存盘/保留/余量等）的可配置化、摘要内容的分段/多轮压缩与跨会话持久化。~~其中「保留区阈值」曾有一处实测局限~~ **已于 2026-07-29 修复**：`RETAIN_TOKENS` 与 `auto_margin` 原是固定常量、不随 `context_window` 缩放，导致小窗口（如 8192）上保留区比整个窗口还大、触发线为负——第二层摘要**永不真正压缩**且每轮空转。现改为「按窗口比例算再夹上限」（`summarize.retain_budget` / `manager._derive_margin`），**64K 及以上逐字维持原值**。护栏见 `tests/test_context_summarize.py::RetainScalesWithWindowTest`。

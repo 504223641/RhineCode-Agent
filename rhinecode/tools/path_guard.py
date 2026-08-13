@@ -109,6 +109,12 @@ def worktrees_dir_of(root: Union[str, Path]) -> Path:
 # 对项目源码检索毫无意义的字节，且**逐字复刻了对话与工具输出**。
 #
 # 与 `worktrees` 同样按**路径相等**判定，不按目录名——理由见 `is_inside`。
+#
+# ⚠ **与 `permission/protected.py` 的 `EXCLUDED_RELATIVE` 取值恰好相同，
+# 但两张表刻意不合一。** 本表的语义是「**搜索**时跳过」，那张是「**写入**不必过
+# 人眼（②″保护路径的排除项）」。语义不同，合一的后果是任一侧的增删误伤另一侧
+# ——最具体的形态：将来出现一个「不该进搜索结果、但改了会变天」的目录
+# （比如某种缓存下来的角色定义），把它加进本表会**静默地把它从保护范围里摘掉**。
 _RUNTIME_ARTIFACT_RELATIVE: tuple[tuple[str, ...], ...] = (
     (".rhinecode", "sessions"),   # c9 会话存档：完整对话原文
     (".rhinecode", "context"),    # c8 存盘的工具结果原文
