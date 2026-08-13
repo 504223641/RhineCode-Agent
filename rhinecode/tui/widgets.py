@@ -248,13 +248,37 @@ class _DiffBlock:
         按 options.max_width 补足空格，使背景铺满整行；其余行（概要/上下文/省略）原样输出。
         行间以换行分隔，末行不补换行，避免产生多余空行。
         """
-        view = self._view
         width = options.max_width
+        rows_out = self._rows()
+        last = len(rows_out) - 1
+        for idx, (text, style, fill) in enumerate(rows_out):
+            if fill:
+                # 补空格到整行宽度（cell_len 正确计算中文/全角宽度），使背景铺满整行
+                pad = max(0, width - cell_len(text))
+                yield Segment(text + " " * pad, style)
+            else:
+                yield Segment(text, style)
+            if idx != last:
+                yield Segment("\n")
+
+    def plain_text(self) -> str:
+        """
+        本块的**纯文本**，供选中复制使用。
+
+        ⚠ **与渲染同源**（都走 `_rows`）。各拼一遍的话，复制出来的内容会与
+        屏幕上看到的悄悄不一致——而那种不一致极难发现：两边单看都是对的。
+        """
+        return "\n".join(text for text, _style, _fill in self._rows())
+
+    def _rows(self) -> "list[tuple[str, Style, bool]]":
+        """
+        组装每行的 `(文本, 样式, 是否整行铺背景)`。**渲染与取纯文本共用这一处。**
+        """
+        view = self._view
         dim = Style.parse(_DIFF_DIM)
         remove_bg = Style.parse(_DIFF_REMOVE_BG)
         add_bg = Style.parse(_DIFF_ADD_BG)
 
-        # 先收集每行的 (文本, 样式, 是否整行铺背景)
         rows_out: list[tuple[str, Style, bool]] = []
         # 概要分支行（灰色，无背景）
         rows_out.append((f"{BRANCH_PREFIX}{_count_phrase(view.added, view.removed)}", dim, False))
@@ -290,16 +314,7 @@ class _DiffBlock:
         if view.truncated:
             rows_out.append(("        …（diff 已截断）", dim, False))
 
-        last = len(rows_out) - 1
-        for idx, (text, style, fill) in enumerate(rows_out):
-            if fill:
-                # 补空格到整行宽度（cell_len 正确计算中文/全角宽度），使背景铺满整行
-                pad = max(0, width - cell_len(text))
-                yield Segment(text + " " * pad, style)
-            else:
-                yield Segment(text, style)
-            if idx != last:
-                yield Segment.line()
+        return rows_out
 
 
 def render_diff_block(view, expanded: bool = False) -> "_DiffBlock":
@@ -701,6 +716,9 @@ class ToolCallWidget(Static):
         self._batch: "Optional[ToolBatchWidget]" = None
         # 最详细一档显示的输出原文；空则回退显示 `_summary`
         self._detail = ""
+        # 本行当前显示内容的**纯文本**，供选中复制使用（见 `get_selection`）。
+        # 每次重绘时同步更新——它必须与屏幕上看到的一致。
+        self._plain = ""
 
     def on_mount(self) -> None:
         """
@@ -779,11 +797,13 @@ class ToolCallWidget(Static):
         """
         if self._pending:
             # 参数还没到，写不出参数摘要，故不带括号——写成 "Write()" 像是无参调用。
-            self.update(f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中…[/]")
-            return
-        self.update(
-            f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中…[/]"
-        )
+            markup = f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中…[/]"
+        else:
+            markup = (
+                f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中…[/]"
+            )
+        self.update(markup)
+        self._plain = RichText.from_markup(markup).plain
 
     def finish(self, ok: bool, summary: str, diff=None, detail: str = "") -> None:
         """
@@ -964,18 +984,55 @@ class ToolCallWidget(Static):
                 f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))})"
                 f"{result}{self._elapsed_suffix()}[/]"
             )
-            self.update(
-                RichGroup(
-                    RichText.from_markup(header),
-                    render_diff_block(diff, expanded=self._detail_level == DETAIL_FULL),
-                )
+            block = render_diff_block(
+                diff, expanded=self._detail_level == DETAIL_FULL
+            )
+            self.update(RichGroup(RichText.from_markup(header), block))
+            self._plain = (
+                RichText.from_markup(header).plain + "\n" + block.plain_text()
             )
             return
         # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"。
         # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
         # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
         header = f"[{color}]● {self._title_text()}{result}{self._elapsed_suffix()}[/]"
-        self.update(RichGroup(RichText.from_markup(header), self._branch_block()))
+        branch = self._branch_block()
+        self.update(RichGroup(RichText.from_markup(header), branch))
+        self._plain = RichText.from_markup(header).plain + "\n" + branch.plain
+
+    def get_selection(self, selection):
+        """
+        交出本行被选中的那段文本（供拖选 + `Ctrl+C` 复制）。
+
+        ## ⚠ 为什么必须自己实现
+
+        Textual 的默认实现只认 `Text` 与 `Content` 两种渲染对象，**别的一律
+        返回 None**。而本组件的终态是 `RichGroup`（标题行 + 结果块/差异块），
+        于是**整行内容在选中复制时凭空消失**——实测「全选」拿到的文本里，
+        用户消息、系统提示、状态栏都在，唯独工具行一个字都没有。
+
+        那正是用户反馈的「整个聊天窗口无法复制」：能选中的只是那些恰好用
+        markup 字符串渲染的行，而工具行——本轮刚把结果原文做得可以展开——
+        恰恰属于复制不走的那一类。
+
+        改渲染结构（把 `RichGroup` 拆成单个 `Text`）做不到：差异块要按**渲染期
+        才知道的宽度**给整行补背景，那是 `Text` 表达不了的。因此保留视觉，
+        在这里补上选择支持。
+
+        ⚠ **不可见时必须返回 None。** 折叠档下本行 `display = False`，而
+        Textual 的全选**照样会问到它**——不挡的话，用户全选拿到的文本里会混进
+        一堆**屏幕上根本没有**的行。那与「看得见却复制不走」是同一类毛病的
+        两面：所见非所得。（反证见 `test_folded_rows_are_not_selectable`，
+        实现期正是它抓出了这一条。）
+
+        :param selection: Textual 给出的选区
+        :returns: `(选中的文本, 行尾)`；不可见或无内容时 None
+
+        副作用：无。
+        """
+        if not self.display or not self._plain:
+            return None
+        return selection.extract(self._plain), "\n"
 
     def _title_text(self) -> str:
         """

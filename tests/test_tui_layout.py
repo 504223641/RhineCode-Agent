@@ -828,3 +828,47 @@ class FrameIntegrityTest(unittest.IsolatedAsyncioTestCase):
                 middle - top,
                 f"内容行必须有框线行没有的底色（灰底）：内容 {middle} / 框线 {top}",
             )
+
+
+    async def test_history_bottom_border_survives_a_panel(self) -> None:
+        """
+        **历史区的下边框在三种状态下都必须在**（真机反馈）。
+
+        用户原话：「原本的历史记录下边框的边框没了」。踩了两层：
+
+        1. 浮层容器带一圈 `padding`（把面板缩进到框内），而 padding 在
+           `height: auto` 下**照样算进高度**——空面板的容器仍占 1 行，
+           dock 在底部时正好压住下边框。修法是无面板时整个隐藏容器。
+        2. 面板弹出后**下框又没了**：`padding` 属于组件区域，即便
+           `background: transparent` 也会把那一行盖成空白。
+           修法是底部改用 `margin`（不属于区域，容器整体上移）。
+
+        判据直接读**那一行画出来的字符**：只要框线字符还在，就说明没被盖。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            view = app.query_one(HistoryView)
+            panel = app.query_one(ConfirmPanel)
+            y = view.region.y + view.region.height - 1
+
+            def bottom_line() -> str:
+                strips = app.screen._compositor.render_strips()
+                return "".join(seg.text for seg in strips[y])
+
+            self.assertIn("─", bottom_line(), "空闲时下边框必须在")
+
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("─", bottom_line(), "面板弹出时下边框仍要在")
+
+            panel.hide()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("─", bottom_line(), "面板收起后下边框仍要在")

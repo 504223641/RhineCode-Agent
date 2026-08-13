@@ -209,7 +209,16 @@ class RhineApp(App):
         layer: panels;
         dock: bottom;
         height: auto;
-        padding: 0 1 1 1;
+        /* ⚠ **缺省隐藏。** 容器带一圈 padding（把面板缩进到历史区框内），
+           而 padding 在 `height: auto` 下照样算进高度——空面板的容器仍占 1 行，
+           dock 在底部时正好压住历史区的下边框，那条框线变成一行空白。
+           可见性由 `_reserve_space_for_panels` 按「有没有可见面板」切换。 */
+        display: none;
+        /* 左右用 padding（一定缩内容区，不受 dock 那个 `1fr` 的影响），
+           底部用 margin——**padding 属于组件区域**，即便背景透明也会把
+           历史区的下边框那一行盖成空白；margin 不属于区域，容器整体上移。 */
+        padding: 0 1 0 1;
+        margin-bottom: 1;
         background: transparent;
     }
     HistoryView {
@@ -1340,18 +1349,38 @@ class RhineApp(App):
                 isinstance(widget, OverlayPanel) and widget.display
                 for widget in self.query("*")
             )
-            # 让出的是**整个浮层容器**占的高度（含它自己的内边距），
-            # 不是面板裸高——容器还带一圈缩进，只算面板会少让一行。
-            reserved = (
-                self.query_one("#panel-dock").outer_size.height if any_visible else 0
+            dock = self.query_one("#panel-dock")
+            # ⚠ **没有面板时容器必须整个隐藏。**
+            #
+            # 它带一圈缩进（把面板收进历史区框内），而缩进在 `height: auto` 下
+            # **照样算进高度**——于是空面板的容器仍占 1 行，dock 在 stage 底部时
+            # 正好**压住历史区的下边框**，那条框线变成一行空白。
+            # 真机反馈：「原本的历史记录下边框的边框没了」。
+            dock.display = any_visible
+            # ⚠ **高度取自面板自身，不能读容器的 `outer_size`。**
+            # 容器刚从隐藏切到显示，此刻它的尺寸还是上一次布局的值（0），
+            # 当场读会把内边距算成 0、内容仍被盖住；而等下一帧再读又要多绕一次
+            # 异步，实测在并发跑测试时帧数不稳。
+            # 面板本身此刻**已经布局完**（它先于本方法被显示），读它是可靠的。
+            panel_h = max(
+                (
+                    widget.outer_size.height
+                    for widget in self.query("*")
+                    if isinstance(widget, OverlayPanel) and widget.display
+                ),
+                default=0,
             )
-            history = self.query_one(HistoryView)
+            # 容器自身的缩进从**样式声明**取，同样不依赖布局是否算完。
+            # ⚠ 与 `#panel-dock` 的 CSS 成对：那边改了缩进，这里自动跟上。
+            spacing = dock.styles.margin.bottom + dock.styles.padding.top
+            reserved = (panel_h + spacing) if any_visible else 0
             # 只改下边距，左右沿用原样式（padding: 0 1）
-            history.styles.padding = (0, 1, reserved, 1)
+            self.query_one(HistoryView).styles.padding = (0, 1, reserved, 1)
         except Exception:  # noqa: BLE001
             # 布局相关的兜底：这只是「让内容别被盖住」的锦上添花，
             # 出错时宁可少让一块地方，也不能把界面拆了。
             pass
+
 
     def action_request_quit(self) -> None:
         """
