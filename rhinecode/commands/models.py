@@ -20,7 +20,7 @@ class CommandType(Enum):
     - LOCAL：纯本地查询/本地编排，绕过 Agent Loop（/help、/mcp、/context、/compact、/memory）。
       注意「本地」指不作为普通用户消息进入 Agent，不代表绝对不访问模型——
       /compact 仍保留既有的专用摘要 LLM 调用（spec 明确例外）。
-    - UI：改变会话或界面状态，绕过 Agent（/think、/plan、/perm、/resume、/clear、/exit）。
+    - UI：改变会话或界面状态，绕过 Agent（/think、/mode、/resume、/clear、/exit）。
     - PROMPT：把内置预设提示词作为用户请求交给正常 Agent 路径（/init）。
     """
 
@@ -56,11 +56,23 @@ class DispatchKind(Enum):
 
 
 class ModeTarget(Enum):
-    """switch_mode 的目标模式：思考模式 / Plan Mode / 权限模式。"""
+    """
+    `switch_mode` 的目标：思考模式 / 运行预设。
+
+    **成对维护点**：新增枚举值须同步三处——本枚举、`tui/app.py` 的
+    `switch_mode` 分支（未知值明确抛错）、`conversation.py` 的对应领域方法。
+
+    auto-plan 扩展的两处变更：
+
+    - `PLAN` → `PRESET`。语义变了：从「切 Plan Mode 这一个开关」变成
+      「在 `auto` 与 `plan` 两个预设间循环」。留旧名会让下一个人以为它
+      只管规划阶段那条轴，而它现在同时写两条轴。
+    - `PERMISSION` **删除**。权限档不再有运行期切换入口（`/perm` 已删），
+      它只能经 `permissions.yaml` 与角色定义的 `permission_mode` 抵达。
+    """
 
     THINKING = "thinking"
-    PLAN = "plan"
-    PERMISSION = "permission"
+    PRESET = "preset"
 
 
 class ReportTarget(Enum):

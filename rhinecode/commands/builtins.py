@@ -1,5 +1,5 @@
 """
-内置命令登记（c10 T15–T19）：12 条规范命令、批准的全部别名与静态 /init 提示词。
+内置命令登记（c10 T15–T19）：全部规范命令、别名与静态 /init 提示词。
 
 设计要点（plan 12.5）：
 - 处理函数只做「参数解释 + 控制器调用」，不导入 Textual、ConversationManager
@@ -202,16 +202,21 @@ def _handle_think(invocation: CommandInvocation, controller: CommandController) 
     controller.refresh_status()
 
 
-def _handle_plan(invocation: CommandInvocation, controller: CommandController) -> None:
-    """/plan：切换 Plan Mode 并立即刷新状态栏（[DEFAULT] ↔ [PLAN]，spec F31）。"""
-    controller.show_message(controller.switch_mode(ModeTarget.PLAN))
+def _handle_mode(invocation: CommandInvocation, controller: CommandController) -> None:
+    """
+    /mode：在 `auto` 与 `plan` 两个预设间循环，并立即刷新状态栏（[AUTO] ↔ [PLAN]）。
+
+    与 `Shift+Tab` 走**同一个**领域方法，两条入口行为逐字相同（auto-plan F5/F6）。
+    `/plan` 是它的别名——老用户的肌肉记忆不断。
+    """
+    controller.show_message(controller.switch_mode(ModeTarget.PRESET))
     controller.refresh_status()
 
 
-def _handle_perm(invocation: CommandInvocation, controller: CommandController) -> None:
-    """/perm：循环切换权限模式并刷新状态栏。"""
-    controller.show_message(controller.switch_mode(ModeTarget.PERMISSION))
-    controller.refresh_status()
+# auto-plan 扩展：`_handle_perm` 与 `/perm` 的 CommandSpec 已整体删除。
+# 权限档不再有运行期切换入口，改由 `permissions.yaml` 的规则与角色定义的
+# `permission_mode` 字段决定（手法对齐 Claude Code 的 `dontAsk`：档位仍然存在、
+# 可被显式指定，只是永不进用户的切换循环）。
 
 
 # ---------------------------------------------------------------------- #
@@ -273,8 +278,11 @@ def build_builtin_registry() -> CommandRegistry:
     """
     构建并返回登记了全部内置命令的注册表（无导入副作用，调用时才注册）。
 
-    登记内容与 plan 第 7 节的批准表格一致：12 条规范命令 + 8 个别名；
-    仅 /resume 有参数提示；C10 全部内置命令 requires_argument=False。
+    登记内容以 c10 plan 第 7 节的批准表格为起点，其后各章陆续增删
+    （c12 `/hooks`、c13 `/agents`、c15 `/tasks`、auto-plan 用 `/mode` 取代
+    `/plan` 与 `/perm`）。**这里刻意不写条数**——原文写着「12 条 + 8 个别名」，
+    而实测早已不是那个数：一个会静默漂移的计数比没有计数更容易误导人。
+    仅 /resume 有参数提示；全部内置命令 requires_argument=False。
     register_many 一次性原子注册：任一冲突则整批不生效（理论上内置表不冲突，
     这里主要为测试注入与未来命令来源保留同一失败语义）。
 
@@ -306,20 +314,12 @@ def build_builtin_registry() -> CommandRegistry:
                 handler=_handle_think,
             ),
             CommandSpec(
-                name="/plan",
-                aliases=(),
-                description="切换计划模式：先规划/澄清需求，审批后再执行（DeepSeek）",
-                usage="/plan",
+                name="/mode",
+                aliases=("/plan",),
+                description="切换运行模式：auto（放手干活）⇄ plan（先规划再执行）；等价于 Shift+Tab",
+                usage="/mode",
                 command_type=CommandType.UI,
-                handler=_handle_plan,
-            ),
-            CommandSpec(
-                name="/perm",
-                aliases=("/permissions", "/allowed-tools"),
-                description="循环切换权限模式：默认 → 严格 → 放行（DeepSeek 工具模式）",
-                usage="/perm",
-                command_type=CommandType.UI,
-                handler=_handle_perm,
+                handler=_handle_mode,
             ),
             CommandSpec(
                 name="/mcp",
