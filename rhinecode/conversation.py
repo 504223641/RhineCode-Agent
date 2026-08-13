@@ -282,6 +282,10 @@ class ConversationManager:
         self.confirm_callback: Optional[ConfirmCallback] = None
         self.clarify_callback: Optional[ClarifyCallback] = None
         self.approve_plan_callback: Optional[ApprovePlanCallback] = None
+        # 预设在**工作线程**里被改动时通知界面刷新状态栏（auto-plan 扩展 F12）。
+        # 由 TUI 注入，与 `skill_manager.notify_activation` 同一个先例与同一套理由。
+        # 为 None 时静默跳过——非 TUI 调用方（测试、端到端宿主）不需要它。
+        self.notify_preset_change: Optional[Callable[[], None]] = None
 
         # 工具/循环能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
         self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
@@ -636,6 +640,51 @@ class ConversationManager:
         self.thinking_effort = self._EFFORT_CYCLE[self.thinking_effort]
         label = self._EFFORT_LABEL[self.thinking_effort]
         return f"思考模式：{label}"
+
+    def _approve_plan_then_exit(self, plan: str) -> bool:
+        """
+        计划审批的包装：转发给 TUI 的审批回调，**获批则退出 plan 预设**。
+
+        auto-plan 扩展 F12/F13/F14。三条语义，逐条说明为什么是这样：
+
+        **F12 获批 → 永久回 `auto`。** 批准的语义是「我认可了，去干吧」，
+        而不是「这一次去干、下次还得再提一遍计划」。改造前 `plan_mode` 是个
+        纯粹的持久开关，获批只影响 Agent 循环内那一轮的 `execution_phase`，
+        于是用户批完一个计划、本轮执行完，下一句「继续」又会被抱回规划阶段
+        要求重新提计划。
+
+        **F13 被拒 → 留在 `plan`。** 拒绝意味着方案不对、还得接着规划；
+        自动退出会让下一轮重想时失去保护（模型可以直接动手了）。
+
+        **F14 本轮不受影响。** Agent 循环拿到的 `plan_mode` 是**入参快照**，
+        循环内部另有自己的局部变量 `execution_phase`——回合中途改这个字段，
+        正在跑的那一轮感知不到。这正是想要的：本回合继续把活干完，
+        下一回合起是 `auto`。
+
+        ⚠ **刻意不在这里改 `engine.mode`。** 两个预设的档位本来就相同、
+        不需要改；而在这里改那个**单实例共享**的引擎的档位，正是
+        `CLAUDE.md` 明令禁止的形态（「权限必须 `derive()` 派生，绝不改主引擎
+        的 `mode`」）——它跑在工作线程上，而主线程正在读同一个字段渲染界面，
+        且子 Agent 的档位是按 `min(主对话档, 角色声明档)` 在委派那一刻派生的，
+        回合中途翻转会让前后两次委派的同名角色拿到不同档位而配置上看不出来。
+        护栏见 `test_auto_plan_integration.py::test_approval_does_not_touch_engine_mode`。
+
+        :param plan: 模型提交的计划正文
+        :returns: 用户是否批准（回调缺失时按未批准处理，fail-closed）
+
+        副作用：获批时改写 `plan_mode` 并通知界面刷新状态栏。
+        """
+        if self.approve_plan_callback is None:
+            return False
+        approved = self.approve_plan_callback(plan)
+        if approved:
+            self.plan_mode = False
+            # 立刻让状态栏变回 [AUTO]。不通知的话，整个执行阶段状态栏都还写着
+            # [PLAN]——那时它已经在动手改文件了，标记与实际正好相反。
+            # 丢一次通知不会留下错误状态：`_do_stream` 的 finally 里无条件再刷一次。
+            if self.notify_preset_change is not None:
+                self.notify_preset_change()
+        return approved
 
     @property
     def preset(self) -> presets.Preset:
@@ -1457,7 +1506,9 @@ class ConversationManager:
                 self._engine,
                 self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
                 self.clarify_callback,
-                self.approve_plan_callback,
+                # auto-plan F12：走包装方法而不是裸回调——获批后要退出 plan 预设。
+                # ⚠ 两处传的必须是**同一个**方法，各写一份逻辑迟早分叉。
+                self._approve_plan_then_exit,
                 self._cancel_event,
                 self._context_manager,
                 None,                    # recorder=None：子对话过程不写会话存档
@@ -1773,7 +1824,8 @@ class ConversationManager:
             self._engine,
             ask,
             self.clarify_callback,
-            self.approve_plan_callback,
+            # auto-plan F12：同上，走包装方法（两处共用同一个实现）。
+            self._approve_plan_then_exit,
             self._cancel_event,
             self._context_manager,
             self.memory_manager.record_message,

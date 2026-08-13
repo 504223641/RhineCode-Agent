@@ -635,6 +635,11 @@ class RhineApp(App):
         # Skill 段，让用户当下就看到激活数变化，而不用等本轮流式结束。
         self._manager.skill_manager.notify_activation = self._notify_skill_activation
 
+        # 预设变化通知（auto-plan 扩展 F12）：计划获批后预设当场变回 auto，
+        # 而那件事发生在**工作线程**（审批回调的返回路径上），状态栏必须跟着变。
+        # 与上面那条 Skill 激活通知同一个先例、同一套理由。
+        self._manager.notify_preset_change = self._notify_preset_change
+
         # 启动后将焦点置于输入框，用户可以直接开始输入
         self.query_one(InputBar).focus()
 
@@ -1230,6 +1235,32 @@ class RhineApp(App):
 
         本回调的价值只在「激活当下立刻刷新」：`_do_stream` 的 finally 里已经
         无条件刷一次状态栏，所以即使这里丢掉一次刷新也不会留下错误状态。
+
+        副作用：跨线程调度一次界面刷新。
+        """
+        try:
+            self.call_from_thread(self._refresh_status)
+        except Exception:
+            # 应用正在退出等边缘情况：刷新丢弃即可。
+            pass
+
+    def _notify_preset_change(self) -> None:
+        """
+        预设在工作线程里变化后立刻刷新状态栏（auto-plan 扩展 F12）。
+
+        目前唯一的触发点是「计划获批 → 预设当场变回 `auto`」，它发生在
+        `ConversationManager._approve_plan_then_exit` 里、跑在 Worker 线程上。
+        不刷的话，整个执行阶段状态栏都还写着 `\\[PLAN]`——而那时模型已经在
+        动手改文件了，标记与实际情况正好相反。
+
+        ⚠ **本方法只能从工作线程调用。** Textual 的 `call_from_thread` 在主线程上
+        调会直接报错，所以主线程发起的切换（`Shift+Tab` 与 `/mode`）**不走这里**
+        ——那两条路径在动作/命令处理函数里同步调 `_refresh_status()` 即可。
+
+        与 `_notify_skill_activation` 同型：**必须包 try/except**，且丢一次刷新
+        不会留下错误状态——`_do_stream` 的 finally 里无条件再刷一次。
+        这里若把异常放出去，它会顺着审批回调的返回路径爬回 Agent 循环，
+        被当成一次工具执行异常回灌给模型。
 
         副作用：跨线程调度一次界面刷新。
         """
