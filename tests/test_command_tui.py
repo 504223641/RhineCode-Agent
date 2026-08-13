@@ -215,6 +215,16 @@ class FakeManager:
         """
         return {}
 
+    def fold_group_map(self) -> dict:
+        """
+        批次归并分组表（tui-activity-fold F2）。
+
+        返回空字典 = **未启用工具能力**那一支：一个工具都不可归并，
+        每次调用照旧独立成行，形态与改造前逐字一致——与 `primary_arg_map`
+        同一个前提（这里模拟的是最小配置下的 App）。
+        """
+        return {}
+
     # ---- c11 Skill 相关 ----
 
     def skill_status_segment(self):

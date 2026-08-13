@@ -46,8 +46,17 @@ def _prompts(panel) -> list[str]:
     return [str(option.prompt) for option in panel._options]
 
 
-def _decision(reason: str = "默认模式下无规则命中"):
-    return SimpleNamespace(reason=reason, kind="path", host="", layer=None)
+def _decision(reason: str = "默认模式下无规则命中", layer: str = "mode"):
+    """
+    造一个决策结果。
+
+    ⚠ `layer` 缺省是 `"mode"`（第④层兜底）——**那才是真实世界里绝大多数
+    确认面板的来源**，也是「原因恒定、没有分辨力」那条规则适用的场合。
+    要验「别的层的原因仍然显示」，显式传 `layer="hook"` 之类。
+    """
+    return SimpleNamespace(
+        reason=reason, kind="path", host="", layer=SimpleNamespace(value=layer)
+    )
 
 
 CLARIFY_OPTIONS = [
@@ -259,6 +268,94 @@ class NoEmojiTest(unittest.IsolatedAsyncioTestCase):
             header = _prompts(panel)[0]
             self.assertIn("Write(docs/notes.md)", header)
             self.assertNotIn("path=", header)
+
+    async def test_confirm_header_does_not_show_the_decision_reason(self) -> None:
+        """
+        **判定原因不进表头**（真机反馈）。
+
+        它原本拼在工具名后面，想说明「为什么停下来问」。但绝大多数确认走的是
+        第④层兜底，那句话恒为「默认模式：无规则命中」——每次都一样、对
+        「放不放行」没有任何帮助，纯粹把真正要读的 `工具名(参数)` 挤到一边。
+
+        ⚠ 有分辨力的原因仍然看得见：URL 类请求下面单独有「判定来自：…」
+        那几行（`_url_detail_lines`），完整判定链在 `--trace` 里。
+        本条只钉住「不要把那句恒定的兜底话铺在表头上」。
+        """
+        app = _Harness()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            panel.set_primary_args({"write_file": "path"})
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "a.md"}),
+                None,
+                _decision("默认模式下无规则命中"),
+            )
+            await pilot.pause()
+            self.assertNotIn("无规则命中", _prompts(panel)[0])
+
+    async def test_confirm_header_keeps_reasons_from_other_layers(self) -> None:
+        """
+        **反证**：只压第④层那句恒定的兜底话，**别的层的原因必须留着**。
+
+        Hook / 规则 / 沙箱 / 网络边界给出的原因是**这一次特有**的，而且往往是
+        用户唯一能看到它的地方——比如「Hook 规则「x」（来源：y）要求这次调用
+        由你确认」。一刀砍掉的后果实测过：`test_e2e_hooks` 场景 2 当场红，
+        **用户再也看不出这次面板是哪条 Hook 规则要求弹的**。
+
+        没有这条反证，把上一条实现成「无条件不显示」照样全绿。
+        """
+        app = _Harness()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            panel.set_primary_args({"read_file": "path"})
+            panel.show_for(
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.md"}),
+                None,
+                _decision("Hook 规则「审计」要求这次调用由你确认。涉及敏感文件", layer="hook"),
+            )
+            await pilot.pause()
+            header = _prompts(panel)[0]
+            self.assertIn("Hook 规则", header)
+            self.assertIn("敏感文件", header)
+
+    async def test_option_hints_line_up(self) -> None:
+        """
+        四个选项右边的**说明必须起于同一列**（真机反馈）。
+
+        主文本宽度不一（「拒绝」4 格 / 「本会话放行」10 格），
+        直接拼两个空格会让说明参差不齐，一眼扫过去像四段互不相干的话。
+
+        ⚠ 判据必须按**显示宽度**（`cell_len`）算：中文一个字占两格，
+        按字符数量出来的「对齐」在屏幕上照样是歪的——而这正是最容易
+        写错、且测试还会绿的地方。
+        """
+        from rich.cells import cell_len
+        from rich.text import Text
+
+        app = _Harness()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            panel.set_primary_args({"write_file": "path"})
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "a.md"}),
+                None,
+                _decision(),
+            )
+            await pilot.pause()
+
+            # 四个可选项：取「说明」起始处的显示宽度。
+            # ⚠ 不能按「第一处两个空格」切——补齐用的空格本身就是变长的，
+            # 那样切出来的是主文本末尾而不是说明开头（写的时候正是这么错的）。
+            # 说明整段包在 `[dim]…[/dim]` 里，按标记切才对。
+            starts = set()
+            for _index, markup in panel._choices:
+                head, sep, _tail = markup.partition("[dim]")
+                self.assertTrue(sep, f"这一项没有说明列：{markup!r}")
+                starts.add(cell_len(Text.from_markup(head).plain))
+
+            self.assertEqual(
+                len(starts), 1, f"说明列没有对齐，起始列有 {sorted(starts)}"
+            )
 
 
 class ContractUnchangedTest(unittest.IsolatedAsyncioTestCase):

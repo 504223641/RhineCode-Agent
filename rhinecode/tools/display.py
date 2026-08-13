@@ -166,6 +166,211 @@ def resolve_call_parts(
     return label, summarize_args_plain(raw)
 
 
+def resolve_full_title(tool_call) -> "tuple[str, str]":
+    """
+    解析一次工具调用的**完整**标题两段：`(标签, 括号内文本)`，纯文本、未转义。
+
+    与 `resolve_call_parts` 的差别只有两点，但都是刻意的：
+
+    1. **列出全部参数**，不只是主参数——展开到最详细一档时，用户要判断的是
+       「这次调用到底做了什么」，只给一个主参数答不了（比如一次搜索限定了
+       `path`，而 `path` 不是主参数，折叠态根本看不见）；
+    2. **每个值都不截断**，也不做整体长度上限。
+
+    折叠态与本函数的关系不是「同一份内容截长短」，而是**两份为不同用途
+    准备的内容**：折叠态挑一个最有辨识度的值给人扫读，展开态给全量供人核对。
+    改造前展开态沿用折叠态算好的截断标题，于是「展开」了却看不到被截掉的部分，
+    这正是本函数要解决的问题（tui-activity-fold F11）。
+
+    :param tool_call: 有 `name` 与 `arguments` 两个属性的对象
+    :returns: `(标签, 括号内文本)`；参数为空或非字典时括号内为空串
+
+    副作用：无（纯函数）。
+    """
+    name = str(getattr(tool_call, "name", "") or "")
+    label = TOOL_LABELS.get(name, name)
+    raw = getattr(tool_call, "arguments", None)
+    if not isinstance(raw, dict) or not raw:
+        return label, ""
+    # 换行折成空格与 `clip_value` 同理（标题只有一行高度），但**不截断长度**。
+    parts = []
+    for key, value in raw.items():
+        text = str(value).replace("\n", " ").replace("\r", " ").strip()
+        parts.append(f"{key}: {text}")
+    return label, ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 工具活动归并（tui-activity-fold 扩展 F2/F3/F5）
+# ---------------------------------------------------------------------------
+# 一批连续的**只读检索**调用在历史区归并成一行，这张表同时回答两个问题：
+# **哪些工具参与归并**（在表里的才参与）、**归到哪一组、用什么量词**。
+#
+# ⚠ **白名单与分组表刻意合一。** 拆成两张的话，将来新增一个检索工具时
+# 极易只改其中一张——只加分组会让它永远独立成行，只加白名单会让它进了批次
+# 却没有量词。合成一张则「登记了就两件事都成立」。
+#
+# ⚠ **刻意不按 `Tool.read_only` 派生。** 那个标志的语义是「无副作用、可并发」，
+# 与「这次调用该不该折叠」并不等价：
+# - `load_skill` 不写任何文件，却会改变整个会话可用的能力集合（不折叠）；
+# - `run_command` 有副作用，但每一条都已被用户过目（折叠，见表内注释）；
+# - MCP 工具的实际语义完全未知（远端 Server 想干什么都行，不折叠）。
+# 显式表是**偏严**方向——**未登记的一律独立成行**。遗漏的代价只是少折叠一行
+# （看得见、有人会来问），反过来则会让一个不该藏的工具被静默藏进聚合行。
+#
+# ## 折叠的安全判据（验收期改过一次，这是现在的版本）
+#
+# **能折叠的，要么无副作用，要么已被用户过目。**
+#
+# 最初的判据是更严的「被折叠的永远只是『读』」。验收时按用户要求让
+# `run_command` 也参与归并（对齐 Claude Code 的 `Ran N shell commands`），
+# 那条就不成立了，于是改成现在这条——它同样能撑住「折叠不藏重要信息」：
+# 命令在执行前必过权限管线，用户要么当场在面板上放行、要么事先写了 allow 规则。
+#
+# ⚠ **写文件与编辑文件仍在表外**，那是这条判据的边界：它们改的是工作区内容、
+# 且带 diff 块，那正是用户要盯着看的**结果**，不是过程。
+FOLD_GROUPS: "dict[str, tuple[str, str]]" = {
+    "glob_files": ("glob", "查找文件 {n} 次"),
+    "grep_content": ("grep", "搜索内容 {n} 次"),
+    "read_file": ("read", "读取 {n} 个文件"),
+    "web_fetch": ("fetch", "抓取 {n} 个网页"),
+    # ⚠ **执行命令参与归并，是验收期改的，与上面四个的理由不同。**
+    #
+    # 上面四个是「无副作用的检索」，折叠它们不藏任何东西。命令**有副作用**，
+    # 按最初那条判据（「被折叠的永远只是读」）本该排除。改口径的依据有两条：
+    #
+    # 1. **它已经被人看过一遍了。** 命令在执行前必过权限管线，默认档下每一条
+    #    都弹确认面板、用户亲手放行；配了 allow 规则的则是用户**事先**写下的
+    #    授权。折叠的是「已经过目的过程」，不是「悄悄发生的事」。
+    # 2. **它折叠后仍然说得出实情。** 聚合语写「执行 3 条命令」，失败会让整行
+    #    变红并写出个数——「跑了什么」按一次 `Ctrl+O` 就能逐条看到。
+    #
+    # ⚠ **写文件与编辑文件仍然不归并**，那条边界没动：它们改的是工作区内容，
+    # 且带 diff 块——那正是用户要盯着看的东西，不是过程。
+    "run_command": ("bash", "执行 {n} 条命令"),
+}
+
+# 运行期间的进行时文案（F5）。批次在封闭之前不知道自己最终有几次调用，
+# 因此这一档只表达「在做哪一类事」。
+RUNNING_VERBS: "dict[str, str]" = {
+    "glob": "查找中…",
+    "grep": "搜索中…",
+    "read": "读取中…",
+    "fetch": "抓取中…",
+    "bash": "执行中…",
+}
+
+# 未登记工具的兜底进行时文案。正常路径下用不到（不可归并的工具压根不进批次），
+# 留着是为了让 `running_verb` 对任意输入都有定义。
+DEFAULT_RUNNING_VERB = "执行中…"
+
+# 行内分隔符。与界面其它位置同源（符号白名单内的六个之一），
+# 别在这里另写一个字面量。
+SEGMENT_SEP = " · "
+
+
+def is_foldable(tool_name: str) -> bool:
+    """
+    该工具是否参与历史区的批次归并（F2）。
+
+    :param tool_name: 内部工具名（非展示标签）
+    :returns: 在 `FOLD_GROUPS` 内为真
+
+    副作用：无（纯函数）。
+    """
+    return str(tool_name or "") in FOLD_GROUPS
+
+
+def running_verb(tool_name: str) -> str:
+    """
+    该工具运行期间的进行时文案（F5），如「搜索中…」。
+
+    :param tool_name: 内部工具名
+    :returns: 进行时文案；未登记的工具回退到通用文案
+
+    副作用：无（纯函数）。
+    """
+    entry = FOLD_GROUPS.get(str(tool_name or ""))
+    if entry is None:
+        return DEFAULT_RUNNING_VERB
+    return RUNNING_VERBS.get(entry[0], DEFAULT_RUNNING_VERB)
+
+
+def compose_batch_summary(entries: "list[tuple[str, Optional[bool]]]") -> str:
+    """
+    把一个批次里的若干次调用压成一句聚合语（F3/F6）。
+
+    产出形如：`查找文件 1 次 · 搜索内容 3 次 · 读取 8 个文件 · 1 个失败`
+
+    ## 两条口径
+
+    1. **分组顺序取该组第一次出现的时序**，不是字母序也不是表里的定义序——
+       聚合语要读起来与实际发生顺序一致（先搜后读时，搜索段就该在前）。
+    2. **失败段恒在末尾**，且只在有失败时出现。它是兜底路径：真正要紧的失败
+       会让模型停下来说明，而那会封闭批次、让那条调用单独可见；
+       这里覆盖的只有「并行调用中某个失败、模型没停」这一种。
+
+    ## 为什么量词都带宾语
+
+    「查找」与「搜索」在中文里近乎同义，并排出现时读的人分不出差别，
+    而聚合语的全部价值就是「一眼看懂这一轮干了什么」。带上宾语
+    （文件名 / 内容）之后区分度才立得住。
+
+    :param entries: 按**发生时序**排列的 `(工具名, 是否成功)`；
+        第二项为 None 表示该次调用尚未产生结果
+    :returns: 单行聚合语；`entries` 为空时返回空串
+
+    副作用：无（纯函数）。
+    """
+    order: "list[str]" = []          # 组标识，按首次出现排
+    counts: "dict[str, int]" = {}
+    failures = 0
+    for name, ok in entries or []:
+        entry = FOLD_GROUPS.get(str(name or ""))
+        if entry is None:
+            # 防御性跳过：不可归并的工具本不该进批次，真进来了也不该让它
+            # 把整句聚合语搞成半截。
+            continue
+        group = entry[0]
+        if group not in counts:
+            order.append(group)
+            counts[group] = 0
+        counts[group] += 1
+        if ok is False:
+            failures += 1
+
+    segments = []
+    for group in order:
+        # 取该组的量词模板。模板与组标识同在 FOLD_GROUPS 里，故必然取得到。
+        template = next(t for g, t in FOLD_GROUPS.values() if g == group)
+        segments.append(template.format(n=counts[group]))
+    if failures:
+        segments.append(f"{failures} 个失败")
+    return SEGMENT_SEP.join(segments)
+
+
+def fold_group_map(registry) -> dict:
+    """
+    从工具注册中心导出「工具名 → (组标识, 量词模板)」映射，与
+    `primary_arg_map` **同构**（同样的入参、同样的容错、同样只建一份）。
+
+    与直接使用 `FOLD_GROUPS` 的差别：**只保留当前真正注册了的工具**。
+    这样一个被 `exclude_tools` 摘掉的工具不会出现在映射里，
+    界面侧不必再判断「这个名字对应的工具还在不在」。
+
+    :param registry: `ToolRegistry`（或任何有 `names()` 的对象）；None 时返回空字典
+    :returns: `FOLD_GROUPS` 与已注册工具名的交集
+
+    副作用：无（只读快照）。
+    """
+    if registry is None:
+        return {}
+    names = getattr(registry, "names", None)
+    if names is None:
+        return {}
+    return {name: FOLD_GROUPS[name] for name in names() if name in FOLD_GROUPS}
+
+
 def primary_arg_map(registry) -> dict:
     """
     从工具注册中心导出「工具名 → 主参数键名」映射。
@@ -202,5 +407,14 @@ __all__ = [
     "clip_value",
     "summarize_args_plain",
     "resolve_call_parts",
+    "resolve_full_title",
     "primary_arg_map",
+    # 工具活动归并（tui-activity-fold）
+    "FOLD_GROUPS",
+    "RUNNING_VERBS",
+    "SEGMENT_SEP",
+    "is_foldable",
+    "running_verb",
+    "compose_batch_summary",
+    "fold_group_map",
 ]

@@ -317,10 +317,23 @@ class ExpandToggleTest(ActivityFixture):
             await _wait_for(lambda: "Ctrl+O 展开" in _activity_text(view), pilot, 10.0)
             self.assertNotIn("Read(src/app.py)", _activity_text(view))
 
+            # 第一下 → 逐条档：活动区展开
             await pilot.press("ctrl+o")
             await _wait_for(lambda: "Read(src/app.py)" in _activity_text(view), pilot, 10.0)
             self.assertIn("Ctrl+O 收回", _activity_text(view))
 
+            # 第二下 → 全文档。**活动区必须保持不变**（tui-activity-fold F13/AC15）：
+            # 它只有折叠 / 展开两态，「逐条」与「全文」对它表现一致——
+            # 它展开后列的是最近的工具调用，那些本来就没有「更详细」的第二层可展。
+            # ⚠ 这一条是 AC15 的护栏：给活动区造出第三态的话，这里当场红。
+            before = _activity_text(view)
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            self.assertEqual(
+                _activity_text(view), before, "活动区在逐条档与全文档下必须一致"
+            )
+
+            # 第三下 → 回到折叠，循环闭合
             await pilot.press("ctrl+o")
             await _wait_for(lambda: "Ctrl+O 展开" in _activity_text(view), pilot, 10.0)
             self.assertNotIn("Read(src/app.py)", _activity_text(view))
@@ -385,13 +398,14 @@ def _history_text(app) -> str:
     view = app.query_one(HistoryView)
     parts = []
     for child in view.query_one("#history-messages").children:
+        # ⚠ 走 `plain_text()` 而不是读 `content`：终态行的内容是 Rich 渲染对象，
+        # 要在渲染期转成 `Content` 才成立（见 `content_from_rich`），
+        # `content` 里留的是上一次 markup 的残留。
+        if hasattr(child, "plain_text"):
+            parts.append(child.plain_text())
+            continue
         content = getattr(child, "content", "")
-        if isinstance(content, str):
-            parts.append(content)
-        else:
-            for item in getattr(content, "renderables", ()) or ():
-                plain = getattr(item, "plain", None)
-                parts.append(plain if plain is not None else str(item))
+        parts.append(content if isinstance(content, str) else str(content))
     return "\n".join(parts)
 
 

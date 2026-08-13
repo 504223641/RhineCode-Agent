@@ -628,7 +628,13 @@ class PanelAnswerTest(DriverFixture):
             # ——它才是用户实际看到的字；option 的 id 那条断言（下面）
             # 才是契约，那个一字未动。
             self.assertIn("Write(x.txt)", panel["display"])
-            self.assertIn("[dim]", panel["display"], "原文保留 markup 标记，不做渲染")
+            # ⚠ 判据从 `[dim]` 换成 `[#FFA500]`（tui-activity-fold 验收期）：
+            # 表头原本在工具名后面拼一段 `[dim]· 判定原因[/dim]`，那是当时唯一的
+            # `[dim]`。真机反馈把那段删了（它恒为「默认模式：无规则命中」，
+            # 每次都一样、还把要读的 `工具名(参数)` 挤到一边）。
+            # **这条判据要的是「原文保留 markup 标记、不做渲染」**，换一个仍然
+            # 存在的标记即可——别顺手删掉它。
+            self.assertIn("[#FFA500]", panel["display"], "原文保留 markup 标记，不做渲染")
             # 可选项四个，且不含任何 disabled 项（表头已被跳过）
             self.assertEqual(
                 [o["id"] for o in panel["options"]],
@@ -862,6 +868,68 @@ class SessionPanelTest(DriverFixture):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["result"], "cancelled")
             await core.shutdown_on_main("test")
+
+
+class PanelArmingIsAtomicTest(DriverFixture):
+    """
+    **「正在等你应答」与「面板已经画出来」必须同时成立**（全量测试实测抓到）。
+
+    ## 这是一个真实的产品竞态，不是测试写法问题
+
+    `_interact` 原先在**工作线程**上先写 `self._pending_interaction = box`，
+    再 `call_from_thread(show_fn)` 弹面板。中间那一小段时间里，程序对外
+    宣称「pending」，而屏幕上什么都没有。
+
+    tui-activity-fold 把窗口拉宽了——F18 要在弹面板前先把状态行切到
+    「等待确认」，那是**第二次**跨线程往返。于是全量测试开始偶发红：
+    `wait` 返回 pending 之后立刻取快照，`panel_visible` 是 `False`、
+    `focused` 还停在 `InputBar`。**单跑必过、全量偶发**——竞态的典型形态。
+
+    修法是把「登记 + 改状态行 + 弹面板」合成主线程上的**一次**调用，
+    外部因此不可能观察到中间态。
+
+    ⚠ 判据必须**连着取好几次快照**：竞态窗口只有几毫秒，取一次很容易
+    恰好落在窗口外面，那样这条护栏就退化成了一句安慰。
+
+    ⚠ **这条护栏是概率性的，如实记在这里**：把 `_interact` 改回旧写法之后
+    连跑六次，红了**一次**。也就是说它抓得住这个缺陷，但不保证每次都抓住
+    ——全量测试里之所以频繁翻车，是因为并发负载把那个窗口撑大了。
+    别因为「单跑绿了」就认为竞态不存在。
+    """
+
+    async def test_pending_never_precedes_the_panel(self):
+        app, _ = self.assemble(CONFIRM_SCRIPT)
+        async with app.run_test(size=(120, 40)) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            await asyncio.to_thread(core.send, "写个文件")
+
+            # 一路盯着，直到出现 pending：**它出现的那一刻面板就必须已经在了**。
+            #
+            # ⚠ 整段包 try/finally：断言失败时若不收尾，被阻塞在确认盒上的工作
+            # 线程永远醒不过来，`IsolatedAsyncioTestCase` 收尾时的
+            # `shutdown_default_executor()`（Python 3.11 无超时）会**永久挂住**
+            # ——一条失败就把整个套件变成一次挂起，连 traceback 都看不到。
+            # 这一点在本轮实测中反复吃过亏。
+            bad = None
+            seen_pending = False
+            try:
+                for _ in range(600):
+                    snap = await asyncio.to_thread(core.snapshot)
+                    if snap["state"] == SessionState.PENDING.value:
+                        seen_pending = True
+                        if not snap["panel_visible"]:
+                            bad = f"宣称 pending 但面板不可见：{snap}"
+                        elif snap["focused"] != "ConfirmPanel":
+                            bad = f"宣称 pending 但焦点还在 {snap['focused']}"
+                        break
+                    await asyncio.sleep(0.005)
+            finally:
+                await asyncio.to_thread(core.answer, "once")
+                await asyncio.to_thread(core.wait, 30.0)
+                await core.shutdown_on_main("test")
+
+            self.assertTrue(seen_pending, "剧本必须真的弹出过确认面板")
+            self.assertIsNone(bad, bad)
 
 
 class FinalTextRecordedTest(DriverFixture):

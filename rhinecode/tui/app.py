@@ -27,7 +27,7 @@ from typing import Optional
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import Key
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Static, Input
 
 from rhinecode.config import Config
@@ -77,10 +77,13 @@ from rhinecode.trace import (
     agent_event_payload,
     full_text,
 )
+from rhinecode.tui.clipboard import copy_text
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
-    ClarifyPanel, SessionPanel, compose_status_text,
+    ClarifyPanel, SessionPanel, StatusLine, OverlayPanel, compose_status_text,
+    # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
+    DETAIL_CYCLE, DETAIL_FOLDED, DetailLevelClicked,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
     # 「流式累积」意味着任何一帧都是在**任意位置**被截断的模型自由文本，
@@ -175,6 +178,61 @@ class RhineApp(App):
     Screen {
         layout: vertical;
     }
+    /*
+     * 历史区与四个交互面板共处的「舞台」（tui-activity-fold 验收期修订）。
+     *
+     * ⚠ **`layers` 必须声明在这里**，因为 dock 与图层都是相对**父容器**的。
+     * 面板走 `panels` 层 + `dock: bottom`，于是它们浮在历史区底部、
+     * **不占常规流的高度**——这正是「面板弹出不再挤压历史区」的全部实现。
+     *
+     * 实测（80×20 终端）：面板出现前后 `HistoryView` 高度都是 14、
+     * 输入框位置都是 17。改造前这两个数会各变一次，用户看到的就是整块在跳。
+     */
+    #stage {
+        height: 1fr;
+        layers: base panels;
+    }
+    /*
+     * 四个交互面板的浮层容器（验收期修订两次）。
+     *
+     * **浮层与框线都落在这一层**，面板自身回到普通子组件：
+     * - `layer` + `dock`：整块浮在历史区底部，不占常规流高度（不挤压历史区）
+     * - `border`（左 / 右 / 下）：**接着历史区那圈框继续画**
+     *
+     * ## ⚠ 为什么是 border 而不是 padding（真机反馈后的第二次修订）
+     *
+     * 上一版用 `padding: 0 1` 把面板缩进到历史区框线内侧，理由是「透明背景
+     * 不会盖掉下面的框线」。**那个理由是错的**：Textual 里
+     * `background: transparent` 只让**颜色**透下来，字符照画不误——padding
+     * 那两列画的是**空格**，于是历史区的 `│` 在面板那几行被逐个擦成空白。
+     * 真机反馈：「弹出面板左右没有边框，对应历史记录左右也没有边框」。
+     *
+     * 现在改成让容器**自己画那两条竖线**（颜色与 `HistoryView` 同一个），
+     * 于是框线在视觉上是连续的一整圈，面板嵌在里面。
+     *
+     * `border-bottom` 同理：容器贴着 stage 底部，正好接管历史区的下边框那一行
+     * ——上一版靠 `margin-bottom: 1` 给那条线让位，让出来的那行在面板与框线
+     * 之间留了一道缝（「面板下面会有一点历史记录面板的空白」）。
+     *
+     * `border-top` **刻意留空**：面板自己带 `border-top: tall <各自的颜色>`，
+     * 那条线兼作「面板与历史内容的分界」，颜色还随面板类型变（确认橘、命令青）。
+     * 在这里再画一条会变成两条平行线。
+     *
+     * `height: auto` + 内部面板缺省 `display: none` ⇒ 空闲时这块高度为 0。
+     */
+    #panel-dock {
+        layer: panels;
+        dock: bottom;
+        height: auto;
+        /* ⚠ **缺省隐藏。** 容器自带边框，而边框在 `height: auto` 下
+           **照样算进高度**——空面板的容器仍占 1 行，dock 在底部时正好压住
+           历史区的下边框，那条框线变成一行空白。
+           可见性由 `_reserve_space_for_panels` 按「有没有可见面板」切换。 */
+        display: none;
+        border: solid #7AEEFF 60%;
+        border-top: none;
+        background: transparent;
+    }
     HistoryView {
         height: 1fr;
         border: solid #7AEEFF 60%;
@@ -228,6 +286,20 @@ class RhineApp(App):
         border-top: tall #808080 60%;
         padding: 0 1;
     }
+    /*
+     * 四个面板的共同外观（真机反馈后统一）。
+     *
+     * **底色一律透明**：原本用 `$boost` 给面板垫一层浅灰，想把它与历史内容
+     * 分开。但浮层容器现在自带左右框线、面板自带顶部分隔线，边界已经说清楚了；
+     * 那层灰反而在框线内侧又切出一条深浅边，看起来像面板没有贴住框
+     * （用户原话：「弹出面板的左右和下方还是有一点边距」）。
+     *
+     * **分隔线一律用主题青**：确认面板原本是橘色（想警示「需要你决定」）。
+     * 但整块面板本来就是为「需要你决定」才弹出来的，颜色不承担额外信息，
+     * 却与输入框、历史区那圈青色框线打架。橘色在本项目里已有确定含义
+     * （工具执行中 / 「情况变了」），面板顶线用它属于一符两义。
+     * 「这是有副作用的操作」由表头那行橘色文字承担，位置更贴近它说的那件事。
+     */
     CommandPanel {
         height: auto;
         max-height: 6;
@@ -236,42 +308,96 @@ class RhineApp(App):
         border: none;
         border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    /* 工具确认 / 计划审批面板：橘色分隔线警示「需要用户决定的操作」 */
     ConfirmPanel {
         height: auto;
         max-height: 8;
         display: none;
         border: none;
-        border-top: tall #FFA500 80%;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    /* Plan Mode 需求澄清面板：青色分隔线，与确认区分 */
     ClarifyPanel {
         height: auto;
         max-height: 12;
         display: none;
         border: none;
-        border-top: tall #7AEEFF 80%;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    /* /resume 会话选择面板：青色分隔线；显示全部会话，超出 15 行由 OptionList 自滚 */
     SessionPanel {
         height: auto;
         max-height: 15;
         display: none;
         border: none;
-        border-top: tall #7AEEFF 80%;
+        border-top: tall #7AEEFF 60%;
         padding: 0 1;
-        background: $boost;
+        background: transparent;
     }
-    InputBar {
+    /*
+     * 回合状态行（tui-activity-fold F14）。
+     *
+     * ⚠ **固定占一行，永不隐藏**（验收期修订）。
+     *
+     * 初版照搬了四个交互面板的做法（`display: none`，按需出现）。那是错的：
+     * 面板是**打断性**的（弹出时用户注意力本就在面板上），状态行是**常伴**的
+     * ——每次运行开始都要出现、结束都要收回，而每一次出现/收回都让
+     * `HistoryView` 的 `1fr` 高度变一次，历史区内容随之重排。
+     * 用户的原话是「每次出现时历史记录的窗口会抖动」。
+     *
+     * 现在它永远占这一行：**布局恒定，零抖动**。空闲时内容为空串，
+     * 屏幕上就是输入框上方的一行空白——这是刻意付的代价，
+     * 换掉的是每轮两次的整区重排。
+     *
+     * 因此这里**不能写 `display: none`**，组件那边也不再改 `display`。
+     */
+    StatusLine {
+        height: 1;
+        padding: 0 1;
+    }
+    /*
+     * 输入框：**边框在外层容器上，整块不上底色**（改了三轮，这是终态）。
+     *
+     * ## 为什么最后是「不上底色」
+     *
+     * 边框线画在**一整个格子**里：`─` 只占那个格子的垂直中段，其余部分露出的是
+     * **该格子的背景色**。于是只要底色与屏幕底色不同，「底色的边界」与「框线」
+     * 就永远差半个格子，差在哪一侧取决于边框那一圈用谁的背景——
+     *
+     * - 边框那圈用灰底 ⇒ 灰色比框线**往外多半格**（「灰色溢出了框」）；
+     * - 边框那圈用屏幕底色 ⇒ 框线与灰块之间**露出一圈黑**（「还是有一圈黑边」）。
+     *
+     * 两者在格子这个粒度上**不可能同时消除**。把底色整个去掉，这个矛盾就不存在了
+     * ——而且与历史区、四个面板的观感统一：全项目只用**框线**划分区域，
+     * 不用色块。
+     *
+     * ⚠ **三处必须一起透明**：容器、`InputBar` 自身（`Input` 自带
+     * `background: $surface`）、以及聚焦态的 `background-tint`
+     * （自带 `$foreground 5%`，只作用在输入行上，不关掉的话一聚焦就又多出
+     * 一层比框线亮的色块）。漏掉任何一处，那圈边就以另一种颜色回来。
+     *
+     * ⚠ **边框留在外层容器上，别挪回 `InputBar`。** 那样 `Input` 的底色与
+     * tint 会连框线那一圈一起铺，上面两条就都失效了。
+     *
+     * 三行的总高度不变（容器 1 + 1 + 1），布局与改造前逐字一致。
+     */
+    #input-frame {
         height: 3;
         border: solid #7AEEFF 60%;
-        margin-top: 0;
+        background: transparent;
+    }
+    InputBar {
+        height: 1;
+        border: none;
+        padding: 0 1;
+        background: transparent;
+    }
+    InputBar:focus {
+        background: transparent;
+        background-tint: $foreground 0%;
     }
     /* 底部状态栏那一行拆成左右两个区（tui-display 扩展 F31）。
        背景色挂在**行容器**上而不是任一子组件上——挂在子组件上的话，
@@ -345,10 +471,14 @@ class RhineApp(App):
         # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
         # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
         self._last_subagent_count = 0
-        # 全局展开开关（tui-display 扩展 F5/F41，`Ctrl+O`）。
-        # **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
-        # verbose 语义，两个键会让用户记两套。
-        self._expanded = False
+        # 全局详细度档位（`Ctrl+O`）。**一个键同时管活动区与历史区**——
+        # 对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套。
+        #
+        # tui-activity-fold 起从布尔改成**三档循环**（折叠 → 逐条 → 全文）：
+        # 批次归并之后「展开」有了两层含义（把批次摊成逐条 / 把单条摊成原文），
+        # 一个布尔表达不了。⚠ 用整数而不是两个布尔——后者能表达一种非法状态
+        # （「不展开批次却展开单条」），而非法状态迟早会被某条路径构造出来。
+        self._detail_level = DETAIL_FOLDED
         # 上一次按下 `Ctrl+C` 的时刻（`time.monotonic`）。
         # 初值取一个足够久远的负数，保证第一次按下必然走「提示」那一支。
         self._last_quit_request = -1e9
@@ -364,21 +494,61 @@ class RhineApp(App):
         self._quit_hint_timer = None
 
     def compose(self) -> ComposeResult:
-        """按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。"""
-        yield HistoryView()
+        """
+        按从上到下的顺序挂载各面板（命令面板与输入框共享同一注册表，c10）。
+
+        ## ⚠ `#stage` 这一层容器是为「面板不再挤压历史区」而加的（验收期修订）
+
+        改造前四个交互面板是常规流里的兄弟节点，一弹出就把 `HistoryView` 的
+        `1fr` 高度挤小，历史区整块重排——用户的原话是「确认面板也会导致历史
+        窗口抖动」。
+
+        现在历史区与四个面板一起放进 `#stage`，面板走**独立图层**并
+        `dock: bottom`：它们浮在历史区底部，**不占常规流的高度**。
+        实测（80×20 终端）历史区高度在面板出现前后都是 14、输入框位置都是 17。
+
+        ⚠ **`ActivityView` 刻意留在 `#stage` 外面**：它是持续显示的观测区，
+        不是打断性的，浮起来会长期遮住历史区内容。
+        """
+        with Vertical(id="stage"):
+            yield HistoryView()
+            # 四个交互面板装进一个浮层容器（见上方说明与 CSS）。
+            # ⚠ **缩进由容器的 padding 做，不能写在面板自己的 margin 上**：
+            # dock 组件的宽度默认是 `1fr`，而 `1fr` 会让 `margin-right` 失效
+            # ——实测面板 x 从 0 变成 1（左边距生效了）、宽度仍是父容器全宽，
+            # 于是右边框被顶出屏幕。左边缩进了、右边没缩，比不缩更难看。
+            with Vertical(id="panel-dock"):
+                yield CommandPanel(self._command_registry)
+                yield ConfirmPanel()
+                yield ClarifyPanel()
+                yield SessionPanel()
         # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
         #
         # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
         # 放历史区上方的话，它空转时会白占两行，而且位置会随历史区滚动跳动。
         yield ActivityView()
-        yield CommandPanel(self._command_registry)
-        yield ConfirmPanel()
-        yield ClarifyPanel()
-        yield SessionPanel()
-        yield InputBar(
-            self._command_registry,
-            placeholder="输入消息，/ 查看命令，Tab 补全，运行中按 Esc 取消，连按两次 Ctrl+C 退出",
-        )
+        # 回合状态行（tui-activity-fold F14）：各面板**下方**、输入框**上方**。
+        #
+        # 位置贴着输入框——用户视线本来就在那里，而它回答的正是「现在还在跑吗」。
+        # ⚠ 它与 `#status-row` 刻意分开：那一行装的是**配置态**（provider /
+        # 模型 / 权限档，常驻），这一行是**本回合活体态**（只在运行中存在）。
+        # 合并会让「常驻状态」与「瞬时状态」争同一块地方。
+        yield StatusLine()
+        # ⚠ 外层容器只负责画框（见 `#input-frame` 那段 CSS）：`Input` 自带的
+        # 灰底会填满含边框在内的整个区域，边框留在它自己身上时，青色框线就画在
+        # 一片灰底上、看起来灰色溢出了框外。
+        with Vertical(id="input-frame"):
+            yield InputBar(
+                self._command_registry,
+                # ⚠ `Ctrl+O` 是 tui-activity-fold 验收期补进来的：行内的
+                # 「（Ctrl+O 展开）」提示被撤掉之后，这里成了它**唯一**的发现渠道。
+                # 撤那句话的理由是它一屏出现四五次、全在说同一个全局快捷键；
+                # 说一次、说在用户找快捷键时会看的地方，才是它该待的位置。
+                placeholder=(
+                    "输入消息，/ 查看命令，Tab 补全，Ctrl+O 展开详情，"
+                    "运行中按 Esc 取消，连按两次 Ctrl+C 退出"
+                ),
+            )
         # 状态栏是**一行两个区**：左区贴左边缘放瞬时提示，右区右对齐放常驻状态
         # （F31，对齐 Claude Code 底部那一行）。合成一个组件做不到「贴左」——
         # 右对齐块里的最左边会随其余各段长度在屏幕中间浮动。
@@ -408,6 +578,14 @@ class RhineApp(App):
         # 确认面板也要（E 组做完的样子里那句「工具名也走 B 组的主参数口径」）：
         # 用户就是靠面板上那一行决定放不放行的，键名在那里同样只占地方。
         self.query_one(ConfirmPanel).set_primary_args(primary_args)
+        # 归并分组表（tui-activity-fold F2）：哪些工具的调用会被收进一行聚合语。
+        # ⚠ 位置与上面那两行同理，**必须排在 `render_history` 之前**——
+        # `--continue` 恢复出来的历史里有工具行，晚一步的话首屏那批会用空表
+        # 画成独立行，与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
+        self.query_one(HistoryView).set_fold_groups(self._manager.fold_group_map())
+        # 批次封闭的行为记录（tui-activity-fold N7/AC26）。走回调注入而不是让
+        # 历史区直接持有记录器——它是纯展示层，认识 trace 会让依赖方向倒过来。
+        self.query_one(HistoryView).set_batch_closed_hook(self._trace_tool_batch)
 
         # 记忆系统接线（c9）：
         # 1. 启动提示（--continue 恢复结果等）作为系统提示行显示；
@@ -658,6 +836,23 @@ class RhineApp(App):
             lambda: {"source": source, "text": full_text(text)},
         )
 
+    def _trace_tool_batch(self, summary: str, calls: int) -> None:
+        """
+        记一条 `ui_tool_batch`：一批工具调用归并成了一行（tui-activity-fold N7）。
+
+        由 `HistoryView` 在批次封闭时回调。**记的是聚合语原文与调用数**——
+        前者是用户真正看到的那句话（与界面同源，见 `ToolBatchWidget.summary_text`），
+        后者是「归并有没有生效」的直接依据：排查「怎么还是一行一行地铺」时，
+        看到 `1 次调用` 就知道批次根本没攒起来。
+
+        :param summary: 聚合语纯文本（未转义）
+        :param calls: 本批次纳入的调用次数
+        """
+        self._recorder.emit_lazy(
+            TraceEventType.UI_TOOL_BATCH,
+            lambda: {"summary": full_text(summary), "calls": calls},
+        )
+
     def show_user_input(self, text: str) -> None:
         """聊天区回显一次用户输入（仅显示，不写入模型历史；由分发器统一调用）。"""
         self._trace_ui_message("user_echo", text)
@@ -856,8 +1051,11 @@ class RhineApp(App):
 
         副作用：重绘活动区组件。
         """
+        # 活动区只有折叠 / 展开两态（tui-activity-fold F13：**不为它造第三档**）。
+        # 「逐条」与「全文」对它而言表现一致——它展开后列的是最近的工具调用，
+        # 那些本来就没有「更详细」的第二层可展。
         self.query_one(ActivityView).update_rows(
-            self._manager.subagent_activity(), self._expanded
+            self._manager.subagent_activity(), self._detail_level != DETAIL_FOLDED
         )
 
     def _maybe_auto_wake(self) -> None:
@@ -926,6 +1124,22 @@ class RhineApp(App):
         self._manager.clear()
         self.query_one(HistoryView).clear_all()
         self.query_one(ActivityView).update_rows(())
+        self._reset_display_state()
+
+    def _reset_display_state(self) -> None:
+        """
+        会话切换后的界面复位（tui-activity-fold F20）：撤下状态行、档位回默认。
+
+        ⚠ **`/clear` 与 `/resume` 两条路径共用这一处。** 各写一遍的话，
+        必然出现「清空能复位、恢复不能」这种一半对的状态，而那在界面上
+        表现为「上一段对话的展开档位莫名其妙地留着」。
+
+        状态行本应已由 `_set_streaming(False)` 收掉，这里再兜一次——
+        会话切换可能发生在一次运行的异常路径上。
+        """
+        self.query_one(StatusLine).stop()
+        self._detail_level = DETAIL_FOLDED
+        self.query_one(HistoryView).set_detail_level(DETAIL_FOLDED)
 
     def compact_context(self) -> None:
         """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
@@ -1107,22 +1321,127 @@ class RhineApp(App):
 
     def action_toggle_expand(self) -> None:
         """
-        全局展开开关（`Ctrl+O`，F5/F41）。
+        全局详细度档位，**三档循环**（`Ctrl+O`）：折叠 → 逐条 → 全文 → 折叠。
 
-        **一个开关同时管活动区与历史区的工具行**——对齐 Claude Code 的全局
-        verbose 语义。两个键会让用户记两套，而这两处展开的是同一类东西
-        （「刚才具体做了什么」）。
+        **一个键同时管活动区与历史区**——对齐 Claude Code 的全局 verbose 语义。
+        两个键会让用户记两套，而这两处展开的是同一类东西（「刚才具体做了什么」）。
+
+        ## 三档各是什么
+
+        | 档 | 历史区 | 活动区 |
+        | --- | --- | --- |
+        | 折叠 | 批次只显示一行聚合语 | 每个子 Agent 一行 |
+        | 逐条 | 批次摊成逐次调用，单条结果仍受行数上限 | 列出最近的工具调用 |
+        | 全文 | 单条显示完整参数与输出原文 | **与逐条一致**（F13：活动区没有第三档） |
+
+        ⚠ 三态循环本身难以预期（用户记不住按第三下会怎样），因此**不靠记忆**
+        ——批次的聚合行末尾常驻一句提示，写的是**按下去会到哪一档**。
 
         ⚠ **不引入焦点切换**：本动作只重绘，不 `focus()` 任何组件。
         活动区任何时候都不抢焦点，输入框与四个面板的键位体系一字不动（F5）。
 
-        副作用：重绘活动区与当前挂着的工具行。
+        副作用：重绘活动区与历史区的批次与工具行。
         """
-        self._expanded = not self._expanded
+        index = DETAIL_CYCLE.index(self._detail_level) if self._detail_level in DETAIL_CYCLE else 0
+        self._detail_level = DETAIL_CYCLE[(index + 1) % len(DETAIL_CYCLE)]
+        self._recorder.emit_lazy(
+            TraceEventType.UI_DETAIL_LEVEL,
+            lambda level=self._detail_level: {"level": level},
+        )
         self._refresh_activity()
-        # 历史区自己记下展开态并广播给已挂载的行——**不要在这里直接遍历组件**：
-        # 那样只覆盖「此刻挂着的」，展开之后新产生的行又会是折叠的。
-        self.query_one(HistoryView).set_expanded(self._expanded)
+        # 历史区自己记下档位并广播给已挂载的批次与工具行——**不要在这里直接
+        # 遍历组件**：那样只覆盖「此刻挂着的」，切档之后新产生的又会是折叠的。
+        self.query_one(HistoryView).set_detail_level(self._detail_level)
+
+    def on_detail_level_clicked(self, event: "DetailLevelClicked") -> None:
+        """
+        某一行被鼠标点开/收起了：**把全局档位同步到它切到的那一档**。
+
+        不同步的话，点击与 `Ctrl+O` 会各记各的档位——用户点开一行之后再按
+        `Ctrl+O`，第一下只是把全局从折叠推到逐条（那一行看不出任何变化），
+        得按第二下才到全文。用户原话：「先点击展开后得按两下 ctrl+o
+        才能切换到 3 档」。
+
+        ⚠ **只同步数字，不重新广播**（不调 `HistoryView.set_detail_level`）：
+        广播会把满屏的批次一起摊开，而「点一下只开这一个」正是鼠标存在的理由。
+        下一次 `Ctrl+O` 才是广播的时机。
+
+        副作用：改 `self._detail_level`。
+        """
+        self._detail_level = event.level
+
+    def on_overlay_panel_visibility_changed(
+        self, _event: "OverlayPanel.VisibilityChanged"
+    ) -> None:
+        """
+        某个浮层面板显示或隐藏了：重算历史区要让出多少底部空间。
+
+        面板改成浮层之后不再挤压历史区（那是抖动的根源），但它们会**盖住
+        历史区最后几行**——而那几行往往正是用户要看的（「我在批准哪一次写入」
+        的那条工具行就在最后）。这里给历史区补一个等于面板高度的底部内边距，
+        内容随之上移，被盖住的部分重新露出来。
+
+        ## 为什么走消息而不是在调用点同步
+
+        Textual 的 `Show` / `Hide` 事件**在 app 层收不到**（实测 `on_show` /
+        `on_hide` 一次都不触发），而面板的显示/隐藏散落在四个组件的
+        `show_for` / `hide` 里。让面板自己广播，就不必在 app 里枚举所有调用点
+        ——枚举那种写法漏一处不报错，只表现为「某个面板弹出时内容少了几行」。
+
+        副作用：改 `HistoryView` 的 `padding` 样式。
+        """
+        # 面板高度要等布局算完才知道，故推到下一帧再读
+        self.call_after_refresh(self._reserve_space_for_panels)
+
+    def _reserve_space_for_panels(self) -> None:
+        """
+        按当前可见面板的高度，设置历史区的底部内边距。
+
+        面板互斥（同时最多一个可见），但仍按总和算——多一个面板同时弹出时
+        这里不会算错，而写死「取第一个」会在那种情况下少让一块地方。
+        """
+        try:
+            # ⚠ **不能写 `self.query(OverlayPanel)`。** Textual 的类型查询按
+            # **CSS 类型名**匹配，而那套名字只收 Widget 子类——`OverlayPanel`
+            # 是个纯 mixin，不在其中，查出来恒为空（实测：面板明明可见、
+            # 查询结果 0 个，padding 永远算成 0，而且不报任何错）。
+            any_visible = any(
+                isinstance(widget, OverlayPanel) and widget.display
+                for widget in self.query("*")
+            )
+            dock = self.query_one("#panel-dock")
+            # ⚠ **没有面板时容器必须整个隐藏。**
+            #
+            # 它带一圈缩进（把面板收进历史区框内），而缩进在 `height: auto` 下
+            # **照样算进高度**——于是空面板的容器仍占 1 行，dock 在 stage 底部时
+            # 正好**压住历史区的下边框**，那条框线变成一行空白。
+            # 真机反馈：「原本的历史记录下边框的边框没了」。
+            dock.display = any_visible
+            # ⚠ **高度取自面板自身，不能读容器的 `outer_size`。**
+            # 容器刚从隐藏切到显示，此刻它的尺寸还是上一次布局的值（0），
+            # 当场读会把内边距算成 0、内容仍被盖住；而等下一帧再读又要多绕一次
+            # 异步，实测在并发跑测试时帧数不稳。
+            # 面板本身此刻**已经布局完**（它先于本方法被显示），读它是可靠的。
+            panel_h = max(
+                (
+                    widget.outer_size.height
+                    for widget in self.query("*")
+                    if isinstance(widget, OverlayPanel) and widget.display
+                ),
+                default=0,
+            )
+            # 容器自身的缩进从**样式声明**取，同样不依赖布局是否算完。
+            # ⚠ 与 `#panel-dock` 的 CSS 成对：那边改了缩进/边框，这里自动跟上
+            # ——`gutter` 已经把 padding 与 border 一起算了，改用哪一种都不必动这行。
+            spacing = dock.styles.gutter.height + dock.styles.margin.height
+            reserved = (panel_h + spacing) if any_visible else 0
+            # 只改下边距，左右沿用原样式（padding: 0 1）
+            self.query_one(HistoryView).styles.padding = (0, 1, reserved, 1)
+        except Exception:  # noqa: BLE001
+            # 布局相关的兜底：这只是「让内容别被盖住」的锦上添花，
+            # 出错时宁可少让一块地方，也不能把界面拆了。
+            pass
+
 
     def action_request_quit(self) -> None:
         """
@@ -1234,7 +1553,16 @@ class RhineApp(App):
                 selected = self.screen.get_selected_text() or ""
             if not selected:
                 return False
+            # **两条路一起走，只要有一条成了就行。**
+            #
+            # `copy_to_clipboard` 走 OSC 52 转义序列（由终端代为写剪贴板），
+            # 好处是天然支持 SSH，代价是**很多终端出于安全默认关闭它**——
+            # 而应用这一端只是往标准输出写了几个字节，**成没成功它根本不知道**。
+            # 用户侧的表现就是「选中了、按了 Ctrl+C、什么也没发生」，且无任何报错。
+            #
+            # 因此再直接调一次操作系统的剪贴板（见 `tui/clipboard.py`）。
             self.copy_to_clipboard(selected)
+            copy_text(selected)
             return True
         except Exception:  # noqa: BLE001 —— 见上：复制失败不阻断退出路径
             return False
@@ -1462,11 +1790,21 @@ class RhineApp(App):
 
         与 c3 不同：忙碌期间不禁用输入框（保持焦点，使运行中 Esc 取消可靠路由到 on_key），
         新一轮的并发提交由 on_input_bar_input_submitted 的 _stream_active 守卫拦截。
+
+        ⚠ **回合状态行挂在这一处**（tui-activity-fold F14）：它是「一次运行的
+        开始与结束」在本文件里唯一的判定点，异常路径也必经此处（`_do_stream`
+        的 `finally` 里那次复位）。另立一处判定必然与它漂移，
+        而漂移的表现是「跑完了状态行还赖着不走」或「跑着跑着它自己没了」。
         """
         self._stream_active = active
         if active:
             # 进入流式：复位提示标志，本轮可以再提示一次。
             self._busy_hint_shown = False
+        status_line = self.query_one(StatusLine)
+        if active:
+            status_line.start()
+        else:
+            status_line.stop()
         if not active:
             self.query_one(InputBar).focus()
 
@@ -1699,8 +2037,26 @@ class RhineApp(App):
                         self.call_from_thread(widget.begin_running, tc)
                     # 改文件类工具会在 res.diff 带上结构化差异，传给工具行渲染彩色 diff 块
                     self.call_from_thread(
-                        widget.finish, res.ok, self._summarize_result(res), getattr(res, "diff", None)
+                        widget.finish,
+                        res.ok,
+                        self._result_summary(res),
+                        getattr(res, "diff", None),
+                        self._result_detail(res),
                     )
+
+                elif etype == AgentEventType.USAGE:
+                    # 本轮 token 用量累加到状态行（tui-activity-fold F15/F17）。
+                    #
+                    # ⚠ **这个事件每轮只在流末尾到达一次**（Provider 协议限制：
+                    # OpenAI 兼容协议的 `include_usage` 在流的最后额外发一块
+                    # usage）。因此状态行上的 token 是**跳变式**更新，
+                    # 而不是像耗时那样持续滚动——这是**已知且如实记录**的行为，
+                    # 验收时别误判成「数字不动 = 坏了」（AC16）。
+                    total = getattr(event.usage, "total_tokens", 0) or 0
+                    if total:
+                        self.call_from_thread(
+                            self.query_one(StatusLine).add_tokens, total
+                        )
 
                 elif etype == AgentEventType.FINISHED:
                     level, line = self._finish_line(event.stop_reason, event.message)
@@ -1738,6 +2094,10 @@ class RhineApp(App):
                     self.call_from_thread(
                         self.query_one(ActivityView).update_rows, ()
                     )
+                    # 展开档位同样属于「上一段对话的状态」（tui-activity-fold
+                    # F20）。与 `/clear` 共用同一处复位——各写一遍必然出现
+                    # 「清空能复位、恢复不能」这种一半对的状态。
+                    self.call_from_thread(self._reset_display_state)
         finally:
             # **作用域泄漏的唯一可靠防护**，必须是 finally 的第一行（trace T42）。
             #
@@ -1861,9 +2221,9 @@ class RhineApp(App):
         return LEVEL_NOTICE, ""
 
     @staticmethod
-    def _summarize_result(res) -> str:
+    def _result_summary(res) -> str:
         """
-        取工具结果在工具行上要展示的文本。
+        取工具结果的**规模描述**，供折叠档与逐条档展示。
 
         优先使用工具自带的 `summary`（那是工具作者亲手写的一句话概括，
         比机器截出来的首行准确得多）；没有时回退到 `output` **全文**。
@@ -1875,7 +2235,7 @@ class RhineApp(App):
         什么，也没法展开。
 
         现在把「省略」整个交给展示层：`ToolCallWidget` 收全文、按
-        `BRANCH_LINE_LIMIT` 折叠、并在末行如实写出「… +N 行（Ctrl+O 展开）」。
+        `BRANCH_LINE_LIMIT` 折叠、并在末行如实写出「… +N 行」。
         职责因此清楚了一层——**这里负责取内容，那里负责决定画多少**。
 
         ⚠ 不截断**不等于**无界（N5）：组件那边有行数上限，且 `output` 本身在
@@ -1889,6 +2249,40 @@ class RhineApp(App):
         text = (res.output or "").strip()
         if not text:
             return "（无输出）" if res.ok else "（无错误信息）"
+        return text
+
+    @staticmethod
+    def _result_detail(res) -> str:
+        """
+        取工具结果的**输出原文**，只供最详细一档展示（tui-activity-fold F12）。
+
+        ## 为什么必须与 `_result_summary` 分成两个函数
+
+        改造前只有一个取值函数，且**优先返回 `summary`**——于是展开到最详细
+        一档时，用户看到的仍是那句「读取 1902 行 · 78.4 KB」。
+        「展开」等于没展开，因为 `output` 原文压根没传到组件手里。
+
+        ## ⚠ 取 `output` 而不是 `full_output`
+
+        有些工具会主动裁剪输出（`run_command` 保留前 30 + 后 10 行，
+        完整原文另存 `full_output`）。这里**刻意取裁剪后的那份**：
+        展开成完整原文会让一次测试套件输出撑爆历史区，而那正是 spec F12
+        明确否掉的。
+
+        代价是「展开了也看不到全部」，因此**被裁剪时就地补一句说明**——
+        判定与措辞都收在这一个函数里，组件侧不必多一个参数。
+        多一个布尔参数就多一处「传了但没用」或「用了但没传」的可能。
+
+        :param res: tools.base.ToolResult
+        :returns: 输出原文；被裁剪过时末尾附一行说明。无输出时返回空串
+                  （组件据此回退显示规模描述）
+        """
+        text = (res.output or "").strip()
+        if not text:
+            return ""
+        # `full_output` 非空即说明工具主动裁剪过（见 `tools/base.py` 的成对维护点）
+        if getattr(res, "full_output", ""):
+            text += "\n（输出已由工具裁剪，完整原文见行为记录）"
         return text
 
     # ------------------------------------------------------------------ #
@@ -1912,10 +2306,41 @@ class RhineApp(App):
         # `source` 记录**这次结算走的是哪条路径**，缺省 human（面板按键路径）。
         # 结算方（`_resolve_interaction`）可以覆写它，见该方法的说明。
         box = {"event": threading.Event(), "result": default, "kind": kind, "source": "human"}
-        self._pending_interaction = box
-        # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
-        self._busy_hint_shown = False
-        self.call_from_thread(show_fn)
+
+        def _arm() -> None:
+            """
+            **在主线程上一次做完三件事**：登记待决盒 → 改状态行 → 弹面板。
+
+            ## ⚠ 为什么必须是一次，而且必须包含登记（真机 + 全量测试实测）
+
+            改造前 `self._pending_interaction = box` 写在**工作线程**上、
+            `call_from_thread(show_fn)` 之前。于是存在一个真实的窗口：
+            **程序已经认为「正在等你应答」，而面板还没画出来。**
+            那一瞬间用户（或端到端驱动）看到的是「三态是 pending，但屏幕上
+            什么都没有」。
+
+            tui-activity-fold 把这个窗口拉宽了——F18 要在弹面板前先把状态行
+            切到「等待确认」，那是**第二次**跨线程往返。全量测试因此开始偶发红：
+            `wait` 返回 pending 之后立刻取快照，`panel_visible` 是 `False`、
+            `focused` 还是 `InputBar`。单跑必过、全量偶发，正是竞态的典型形态。
+
+            合成一次之后窗口整个消失：登记与显示在同一个主线程回合内完成，
+            外部**不可能**观察到「pending 但没有面板」这个中间态。
+            顺带省掉一次跨线程往返，面板出得更快。
+
+            ⚠ 别把登记挪回工作线程去「省事」——那正是窗口的来源。
+            """
+            self._pending_interaction = box
+            # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
+            self._busy_hint_shown = False
+            # 状态行切到等待语义并**撤下中断提示**（tui-activity-fold F18）：
+            # 面板有自己的取消方式，两套提示同屏会误导用户去按 Esc。
+            # ⚠ 耗时**继续累计**——那段等待确实在这次回合内，用户等了多久就是多久。
+            # 三类交互（确认 / 澄清 / 审批）共用本入口，改这一处即可。
+            self.query_one(StatusLine).set_phase("等待确认", False)
+            show_fn()
+
+        self.call_from_thread(_arm)
         # c12 `notification`：面板**已经弹出之后**才分发。
         #
         # 放在 `show_fn` 之后而不是之前，是因为 Hook 动作可能跑上几十秒；
@@ -1928,6 +2353,10 @@ class RhineApp(App):
             message=display or f"等待用户{kind}",
         )
         box["event"].wait()
+        # 面板结算：状态行回到运行语义、恢复中断提示（F18）。
+        # 放在 `wait()` 之后、埋点之前——此刻用户已经做完决定，Agent Loop
+        # 即将继续跑，界面上就该重新显示「按 Esc 可以中断」。
+        self.call_from_thread(self.query_one(StatusLine).set_phase, "处理中…", True)
         result = box["result"]
         # 交互埋点（trace F14）：埋在**阻塞等待返回之后**（即结算时刻），
         # 一次交互恰好一条。埋在弹出时会记不到 result，而「用户选了什么」

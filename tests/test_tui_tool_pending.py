@@ -308,21 +308,19 @@ class _Harness(App):
 
 def _text_of(widget) -> str:
     """
-    取出工具行当前展示的文本，屏蔽 `Static.update` 收到的三种形态差异。
+    取出工具行当前展示的文本，屏蔽两种形态差异。
 
-    进行中态传的是 markup 字符串（含 `[#FFA500]` 这类标签，断言时无妨）；
-    定色态传的是 `RichGroup`——直接 `str()` 只会得到对象表示，必须逐个取子元素的
-    `.plain`。测试关心的是「用户看到了什么字」，所以在这里统一拍平成纯文本。
+    进行中态是 markup 字符串（含 `[#FFA500]` 这类标签，断言时无妨）；
+    定色态是 Rich 渲染对象，要在渲染期按实时宽度转成 `Content` 才成立
+    （那是选区功能的前提，见 `content_from_rich`）。
+
+    ⚠ **别读 `widget.content`**：定色之后那里留的是上一次 markup 的残留，
+    断言会拿着「执行中…」去找「失败」，红得莫名其妙。
     """
+    if hasattr(widget, "plain_text"):
+        return widget.plain_text()
     content = widget.content
-    if isinstance(content, str):
-        return content
-    renderables = getattr(content, "renderables", None) or [content]
-    parts = []
-    for item in renderables:
-        plain = getattr(item, "plain", None)
-        parts.append(plain if plain is not None else str(item))
-    return "\n".join(parts)
+    return content if isinstance(content, str) else str(content)
 
 
 class PendingWidgetTest(unittest.IsolatedAsyncioTestCase):
@@ -396,7 +394,13 @@ class PendingWidgetTest(unittest.IsolatedAsyncioTestCase):
             widget._start -= 600
             widget._render_running()
 
-            self.assertIn("600s", _text_of(widget))
+            # ⚠ **判据形态在 tui-activity-fold F19 之后又变了一次，意图仍没变。**
+            # 那一版起**运行中不再显示秒数**（统一由底部的回合状态行承担一处
+            # 总耗时），所以这个数已经读不到界面文本上了。改成直接问组件
+            # 「你认为过了多久」——量的是同一件事：起点确实被拨到了 600 秒前。
+            self.assertGreaterEqual(widget._elapsed(), 600)
+            # 顺带钉住 F19 本身：那 600 秒不该出现在运行中的工具行上
+            self.assertNotIn("600", _text_of(widget))
 
             widget.begin_running(tc)
             widget.finish(True, "新建 · 1 行 · 2 B")
@@ -553,7 +557,14 @@ class DoStreamWiringTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(rows), 1, "pending 与 start 必须共用一行")
         text = text_of(rows[0])
-        self.assertIn("完成", text)
+        # tui-activity-fold F7 起**成功态不再写「完成」二字**（绿色已经把状态
+        # 说完了），原来的 `assertIn("完成")` 因此失效。
+        #
+        # 换成两条合起来等价的判据：**结果摘要出现了**（说明 `finish` 正常走完、
+        # 拿到了 ToolResult），且**没有任何失败字样**。这一行真正要证明的是
+        # 「它没有被 finally 里的收尾逻辑覆写成失败·未执行」，两条都指着它。
+        self.assertIn("新建", text)
+        self.assertNotIn("失败", text)
         self.assertNotIn("未执行", text)
         self.assertIn("x.txt", text)
 

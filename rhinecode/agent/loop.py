@@ -754,6 +754,22 @@ class Agent:
                 for notice in context_manager.before_request(
                     history, allow_summary=options.allow_summary
                 ):
+                    # ⚠ **第一层存盘不再通知界面**（tui-activity-fold 验收期修订）。
+                    #
+                    # 「已把 N 个大型工具结果存盘」是纯内部机制：它不改变对话内容、
+                    # 不需要用户做任何事，而它出现的时机恰好是历史最长、屏幕最挤的
+                    # 时候——正是本轮改造要腾出的那块地方。留着它等于一边归并工具行
+                    # 一边往历史里塞新的过程噪音。
+                    #
+                    # **证据不丢**：`context/manager.py` 已在存盘处埋了
+                    # `context_compaction` 事件，排查时用 `--trace` 照样查得到，
+                    # 那才是这条信息该待的地方。
+                    #
+                    # ⚠ 第二层 LLM 摘要**仍然通知**：它会真的改写历史（早段被压成
+                    # 一条摘要），用户此后再往上翻会发现内容变了——那不是内部机制，
+                    # 是对话本身发生了变化，必须告知。
+                    if notice.kind == "offload":
+                        continue
                     # 提示级：上下文压缩是后台常规动作（tui-display 扩展 F19）
                     yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
 
@@ -1643,7 +1659,21 @@ class Agent:
         if decision.decision == Decision.ASK:
             approved = ask(tc, tool, decision)
             if not approved:
-                res = ToolResult(ok=False, output=DENIED_BY_USER_FEEDBACK.format(name=tc.name))
+                # ⚠ **`summary` 不可省**（真机反馈）。缺它的话工具行会退回去取
+                # `output` 全文，于是那段**写给模型看**的六行劝阻文案
+                # （「不要重试、不要改参数…请立即停止本次任务的推进…」）
+                # 原样铺在用户眼前——而用户刚刚才按下拒绝，最不需要的就是
+                # 一段解释「拒绝意味着什么」的说明。
+                #
+                # 两条内容因此分家：`output` 给模型（长、带约束），
+                # `summary` 给人（一句话，说清这一行为什么是红的）。
+                # 另外两条自动拒绝分支（非交互 / 无人值守）早就是这么写的，
+                # 唯独这条漏了——三处形态必须一致。
+                res = ToolResult(
+                    ok=False,
+                    output=DENIED_BY_USER_FEEDBACK.format(name=tc.name),
+                    summary="用户拒绝了这次调用",
+                )
                 results[tc.id] = res
                 # 置位后主循环下一轮**不发工具**（硬约束，见 DENIED_BY_USER_FEEDBACK 注释）
                 ctx.user_denied = True

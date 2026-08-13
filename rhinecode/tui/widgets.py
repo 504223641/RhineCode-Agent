@@ -29,7 +29,9 @@ from rich.style import Style
 from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.content import Content, Span
 from textual.events import Key
+from textual.style import Style as VisualStyle
 from textual.widgets import Static, Input, OptionList
 from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
@@ -41,9 +43,13 @@ from rhinecode.memory.session import SessionInfo
 from rhinecode.subagents.tasks import BRANCH_AGENT_NAME, STATUS_LABELS, TaskStatus
 from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
 from rhinecode.tools.display import (
+    SEGMENT_SEP,
     TOOL_LABELS,
     clip_value,
+    compose_batch_summary,
     resolve_call_parts,
+    resolve_full_title,
+    running_verb,
     summarize_args_plain,
 )
 
@@ -174,6 +180,77 @@ def build_replay_items(messages) -> "list[tuple]":
     return items
 
 
+def content_from_rich(renderable, width: int) -> Content:
+    """
+    把任意 **Rich 可渲染对象**转成 Textual 的 `Content`，使其**可被选中、
+    可被高亮、可被复制**。
+
+    ## 为什么必须做这一步转换（读 Textual 源码才看得出来的事）
+
+    Textual 有两套渲染对象：自家的 `Content`/`Visual`，与包一层的 `RichVisual`
+    （用来兼容 Rich 生态）。**选区功能只对前者成立**，而且是**三处一起失效**：
+
+    1. `RichVisual.render_strips()` 收到 `RenderOptions.selection` 之后
+       **原样丢弃**——于是拖选时那块区域**一点高亮都不会画**，用户看到的是
+       「这里根本选不中」。
+    2. 光标定位靠段落样式里的 `meta["offset"]`，那是 `Content` 渲染时才写进去的。
+       Rich 段落没有它，于是 `Screen.get_widget_and_offset_at()` 返回的偏移是
+       `None`——**没有偏移就没有「从这个字到那个字」**，该组件只能整块选中。
+    3. `Widget.get_selection()` 的默认实现只认 `Text` 与 `Content`，
+       别的**一律返回 None**，于是复制时整块内容凭空消失。
+
+    第 3 条可以靠子类补一个 `get_selection` 绕过（本项目上一轮就是这么做的），
+    但**前两条绕不过去**：补了也只是「看不见地整块选中」。用户的原话是
+    「其他的连选择都不行」——那不是复制的问题，是**屏幕上没有任何反馈**。
+
+    转换之后三条一起解决，且**视觉一模一样**：本函数走的是 Rich 自己的
+    `console.render()`，拿到的段落就是原本要画到屏幕上的那些，只是把
+    「文本 + 样式」重新装进 `Content` 而已。
+
+    ## 为什么需要 width 参数
+
+    Rich 的排版是**宽度相关**的：Markdown 要按宽度折行、diff 块要按宽度给
+    整行补背景。因此转换必须发生在**知道宽度之后**，调用方一律在
+    `render()` / `get_content_height()` 里调它（那两处才拿得到实时宽度），
+    **不要在构造组件时提前转**——那样终端一 resize 排版就错了。
+
+    :param renderable: 任意 Rich 可渲染对象（`Text` / `Group` / `Markdown` / 自定义）
+    :param width: 渲染宽度（单位是终端单元格），必须 > 0
+    :returns: 等价的 `Content`；样式逐段保留
+
+    副作用：无（只读地跑一遍 Rich 渲染）。
+    """
+    from textual.app import active_app
+
+    console = active_app.get().console
+    options = console.options.update(width=width, height=None, highlight=False)
+    parts: "list[str]" = []
+    spans: "list[Span]" = []
+    pos = 0
+    for seg_text, seg_style, control in console.render(renderable, options):
+        # 控制段（光标移动之类）不产生可见字符，带进来只会污染文本
+        if control or not seg_text:
+            continue
+        parts.append(seg_text)
+        end = pos + len(seg_text)
+        if seg_style is not None:
+            spans.append(Span(pos, end, VisualStyle.from_rich_style(seg_style)))
+        pos = end
+    text = "".join(parts)
+
+    # Rich 习惯在整体渲染的末尾补换行；`Content` 会把它算成真实的一行，
+    # 于是每个组件底下都多出一条空行。裁掉尾部换行的同时要把越界的 span 一并夹回去。
+    trimmed = text.rstrip("\n")
+    if len(trimmed) != len(text):
+        limit = len(trimmed)
+        spans = [
+            Span(span.start, min(span.end, limit), span.style)
+            for span in spans
+            if span.start < limit
+        ]
+    return Content(trimmed, spans)
+
+
 # diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
 # 上下文行、行号、概要统一用灰色前景。
 # Rich 的 "on <color>" 表示设置背景色；不写前景即沿用终端默认字色。
@@ -244,13 +321,37 @@ class _DiffBlock:
         按 options.max_width 补足空格，使背景铺满整行；其余行（概要/上下文/省略）原样输出。
         行间以换行分隔，末行不补换行，避免产生多余空行。
         """
-        view = self._view
         width = options.max_width
+        rows_out = self._rows()
+        last = len(rows_out) - 1
+        for idx, (text, style, fill) in enumerate(rows_out):
+            if fill:
+                # 补空格到整行宽度（cell_len 正确计算中文/全角宽度），使背景铺满整行
+                pad = max(0, width - cell_len(text))
+                yield Segment(text + " " * pad, style)
+            else:
+                yield Segment(text, style)
+            if idx != last:
+                yield Segment("\n")
+
+    def plain_text(self) -> str:
+        """
+        本块的**纯文本**，供选中复制使用。
+
+        ⚠ **与渲染同源**（都走 `_rows`）。各拼一遍的话，复制出来的内容会与
+        屏幕上看到的悄悄不一致——而那种不一致极难发现：两边单看都是对的。
+        """
+        return "\n".join(text for text, _style, _fill in self._rows())
+
+    def _rows(self) -> "list[tuple[str, Style, bool]]":
+        """
+        组装每行的 `(文本, 样式, 是否整行铺背景)`。**渲染与取纯文本共用这一处。**
+        """
+        view = self._view
         dim = Style.parse(_DIFF_DIM)
         remove_bg = Style.parse(_DIFF_REMOVE_BG)
         add_bg = Style.parse(_DIFF_ADD_BG)
 
-        # 先收集每行的 (文本, 样式, 是否整行铺背景)
         rows_out: list[tuple[str, Style, bool]] = []
         # 概要分支行（灰色，无背景）
         rows_out.append((f"{BRANCH_PREFIX}{_count_phrase(view.added, view.removed)}", dim, False))
@@ -278,7 +379,7 @@ class _DiffBlock:
             else:  # MARK_CONTEXT：无背景，灰色前景
                 rows_out.append((f"{num}  {row.text}", dim, False))
         if hidden:
-            rows_out.append((f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}", dim, False))
+            rows_out.append((f"{BRANCH_CONT_INDENT}… +{hidden} 行", dim, False))
         # `view.truncated` 是 **diff 生成侧**（tools/diff.py）的截断标记，与本处的
         # 展示折叠是两回事：前者说「这份 diff 本身就没算全」，后者说「算全了但
         # 没画全」。两条都可能出现，故各画各的、不合并——合并会让用户以为
@@ -286,16 +387,7 @@ class _DiffBlock:
         if view.truncated:
             rows_out.append(("        …（diff 已截断）", dim, False))
 
-        last = len(rows_out) - 1
-        for idx, (text, style, fill) in enumerate(rows_out):
-            if fill:
-                # 补空格到整行宽度（cell_len 正确计算中文/全角宽度），使背景铺满整行
-                pad = max(0, width - cell_len(text))
-                yield Segment(text + " " * pad, style)
-            else:
-                yield Segment(text, style)
-            if idx != last:
-                yield Segment.line()
+        return rows_out
 
 
 def render_diff_block(view, expanded: bool = False) -> "_DiffBlock":
@@ -337,12 +429,90 @@ BRANCH_LINE_LIMIT = 5
 # 取 12 而不是 5：diff 的每一行信息量比结果行低（大半是上下文行），
 # 5 行往往连一个 hunk 都放不下。
 DIFF_ROW_LIMIT = 12
-# 折叠提示里给出的展开方式。**与 A 组共用同一个快捷键**，不为工具行另立一个
-# （F41：对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套）。
-EXPAND_HINT = "（Ctrl+O 展开）"
+# ⚠ **已停用**（tui-activity-fold 验收期修订）：行内不再写「（Ctrl+O 展开）」。
+#
+# 它原本挂在每一处被折叠的地方——每个批次聚合行、每个超长结果块、每个 diff 块。
+# 一屏上出现四五次同一句话，而它说的是**一个全局快捷键**，重复到第二次就已经
+# 没有信息量了；本轮改造的整个目的又恰恰是把重复的过程噪音压下去。
+#
+# 发现性改由**输入框占位符**承担（那里本来就列着 `/`、Tab、Esc、Ctrl+C，
+# 唯独缺 Ctrl+O）——说一次，说在用户找快捷键时会看的地方。
+#
+# 常量保留是为了让「还剩多少行」那个数字的语义有处可查：**被折叠的部分仍然
+# 如实写出行数**，只是不再附带怎么展开。
+EXPAND_HINT = ""
 # 次级信息的灰色前景。取值沿用改造前 `ToolCallWidget._COLOR_BRANCH` 的 #808080，
 # 这样「统一来源」这件事本身不改变任何一处的既有观感。
 SECONDARY_COLOR = "#808080"
+
+# 界面主题色。取自 CSS 里 HistoryView / InputBar 的边框与命令面板的分隔线，
+# 三处本来就是同一个值，这里给它一个名字供 markup 侧引用。
+# ⚠ 改这个值要连同 `app.py` 的 CSS 一起改，否则状态行会与边框脱色。
+THEME_COLOR = "#7AEEFF"
+
+# ---------------------------------------------------------------------------
+# 详细度档位（tui-activity-fold 扩展 F8/F9/F10）
+# ---------------------------------------------------------------------------
+# 三档循环取代改造前的布尔开关：
+#   0 折叠  批次只显示一行聚合语
+#   1 逐条  批次展开为逐次调用；单条仍受结果行数上限约束
+#   2 全文  单条显示完整参数与输出原文
+#
+# ⚠ **用整数而不是两个布尔。** 两个布尔能表达四种状态，其中一种是非法的
+# （「不展开批次，却展开单条」）——而非法状态迟早会被某条路径构造出来，
+# 到时候表现为「折叠着的批次里露出半截原文」，没有任何报错。
+DETAIL_FOLDED = 0
+DETAIL_ITEMS = 1
+DETAIL_FULL = 2
+DETAIL_CYCLE = (DETAIL_FOLDED, DETAIL_ITEMS, DETAIL_FULL)
+
+# 档位的动作措辞。⚠ **不再挂在聚合行末尾**（tui-activity-fold 验收期修订）：
+# 那句话说的是一个**全局**快捷键，而一屏上可能有好几个批次、好几个折叠块——
+# 同一句话重复四五次，第二次起就没有信息量了，而本轮改造的整个目的恰恰是
+# 把重复的过程噪音压下去。
+#
+# 发现性改由**输入框占位符**承担：说一次，说在用户找快捷键时会看的地方。
+#
+# 本表保留，供 `/help`、占位符与将来可能的状态提示复用——三档的**名字**
+# 仍然需要一处权威定义，而「展开 / 看全文 / 收起」这套**动作**措辞比
+# 「档 1 / 档 2 / 档 3」这种状态编号好懂（用户不必先知道自己在第几档）。
+NEXT_LEVEL_HINT = {
+    DETAIL_FOLDED: "展开",
+    DETAIL_ITEMS: "看全文",
+    DETAIL_FULL: "收起",
+}
+
+# ---------------------------------------------------------------------------
+# 回合状态行的旋转标记（tui-activity-fold 扩展 F16/F16a）
+# ---------------------------------------------------------------------------
+# 四帧循环：空心菱形 → 含心菱形 → 实心菱形 → 含心菱形。
+# 由用户指定「菱形向外扩散」并在真实终端逐候选预览后选定。
+#
+# ⚠ **两条硬约束**：
+# 1. **四帧的显示宽度必须两两相等。** 不等的话每换一帧就把整行文字左右推一下，
+#    整行看起来在抖，比没有动画更糟。护栏见 `tests/test_tui_status_line.py`。
+# 2. 四个字形都已登记进符号白名单（`tests/test_tui_symbols.py`）。
+#
+# ⚠ **一条已知风险，本轮明确接受**：这组字形属 Unicode「模糊宽度」
+# （East Asian Width = Ambiguous）。Rich 的 `cell_len` 按 **1 格**计算，
+# 而终端在中日韩环境下**可能画成 2 格**——两者不一致会让该行后续内容错位。
+# 用户已在真实终端预览全部候选后选定此方案，故接受；实装后须真机复核。
+#
+# **若真机复核发现错位，退路是换成全「中性宽度」的字形组**（Rich 与终端
+# 两侧都算 1 格、不存在分歧），下面两组均已实测可用：
+#     ("⬩", "⟐", "✥", "⟐")   中心小菱形恒在、外框三级外扩
+#     ("✢", "✣", "✤", "✥")   同族四变体、笔画风格最统一
+# **换字形只需替换这张表，不动任何结构**——记下这条是因为没有它的话，
+# 下一个人遇到错位会误以为要重做整个状态行。
+# 批次尚未进入执行态时聚合行显示的兜底文案。
+# ⚠ **渲染与 `summary_text()` 必须共用它**——各写一份的话，一个刚建好的批次
+# 会出现「界面上显示『执行中…』而行为记录里是空串」这种对不上的情况。
+DEFAULT_BATCH_VERB = "执行中…"
+
+SPINNER_FRAMES = ("◇", "◈", "◆", "◈")
+# 帧间隔（秒）。太快让人眼疲劳，太慢则失去「还活着」的提示作用。
+# 刻意是常量而非配置项——本轮不引入新的配置面。
+SPINNER_INTERVAL = 0.15
 
 # 系统行分级里两个高档位的**文字**前缀（tui-display 扩展 F19/F21）。
 #
@@ -544,7 +714,169 @@ def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tup
     return escape(label), escape(inner)
 
 
-class ToolCallWidget(Static):
+class DetailLevelClicked(TextualMessage):
+    """
+    某一行被鼠标点开/收起了，携带它切到的**新档位**。
+
+    ## 为什么要往上报（真机反馈）
+
+    `Ctrl+O` 是**全局**档位，由 `RhineApp._detail_level` 保管；鼠标点击是
+    **单行**的，只改那一行。两者各记各的，于是出现这个现象——
+
+    > 「当我先点击展开后，得按两下 `Ctrl+O` 才能切换到第 3 档。」
+
+    因为点击把那一行推到了逐条档，而全局档位仍停在折叠：第一下 `Ctrl+O`
+    只是把全局从折叠推到逐条（那一行**看不出任何变化**），第二下才到全文。
+    用户按下去没反应，会以为是按键丢了。
+
+    修法是让点击**把全局档位也带到同一处**——此后 `Ctrl+O` 接着往下走。
+    ⚠ **只同步数字，不重新广播**：广播会把满屏的批次一起摊开，
+    而「点一下只开这一个」正是鼠标存在的理由。
+    """
+
+    def __init__(self, level: int) -> None:
+        super().__init__()
+        self.level = level
+
+
+class SelectableStatic(Static):
+    """
+    **能被拖选、能被高亮、能被复制**的 `Static`——即便内容来自 Rich 渲染对象。
+
+    ## 它解决的是「屏幕上根本没反应」，不只是「复制不到」
+
+    Textual 把 Rich 可渲染对象包进 `RichVisual`，而选区功能对它**三处一起失效**
+    （逐条论证见 `content_from_rich` 的说明）：不画高亮、拿不到字符偏移、
+    默认的 `get_selection` 直接返回 None。上一轮只补了第三条，于是出现了用户
+    描述的那个状态——「其他的连选择都不行」：内容其实进了选区，但屏幕上
+    一点反馈都没有，也没法只选其中一段。
+
+    本类的做法是**把 Rich 对象在渲染那一刻转成 `Content`**（`set_rich`），
+    之后一切都走 Textual 的原生通路：高亮它自己会画，偏移它自己会写，
+    `get_selection` 用父类的默认实现就够了。视觉与转换前一模一样。
+
+    ## 两种用法
+
+    - `update(markup)`：内容本来就是 markup 字符串，什么都不用做（原生已支持）。
+    - `set_rich(renderable)`：内容是 Rich 对象（AI 正文的 Markdown、
+      工具行的标题 + 结果块），由本类在 `render()` 里按**实时宽度**转换。
+
+    ⚠ **宽度必须是渲染期的实时值**：Markdown 要按宽度折行、diff 块要按宽度
+    补整行背景。提前转好存起来的话，终端一 resize 排版就错了。
+    """
+
+    def __init__(self, *args, plain: str = "", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # 兼容字段：仍有调用方（回放路径、测试）按纯文本读这一行的内容。
+        # 走 `set_rich` 时它由转换结果回填，不必调用方自己维护。
+        self._plain = plain
+        self._rich = None
+        # (宽度, Content) 记忆化。流式正文每来一块就重画一次，不缓存的话
+        # 每一块都要把整篇 Markdown 重排一遍——宽度没变时直接复用即可。
+        self._rich_cache: "Optional[tuple[int, Content]]" = None
+        # `get_content_height` 先于 `render` 被调用，且它拿得到确切宽度；
+        # 记下来供 `render` 在 `self.size` 尚未定稿时兜底。
+        self._last_width = 0
+
+    def set_plain(self, text: str) -> None:
+        """更新纯文本缓存。**改了显示内容就要跟着调**，否则复制到的是旧内容。"""
+        self._plain = text or ""
+
+    def set_markup(self, markup: str) -> None:
+        """
+        把本行换回**普通 markup 字符串**内容（并清掉 Rich 内容与记忆化）。
+
+        markup 字符串走 Textual 原生的 `Content` 通路，选区功能本来就成立，
+        所以这条路径不需要任何额外处理——但**必须把 `_rich` 清掉**，
+        否则 `render()` 会继续画上一次的 Rich 内容（内容不更新，且不报错）。
+        """
+        self._rich = None
+        self._rich_cache = None
+        self.update(markup)
+        self._plain = RichText.from_markup(markup).plain
+
+    def set_rich(self, renderable, plain: str = "") -> None:
+        """
+        把本行的内容换成一个 Rich 可渲染对象（在渲染期转成 `Content`）。
+
+        :param renderable: 任意 Rich 可渲染对象
+        :param plain: 可选的纯文本；不给则由转换结果回填
+
+        副作用：清掉记忆化并请求重排（内容高度可能变）。
+        """
+        self._rich = renderable
+        self._rich_cache = None
+        if plain:
+            self._plain = plain
+        self.refresh(layout=True)
+
+    def plain_text(self) -> str:
+        """
+        本行**当前显示内容的纯文本**（唯一权威来源）。
+
+        ⚠ **不要改回直接读 `widget.content`**：走 `set_rich` 的行（终态工具行、
+        AI 正文）内容不在那里，读到的是上一次 markup 的残留——测试会拿着
+        「执行中…」去断言「失败」，红得莫名其妙。
+        """
+        if self._rich is not None:
+            width = self.size.width or self._last_width or 80
+            return self._rich_content(width).plain
+        return self._plain
+
+    def _rich_content(self, width: int) -> Content:
+        """按给定宽度取（并缓存）转换结果，同时回填纯文本缓存。"""
+        if self._rich_cache is not None and self._rich_cache[0] == width:
+            return self._rich_cache[1]
+        content = content_from_rich(self._rich, width)
+        self._rich_cache = (width, content)
+        self._plain = content.plain
+        return content
+
+    def render(self):
+        """
+        渲染本行。带 Rich 内容时转成 `Content`，否则沿用父类（markup 字符串）。
+        """
+        if self._rich is None:
+            return super().render()
+        width = self.size.width or self._last_width
+        if not width:
+            # 还没排版过，先给一个不会崩的值；拿到真实宽度后会重画。
+            width = 80
+        return self._rich_content(width)
+
+    def get_content_height(self, container, viewport, width: int) -> int:
+        """
+        算内容高度。**这里是全流程中第一个知道确切宽度的地方**，顺手记下来
+        供 `render()` 兜底——否则首次渲染可能按 80 列排版、与实际宽度不符。
+        """
+        if self._rich is not None and width:
+            self._last_width = width
+            return self._rich_content(width).get_height(self.styles, width)
+        return super().get_content_height(container, viewport, width)
+
+    def get_selection(self, selection):
+        """
+        交出被选中的那段文本。
+
+        ⚠ **不可见时必须返回 None**：折叠起来的行**照样会被全选问到**，
+        不挡的话用户拿到的文本里会混进屏幕上根本没有的内容
+        （所见非所得，与「看得见却复制不走」是同一类毛病的两面）。
+
+        可见时交给父类：本类的 `render()` 保证产出的是 `Content`，
+        父类的默认实现对它是完全正确的（还顺带支持了「只选中一部分」）。
+        """
+        if not self.display:
+            return None
+        result = super().get_selection(selection)
+        if result is not None:
+            return result
+        # 父类拿不到（极少数仍用非 Content 渲染对象的路径）时退回纯文本缓存
+        if not self._plain:
+            return None
+        return selection.extract(self._plain), "\n"
+
+
+class ToolCallWidget(SelectableStatic):
     """
     单个工具调用的展示行，自管理计时。
 
@@ -585,7 +917,13 @@ class ToolCallWidget(Static):
         :param primary_args: `{工具名: 主参数键名}`（F12）。由 `HistoryView` 透传，
                              缺省 None → 标题全部走键值对摘要，形态与改造前一致
         """
-        super().__init__(markup=True)
+        # ⚠ 必须给一个**初始内容**（空串）而不是留空。留空时 renderable 是 None，
+        # 而本组件进入批次容器之后，挂载时序变了——Textual 可能在 `on_mount`
+        # 跑之前先渲染一次，于是在合成器里抛
+        # `AttributeError: 'NoneType' has no attribute 'render_strips'`。
+        # 那是**布局阶段主线程**的异常，业务调用栈上没有任何线索。
+        # 改造前它直接挂在历史区、总是先 on_mount 再渲染，所以一直没暴露。
+        super().__init__("", markup=True)
         self._pending = pending
         self._name = tool_call.name
         self._primary_args = primary_args or {}
@@ -600,15 +938,49 @@ class ToolCallWidget(Static):
         self._summary = ""
         self._diff = None
         self._final_elapsed = 0
-        # 全局展开开关的本地副本，由 `set_expanded` 广播进来（见 app.action_toggle_expand）
-        self._expanded = False
+        # 全局详细度档位的本地副本，由 `set_detail_level` 广播进来
+        # （见 app.action_toggle_expand）。改造前是个布尔 `_expanded`，
+        # 三档循环之后换成整数——理由见模块级 `DETAIL_CYCLE` 的注释。
+        self._detail_level = DETAIL_FOLDED
+        # ── 归并（tui-activity-fold A 组）──
+        # 保留原始调用：**最详细一档要重算标题**（完整参数、不截断），
+        # 而 `_args_summary` 是构造时就算好的截断版。
+        self._tool_call = tool_call
+        # 所属批次（可能为 None——不可归并的工具独立成行）。
+        # ⚠ 回调只在主线程内直接发生，不新增任何跨线程通道。
+        self._batch: "Optional[ToolBatchWidget]" = None
+        # 最详细一档显示的输出原文；空则回退显示 `_summary`
+        self._detail = ""
+        # 本行当前显示内容的**纯文本**，供选中复制使用（见 `get_selection`）。
+        # 每次重绘时同步更新——它必须与屏幕上看到的一致。
+        self._plain = ""
 
     def on_mount(self) -> None:
-        """挂载后记录起始时刻、立即渲染 0s，并启动每秒刷新的主线程定时器。"""
+        """
+        挂载后记录起始时刻并立即渲染一次。
+
+        ## 为什么这里**没有**每秒刷新的定时器（tui-activity-fold F19）
+
+        改造前每一行都自持一个 `set_interval(1.0)` 来滚动「执行中… Ns」。
+        并发执行五个只读工具时，屏幕上就有五个数字各自在跳——它们表达的是
+        同一件事（「还在跑」），却占了五份注意力。
+
+        现在这件事统一由**底部的回合状态行**（`StatusLine`）承担：
+        全界面同时至多一个该类定时器，显示的是**本回合总耗时**。
+
+        ⚠ **这个改动依赖状态行先存在**（实现期为此把本任务从 A 组挪到了 C 组
+        之后）。tui-display 曾有一条反证护栏专门保护这里的秒数，理由是
+        「那是参数生成期界面上唯一的活体信号」——那条需求仍然成立，
+        只是承载者从工具行换成了状态行。**在状态行做好之前撤掉它，
+        `write_file` 的参数生成期（模型吐整份文件内容，可能几十秒）
+        会退回到一个完全静止的窗口**，而写文件不参与归并、折叠救不了它。
+
+        ⚠ **终态的耗时不受影响。** `finish` 时用 `monotonic() - self._start`
+        一次性算出即可，那从来不需要定时器——定时器只是为了让**运行中**的
+        数字每秒变一下。
+        """
         self._start = monotonic()
         self._render_running()
-        # 每秒刷新一次耗时显示；定时器运行在主线程事件循环，不占用 Worker
-        self._timer = self.set_interval(1.0, self._render_running)
 
     @property
     def pending(self) -> bool:
@@ -638,7 +1010,12 @@ class ToolCallWidget(Static):
         # 标签也要重算：委派工具在 pending 阶段还不知道派给哪个角色，
         # 参数到齐后标签才从内部名转成角色名（F12 分支 1）。
         self._label, self._args_summary = resolve_call_title(tool_call, self._primary_args)
+        # 最详细一档要按**当前**参数重算完整标题，故原始调用也要更新
+        self._tool_call = tool_call
         self._start = monotonic()
+        # 告诉所属批次「这一类活儿开始了」，让聚合行切到对应的进行时文案（F5）
+        if self._batch is not None:
+            self._batch.note_running(self._name, self._args_summary)
         self._render_running()
 
     def _elapsed(self) -> int:
@@ -646,59 +1023,155 @@ class ToolCallWidget(Static):
         return int(monotonic() - self._start)
 
     def _render_running(self) -> None:
-        """以橘色渲染进行中状态（按阶段选文案），显示当前已耗时。"""
+        """
+        以橘色渲染进行中状态（按阶段选文案）。
+
+        ⚠ **不显示秒数**（tui-activity-fold F19/AC20）：运行中的时间统一由
+        底部的回合状态行显示**一处总耗时**。「这一行还在跑」由橘色 + 文案
+        表达，不需要每行各带一个数字来证明。
+        """
         if self._pending:
             # 参数还没到，写不出参数摘要，故不带括号——写成 "Write()" 像是无参调用。
-            self.update(
-                f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中… {self._elapsed()}s[/]"
+            markup = f"[{self._COLOR_RUNNING}]● {self._label} 参数生成中…[/]"
+        else:
+            markup = (
+                f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中…[/]"
             )
-            return
-        self.update(
-            f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中… {self._elapsed()}s[/]"
-        )
+        self.set_markup(markup)
 
-    def finish(self, ok: bool, summary: str, diff=None) -> None:
+    def finish(self, ok: bool, summary: str, diff=None, detail: str = "") -> None:
         """
         结束计时并切换到成功/失败终态。
 
         由 TUI 的 Worker 通过 call_from_thread 在主线程调用，线程安全。
 
         本方法只**记下终态素材**，画由 `_render_finished` 负责——两者分开是为了
-        让 `set_expanded` 能在任何时候重画同一行（F41 的展开/收回）。
+        让 `set_detail_level` 能在任何时候重画同一行（展开/收回）。
+
+        ## 为什么结果文本收两份
+
+        `summary` 是工具自报的**规模描述**（「读取 234 行 · 12.3 KB」），
+        `detail` 是**输出原文**。两者服务不同档位：折叠与逐条档要的是前者
+        （一眼看清做了多大一件事），最详细一档要的是后者（核对具体内容）。
+
+        改造前只收一份且优先取 summary，于是**展开之后看到的仍是那句规模描述**
+        ——「展开」等于没展开。这是 tui-activity-fold 自检时发现的缺口。
 
         :param ok: 工具是否成功（决定绿/红）
-        :param summary: 结果摘要文本，**可以是多行全文**（折叠交给渲染，见
+        :param summary: 结果的规模描述，**可以是多行**（折叠交给渲染，见
                         `BRANCH_LINE_LIMIT`）
         :param diff: 可选的 tools.diff.DiffView。改文件类工具会带上它，
                      此时在状态行下方追加渲染一个彩色 diff 块；其它工具留空。
+        :param detail: 输出原文，仅最详细一档显示；**为空时该档回退显示 summary**
 
-        副作用：停止计时定时器，原地更新本行内容。
+        副作用：停止计时定时器，原地更新本行内容，并回调所属批次重算聚合语。
         """
         if self._timer is not None:
             self._timer.stop()
         self._final_elapsed = self._elapsed()
         self._finished = True
+        self._detail = detail or ""
         self._ok = ok
         self._summary = summary or ""
         self._diff = diff
         self._render_finished()
+        # 回调所属批次重算聚合语（计数与失败数都可能变）。
+        # ⚠ 在 `_render_finished` **之后**：本行先把自己画对，再让批次去读
+        # 已经落定的状态——反过来的话批次读到的是上一轮的成败。
+        if self._batch is not None:
+            self._batch.note_finished(self._name, ok)
 
-    def set_expanded(self, expanded: bool) -> None:
+    @property
+    def batch(self) -> "Optional[ToolBatchWidget]":
         """
-        接收全局展开开关的广播（`Ctrl+O`，见 `app.action_toggle_expand`）。
+        本行所属的批次；**独立成行时为 None**。
 
-        只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下状态即可，
-        等它 `finish` 时自然按新状态渲染。
+        `HistoryView.set_detail_level` 靠它区分「批次内的子行」（档位由批次转发）
+        与「独立行」（直接下发），避免重复重绘。
+        """
+        return self._batch
 
-        :param expanded: 展开为真、折叠为假
+    @property
+    def primary_text(self) -> str:
+        """
+        本次调用的主参数值（纯文本、未转义），供所属批次做从属行显示。
+
+        与标题括号里的是同一份内容——批次的从属行与展开后的工具行标题
+        因此不会出现「同一次调用，两处显示的参数不一样」。
+        """
+        return self._args_summary
+
+    def set_batch(self, batch: "Optional[ToolBatchWidget]") -> None:
+        """
+        登记所属批次（tui-activity-fold A 组）。
+
+        登记之后，本行每次进入执行态或定色都会回调批次重算聚合语。
+
+        ⚠ **回调只在主线程内直接发生**——`begin_running` 与 `finish` 本身
+        就是 Worker 经 `call_from_thread` 调进主线程的，因此这条链上
+        **不新增任何跨线程通道**（本项目已因「加锁临界区内做跨线程调度」死锁四次）。
+
+        :param batch: 所属批次；不可归并的工具独立成行，传 None
+        """
+        self._batch = batch
+
+    def on_click(self, event) -> None:
+        """
+        点这一行 → 这**一次调用**在「逐条 ↔ 全文」之间切换。
+
+        与批次那一层配合成两级：点聚合行摊开这一批，点其中某一条看它的
+        完整参数与输出原文——不必为了看一次调用的细节把满屏都切到全文档。
+
+        ⚠ 仍处**折叠档**时点单条是够不着的（那时它根本不可见），
+        因此这里只在「逐条 ↔ 全文」之间切，不回落到折叠。
+
+        ⚠ `event.stop()` 的理由与批次那边相同：不拦会冒泡到可滚动的历史区。
+
+        ⚠ **拖选也会发 `Click`，必须挡掉。** Textual 判定「是不是一次点击」
+        的依据是 **`MouseDown` 与 `MouseUp` 落在同一个组件**——**根本不看鼠标
+        有没有移动**（`app.py`：`if mouse_up_widget is mouse_down_widget`）。
+        于是在一行之内拖着选文字，抬手时照样发 Click，内容就被展开了。
+        用户原话：「我选择以后会自动展开」。
+
+        判据用 `screen.selections`：单纯点击时它是空的，拖选过就非空。
+        """
+        event.stop()
+        if self.screen.selections:
+            return
+        nxt = DETAIL_ITEMS if self._detail_level == DETAIL_FULL else DETAIL_FULL
+        self.set_detail_level(nxt)
+        # 把全局档位带到同一处，否则下一次 `Ctrl+O` 会先「补」上这一步、
+        # 按下去看不出任何变化（见 `DetailLevelClicked` 的说明）。
+        self.post_message(DetailLevelClicked(nxt))
+
+    def set_detail_level(self, level: int) -> None:
+        """
+        接收全局详细度档位的广播（`Ctrl+O`，见 `app.action_toggle_expand`）
+        或单次点击。
+
+        只对**已定色**的行重画；仍在执行中的行没有分支内容可展，记下档位即可，
+        等它 `finish` 时自然按新档位渲染。
+
+        :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
 
         副作用：可能原地重绘本行。
         """
-        if self._expanded == expanded:
+        if self._detail_level == level:
             return
-        self._expanded = expanded
+        self._detail_level = level
         if self._finished:
             self._render_finished()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        **薄封装**，保留供回放路径与既有测试使用（它们只认「展开 / 收起」两态）。
+
+        映射：展开 → 最详细一档；收起 → 折叠档。
+        新代码请直接用 `set_detail_level`。
+
+        :param expanded: 展开为真、折叠为假
+        """
+        self.set_detail_level(DETAIL_FULL if expanded else DETAIL_FOLDED)
 
     def _branch_block(self) -> RichText:
         """
@@ -711,7 +1184,11 @@ class ToolCallWidget(Static):
         用 `RichText` 纯文本而不是 markup：结果摘要来自工具输出原文，
         含 `[` 是常态，纯文本渲染天然免转义（与本类既有做法一致）。
         """
-        lines = self._summary.split("\n")
+        # 档位决定读哪一份素材（tui-activity-fold F12）：
+        # 最详细一档读**输出原文**，其余读工具自报的那句规模描述。
+        # `_detail` 为空时回退——脚本化 Provider 与回放路径都可能只给 summary。
+        source = self._detail if (self._detail_level == DETAIL_FULL and self._detail) else self._summary
+        lines = source.split("\n")
         # 去掉尾部空行：命令输出几乎都以换行结尾，留着会白占一行折叠额度
         while lines and not lines[-1].strip():
             lines.pop()
@@ -719,14 +1196,14 @@ class ToolCallWidget(Static):
             lines = [""]
 
         hidden = 0
-        if not self._expanded and len(lines) > BRANCH_LINE_LIMIT:
+        if self._detail_level != DETAIL_FULL and len(lines) > BRANCH_LINE_LIMIT:
             hidden = len(lines) - BRANCH_LINE_LIMIT
             lines = lines[:BRANCH_LINE_LIMIT]
 
         rendered = [BRANCH_PREFIX + lines[0]]
         rendered.extend(BRANCH_CONT_INDENT + line for line in lines[1:])
         if hidden:
-            rendered.append(f"{BRANCH_CONT_INDENT}… +{hidden} 行{EXPAND_HINT}")
+            rendered.append(f"{BRANCH_CONT_INDENT}… +{hidden} 行")
         return RichText("\n".join(rendered), style=self._COLOR_BRANCH)
 
     def _render_finished(self) -> None:
@@ -736,28 +1213,65 @@ class ToolCallWidget(Static):
         统一为两段式：第一行 `● 标题 完成/失败 [(Ns)]`，其下是 `⎿` 分支块。
         """
         color = self._COLOR_OK if self._ok else self._COLOR_FAIL
-        result = "完成" if self._ok else "失败"
+        # 成功态**不写「完成」二字**（tui-activity-fold F7）：绿色已经把状态说完了，
+        # 文字重复一遍只是多占宽度、多一处视觉停顿。
+        #
+        # ⚠ **失败态的「失败」必须保留。** 它是这一行脱离颜色之后**唯一**还能
+        # 辨认状态的依靠——截图、配色异常的终端、端到端驱动抓到的纯文本里，
+        # 颜色全都可能丢失。这个不对称是刻意的：成功是常态（可以安静），
+        # 失败要抢注意力（必须写出来）。
+        #
+        # 前导空格并进本变量而不是留在 f-string 里，否则成功态会拖一个尾部空格。
+        result = "" if self._ok else " 失败"
         diff = self._diff
         if diff is not None and diff.rows:
             # 改文件类工具（成功）：标题用 diff 自带的 op/path（比工具名+参数摘要
             # 更贴近改动语义），分支由 render_diff_block 产出。
             header = (
-                f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))}) "
+                f"[{color}]● {escape(str(diff.op))}({escape(str(diff.path))})"
                 f"{result}{self._elapsed_suffix()}[/]"
             )
-            self.update(
-                RichGroup(
-                    RichText.from_markup(header),
-                    render_diff_block(diff, expanded=self._expanded),
-                )
+            block = render_diff_block(
+                diff, expanded=self._detail_level == DETAIL_FULL
             )
+            self.set_rich(RichGroup(RichText.from_markup(header), block))
             return
         # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"。
         # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
         # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
-        title = self._label if self._pending else f"{self._label}({self._args_summary})"
-        header = f"[{color}]● {title} {result}{self._elapsed_suffix()}[/]"
-        self.update(RichGroup(RichText.from_markup(header), self._branch_block()))
+        header = f"[{color}]● {self._title_text()}{result}{self._elapsed_suffix()}[/]"
+        branch = self._branch_block()
+        self.set_rich(RichGroup(RichText.from_markup(header), branch))
+
+    def _title_text(self) -> str:
+        """
+        按当前档位产出标题（**已转义**，可直接嵌进 markup）。
+
+        ## 两份内容，不是一份的长短版（tui-activity-fold F11）
+
+        - 折叠 / 逐条档：`标签(主参数值)`——挑一个最有辨识度的值给人扫读，
+          其余参数不显示，长值截断。
+        - 最详细一档：`标签(键: 值, 键: 值…)`——**列全部参数、每个值都不截断**。
+
+        改造前展开态沿用构造时算好的截断标题，于是「展开」了却看不到被截掉的
+        部分——那正是本方法要解决的问题。
+
+        ⚠ 仍处 pending 的行不写括号：参数还没生成完，写成 `Write()`
+        像是「调用无参数」而不是「参数没来得及生成」。
+
+        ⚠ **转义只做一次。** `self._label` 与 `self._args_summary` 来自
+        `resolve_call_title`，那个函数**已经转义过**；而 `resolve_full_title`
+        是 `tools/display` 的纯文本内核、**未转义**，必须在这里补上。
+        搞反任一边都会出问题：漏转会在布局阶段抛 `MarkupError` 并拆掉整个应用，
+        重复转会让用户看到字面的 `\\[`。
+        """
+        if self._pending:
+            return self._label
+        if self._detail_level == DETAIL_FULL:
+            label, inner = resolve_full_title(self._tool_call)
+            # 参数为空时退回只写标签，避免出现一个空括号
+            return f"{escape(label)}({escape(inner)})" if inner else escape(label)
+        return f"{self._label}({self._args_summary})"
 
     def _elapsed_suffix(self) -> str:
         """
@@ -774,6 +1288,294 @@ class ToolCallWidget(Static):
         if self._final_elapsed < 1:
             return ""
         return f" ({self._final_elapsed}s)"
+
+
+class ToolBatchWidget(SelectableStatic):
+    """
+    一批**连续的只读检索调用**在历史区的呈现（tui-activity-fold 扩展 A 组）。
+
+    ## 它解决什么
+
+    改造前每次工具调用各占屏幕两行且全部累积：一次「读一下项目」发 20 次
+    `Read`/`Glob`/`Grep`，历史区净增 40 行，把真正要读的结论淹掉了。
+    本组件把这样一批调用收成**一行聚合语**，默认折叠。
+
+    ## 两种形态，按「封闭与否」切换
+
+    - **未封闭**（还可能有新调用进来）：`● 搜索中…` + 从属行显示当前调用的参数
+    - **已封闭**：`● 搜索内容 3 次 · 读取 2 个文件` + 档位提示
+
+    ⚠ **运行期间的形态与最终调用数量无关。** 批次的规模只有封闭时才知道——
+    第一次 `Read` 发出去时，无从预知后面还会不会有第二次。因此
+    「按数量选形态」这件事在运行中做不到，也不该做。
+
+    ## ⚠ 为什么它**不是容器**
+
+    最自然的写法是让批次做一个 `Vertical`、把工具行 mount 进去。
+    实现期试过，**在挂载时序上踩了一连串不报错的坑**：
+
+    - `HistoryView.add_tool_widget` 挂完批次会**紧接着**调 `attach`，
+      而此时容器自身的挂载还没落地。往未挂载的容器 mount，实测会让
+      **整个批次连同工具行从 DOM 里消失**（挂一条系统行之后
+      `#history-messages` 里只剩那条系统行），且不报任何错。
+    - 改成「先入队、`on_mount` 时补挂」之后，补挂要多一轮事件循环才落地；
+      在那之前若发生一次布局（例如封闭批次触发重绘），批次照样被挤掉。
+
+    现在的做法从**结构上**消掉这一整类问题：**批次只是一个 `Static`
+    （就是那行聚合语），工具行仍旧直接挂在历史区、与批次平级。**
+    批次只持有它们的引用来控制可见性。DOM 上没有嵌套，也就没有嵌套的时序。
+
+    折叠时把这些工具行 `display = False`，屏幕上就只剩聚合行那一行——
+    与「装进容器再隐藏容器」的视觉效果完全一致。
+
+    ## 三个不变量
+
+    1. **一切嵌入的纯文本必须过本模块的 `escape`。** 主参数值来自工具参数，
+       含方括号是常态，落单的 `[` 会在布局阶段的主线程抛 `MarkupError`，
+       没有任何 try/except 兜得住。
+    2. **状态变更方法只在主线程内被调用**（`ToolCallWidget.finish` 本身就是
+       经 `call_from_thread` 到主线程的），本类**不新增任何跨线程通道**。
+    3. **本类不参与 `tool_widgets` 表的登记与摘除。** Worker 侧仍持有
+       `ToolCallWidget` 引用、仍按原口径 `pop`。
+    """
+
+    def __init__(self, detail_level: int = DETAIL_FOLDED) -> None:
+        """
+        :param detail_level: 建立时的详细度档位，由 `HistoryView` 按全局档位传入
+                             （新批次必须跟上当前档位，否则展开状态下新产生的
+                             批次会是折叠的）
+        """
+        super().__init__("", markup=True)
+        # ⚠ **字段名前缀 `_batch_` 是刻意的，别改回 `_closed`。**
+        #
+        # Textual 的 `MessagePump`（`Static` 的基类之一）在实例上放了一个
+        # `_closed` 属性，用来标记「这个组件的消息泵已关停」。本类原先把
+        # 「批次已封闭」也存成 `self._closed`，于是 `close()` 一执行就等于
+        # 告诉 Textual「我关停了」——**它随后把整个节点从 DOM 里清理掉**，
+        # 界面上批次连同它统辖的工具行一起消失，而且**不报任何错**。
+        #
+        # 这是本轮撞上的**第二个** Textual 内部名（第一个是 `_render`，
+        # 那次的表现是合成器里抛 `'NoneType' has no attribute 'render_strips'`）。
+        # 新增字段前先在实例上 `hasattr` 查一遍，比事后二分省得多。
+        self._batch_closed = False
+        # [(工具名, 是否成功)]，按发生时序；第二项 None 表示尚未产生结果
+        self._entries: "list[tuple[str, Optional[bool]]]" = []
+        # 本批次统辖的工具行。**只持引用，不做父节点**——它们挂在历史区里，
+        # 与本组件平级（见类 docstring）。
+        self._widgets: "list[ToolCallWidget]" = []
+        self._detail_level = detail_level
+        # 未封闭态显示的两段：进行时文案 + 当前调用的主参数值
+        self._running_text = ""
+        self._running_arg = ""
+        # 单次调用时聚合行下方要保留的那条从属行（F4）——多次时为空
+        self._single_arg = ""
+
+    def on_mount(self) -> None:
+        """挂载后立即画一次，避免出现一瞬间的空行。"""
+        self._repaint()
+
+    @property
+    def closed(self) -> bool:
+        """本批次是否已封闭（封闭后不再接受新的工具行）。"""
+        return self._batch_closed
+
+    @property
+    def call_count(self) -> int:
+        """本批次已纳入的调用次数（供测试与埋点用）。"""
+        return len(self._entries)
+
+    def attach(self, widget: "ToolCallWidget", tool_name: str) -> None:
+        """
+        把一条工具行纳入本批次。
+
+        ⚠ **本方法不挂载 widget**——挂载由 `HistoryView` 负责，工具行与本组件
+        在历史区里是**平级**的（理由见类 docstring：嵌套会踩挂载时序的坑）。
+        这里只登记引用与计数，并按当前档位设定它的可见性。
+
+        :param widget: 工具行（挂载与否都可以，本方法不关心）
+        :param tool_name: 内部工具名（用于聚合计数，非展示标签）
+
+        副作用：登记 entry 与引用、给 widget 装上回指本批次的引用、
+        改 widget 的可见性与档位、重绘聚合行。
+        """
+        self._entries.append((str(tool_name or ""), None))
+        self._widgets.append(widget)
+        widget.set_batch(self)
+        widget.set_detail_level(self._detail_level)
+        # 折叠档下工具行整体不可见——折叠的全部意义就在这里
+        widget.display = self._detail_level != DETAIL_FOLDED
+        # 单次时聚合行下面要显示这一次调用的参数（F4），先记下来
+        self._single_arg = widget.primary_text
+        self._repaint()
+
+    def note_running(self, tool_name: str, primary_value: str) -> None:
+        """
+        某次调用进入执行态：更新未封闭态显示的进行时文案与从属行（F5）。
+
+        并发时**后到的覆盖先到的**——从属行的语义是「最近开始的那一个」。
+
+        :param tool_name: 内部工具名
+        :param primary_value: 该次调用的主参数值（已是纯文本，未转义）
+        """
+        self._running_text = running_verb(tool_name)
+        self._running_arg = primary_value or ""
+        self._single_arg = self._running_arg or self._single_arg
+        self._repaint()
+
+    def note_finished(self, tool_name: str, ok: bool) -> None:
+        """
+        某次调用定色：把对应 entry 的成败落定并重算聚合语。
+
+        按工具名从后往前找**第一个尚未落定**的条目——同一个批次里同名调用
+        可能有多次，从后往前配对与「后发起的先完成」这种并发形态更吻合，
+        且无论配到哪一个，聚合计数的结果都相同（计数只看总数与失败数）。
+
+        :param tool_name: 内部工具名
+        :param ok: 该次调用是否成功
+        """
+        name = str(tool_name or "")
+        for i in range(len(self._entries) - 1, -1, -1):
+            entry_name, entry_ok = self._entries[i]
+            if entry_name == name and entry_ok is None:
+                self._entries[i] = (entry_name, bool(ok))
+                break
+        self._repaint()
+
+    def close(self) -> None:
+        """
+        封闭本批次：形态从进行时切到完成时，此后不再接受新行。
+
+        **幂等**——`_mount_widget` 每挂一条非工具行内容就会调它一次，
+        而连续几条系统行是常态。
+
+        副作用：重绘聚合行。
+        """
+        if self._batch_closed:
+            return
+        self._batch_closed = True
+        self._repaint()
+
+    def on_click(self, event) -> None:
+        """
+        点这一行 → 这**一个**批次在「折叠 ↔ 逐条」之间切换。
+
+        `Ctrl+O` 是全局档位，管所有批次；鼠标是**单个**的——想看某一批具体
+        做了什么，不必把满屏的批次一起摊开。
+
+        ⚠ **必须 `event.stop()`**：不拦的话事件继续往上冒泡到历史区，
+        而历史区是可滚动容器，Textual 会把它当成一次滚动交互处理
+        （表现为「点一下内容跳一段」）。
+
+        ⚠ **拖选也会发 `Click`，必须挡掉。** Textual 判定「是不是一次点击」
+        的依据是 **`MouseDown` 与 `MouseUp` 落在同一个组件**——**根本不看鼠标
+        有没有移动**（`app.py`：`if mouse_up_widget is mouse_down_widget`）。
+        于是在一行之内拖着选文字，抬手时照样发 Click，内容就被展开了。
+        用户原话：「我选择以后会自动展开」。
+
+        判据用 `screen.selections`：单纯点击时它是空的，拖选过就非空。
+        """
+        event.stop()
+        if self.screen.selections:
+            return
+        nxt = DETAIL_FOLDED if self._detail_level != DETAIL_FOLDED else DETAIL_ITEMS
+        self.set_detail_level(nxt)
+        self.post_message(DetailLevelClicked(nxt))
+
+    def set_detail_level(self, level: int) -> None:
+        """
+        接收全局档位广播（`Ctrl+O`）或单次点击。
+
+        折叠档 → 本批次统辖的工具行整体隐藏，屏幕上只留聚合行；
+        其余档位 → 显示它们并把档位逐个转发。
+
+        :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
+
+        副作用：改所辖工具行的可见性、转发档位、重绘聚合行。
+        """
+        if level == self._detail_level:
+            return
+        self._detail_level = level
+        visible = level != DETAIL_FOLDED
+        # 遍历**引用列表**而不是 `self.query(...)`——工具行不是本组件的子节点，
+        # 它们与本组件平级地挂在历史区里（见类 docstring）。
+        for widget in self._widgets:
+            widget.display = visible
+            widget.set_detail_level(level)
+        self._repaint()
+
+    def summary_text(self) -> str:
+        """
+        当前聚合语的**纯文本**（未转义、不含档位提示），供埋点与测试使用。
+
+        单独抽出来是为了让 trace 负载与界面显示同源——各拼一遍的话，
+        记录里的聚合语与用户看到的会悄悄不一致。
+
+        ⚠ **实现就在 `_compose_head`，两边共用同一处**。这正是「同源」要防的事：
+        渲染那边写「已完成的聚合语 · 进行时」、这边只返回进行时的话，
+        记录里的聚合语与用户看到的会悄悄不一致——而两边单看都是对的。
+        """
+        return self._compose_head()
+
+    def _compose_head(self) -> str:
+        """
+        聚合行首行的**纯文本**（未转义）。渲染与埋点共用这一处。
+
+        两态：
+        - **未封闭**：`已落定的聚合语 · 进行时`，例如
+          `查找文件 1 次 · 读取 5 个文件 · 读取中…`。
+          ⚠ 前半截不可省（真机反馈：「上面一行不会实时更新状态」），
+          且**只统计已落定的调用**——正在跑的那一次由进行时表达，
+          算进计数会让数字比实际完成量多一个。
+        - **已封闭**：完整聚合语。
+        """
+        if self._batch_closed:
+            return compose_batch_summary(self._entries)
+        done = [(name, ok) for name, ok in self._entries if ok is not None]
+        summary = compose_batch_summary(done)
+        head = self._running_text or DEFAULT_BATCH_VERB
+        return f"{summary}{SEGMENT_SEP}{head}" if summary else head
+
+    def _has_failure(self) -> bool:
+        """本批次里是否有已落定的失败调用（F6）。"""
+        return any(ok is False for _name, ok in self._entries)
+
+    def _repaint(self) -> None:
+        """
+        画聚合行。两态分支见类 docstring。
+
+        ⚠ 所有纯文本都过 `escape`：主参数值与聚合语都可能含字面 `[`。
+
+        本组件**自己就是那行聚合语**（继承 `Static`），因此这里直接 `update`
+        自身，不存在「子组件挂没挂上」的问题——那正是不做容器换来的简化。
+        """
+        color = ToolCallWidget._COLOR_FAIL if self._has_failure() else ToolCallWidget._COLOR_OK
+
+        if not self._batch_closed:
+            # 未封闭：**已完成的聚合语 + 进行时**，下面一行是当前这次调用的参数。
+            # **不显示耗时**——那由状态行统一承担（F5），两处各显示一份会让用户
+            # 去比对两个不相等的数字。
+            #
+            # ⚠ 首行文案走 `_compose_head`（与埋点共用一处），别在这里另拼一遍。
+            lines = [f"[{ToolCallWidget._COLOR_RUNNING}]● {escape(self._compose_head())}[/]"]
+            if self._running_arg:
+                lines.append(
+                    f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._running_arg)}[/]"
+                )
+            self.set_markup("\n".join(lines))
+            return
+
+        # 已封闭：只写聚合语。
+        # ⚠ **不再附档位提示**（tui-activity-fold 验收期修订）：那句话说的是一个
+        # 全局快捷键，而一屏上可能有好几个批次——重复到第二次就没有信息量了。
+        # 发现性改由输入框占位符承担，见 `NEXT_LEVEL_HINT` 的注释。
+        lines = [f"[{color}]● {escape(self._compose_head())}[/]"]
+        # F4：只有一次调用时，聚合行下方保留一条从属行放主参数值——
+        # 单次时那个信息放得下，不给是纯损失；多次时十个文件名塞不进一行。
+        if len(self._entries) == 1 and self._single_arg:
+            lines.append(
+                f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._single_arg)}[/]"
+            )
+        self.set_markup("\n".join(lines))
 
 
 # `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
@@ -835,24 +1637,89 @@ class HistoryView(ScrollableContainer):
     # 与改造前逐字一致。
     _primary_args: dict = {}
 
-    # 全局展开开关的本地副本（`Ctrl+O`，F5/F41）。
+    # 全局详细度档位的本地副本（`Ctrl+O`，三档循环）。
     #
-    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：展开之后新产生的
-    # 每一行都要按展开态画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
+    # ⚠ **必须记在这里，而不是只广播给「当前挂着的行」**：切档之后新产生的
+    # 每一行都要按当前档位画。只广播不记的话，用户按下 Ctrl+O 之后接着跑的工具
     # 又是折叠的——现象是「这个开关时灵时不灵」，而那比没有开关更让人困惑。
-    _expanded: bool = False
+    _detail_level: int = DETAIL_FOLDED
+
+    # 归并分组表（tui-activity-fold F2），由 `set_fold_groups` 灌进来。
+    # 缺省空字典同样是**零回归的关键**：拿不到它时一个工具都不可归并，
+    # 每次调用照旧独立成行，形态与改造前逐字一致。
+    _fold_groups: dict = {}
+
+    # 当前尚未封闭的批次。None 表示「此刻没有正在收集的批次」。
+    # ⚠ 类属性写 None（不可变）是安全的：赋值 `self._current_batch = x` 会创建
+    # 实例属性，不会串到别的实例上。写成可变对象才会有那个坑。
+    _current_batch: "Optional[ToolBatchWidget]" = None
+
+    def set_detail_level(self, level: int) -> None:
+        """
+        接收全局详细度档位，**记下来并广播给已挂载的批次与独立工具行**。
+
+        :param level: `DETAIL_FOLDED` / `DETAIL_ITEMS` / `DETAIL_FULL` 之一
+
+        副作用：改自身状态；重绘全部批次与已定色的工具行。
+        """
+        self._detail_level = level
+        # 先发给批次——它会把档位转发给自己的子行，并按档位控制它们的可见性。
+        for batch in self.query(ToolBatchWidget):
+            batch.set_detail_level(level)
+        # 再发给**不在任何批次里**的独立工具行（写文件 / 执行命令 / 委派 / Skill）。
+        # 批次内的子行刚才已由批次转发过，这里跳过，免得重复重绘。
+        for widget in self.query(ToolCallWidget):
+            if widget.batch is None:
+                widget.set_detail_level(level)
 
     def set_expanded(self, expanded: bool) -> None:
-        """
-        接收全局展开开关，**记下来并广播给已挂载的工具行**（F5/F41）。
+        """**薄封装**，保留供既有调用方使用（它们只认「展开 / 收起」两态）。"""
+        self.set_detail_level(DETAIL_FULL if expanded else DETAIL_FOLDED)
 
-        :param expanded: 展开为真、折叠为假
-
-        副作用：改自身状态；重绘全部已定色的工具行。
+    def set_fold_groups(self, mapping: dict) -> None:
         """
-        self._expanded = expanded
-        for widget in self.query(ToolCallWidget):
-            widget.set_expanded(expanded)
+        接收「哪些工具参与批次归并」的映射（tui-activity-fold F2）。
+
+        :param mapping: 由工具注册中心导出的一次性快照
+                        （见 `tools.display.fold_group_map`）
+
+        副作用：只影响**此后**新建的工具行。
+        ⚠ 与 `set_primary_args` 同理，**必须在历史回放之前**调用——`--continue`
+        恢复出来的历史里有工具行，晚一步的话首屏那批会用空表画成独立行，
+        与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
+        """
+        self._fold_groups = dict(mapping or {})
+
+    # 批次封闭时的回调（`(聚合语, 调用数) -> None`），由 `app.on_mount` 注入。
+    # 缺省是个空实现——历史区不认识行为记录器，装配不到时它照常工作。
+    _on_batch_closed = None
+
+    def set_batch_closed_hook(self, callback) -> None:
+        """
+        登记「批次封闭」的回调，供上层产出行为记录（tui-activity-fold N7）。
+
+        ⚠ 走回调而不是让本组件直接持有记录器：历史区是纯展示层，
+        认识 `trace` 会让依赖方向倒过来。
+        """
+        self._on_batch_closed = callback
+
+    def _close_batch(self) -> None:
+        """
+        封闭当前批次（若有）。**幂等**——连续挂几条系统行是常态。
+
+        调用点只有一个：`_mount_widget` 挂载非工具行内容时。
+        """
+        batch = self._current_batch
+        if batch is None:
+            return
+        batch.close()
+        self._current_batch = None
+        if self._on_batch_closed is not None:
+            # 埋点整段兜异常：观测设施绝不能反过来打断被观测的界面
+            try:
+                self._on_batch_closed(batch.summary_text(), batch.call_count)
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_primary_args(self, mapping: dict) -> None:
         """
@@ -918,9 +1785,28 @@ class HistoryView(ScrollableContainer):
         `ToolCallWidget`（调用方要拿它调 `begin_running` / `finish`），
         写死父类会让那个承诺在类型上退化成「某个 Static」。
 
-        :param widget: 任意 Static 子类实例（普通消息行 / 用户消息行 / 工具行）
+        ## ⚠ 本方法同时是**批次封闭的唯一判定点**（tui-activity-fold F1）
+
+        挂载**任何非工具行内容**（AI 正文、思考块、系统行、通知、用户消息）
+        之前先封闭当前批次。规则一句话：
+        **「历史区里出现了别的东西」就是「这批工具调用结束了」。**
+
+        为什么判定放在这里而不是去监听 `TEXT` 事件：这里是历史区一切内容的
+        **必经之路**，规则因此简单到不可能漏。监听事件的写法要在 app 层枚举
+        所有断开时机（正文 / 思考 / 各类系统行 / 通知 / 恢复回放…），
+        漏一处就会出现「一个批次跨越了中间那段正文」——而那在界面上表现为
+        时序错乱：聚合行说的事情，一部分发生在它上面那段话之前，一部分之后。
+
+        ⚠ **确认面板不在此列**，因此不会断开批次（AC2）：四个交互面板都是
+        `compose` 里的独立组件，弹出时不往历史区挂任何东西。这不是特意写的
+        判断，是既有布局结构的自然结果。
+
+        :param widget: 任意 Static 子类实例（普通消息行 / 用户消息行 / 工具行 / 批次）
         :returns: 原样返回该组件（流式场景下供后续 update_widget 使用）
         """
+        # 工具行与批次容器本身不封闭批次——前者要进批次，后者就是批次。
+        if not isinstance(widget, (ToolCallWidget, ToolBatchWidget)):
+            self._close_batch()
         container = self.query_one("#history-messages", Vertical)
         container.mount(widget)
         # 每次新增消息后自动滚动到底部，保持用户视角始终看到最新内容
@@ -932,9 +1818,16 @@ class HistoryView(ScrollableContainer):
         在历史区末尾添加一个新的 Static 消息组件并自动滚动到底部。
 
         :param markup: Rich markup 格式的显示内容
-        :returns: 新建的 Static 组件引用（流式场景下供后续 update_widget 使用）
+        :returns: 新建的组件引用（流式场景下供后续 update_widget 使用）
+
+        ⚠ 用 `SelectableStatic` 而不是裸 `Static`：这些行**后续可能被换成
+        Rich 渲染对象**（AI 正文就是），而 Textual 对那一类**不画选区高亮、
+        不给字符偏移、也复制不走**。`SelectableStatic.set_rich` 会在渲染那一刻
+        把它转成 `Content`，三条一起解决——见该类与 `content_from_rich` 的说明。
         """
-        return self._mount_widget(Static(markup, markup=True))
+        return self._mount_widget(
+            SelectableStatic(markup, markup=True, plain=RichText.from_markup(markup).plain)
+        )
 
     @staticmethod
     def _build_user_widget(text: str) -> "UserMessageWidget":
@@ -984,15 +1877,27 @@ class HistoryView(ScrollableContainer):
 
         :param widget: 要更新的 Static 组件（begin_assistant_turn 等方法的返回值）
         :param markup: 新的 Rich markup 内容（完整替换，非追加）
+
+        ⚠ **必须走 `set_markup`**，它会把内容与纯文本缓存一起换掉。
+        改造前这里只调 `update()`、缓存不动，于是这一行**复制到的是建行时
+        那一瞬的内容**。思考块正是这条路径：建行时只有一个 `✻ ` 前缀，
+        内容全靠这里流式灌进去——不同步的话用户拖选整段思考，
+        复制出来只有那个孤零零的前缀。实测扫出来的就是 `'✻ '`。
         """
-        widget.update(markup)
+        if hasattr(widget, "set_markup"):
+            # `set_markup` 顺带清掉 Rich 内容与纯文本缓存——不清的话，
+            # 一行从 Rich 内容切回 markup 时会**继续画上一次的内容**（不报错）。
+            widget.set_markup(markup)
+        else:  # 兼容仍传裸 Static 的调用方
+            widget.update(markup)
         self._scroll_to_latest()
 
     def update_ai_widget(self, widget: Static, content: str) -> None:
         """
         原地更新 AI 回复组件，将 content 作为 Markdown 渲染并滚动到底部。
 
-        与 update_widget() 不同，此方法使用 Rich Markdown 渲染器，
+        与 update_widget() 不同，此方法使用 Rich Markdown 渲染器（经
+        `set_rich` 在渲染期转成 `Content`，保住选区功能），
         支持代码块语法高亮、标题、粗体、斜体、列表、表格等 Markdown 格式。
         "Rhine" 前缀以青绿色粗体单独渲染，正文内容整体作为 Markdown 文档渲染，
         两者通过 RichGroup 纵向组合后传给 Static.update()。
@@ -1004,8 +1909,15 @@ class HistoryView(ScrollableContainer):
         """
         label = RichText("Rhine ", style="bold #CCFF99")
         body = RichMarkdown(content)
-        # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable
-        widget.update(RichGroup(label, body))
+        # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable。
+        # ⚠ 走 `set_rich` 而不是 `update`：后者会让这段正文变成 `RichVisual`，
+        # 而**选区功能对它三处一起失效**——不画高亮、没有字符偏移、
+        # 复制拿不到内容（详见 `content_from_rich`）。`set_rich` 会在渲染那一刻
+        # 按实时宽度把它转成 `Content`，视觉一模一样，选区则全部可用。
+        if hasattr(widget, "set_rich"):
+            widget.set_rich(RichGroup(label, body))
+        else:  # 兼容极少数仍传裸 Static 的调用方（回放路径的老测试）
+            widget.update(RichGroup(label, body))
         self._scroll_to_latest()
 
     def add_tool_widget(self, tool_call, pending: bool = False) -> "ToolCallWidget":
@@ -1016,6 +1928,17 @@ class HistoryView(ScrollableContainer):
         收到 tool_start 时对返回的引用调用 begin_running() 补参数并转执行态，
         收到 tool_result 时再调用 finish() 定色。两阶段共用同一行，不新建第二行。
 
+        ## 两条分流（tui-activity-fold F2）
+
+        - **可归并**（只读检索类）：进当前批次；没有正在收集的批次就先新建一个。
+        - **不可归并**（写文件 / 执行命令 / 委派 / 加载 Skill / 未登记的一切）：
+          先封闭当前批次，再按改造前的方式独立挂进历史区。
+
+        ⚠ **返回值口径一字不变**：无论走哪条分流，返回的都是 `ToolCallWidget`，
+        Worker 侧仍持它调 `begin_running` / `finish`、仍按原口径从 `tool_widgets`
+        表里 `pop`。批次**只改变这个组件挂在哪**，不参与那张表的登记与摘除
+        ——「建行/定色必须成对」那条既有不变量因此原样成立。
+
         :param tool_call: provider.base.ToolCall，用于初始化展示内容
         :param pending: True 表示模型仍在生成该调用的参数（见 ToolCallWidget）
         :returns: 新建的 ToolCallWidget，供后续 begin_running() / finish() 更新
@@ -1023,8 +1946,27 @@ class HistoryView(ScrollableContainer):
         widget = ToolCallWidget(
             tool_call, pending=pending, primary_args=self._primary_args
         )
-        # 新行也要跟上当前的展开态（见 `set_expanded` 里那条注释）。
-        widget.set_expanded(self._expanded)
+        name = str(getattr(tool_call, "name", "") or "")
+        if name in self._fold_groups:
+            batch = self._current_batch
+            if batch is None or batch.closed:
+                batch = ToolBatchWidget(self._detail_level)
+                self._current_batch = batch
+                self._mount_widget(batch)
+            # ⚠ 工具行**照常挂在历史区**，与批次平级——批次不是容器，
+            # 它只持引用来控制可见性（理由见 `ToolBatchWidget` 的 docstring：
+            # 嵌套挂载在时序上踩过一连串不报错的坑）。
+            self._mount_widget(widget)
+            # 档位与可见性由 `attach` 一并设定，故这里不单独调 set_detail_level。
+            batch.attach(widget, name)
+            return widget
+
+        # 不可归并：独立成行，形态与改造前逐字一致。
+        # ⚠ 显式封闭——`_mount_widget` 里那条判断放行工具行（可归并的要进批次），
+        # 所以走到这里必须自己把批次收掉。
+        self._close_batch()
+        # 新行也要跟上当前的档位（见 `set_detail_level` 里那条注释）。
+        widget.set_detail_level(self._detail_level)
         return self._mount_widget(widget)
 
     def append_system(self, text: str) -> None:
@@ -1133,8 +2075,15 @@ class HistoryView(ScrollableContainer):
         self._add_widget(f"[bold #FFA500]{WARNING_PREFIX}{escape(text)}[/bold #FFA500]")
 
     def clear_all(self) -> None:
-        """清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。"""
+        """
+        清空所有历史消息组件（对应 /clear 命令的 UI 侧操作）。
+
+        ⚠ 必须一并把 `_current_batch` 置空：`remove_children` 已经把批次容器
+        从 DOM 里删掉了，但这里还攥着一个指向已删除组件的引用——下一次
+        可归并的调用会往那个「幽灵批次」里 `mount`，界面上什么都不出现。
+        """
         self.query_one("#history-messages", Vertical).remove_children()
+        self._current_batch = None
 
     # ------------------------------------------------------------------ #
     # 会话历史回放（c9 /resume 交互化）
@@ -1149,7 +2098,12 @@ class HistoryView(ScrollableContainer):
         区别只是内容一次到位、无需占位-更新两步。
         """
         label = RichText("Rhine ", style="bold #CCFF99")
-        return Static(RichGroup(label, RichMarkdown(content)))
+        widget = SelectableStatic("")
+        # ⚠ 走 `set_rich` 而不是把 RichGroup 直接塞进构造函数：后者会让这一行
+        # 变成 `RichVisual`，回放出来的历史**选不中也复制不走**（详见
+        # `content_from_rich`）。与实时路径 `update_ai_widget` 同一个理由。
+        widget.set_rich(RichGroup(label, RichMarkdown(content)))
+        return widget
 
     @staticmethod
     def _build_tool_record_widget(
@@ -1177,7 +2131,9 @@ class HistoryView(ScrollableContainer):
         # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
         header = f"[{ToolCallWidget._COLOR_OK}]● {label}({inner})[/]"
         branch = RichText(f"{BRANCH_PREFIX}{result_summary}", style=ToolCallWidget._COLOR_BRANCH)
-        return Static(RichGroup(RichText.from_markup(header), branch))
+        widget = SelectableStatic("")
+        widget.set_rich(RichGroup(RichText.from_markup(header), branch))
+        return widget
 
     def render_history(self, messages) -> None:
         """
@@ -1364,6 +2320,42 @@ class ActivityView(Vertical):
         self.display = True
 
 
+class OverlayPanel:
+    """
+    浮层面板的共用行为：**改变可见性时告诉外面一声**。
+
+    ## 为什么需要它
+
+    四个交互面板改成浮层之后（`layer: panels` + `dock: bottom`），它们不再
+    挤压历史区——这解决了抖动，但带来一个新问题：**它们会盖住历史区最后几行**，
+    而那几行往往正是用户要看的（比如「我在批准哪一次写入」的那条工具行）。
+
+    补偿办法是给历史区加一个等于面板高度的**底部内边距**，让内容上移。
+    但那要求「面板一显示/隐藏就有人来同步」，而 Textual 的 `Show` / `Hide`
+    事件**在 app 层收不到**（实测：`on_show` / `on_hide` 一次都不触发）。
+
+    因此改由面板自己在改可见性时 `post_message`。
+
+    ⚠ **四个面板必须都走 `set_visible`，不能再直接写 `self.display = ...`**。
+    漏一处不报错，只是那个面板弹出时把历史区末尾几行盖住了——而用户看到的是
+    「内容莫名其妙少了几行」，不会想到是面板压上去了。
+    """
+
+    class VisibilityChanged(TextualMessage):
+        """面板显示或隐藏了。app 据此重算历史区要让出多少底部空间。"""
+
+    def set_visible(self, visible: bool) -> None:
+        """
+        切换可见性并广播一次变化。
+
+        :param visible: 是否显示
+
+        副作用：改 `display`；向上发 `VisibilityChanged` 消息。
+        """
+        self.display = visible
+        self.post_message(self.VisibilityChanged())
+
+
 class CommandHighlighter(Highlighter):
     """
     输入框命令字段高亮器（c10 T36，spec F24）。
@@ -1401,7 +2393,7 @@ class CommandHighlighter(Highlighter):
             text.stylize(self.COMMAND_STYLE, 0, end)
 
 
-class CommandPanel(OptionList):
+class CommandPanel(OverlayPanel, OptionList):
     """
     斜杠命令提示面板（c10 起从注册表动态取候选，不再维护静态 COMMANDS 列表）。
 
@@ -1440,19 +2432,19 @@ class CommandPanel(OptionList):
         items = self._registry.complete(prefix)
         self.clear_options()
         if not items:
-            self.display = False
+            self.set_visible(False)
             return
         for item in items:
             self.add_option(
                 Option(f"{item.value}  [dim]{escape(item.description)}[/dim]", id=item.value)
             )
-        self.display = True
+        self.set_visible(True)
         # 首个候选默认高亮：Enter 即执行（与确认面板的顺手体验一致）
         self.highlighted = 0
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
 
 class InputBar(Input):
@@ -1657,6 +2649,158 @@ def compose_status_text(
     return text + " "
 
 
+class StatusLine(Static):
+    """
+    本回合的**活体状态行**（tui-activity-fold 扩展 C 组，F14–F19）。
+
+    位于各交互面板**下方**、输入框**上方**，形如：
+
+        ◈ 处理中… (12s · ↑ 2.1k · esc 中断)
+
+    ## 它与底部另外两个区的分工
+
+    | 区 | 装什么 | 生命周期 |
+    | --- | --- | --- |
+    | `#status-row` 右区（`StatusBar`） | **配置态**：provider / 模型 / 权限档 | 常驻 |
+    | `#status-row` 左区（`StatusHint`） | 瞬时提示（「再按一次 Ctrl+C 退出」） | 两秒 |
+    | **本组件** | **本回合活体态**：还在跑、跑了多久、烧了多少 | 一次运行 |
+
+    ⚠ **它不进历史区。** 「跑了 12 秒」这条信息几秒后就过期，
+    写进历史等于往对话里灌过期数据。运行一结束就整个隐藏、不占布局。
+
+    ## 为什么它是全界面唯一的动画定时器
+
+    改造前每个工具行各自持一个每秒刷新的定时器，并发执行五个只读工具时
+    屏幕上就有五个数字各自在跳——它们表达的是同一件事（「还在跑」），
+    却占了五份注意力。现在统一由本组件承担。
+    """
+
+    # ⚠ 字段名避开了 Textual 内部名。本轮已经撞过两次（`_render` 与 `_closed`），
+    # 两次都**不报错**、只是界面上东西凭空少了。`_running` 同样是
+    # `MessagePump` 的内部字段，**不要拿它存「是否在运行」**。
+    def __init__(self) -> None:
+        super().__init__("", markup=True)
+        self._start_time = 0.0
+        self._tokens = 0
+        self._frame_index = 0
+        self._phase = "处理中…"
+        self._interruptible = True
+        self._spin_timer = None
+        # 「这一轮在跑吗」。⚠ **不能叫 `_running`**——那是 Textual `MessagePump`
+        # 的内部字段（本轮预检时抓到，见 `ToolBatchWidget` 里那段关于撞名的注释）。
+        self._active = False
+
+    def start(self) -> None:
+        """
+        开始一次运行：清零计数、启动帧定时器。
+
+        **幂等**——重复调用只是重新起算（`_set_streaming(True)` 在异常路径上
+        可能被调两次）。
+
+        ⚠ **不改 `display`**：本组件固定占一行、永不隐藏。空闲时画空串。
+        理由见 `app.py` 里 `StatusLine` 那段 CSS 的注释——按需出现会让
+        `HistoryView` 每轮重排两次，用户看到的是历史区在抖。
+
+        副作用：起一个主线程定时器、重绘自身。
+        """
+        self._start_time = monotonic()
+        self._tokens = 0
+        self._frame_index = 0
+        self._phase = "处理中…"
+        self._interruptible = True
+        self._active = True
+        if self._spin_timer is None:
+            self._spin_timer = self.set_interval(SPINNER_INTERVAL, self._tick)
+        self._repaint()
+
+    def stop(self) -> None:
+        """
+        运行结束：停定时器、把这一行**画空**。**幂等**。
+
+        ⚠ 同样不改 `display`（见 `start`）。空闲时留下的是一行空白，
+        而不是一行消失——后者才是抖动的来源。
+        """
+        if self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+        self._active = False
+        self.update("")
+
+    def add_tokens(self, count: int) -> None:
+        """
+        累加本回合的 token 用量。
+
+        ⚠ **它是跳变式更新，不是持续滚动**（F17）：Provider 协议只在**每轮
+        流末尾**产出一次用量。这与耗时那一段的节奏不同，是**已知且如实记录**
+        的行为，不是缺陷。
+
+        :param count: 本轮的 token 数；非正数忽略
+        """
+        if count and count > 0:
+            self._tokens += int(count)
+            self._repaint()
+
+    def set_phase(self, phase: str, interruptible: bool = True) -> None:
+        """
+        切换阶段词与中断提示的可见性。
+
+        :param phase: 阶段文案（如「处理中…」「等待确认」）
+        :param interruptible: 假 → **不显示中断提示**（F18）。确认面板弹出期间
+            用它：面板有自己的取消方式，两套提示同屏会误导
+
+        ⚠ **不重置 `_start_time`。** F18 要求面板等待期间耗时继续累计——
+        那段时间确实在这次回合内，用户等了多久就是等了多久。
+        """
+        self._phase = phase or "处理中…"
+        self._interruptible = interruptible
+        self._repaint()
+
+    def _tick(self) -> None:
+        """定时器回调：推进一帧并重绘（主线程内，不涉及任何跨线程调度）。"""
+        self._frame_index = (self._frame_index + 1) % len(SPINNER_FRAMES)
+        self._repaint()
+
+    def _cost_segments(self) -> "list[str]":
+        """
+        括号里那几段：耗时 / token / 中断提示。**渲染与纯文本产出共用这一处**
+        ——各拼一遍的话，记录里的状态行与用户看到的会悄悄不一致。
+
+        无数据的段**整段隐藏**（与状态栏各段的既有做法一致）：
+        没消耗 token 时不写 `↑ 0 tokens`，不可中断时不写 `esc 中断`。
+        """
+        segments = [f"{int(monotonic() - self._start_time)}s"]
+        if self._tokens:
+            segments.append(f"↑{format_tokens(self._tokens)}")
+        if self._interruptible:
+            segments.append("esc 中断")
+        return segments
+
+    def _current_frame(self) -> str:
+        """当前这一帧的旋转标记。"""
+        return SPINNER_FRAMES[self._frame_index % len(SPINNER_FRAMES)]
+
+    def compose_text(self) -> str:
+        """产出状态行的**纯文本**（不含颜色标记），供测试与埋点使用。"""
+        return f"{self._current_frame()} {self._phase} ({SEGMENT_SEP.join(self._cost_segments())})"
+
+    def _repaint(self) -> None:
+        """
+        重绘。旋转标记取主题青（与历史区/输入框边框同色）——
+        同色是刻意的：它表达「状态行属于界面框架，不属于对话内容」。
+
+        ⚠ 方法名不叫 `_render`：那是 Textual 用来产出 Visual 的内部方法，
+        覆盖它会让合成器抛 `'NoneType' has no attribute 'render_strips'`
+        （本轮真实踩过，见 `ToolBatchWidget` 的注释）。
+        """
+        if not self._active:
+            return
+        body = SEGMENT_SEP.join(self._cost_segments())
+        self.update(
+            f"[{THEME_COLOR}]{self._current_frame()}[/] {escape(self._phase)}"
+            f"[{SECONDARY_COLOR}] ({escape(body)})[/]"
+        )
+
+
 class StatusHint(Static):
     """
     状态栏那一行的**左区**：贴着左边缘的瞬时提示位（tui-display 扩展 F31）。
@@ -1735,7 +2879,7 @@ class StatusBar(Static):
         )
 
 
-class NumberedPanel(OptionList):
+class NumberedPanel(OverlayPanel, OptionList):
     """
     三个可选面板（确认 / 澄清 / 会话）的共用底座（tui-display 扩展 E 组）。
 
@@ -1881,10 +3025,22 @@ class ConfirmPanel(NumberedPanel):
 
         说明用暗色跟在主文本后面——它是次级信息，与主文本同亮度会让每一行
         都在争注意力，而用户真正要读的只有那几个动词。
+
+        ⚠ **主文本按显示宽度补齐，让说明列对齐**（真机反馈）。
+        四个选项的主文本宽度不一（「拒绝」4 格、「本会话放行」10 格），
+        直接拼两个空格会让说明参差不齐，一眼扫过去像四段互不相干的话。
+
+        补齐必须用 `cell_len` 而不是 `len`：中文一个字占**两格**，
+        按字符数补出来的「对齐」在屏幕上照样是歪的。
         """
         first = None
+        width = max((cell_len(label) for _id, label, _d in items), default=0)
         for option_id, label, detail in items:
-            markup = f"{label}  [dim]{detail}[/dim]" if detail else label
+            if detail:
+                pad = " " * (width - cell_len(label) + 2)
+                markup = f"{label}{pad}[dim]{detail}[/dim]"
+            else:
+                markup = label
             index = self._add_choice(option_id, markup)
             if first is None:
                 first = index
@@ -1971,8 +3127,27 @@ class ConfirmPanel(NumberedPanel):
             # 记过这个坑：地址被截断意味着攻击者只要把恶意部分放在第 31 个字符
             # 之后，这一层就形同虚设）。
             inner = summarize_args(tool_call.arguments, max_len=200)
-        # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
-        reason = f"  [dim]· {escape(decision.reason)}[/dim]" if decision is not None else ""
+        # 判定原因：**只在它有分辨力的时候才显示**（真机反馈后收窄，不是一刀砍掉）。
+        #
+        # 原本无条件拼在表头后面。问题是绝大多数确认走的是**第④层兜底**，
+        # 那句话恒为「默认模式：无规则命中」——每次都一样、对判断放不放行
+        # 没有任何帮助，纯粹占掉表头宽度，把真正要读的 `工具名(参数)` 挤到一边。
+        #
+        # ⚠ **但不能因此整段删掉。** 别的层给出的原因是**这一次特有**的，
+        # 而且往往是用户唯一能看到它的地方：
+        #   - `hook` → 「Hook 规则「x」（来源：y）要求这次调用由你确认。<自定义原因>」
+        #   - `rule` / `sandbox` / `network` → 具体命中了哪条、越了哪个界
+        # 一刀砍掉的后果实测过：`test_e2e_hooks` 场景 2 当场红——**用户再也
+        # 看不出这次面板是哪条 Hook 规则要求弹的**。
+        #
+        # 因此判据是「原因来自哪一层」，不是「有没有原因」。
+        layer = getattr(decision, "layer", None) if decision is not None else None
+        layer_value = str(getattr(layer, "value", layer) or "")
+        reason = (
+            f"  [dim]· {escape(decision.reason)}[/dim]"
+            if decision is not None and decision.reason and layer_value != "mode"
+            else ""
+        )
         self._reset_choices()
         # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航。
         # `⚠` 去掉（F28）——「确认执行」四个字 + 橘色分隔线已经说清了它的性质。
@@ -1999,10 +3174,12 @@ class ConfirmPanel(NumberedPanel):
                 ("yes", "本次放行", "仅执行本次"),
                 ("yes_session", "本会话放行", "本会话内相同调用不再询问"),
                 ("yes_permanent", "永久放行", "写入本地配置，重启仍生效"),
-                ("no", "拒绝", "让模型据此调整                    Esc"),
+                # ⚠ `Esc` 后面**不再手工塞空格**：说明列已由 `_add_choices` 按
+                # 显示宽度对齐，手工空格只会把这一行又推歪。
+                ("no", "拒绝", "让模型据此调整（Esc）"),
             ]
         )
-        self.display = True
+        self.set_visible(True)
         # 默认高亮「本次放行」，回车即执行（与 / 命令面板一致的顺手体验）
         self.highlighted = self._first_choice
 
@@ -2022,12 +3199,12 @@ class ConfirmPanel(NumberedPanel):
         self._reset_choices()
         self._add_static(f"[#FFA500]{escape(title)}[/#FFA500]")
         self._add_choices([("yes", yes_label, ""), ("no", no_label, "Esc")])
-        self.display = True
+        self.set_visible(True)
         self.highlighted = self._first_choice
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为拒绝执行。"""
@@ -2097,14 +3274,14 @@ class ClarifyPanel(NumberedPanel):
                 self._add_static(f"[dim]     {escape(opt.detail)}[/dim]")
 
         self._add_static("[dim]                                              Esc 取消[/dim]")
-        self.display = True
+        self.set_visible(True)
         # 默认高亮第一个可选概述行
         if first_selectable is not None:
             self.highlighted = first_selectable
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 解释为用户取消澄清。"""
@@ -2185,14 +3362,14 @@ class SessionPanel(NumberedPanel):
             option_index = self._add_choice(info.session_id, line)
             if first_selectable is None:
                 first_selectable = option_index
-        self.display = True
+        self.set_visible(True)
         # 默认高亮第一个可选会话（最近的可恢复会话，回车即载入）
         if first_selectable is not None:
             self.highlighted = first_selectable
 
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
-        self.display = False
+        self.set_visible(False)
 
     def action_cancel(self) -> None:
         """Esc 绑定：发出 Cancelled 消息，由 App 关闭面板。"""

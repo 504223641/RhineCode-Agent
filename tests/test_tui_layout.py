@@ -28,6 +28,7 @@ import io
 from types import SimpleNamespace
 import unittest
 
+from rich.cells import cell_len
 from rich.console import Console
 from textual.app import App, ComposeResult
 
@@ -202,20 +203,18 @@ def _text_of(widget) -> str:
     """
     取出工具行当前展示的纯文本。
 
-    终态传给 `Static.update` 的是 `RichGroup`，直接 `str()` 只会得到对象表示，
-    必须逐个取子元素的 `.plain`。与 `test_tui_tool_pending.py` 里那份同口径
-    ——那边验的是「建行/定色」的时序，这边验的是折叠，共用一个辅助函数会让
-    两个文件互相牵制，故各留一份（十行的辅助函数，不值得抽公共模块）。
+    ⚠ **必须走 `plain_text()`，别读 `widget.content`**：终态行的内容是 Rich
+    渲染对象，要在渲染期按实时宽度转成 `Content` 才成立（那是选区功能的前提，
+    见 `content_from_rich`），`content` 里留的是**上一次 markup 的残留**
+    ——读它会拿着「执行中…」去断言「+15 行」，红得莫名其妙。
+
+    与 `test_tui_tool_pending.py` 里那份同口径——那边验的是「建行/定色」的
+    时序，这边验的是折叠，共用一个辅助函数会让两个文件互相牵制，故各留一份。
     """
+    if hasattr(widget, "plain_text"):
+        return widget.plain_text()
     content = widget.content
-    if isinstance(content, str):
-        return content
-    renderables = getattr(content, "renderables", None) or [content]
-    parts = []
-    for item in renderables:
-        plain = getattr(item, "plain", None)
-        parts.append(plain if plain is not None else str(item))
-    return "\n".join(parts)
+    return content if isinstance(content, str) else str(content)
 
 
 class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
@@ -243,7 +242,15 @@ class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"命中第 {BRANCH_LINE_LIMIT - 1} 处", text)
             self.assertNotIn(f"命中第 {BRANCH_LINE_LIMIT} 处", text, "超限的行不该出现")
             self.assertIn(f"+{20 - BRANCH_LINE_LIMIT} 行", text)
-            self.assertIn("Ctrl+O", text, "必须写明怎么展开，否则用户只知道被省了")
+            # ⚠ **tui-activity-fold 验收期起，行内不再写「怎么展开」。**
+            # 那句话说的是一个**全局**快捷键，而一屏上可能有好几个折叠块——
+            # 同一句话重复四五次之后就只剩噪音了，而本轮改造的整个目的恰恰是
+            # 把重复的过程噪音压下去。发现性改由输入框占位符承担，
+            # 护栏见 `ExpandHintDiscoveryTest`。
+            #
+            # **「还剩多少行」这个数字必须留着**：它才是「被省了东西」的迹象。
+            # 改造前只取首行、连迹象都没有，那正是当初加这条用例的原因。
+            self.assertNotIn("Ctrl+O", text, "行内不再重复全局快捷键")
 
     async def test_expanded_shows_everything(self) -> None:
         app = _ToolHarness()
@@ -359,7 +366,11 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             text = _text_of(widget)
-            self.assertIn("完成", text)
+            # tui-activity-fold F7 起**成功态不再写「完成」二字**（绿色已经把状态
+            # 说完了）。断言换成「标签仍在」，本用例量的东西不变——它验的是
+            # 「不足一秒时没有那个括号」，与状态词无关。
+            self.assertIn("Read", text)
+            self.assertNotIn("完成", text)
             self.assertNotIn("(0s)", text)
             self.assertNotIn("0s", text)
 
@@ -377,13 +388,27 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("(3s)", _text_of(widget))
 
-    async def test_running_timer_is_untouched(self) -> None:
+    async def test_pending_phase_is_still_visible(self) -> None:
         """
-        **反证**：执行中的实时计时不受影响。
+        **反证（tui-activity-fold 起改写，不是删除）**：参数生成期必须仍有活体信号。
 
-        那是模型生成参数 / 等确认面板的那段时间里界面上唯一的活体信号，
-        从 0s 开始涨正是它的价值所在。把 F13 的规则误加到那边，用户会重新
-        看到一个几十秒完全静止的窗口——正是 tool_pending 那条护栏当初要解决的问题。
+        ## 这条需求的来历与它现在的承载者
+
+        原判据是「工具行显示 `参数生成中… 0s`，秒数在涨」。理由是：那是模型
+        生成参数（写文件类调用可能吐几十秒）/ 等确认面板的那段时间里，
+        **界面上唯一的活体信号**——没有它，用户看到的是一个完全静止的窗口，
+        无从判断程序是在干活还是卡住了。
+
+        tui-activity-fold F19 把**运行中的秒数**从工具行撤走了，因为并发执行
+        五个只读工具时屏幕上会有五个数字各自在跳。但**需求本身没有变**，
+        只是承载者换成了底部的回合状态行（一处总耗时 + 旋转标记）。
+
+        因此这条护栏改写为两半：
+        1. 工具行仍然明确写出**它处在哪个阶段**（这里）；
+        2. 活体信号（会动的东西）由 `test_tui_status_line.py` 钉住。
+
+        ⚠ **不要把这条删掉**：删了之后「参数生成中」这个阶段词消失也没人发现，
+        而那正是 tool_pending 那条护栏当初要解决的问题。
         """
         app = _ToolHarness()
         async with app.run_test(size=(120, 40)) as pilot:
@@ -395,12 +420,14 @@ class ElapsedSuffixTest(unittest.IsolatedAsyncioTestCase):
 
             text = _text_of(widget)
             self.assertIn("参数生成中", text)
-            self.assertIn("0s", text)
+            # F19/AC20：运行中的秒数已收敛到状态行，工具行上不该再有
+            self.assertNotIn("0s", text)
+            self.assertIsNone(widget._timer, "工具行不得再自持每秒刷新的定时器")
 
 
 class SummarizeResultTest(unittest.TestCase):
     """
-    T14：`_summarize_result` 交出全文，把「省略」整个交给展示层。
+    T14：`_result_summary` 交出全文，把「省略」整个交给展示层。
 
     职责因此分成两层——**这里负责取内容，组件负责决定画多少**。改造前
     两件事挤在一处：取首行、截到 80 字符，于是内容在到达组件之前就没了，
@@ -414,22 +441,22 @@ class SummarizeResultTest(unittest.TestCase):
     def test_tool_provided_summary_still_wins(self) -> None:
         """工具自带的 summary 优先级不变——那是作者亲手写的概括。"""
         self.assertEqual(
-            RhineApp._summarize_result(self._res(output="一大堆", summary="命中 23 处")),
+            RhineApp._result_summary(self._res(output="一大堆", summary="命中 23 处")),
             "命中 23 处",
         )
 
     def test_full_output_is_handed_over_intact(self) -> None:
         text = "\n".join(f"第 {i} 行" for i in range(30))
-        self.assertEqual(RhineApp._summarize_result(self._res(output=text)), text)
+        self.assertEqual(RhineApp._result_summary(self._res(output=text)), text)
 
     def test_long_single_line_is_not_clipped_at_80(self) -> None:
         """改造前这里截到 80 字符，组件那边再想展开也没有内容可展。"""
         line = "x" * 500
-        self.assertEqual(RhineApp._summarize_result(self._res(output=line)), line)
+        self.assertEqual(RhineApp._result_summary(self._res(output=line)), line)
 
     def test_empty_output_wording_depends_on_success(self) -> None:
-        self.assertEqual(RhineApp._summarize_result(self._res(ok=True)), "（无输出）")
-        self.assertEqual(RhineApp._summarize_result(self._res(ok=False)), "（无错误信息）")
+        self.assertEqual(RhineApp._result_summary(self._res(ok=True)), "（无输出）")
+        self.assertEqual(RhineApp._result_summary(self._res(ok=False)), "（无错误信息）")
 
 
 class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
@@ -462,7 +489,9 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"新增第 {DIFF_ROW_LIMIT - 1} 行", text)
         self.assertNotIn(f"新增第 {DIFF_ROW_LIMIT} 行", text)
         self.assertIn(f"+{40 - DIFF_ROW_LIMIT} 行", text)
-        self.assertIn("Ctrl+O", text)
+        # 行内不再写快捷键（tui-activity-fold 验收期修订，见 BranchFoldTest 的说明）；
+        # **剩余行数必须留着**——它才是「被省了东西」的迹象
+        self.assertNotIn("Ctrl+O", text)
 
     def test_expanded_diff_shows_every_row(self) -> None:
         text = self._render(self._big_diff(40), expanded=True)
@@ -487,7 +516,7 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
         view.truncated = True
         text = self._render(view, expanded=False)
         self.assertIn("diff 已截断", text)
-        self.assertIn("Ctrl+O", text)
+        self.assertNotIn("Ctrl+O", text)
 
         # 展开之后「生成侧截断」那条仍在——它不是展开能解决的
         expanded = self._render(view, expanded=True)
@@ -497,13 +526,18 @@ class DiffFoldTest(unittest.IsolatedAsyncioTestCase):
 
 class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
     """
-    T39：`Ctrl+O` 是**一个**全局开关，同时管活动区与历史区的工具行。
+    T39：`Ctrl+O` 是**一个**全局键，同时管活动区与历史区。
 
     对齐 Claude Code 的全局 verbose 语义。两个键会让用户记两套，而这两处
     展开的是同一类东西（「刚才具体做了什么」）。
+
+    ⚠ **tui-activity-fold 起它是三档循环**（折叠 → 逐条 → 全文 → 折叠），
+    不再是两态开关。批次归并之后「展开」有了两层含义：把批次摊成逐条、
+    把单条摊成原文。**逐条档的单条结果仍受行数上限约束**——那一档要的是
+    「这一批都调了什么」，不是每条的内容。
     """
 
-    async def test_toggle_broadcasts_to_mounted_tool_rows(self) -> None:
+    async def test_cycle_goes_folded_items_full_folded(self) -> None:
         from tests.test_command_tui import _make_app
 
         app, _ = _make_app()
@@ -513,28 +547,37 @@ class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             widget.finish(True, "\n".join(f"第 {i} 行" for i in range(20)))
             await pilot.pause()
-            self.assertIn("+15 行", _text_of(widget))
+            self.assertIn("+15 行", _text_of(widget), "起点是折叠档")
 
+            # 第一下 → 逐条档：批次摊开了，但**单条结果仍受行数上限**
             await pilot.press("ctrl+o")
             await pilot.pause()
-            self.assertNotIn("+15 行", _text_of(widget), "工具行也该跟着展开")
-            self.assertIn("第 19 行", _text_of(widget))
+            self.assertIn("+15 行", _text_of(widget), "逐条档的单条结果仍要折叠")
 
+            # 第二下 → 全文档：这才看得到原文
             await pilot.press("ctrl+o")
             await pilot.pause()
-            self.assertIn("+15 行", _text_of(widget), "再按一次要收回")
+            self.assertNotIn("+15 行", _text_of(widget))
+            self.assertIn("第 19 行", _text_of(widget), "全文档要看得到最后一行")
+
+            # 第三下 → 回到折叠，循环闭合
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            self.assertIn("+15 行", _text_of(widget), "按满三下必须回到起点")
 
     async def test_rows_finished_after_the_toggle_respect_it(self) -> None:
         """
-        **顺序反证**：先按 `Ctrl+O`、后定色的行，也要按展开态画。
+        **顺序反证**：先切档、后定色的行，也要按当前档位画。
 
-        只广播给「当前挂着的行」而不记下全局状态的话，展开之后新产生的每一行
+        只广播给「当前挂着的行」而不记下全局档位的话，切档之后新产生的每一行
         又会是折叠的——用户会以为开关时灵时不灵。
         """
         from tests.test_command_tui import _make_app
 
         app, _ = _make_app()
         async with app.run_test(size=(120, 40)) as pilot:
+            # 按两下到全文档（一下只到逐条档，那一档看不到原文）
+            await pilot.press("ctrl+o")
             await pilot.press("ctrl+o")
             await pilot.pause()
 
@@ -549,3 +592,375 @@ class GlobalExpandTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpandHintDiscoveryTest(unittest.TestCase):
+    """
+    `Ctrl+O` 的**发现渠道**（tui-activity-fold 验收期修订）。
+
+    行内那句「（Ctrl+O 展开）」被撤掉了——它一屏出现四五次、全在说同一个
+    全局快捷键，而本轮改造的整个目的就是压掉重复的过程噪音。
+
+    ⚠ 撤掉之后，**输入框占位符成了它唯一的发现渠道**。没有这条护栏的话，
+    将来有人顺手改占位符（那一行本来就挤）就会让这个功能彻底隐形，
+    而且不会有任何测试红。
+    """
+
+    def test_placeholder_mentions_ctrl_o(self) -> None:
+        import inspect
+
+        source = inspect.getsource(RhineApp.compose)
+        self.assertIn("Ctrl+O", source, "输入框占位符必须提到 Ctrl+O")
+
+    def test_placeholder_still_mentions_the_other_keys(self) -> None:
+        """
+        **反证**：不是把别的提示挤掉换来的位置。
+
+        占位符那一行本来就挤，加东西时最容易发生的事就是挤掉别的——
+        而 `Esc` 与 `Ctrl+C` 那两条各自都有历史（前者是运行中唯一的逃生口，
+        后者是 tui-display 改键位时专门加的）。
+        """
+        import inspect
+
+        source = inspect.getsource(RhineApp.compose)
+        for key in ("Tab", "Esc", "Ctrl+C"):
+            with self.subTest(key=key):
+                self.assertIn(key, source)
+
+
+class NoJitterTest(unittest.IsolatedAsyncioTestCase):
+    """
+    **面板与状态行都不得挤压历史区**（tui-activity-fold 验收期修订）。
+
+    ## 这条测试在防什么
+
+    用户的原话是「每次出现时历史记录的窗口会抖动」——初版把状态行和四个交互
+    面板都放在常规流里，它们一出现就把 `HistoryView` 的 `1fr` 高度挤小，
+    历史区整块重排。一轮对话里状态行出现/收回各一次，面板还可能弹好几次，
+    于是屏幕一直在跳。
+
+    修法是两条不同的路：状态行**固定占一行、永不隐藏**；四个面板改走
+    **独立图层 + dock 到历史区底部**，浮起来、不占常规流高度。
+
+    ## 判据为什么是这两个数
+
+    「抖动」在代码里没有直接对应物，能量的只有**布局尺寸**。取历史区高度与
+    输入框纵坐标两个数：前者是内容区被压没被压，后者是整条底部有没有位移。
+    两个都不变，屏幕上就不会有任何东西跳。
+    """
+
+    async def _numbers(self, app) -> tuple:
+        """
+        取「历史区外框高度」与「输入框纵坐标」。
+
+        ⚠ **必须用 `outer_size` 而不是 `size`。** 前者是这个组件在屏幕上**占了
+        多大地方**（含内边距），后者只是内容区——而面板浮起来时我们会**故意**
+        给历史区加底部内边距把内容顶上去，那会让 `size` 变小。
+        拿 `size` 当判据的话，这条护栏会把「刻意的内容补偿」误判成「布局抖动」，
+        两件相反的事就分不开了。
+        """
+        view = app.query_one(HistoryView)
+        bar = app.query_one("InputBar")
+        return view.outer_size.height, bar.region.y
+
+    async def test_confirm_panel_does_not_resize_history(self) -> None:
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            before = await self._numbers(app)
+
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            during = await self._numbers(app)
+
+            panel.hide()
+            await pilot.pause()
+            after = await self._numbers(app)
+
+            self.assertEqual(
+                before, during, f"确认面板弹出不得改变布局：{before} → {during}"
+            )
+            self.assertEqual(before, after, "收起后同样不得改变")
+
+    async def test_status_line_does_not_resize_history(self) -> None:
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import StatusLine
+
+        app, _ = _make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            before = await self._numbers(app)
+
+            line = app.query_one(StatusLine)
+            line.start()
+            await pilot.pause()
+            during = await self._numbers(app)
+
+            line.stop()
+            await pilot.pause()
+            after = await self._numbers(app)
+
+            self.assertEqual(
+                before, during, f"状态行出现不得改变布局：{before} → {during}"
+            )
+            self.assertEqual(before, after)
+
+    async def test_history_gets_bottom_padding_while_a_panel_is_up(self) -> None:
+        """
+        面板浮起来之后**不能把历史区最后几行盖住**。
+
+        补偿办法是给历史区加一个等于面板高度的底部内边距，内容随之上移。
+        没有它的话，用户要看的那条工具行（「我在批准哪一次写入」）恰好被压在
+        面板下面——而那正是他此刻最需要看的东西。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            view = app.query_one(HistoryView)
+            self.assertEqual(view.styles.padding.bottom, 0, "空闲时不留白")
+
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()  # 内边距要等布局算出面板高度后的下一帧
+
+            self.assertGreater(
+                view.styles.padding.bottom,
+                0,
+                "面板浮起来时历史区必须让出等高的底部空间",
+            )
+
+            panel.hide()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(view.styles.padding.bottom, 0, "面板收起后必须还回去")
+
+
+class FrameIntegrityTest(unittest.IsolatedAsyncioTestCase):
+    """
+    边框的完整性（验收期修订）。
+
+    两条都是**肉眼看着不对、但代码上说不清哪里错**的问题，用户真机反馈：
+
+    - 「弹出面板只有上下两条线会超出历史记录框的边界，感官上不是很好」
+    - 「把 input bar 的灰色背景范围改下，只让它在框内范围显示灰色背景」
+
+    因此判据取**渲染出来的坐标与颜色**，不是样式声明——声明对了但被别的规则
+    覆盖掉，是这类问题最常见的形态。
+    """
+
+    async def test_panel_stays_inside_the_history_border(self) -> None:
+        """
+        面板浮起来时必须缩在历史区边框**内侧**，三边都不能盖住框线。
+
+        ⚠ 实现期在这里踩过一个坑：缩进原本写在面板自己的 `margin` 上，
+        而 dock 组件的宽度默认是 `1fr`，`1fr` 会让 **`margin-right` 失效**
+        ——实测面板 x 从 0 变 1（左边距生效了）、宽度仍是父容器全宽，
+        于是右边框被顶出屏幕。**左边缩了右边没缩，比不缩更难看。**
+        缩进因此挪到了浮层容器的 `padding` 上。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(70, 22)) as pilot:
+            view = app.query_one(HistoryView)
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertGreater(panel.region.x, view.region.x, "左边要留出框线")
+            self.assertLess(
+                panel.region.x + panel.region.width,
+                view.region.x + view.region.width,
+                "右边要留出框线（dock 的 1fr 会吃掉 margin-right，这条专防那个）",
+            )
+            self.assertLess(
+                panel.region.y + panel.region.height,
+                view.region.y + view.region.height,
+                "底部要留出框线",
+            )
+
+    async def test_no_colour_blocks_only_frame_lines(self) -> None:
+        """
+        **界面只用框线划分区域，不用色块**——输入框与四个面板都不铺底色。
+
+        ## 这条判据翻转过两次，两次都是真机反馈，最后落到「干脆不铺」
+
+        终端的格子不可再分：边框线只占格子的中段，其余部分露出的是**那个格子
+        的背景色**。于是只要底色与屏幕底色不同，「底色边界」与「框线」就永远
+        差半格，差在哪一侧取决于边框那一圈用谁的背景——
+
+        - 边框那圈用底色 ⇒ 色块比框线**往外多半格**（用户：「灰色溢出了框」）；
+        - 边框那圈用屏幕底色 ⇒ 框线与色块之间**露出一圈黑**（用户：「还是有一圈黑边」）。
+
+        **在格子这个粒度上两者不可能同时消除。** 最终决定：把底色整个去掉，
+        矛盾随之不存在，且历史区 / 输入框 / 面板观感统一。
+
+        判据读的是**合成器画出来的每一格背景色**——样式声明对了却被别的规则
+        覆盖，是这类问题最常见的形态。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(70, 22)) as pilot:
+            await pilot.pause()
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+            strips = app.screen._compositor.render_strips()
+            screen_bg = app.screen.styles.background.hex6.lower()
+
+            def dominant_bg(y: int) -> str:
+                """
+                取那一行**占格子最多**的背景色。
+
+                ⚠ 不能用「颜色集合相等」：内容行还有光标、高亮项那几格反色，
+                它们是应该存在的，拿它们去比会永远不等。这里问的是
+                「这一行的**底**是什么颜色」。
+                """
+                counter: dict = {}
+                for seg in strips[y]:
+                    if seg.style and seg.style.bgcolor:
+                        key = seg.style.bgcolor.get_truecolor().hex.lower()
+                        counter[key] = counter.get(key, 0) + seg.cell_length
+                return max(counter, key=counter.get) if counter else ""
+
+            # ⚠ **当前高亮那一行要跳过**：`OptionList` 用整行反色表示「选中的是
+            # 这一条」，那是**功能性**的，不是装饰色块。不跳过的话这条判据会把
+            # 它当成违规，而真正要防的（面板整体铺一层 `$boost`）反而淹在噪音里。
+            # 注意用 `content_region` 而不是 `region`：面板顶部那条 `tall` 分隔线
+            # 占了 region 的第一行，选项从内容区才开始排。
+            highlighted_y = (
+                panel.content_region.y + panel.highlighted
+                if panel.highlighted is not None
+                else None
+            )
+            offenders = []
+            for name, widget in (
+                ("输入框", app.query_one("#input-frame")),
+                ("确认面板", panel),
+            ):
+                for dy in range(widget.region.height):
+                    y = widget.region.y + dy
+                    if y == highlighted_y:
+                        continue
+                    got = dominant_bg(y)
+                    if got and got != screen_bg:
+                        offenders.append((name, dy, got))
+
+            self.assertEqual(
+                offenders,
+                [],
+                f"这些行铺了色块（屏幕底色是 {screen_bg}）：{offenders}",
+            )
+
+    async def test_history_side_borders_survive_a_panel(self) -> None:
+        """
+        **面板弹出时，历史区左右两条竖线不能断**（真机反馈）。
+
+        用户原话：「弹出面板左右没有边框，并且对应历史记录左右也没有边框」。
+
+        ## 根因：`background: transparent` 只让颜色透下来，字符照画
+
+        上一版靠浮层容器的 `padding: 0 1` 把面板缩进到框线内侧，理由写的是
+        「透明背景不会盖掉下面的框线」——**那个理由是错的**。padding 那两列
+        画的是**空格**，于是历史区的 `│` 在面板那几行被逐个擦成空白。
+        现在改成让容器**自己画那两条竖线**（与 `HistoryView` 同色）。
+
+        判据直接数**面板那几行左右两端画出来的字符**。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            view = app.query_one(HistoryView)
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            strips = app.screen._compositor.render_strips()
+            left = view.region.x
+            right = view.region.x + view.region.width - 1
+            broken = []
+            for y in range(panel.region.y, panel.region.y + panel.region.height):
+                # ⚠ **必须按「单元格」而不是「字符」定位**：中文占两格，
+                # 直接对 `"".join(seg.text)` 取下标会一路偏移到行尾，
+                # 判据变成「行太短」这种与本条无关的失败。
+                cells = []
+                for seg in strips[y]:
+                    for char in seg.text:
+                        cells.append(char)
+                        # 宽字符在屏幕上占两格，补一格占位让下标与列号对齐
+                        cells.extend(" " * (cell_len(char) - 1))
+                if len(cells) <= right:
+                    broken.append((y, "行太短", len(cells)))
+                    continue
+                if cells[left] != "│" or cells[right] != "│":
+                    broken.append((y, repr(cells[left]), repr(cells[right])))
+
+            self.assertEqual(broken, [], f"这些行的左右框线断了：{broken}")
+
+
+    async def test_history_bottom_border_survives_a_panel(self) -> None:
+        """
+        **历史区的下边框在三种状态下都必须在**（真机反馈）。
+
+        用户原话：「原本的历史记录下边框的边框没了」。踩了两层：
+
+        1. 浮层容器带一圈 `padding`（把面板缩进到框内），而 padding 在
+           `height: auto` 下**照样算进高度**——空面板的容器仍占 1 行，
+           dock 在底部时正好压住下边框。修法是无面板时整个隐藏容器。
+        2. 面板弹出后**下框又没了**：`padding` 属于组件区域，即便
+           `background: transparent` 也会把那一行盖成空白。
+           修法是底部改用 `margin`（不属于区域，容器整体上移）。
+
+        判据直接读**那一行画出来的字符**：只要框线字符还在，就说明没被盖。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            view = app.query_one(HistoryView)
+            panel = app.query_one(ConfirmPanel)
+            y = view.region.y + view.region.height - 1
+
+            def bottom_line() -> str:
+                strips = app.screen._compositor.render_strips()
+                return "".join(seg.text for seg in strips[y])
+
+            self.assertIn("─", bottom_line(), "空闲时下边框必须在")
+
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("─", bottom_line(), "面板弹出时下边框仍要在")
+
+            panel.hide()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("─", bottom_line(), "面板收起后下边框仍要在")
