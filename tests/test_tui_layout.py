@@ -28,6 +28,7 @@ import io
 from types import SimpleNamespace
 import unittest
 
+from rich.cells import cell_len
 from rich.console import Console
 from textual.app import App, ComposeResult
 
@@ -202,20 +203,18 @@ def _text_of(widget) -> str:
     """
     取出工具行当前展示的纯文本。
 
-    终态传给 `Static.update` 的是 `RichGroup`，直接 `str()` 只会得到对象表示，
-    必须逐个取子元素的 `.plain`。与 `test_tui_tool_pending.py` 里那份同口径
-    ——那边验的是「建行/定色」的时序，这边验的是折叠，共用一个辅助函数会让
-    两个文件互相牵制，故各留一份（十行的辅助函数，不值得抽公共模块）。
+    ⚠ **必须走 `plain_text()`，别读 `widget.content`**：终态行的内容是 Rich
+    渲染对象，要在渲染期按实时宽度转成 `Content` 才成立（那是选区功能的前提，
+    见 `content_from_rich`），`content` 里留的是**上一次 markup 的残留**
+    ——读它会拿着「执行中…」去断言「+15 行」，红得莫名其妙。
+
+    与 `test_tui_tool_pending.py` 里那份同口径——那边验的是「建行/定色」的
+    时序，这边验的是折叠，共用一个辅助函数会让两个文件互相牵制，故各留一份。
     """
+    if hasattr(widget, "plain_text"):
+        return widget.plain_text()
     content = widget.content
-    if isinstance(content, str):
-        return content
-    renderables = getattr(content, "renderables", None) or [content]
-    parts = []
-    for item in renderables:
-        plain = getattr(item, "plain", None)
-        parts.append(plain if plain is not None else str(item))
-    return "\n".join(parts)
+    return content if isinstance(content, str) else str(content)
 
 
 class BranchFoldTest(unittest.IsolatedAsyncioTestCase):
@@ -793,41 +792,134 @@ class FrameIntegrityTest(unittest.IsolatedAsyncioTestCase):
                 "底部要留出框线",
             )
 
-    async def test_input_grey_background_stays_inside_its_border(self) -> None:
+    async def test_no_colour_blocks_only_frame_lines(self) -> None:
         """
-        输入框的灰底只在**框内那一行**，边框那两行不该是灰的。
+        **界面只用框线划分区域，不用色块**——输入框与四个面板都不铺底色。
 
-        `Input` 自带 `background: $surface`，而 background 会填满**整个组件
-        区域、包括边框占的两行**——青色框线因此画在一片灰底上，看起来灰色
-        溢出了框外。Textual 没有「单独给边框设背景」的属性，故把边框挪到
-        外层容器 `#input-frame`：容器透明只画框，输入框只剩那一行灰底。
+        ## 这条判据翻转过两次，两次都是真机反馈，最后落到「干脆不铺」
 
-        判据读的是**合成器画出来的每一格背景色**：边框两行必须与内容行不同色。
+        终端的格子不可再分：边框线只占格子的中段，其余部分露出的是**那个格子
+        的背景色**。于是只要底色与屏幕底色不同，「底色边界」与「框线」就永远
+        差半格，差在哪一侧取决于边框那一圈用谁的背景——
+
+        - 边框那圈用底色 ⇒ 色块比框线**往外多半格**（用户：「灰色溢出了框」）；
+        - 边框那圈用屏幕底色 ⇒ 框线与色块之间**露出一圈黑**（用户：「还是有一圈黑边」）。
+
+        **在格子这个粒度上两者不可能同时消除。** 最终决定：把底色整个去掉，
+        矛盾随之不存在，且历史区 / 输入框 / 面板观感统一。
+
+        判据读的是**合成器画出来的每一格背景色**——样式声明对了却被别的规则
+        覆盖，是这类问题最常见的形态。
         """
         from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
 
         app, _ = _make_app()
         async with app.run_test(size=(70, 22)) as pilot:
             await pilot.pause()
-            frame = app.query_one("#input-frame")
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
             strips = app.screen._compositor.render_strips()
+            screen_bg = app.screen.styles.background.hex6.lower()
 
-            def bg_set(y: int) -> set:
-                colors = set()
+            def dominant_bg(y: int) -> str:
+                """
+                取那一行**占格子最多**的背景色。
+
+                ⚠ 不能用「颜色集合相等」：内容行还有光标、高亮项那几格反色，
+                它们是应该存在的，拿它们去比会永远不等。这里问的是
+                「这一行的**底**是什么颜色」。
+                """
+                counter: dict = {}
                 for seg in strips[y]:
                     if seg.style and seg.style.bgcolor:
-                        colors.add(seg.style.bgcolor.get_truecolor().hex)
-                return colors
+                        key = seg.style.bgcolor.get_truecolor().hex.lower()
+                        counter[key] = counter.get(key, 0) + seg.cell_length
+                return max(counter, key=counter.get) if counter else ""
 
-            top = bg_set(frame.region.y)
-            middle = bg_set(frame.region.y + 1)
-            bottom = bg_set(frame.region.y + frame.region.height - 1)
-
-            self.assertEqual(top, bottom, "上下框线应当同色")
-            self.assertTrue(
-                middle - top,
-                f"内容行必须有框线行没有的底色（灰底）：内容 {middle} / 框线 {top}",
+            # ⚠ **当前高亮那一行要跳过**：`OptionList` 用整行反色表示「选中的是
+            # 这一条」，那是**功能性**的，不是装饰色块。不跳过的话这条判据会把
+            # 它当成违规，而真正要防的（面板整体铺一层 `$boost`）反而淹在噪音里。
+            # 注意用 `content_region` 而不是 `region`：面板顶部那条 `tall` 分隔线
+            # 占了 region 的第一行，选项从内容区才开始排。
+            highlighted_y = (
+                panel.content_region.y + panel.highlighted
+                if panel.highlighted is not None
+                else None
             )
+            offenders = []
+            for name, widget in (
+                ("输入框", app.query_one("#input-frame")),
+                ("确认面板", panel),
+            ):
+                for dy in range(widget.region.height):
+                    y = widget.region.y + dy
+                    if y == highlighted_y:
+                        continue
+                    got = dominant_bg(y)
+                    if got and got != screen_bg:
+                        offenders.append((name, dy, got))
+
+            self.assertEqual(
+                offenders,
+                [],
+                f"这些行铺了色块（屏幕底色是 {screen_bg}）：{offenders}",
+            )
+
+    async def test_history_side_borders_survive_a_panel(self) -> None:
+        """
+        **面板弹出时，历史区左右两条竖线不能断**（真机反馈）。
+
+        用户原话：「弹出面板左右没有边框，并且对应历史记录左右也没有边框」。
+
+        ## 根因：`background: transparent` 只让颜色透下来，字符照画
+
+        上一版靠浮层容器的 `padding: 0 1` 把面板缩进到框线内侧，理由写的是
+        「透明背景不会盖掉下面的框线」——**那个理由是错的**。padding 那两列
+        画的是**空格**，于是历史区的 `│` 在面板那几行被逐个擦成空白。
+        现在改成让容器**自己画那两条竖线**（与 `HistoryView` 同色）。
+
+        判据直接数**面板那几行左右两端画出来的字符**。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            view = app.query_one(HistoryView)
+            panel = app.query_one(ConfirmPanel)
+            panel.show_for(
+                ToolCall(id="c1", name="write_file", arguments={"path": "x.txt"}), None
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            strips = app.screen._compositor.render_strips()
+            left = view.region.x
+            right = view.region.x + view.region.width - 1
+            broken = []
+            for y in range(panel.region.y, panel.region.y + panel.region.height):
+                # ⚠ **必须按「单元格」而不是「字符」定位**：中文占两格，
+                # 直接对 `"".join(seg.text)` 取下标会一路偏移到行尾，
+                # 判据变成「行太短」这种与本条无关的失败。
+                cells = []
+                for seg in strips[y]:
+                    for char in seg.text:
+                        cells.append(char)
+                        # 宽字符在屏幕上占两格，补一格占位让下标与列号对齐
+                        cells.extend(" " * (cell_len(char) - 1))
+                if len(cells) <= right:
+                    broken.append((y, "行太短", len(cells)))
+                    continue
+                if cells[left] != "│" or cells[right] != "│":
+                    broken.append((y, repr(cells[left]), repr(cells[right])))
+
+            self.assertEqual(broken, [], f"这些行的左右框线断了：{broken}")
 
 
     async def test_history_bottom_border_survives_a_panel(self) -> None:

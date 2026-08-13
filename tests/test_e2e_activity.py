@@ -398,13 +398,14 @@ def _history_text(app) -> str:
     view = app.query_one(HistoryView)
     parts = []
     for child in view.query_one("#history-messages").children:
+        # ⚠ 走 `plain_text()` 而不是读 `content`：终态行的内容是 Rich 渲染对象，
+        # 要在渲染期转成 `Content` 才成立（见 `content_from_rich`），
+        # `content` 里留的是上一次 markup 的残留。
+        if hasattr(child, "plain_text"):
+            parts.append(child.plain_text())
+            continue
         content = getattr(child, "content", "")
-        if isinstance(content, str):
-            parts.append(content)
-        else:
-            for item in getattr(content, "renderables", ()) or ():
-                plain = getattr(item, "plain", None)
-                parts.append(plain if plain is not None else str(item))
+        parts.append(content if isinstance(content, str) else str(content))
     return "\n".join(parts)
 
 

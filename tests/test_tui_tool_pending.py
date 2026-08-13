@@ -308,21 +308,19 @@ class _Harness(App):
 
 def _text_of(widget) -> str:
     """
-    取出工具行当前展示的文本，屏蔽 `Static.update` 收到的三种形态差异。
+    取出工具行当前展示的文本，屏蔽两种形态差异。
 
-    进行中态传的是 markup 字符串（含 `[#FFA500]` 这类标签，断言时无妨）；
-    定色态传的是 `RichGroup`——直接 `str()` 只会得到对象表示，必须逐个取子元素的
-    `.plain`。测试关心的是「用户看到了什么字」，所以在这里统一拍平成纯文本。
+    进行中态是 markup 字符串（含 `[#FFA500]` 这类标签，断言时无妨）；
+    定色态是 Rich 渲染对象，要在渲染期按实时宽度转成 `Content` 才成立
+    （那是选区功能的前提，见 `content_from_rich`）。
+
+    ⚠ **别读 `widget.content`**：定色之后那里留的是上一次 markup 的残留，
+    断言会拿着「执行中…」去找「失败」，红得莫名其妙。
     """
+    if hasattr(widget, "plain_text"):
+        return widget.plain_text()
     content = widget.content
-    if isinstance(content, str):
-        return content
-    renderables = getattr(content, "renderables", None) or [content]
-    parts = []
-    for item in renderables:
-        plain = getattr(item, "plain", None)
-        parts.append(plain if plain is not None else str(item))
-    return "\n".join(parts)
+    return content if isinstance(content, str) else str(content)
 
 
 class PendingWidgetTest(unittest.IsolatedAsyncioTestCase):

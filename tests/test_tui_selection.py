@@ -3,24 +3,34 @@
 
 用户原话：「整个聊天窗口其实都无法复制」。
 
-## 根因不是「Textual 不支持选择」
+## 根因不是「Textual 不支持选择」，而是「Rich 渲染对象走的是另一条路」
 
 Textual 8.x 原生支持文本选择，项目也早就接了拖选 + `Ctrl+C` 复制
-（`app._copy_selection_if_any`）。真正的问题是 **`Widget.get_selection` 的默认
-实现只认 `Text` 与 `Content` 两种渲染对象，别的一律返回 None**——
+（`app._copy_selection_if_any`）。问题出在 Textual 内部有**两套渲染对象**：
+自家的 `Content`/`Visual`，与包一层兼容 Rich 生态的 `RichVisual`。
+**选区功能只对前者成立，且是三处一起失效**：
 
-而工具行的终态是 `RichGroup`（标题行 + 结果块／差异块），于是**整行内容在
-选中复制时凭空消失**：实测「全选」拿到的文本里，用户消息、系统提示、状态栏
-都在，唯独工具行一个字都没有。
+1. `RichVisual.render_strips()` 把 `RenderOptions.selection` **原样丢弃**
+   ——拖选时那块区域**一点高亮都不画**；
+2. 字符偏移靠段落样式里的 `meta["offset"]`，那是 `Content` 渲染时才写的，
+   于是 `Screen.get_widget_and_offset_at()` 返回 `None`——**没有偏移就没有
+   「从这个字到那个字」**，只能整块选中；
+3. `Widget.get_selection()` 的默认实现只认 `Text` 与 `Content`，
+   别的**一律返回 None**——复制时整块内容凭空消失。
 
-这是 tui-display 引入 `RichGroup` 时就埋下的，但 tui-activity-fold 让它更要命
-——本轮刚把结果原文做得可以展开，展开看到了却复制不走。
+## 两轮修复，各自解决了什么
 
-## 为什么不改渲染结构
+**第一轮**只补了第 3 条（子类自己实现 `get_selection`，交出纯文本缓存）。
+「全选 + 复制」通了，但用户第二次反馈**「其他的连选择都不行」**——
+前两条没动，屏幕上仍然没有任何反馈，也没法只选其中一段。
 
-把 `RichGroup` 拆成单个 `Text` 做不到：差异块要按**渲染期才知道的宽度**给
-整行补背景，那是 `Text` 表达不了的。因此保留视觉，在 `get_selection` 里补上
-选择支持，纯文本与渲染**同源**（都走 `_DiffBlock._rows`）。
+**第二轮**把渲染对象**换成 `Content`**（`content_from_rich` 在渲染那一刻
+按实时宽度转换），三条一起解决，视觉一模一样。
+
+⚠ 因此本文件的判据分两类，**缺一不可**：
+「能不能复制到内容」（第 3 条）与**「问不问得出字符偏移」**（第 2 条）。
+后者才分辨得出用户实际遇到的那个状态——只补了第 3 条的旧实现下，
+前一类判据**照样全绿**。
 """
 
 import unittest
@@ -427,6 +437,68 @@ class EveryRowKindIsSelectableTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 unreachable, [], f"这些行的内容复制不走：{unreachable}"
+            )
+
+    async def test_every_row_is_drag_addressable(self) -> None:
+        """
+        **每一种行都要能「拖选其中一段」**——这条比上一条更贴近用户的真实动作。
+
+        ## 为什么单有 `get_selection` 不够（用户第二次反馈的那个状态）
+
+        补完 `get_selection` 之后，「全选 + 复制」是通的，但用户报的是
+        「其他的连选择都不行」。查 Textual 源码才看清：Rich 渲染对象经
+        `RichVisual` 走，而它**三处一起失效**——
+
+        1. `RichVisual.render_strips()` 把 `RenderOptions.selection` 原样丢弃，
+           **拖选时一点高亮都不画**；
+        2. 字符偏移靠段落样式里的 `meta["offset"]`，那是 `Content` 才会写的，
+           于是 `get_widget_and_offset_at()` 返回 `None`——**没有偏移就没有
+           「从这个字到那个字」**，只能整块选中；
+        3. `get_selection` 默认对它返回 None（上一轮补掉的那条）。
+
+        补第 3 条只解决了「复制拿不到」，前两条要靠**把渲染对象换成 `Content`**
+        才成立。本用例断言的正是第 2 条：**每一行都问得出字符偏移**。
+        它是前两条的机器可判据理——偏移拿得到，就说明这一行走的是 `Content`
+        通路，高亮与部分选中随之成立。
+
+        ⚠ 判据刻意用「偏移非 None」而不是「复制得到内容」：后者在只补了
+        第 3 条的旧实现下**照样全绿**，分辨不出用户实际遇到的那个状态。
+        """
+        from rhinecode.provider.base import ToolCall
+
+        app = _Harness()
+        async with app.run_test(size=(80, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            view.set_primary_args(PRIMARY)
+
+            view.append_user("用户消息")
+            thinking = view.begin_thinking_turn()
+            view.update_widget(thinking, "[dim italic]✻ 思考的内容[/dim italic]")
+            assistant = view.begin_assistant_turn()
+            view.update_ai_widget(assistant, "AI 正文有一段话")
+            view.append_system("提示级消息")
+            tool = view.add_tool_widget(
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.py"})
+            )
+            await pilot.pause()
+            tool.finish(True, "读取 3 行")
+            await pilot.pause()
+
+            blind = []
+            for child in view.query_one("#history-messages").children:
+                if not child.display or not child.region:
+                    continue
+                # 取该行内容区左上角往右一格：一定落在正文上
+                x = child.content_region.x + 1
+                y = child.content_region.y
+                _widget, offset = app.screen.get_widget_and_offset_at(x, y)
+                if offset is None:
+                    blind.append(type(child).__name__)
+
+            self.assertEqual(
+                blind,
+                [],
+                f"这些行拖选时既不会高亮、也只能整块选中：{blind}",
             )
 
     async def test_thinking_content_survives_streaming(self) -> None:

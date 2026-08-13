@@ -230,6 +230,25 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
   **`_running`**（同类，预检时抓到，未踩）。
   ⚠ `vars(cls)` 查不出来——它们是 `__init__` 里设的**实例属性**，
   必须 `hasattr(Static("x"), name)` 才看得见
+- **历史区的内容一律走 `SelectableStatic`，Rich 渲染对象必须经 `set_rich`
+  （tui-activity-fold 验收期）** → `tui/widgets.py` 的 `content_from_rich` +
+  `SelectableStatic.set_rich` / `set_markup` / `plain_text`。
+  **直接 `widget.update(RichGroup(...))` 不报错**，只是那一块内容
+  **拖选时既不高亮、也只能整块选中**——Textual 内部有两套渲染对象，
+  Rich 那套（`RichVisual`）对选区**三处一起失效**：① `render_strips()` 把
+  `RenderOptions.selection` 原样丢弃（不画高亮）② 字符偏移靠 `Content` 才会写的
+  `meta["offset"]`，没有它 `get_widget_and_offset_at()` 返回 `None`
+  （**没有偏移就没有「从这个字到那个字」**）③ `get_selection()` 默认只认
+  `Text`/`Content`，别的返回 None（复制拿不到）。
+  ⚠ **只补第 ③ 条是个陷阱**：子类实现一个 `get_selection` 之后
+  「全选 + 复制」就通了、测试也全绿，而用户看到的仍是「连选择都不行」。
+  真实反馈来了两轮才定位到前两条。因此护栏必须有一条判「**问不问得出字符偏移**」
+  （`test_tui_selection.py::test_every_row_is_drag_addressable`，含反证）。
+  ⚠ 转换**必须发生在渲染期**（`render` / `get_content_height` 里，那两处才有
+  实时宽度）：Markdown 要按宽度折行、diff 块要按宽度补整行背景，提前转好存起来
+  的话终端一 resize 排版就错。
+  ⚠ 取这类行的文本**一律用 `plain_text()`，别读 `widget.content`**——
+  走 `set_rich` 的行内容不在那里，读到的是上一次 markup 的残留
 - **归并分组表与白名单合一（tui-activity-fold F2）** → `tools/display.py` 的
   `FOLD_GROUPS` 一张表同时回答「哪些工具参与批次归并」与「归到哪组、用什么量词」。
   **刻意不按 `Tool.read_only` 派生**：那个标志的语义是「无副作用、可并发」，

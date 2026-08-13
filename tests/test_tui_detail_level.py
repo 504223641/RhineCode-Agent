@@ -53,16 +53,17 @@ def call(tid: str, name: str, **arguments):
 
 
 def text_of(widget) -> str:
-    """取组件当前展示的纯文本（终态是 RichGroup，要逐个取子元素的 plain）。"""
+    """
+    取组件当前展示的纯文本。
+
+    ⚠ **必须走 `plain_text()`**，别读 `widget.content`：终态行的内容是
+    Rich 渲染对象，要在渲染期按实时宽度转成 `Content` 才成立（那是选区
+    功能的前提，见 `content_from_rich`），`content` 里留的是上一次 markup。
+    """
+    if hasattr(widget, "plain_text"):
+        return widget.plain_text()
     content = widget.content
-    if isinstance(content, str):
-        return content
-    renderables = getattr(content, "renderables", None) or [content]
-    parts = []
-    for item in renderables:
-        plain = getattr(item, "plain", None)
-        parts.append(plain if plain is not None else str(item))
-    return "\n".join(parts)
+    return content if isinstance(content, str) else str(content)
 
 
 async def prepared(app: App) -> HistoryView:

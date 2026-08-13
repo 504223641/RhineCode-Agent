@@ -29,7 +29,9 @@ from rich.style import Style
 from rich.text import Text as RichText
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.content import Content, Span
 from textual.events import Key
+from textual.style import Style as VisualStyle
 from textual.widgets import Static, Input, OptionList
 from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
@@ -176,6 +178,77 @@ def build_replay_items(messages) -> "list[tuple]":
                 items.append(("tool", tc, summary))
         # role="tool" 与未知 role：跳过
     return items
+
+
+def content_from_rich(renderable, width: int) -> Content:
+    """
+    把任意 **Rich 可渲染对象**转成 Textual 的 `Content`，使其**可被选中、
+    可被高亮、可被复制**。
+
+    ## 为什么必须做这一步转换（读 Textual 源码才看得出来的事）
+
+    Textual 有两套渲染对象：自家的 `Content`/`Visual`，与包一层的 `RichVisual`
+    （用来兼容 Rich 生态）。**选区功能只对前者成立**，而且是**三处一起失效**：
+
+    1. `RichVisual.render_strips()` 收到 `RenderOptions.selection` 之后
+       **原样丢弃**——于是拖选时那块区域**一点高亮都不会画**，用户看到的是
+       「这里根本选不中」。
+    2. 光标定位靠段落样式里的 `meta["offset"]`，那是 `Content` 渲染时才写进去的。
+       Rich 段落没有它，于是 `Screen.get_widget_and_offset_at()` 返回的偏移是
+       `None`——**没有偏移就没有「从这个字到那个字」**，该组件只能整块选中。
+    3. `Widget.get_selection()` 的默认实现只认 `Text` 与 `Content`，
+       别的**一律返回 None**，于是复制时整块内容凭空消失。
+
+    第 3 条可以靠子类补一个 `get_selection` 绕过（本项目上一轮就是这么做的），
+    但**前两条绕不过去**：补了也只是「看不见地整块选中」。用户的原话是
+    「其他的连选择都不行」——那不是复制的问题，是**屏幕上没有任何反馈**。
+
+    转换之后三条一起解决，且**视觉一模一样**：本函数走的是 Rich 自己的
+    `console.render()`，拿到的段落就是原本要画到屏幕上的那些，只是把
+    「文本 + 样式」重新装进 `Content` 而已。
+
+    ## 为什么需要 width 参数
+
+    Rich 的排版是**宽度相关**的：Markdown 要按宽度折行、diff 块要按宽度给
+    整行补背景。因此转换必须发生在**知道宽度之后**，调用方一律在
+    `render()` / `get_content_height()` 里调它（那两处才拿得到实时宽度），
+    **不要在构造组件时提前转**——那样终端一 resize 排版就错了。
+
+    :param renderable: 任意 Rich 可渲染对象（`Text` / `Group` / `Markdown` / 自定义）
+    :param width: 渲染宽度（单位是终端单元格），必须 > 0
+    :returns: 等价的 `Content`；样式逐段保留
+
+    副作用：无（只读地跑一遍 Rich 渲染）。
+    """
+    from textual.app import active_app
+
+    console = active_app.get().console
+    options = console.options.update(width=width, height=None, highlight=False)
+    parts: "list[str]" = []
+    spans: "list[Span]" = []
+    pos = 0
+    for seg_text, seg_style, control in console.render(renderable, options):
+        # 控制段（光标移动之类）不产生可见字符，带进来只会污染文本
+        if control or not seg_text:
+            continue
+        parts.append(seg_text)
+        end = pos + len(seg_text)
+        if seg_style is not None:
+            spans.append(Span(pos, end, VisualStyle.from_rich_style(seg_style)))
+        pos = end
+    text = "".join(parts)
+
+    # Rich 习惯在整体渲染的末尾补换行；`Content` 会把它算成真实的一行，
+    # 于是每个组件底下都多出一条空行。裁掉尾部换行的同时要把越界的 span 一并夹回去。
+    trimmed = text.rstrip("\n")
+    if len(trimmed) != len(text):
+        limit = len(trimmed)
+        spans = [
+            Span(span.start, min(span.end, limit), span.style)
+            for span in spans
+            if span.start < limit
+        ]
+    return Content(trimmed, spans)
 
 
 # diff 块配色：删除/新增行用「背景色」高亮整行（不改前景字色，保持默认终端文字色），
@@ -641,7 +714,144 @@ def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tup
     return escape(label), escape(inner)
 
 
-class ToolCallWidget(Static):
+class SelectableStatic(Static):
+    """
+    **能被拖选、能被高亮、能被复制**的 `Static`——即便内容来自 Rich 渲染对象。
+
+    ## 它解决的是「屏幕上根本没反应」，不只是「复制不到」
+
+    Textual 把 Rich 可渲染对象包进 `RichVisual`，而选区功能对它**三处一起失效**
+    （逐条论证见 `content_from_rich` 的说明）：不画高亮、拿不到字符偏移、
+    默认的 `get_selection` 直接返回 None。上一轮只补了第三条，于是出现了用户
+    描述的那个状态——「其他的连选择都不行」：内容其实进了选区，但屏幕上
+    一点反馈都没有，也没法只选其中一段。
+
+    本类的做法是**把 Rich 对象在渲染那一刻转成 `Content`**（`set_rich`），
+    之后一切都走 Textual 的原生通路：高亮它自己会画，偏移它自己会写，
+    `get_selection` 用父类的默认实现就够了。视觉与转换前一模一样。
+
+    ## 两种用法
+
+    - `update(markup)`：内容本来就是 markup 字符串，什么都不用做（原生已支持）。
+    - `set_rich(renderable)`：内容是 Rich 对象（AI 正文的 Markdown、
+      工具行的标题 + 结果块），由本类在 `render()` 里按**实时宽度**转换。
+
+    ⚠ **宽度必须是渲染期的实时值**：Markdown 要按宽度折行、diff 块要按宽度
+    补整行背景。提前转好存起来的话，终端一 resize 排版就错了。
+    """
+
+    def __init__(self, *args, plain: str = "", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # 兼容字段：仍有调用方（回放路径、测试）按纯文本读这一行的内容。
+        # 走 `set_rich` 时它由转换结果回填，不必调用方自己维护。
+        self._plain = plain
+        self._rich = None
+        # (宽度, Content) 记忆化。流式正文每来一块就重画一次，不缓存的话
+        # 每一块都要把整篇 Markdown 重排一遍——宽度没变时直接复用即可。
+        self._rich_cache: "Optional[tuple[int, Content]]" = None
+        # `get_content_height` 先于 `render` 被调用，且它拿得到确切宽度；
+        # 记下来供 `render` 在 `self.size` 尚未定稿时兜底。
+        self._last_width = 0
+
+    def set_plain(self, text: str) -> None:
+        """更新纯文本缓存。**改了显示内容就要跟着调**，否则复制到的是旧内容。"""
+        self._plain = text or ""
+
+    def set_markup(self, markup: str) -> None:
+        """
+        把本行换回**普通 markup 字符串**内容（并清掉 Rich 内容与记忆化）。
+
+        markup 字符串走 Textual 原生的 `Content` 通路，选区功能本来就成立，
+        所以这条路径不需要任何额外处理——但**必须把 `_rich` 清掉**，
+        否则 `render()` 会继续画上一次的 Rich 内容（内容不更新，且不报错）。
+        """
+        self._rich = None
+        self._rich_cache = None
+        self.update(markup)
+        self._plain = RichText.from_markup(markup).plain
+
+    def set_rich(self, renderable, plain: str = "") -> None:
+        """
+        把本行的内容换成一个 Rich 可渲染对象（在渲染期转成 `Content`）。
+
+        :param renderable: 任意 Rich 可渲染对象
+        :param plain: 可选的纯文本；不给则由转换结果回填
+
+        副作用：清掉记忆化并请求重排（内容高度可能变）。
+        """
+        self._rich = renderable
+        self._rich_cache = None
+        if plain:
+            self._plain = plain
+        self.refresh(layout=True)
+
+    def plain_text(self) -> str:
+        """
+        本行**当前显示内容的纯文本**（唯一权威来源）。
+
+        ⚠ **不要改回直接读 `widget.content`**：走 `set_rich` 的行（终态工具行、
+        AI 正文）内容不在那里，读到的是上一次 markup 的残留——测试会拿着
+        「执行中…」去断言「失败」，红得莫名其妙。
+        """
+        if self._rich is not None:
+            width = self.size.width or self._last_width or 80
+            return self._rich_content(width).plain
+        return self._plain
+
+    def _rich_content(self, width: int) -> Content:
+        """按给定宽度取（并缓存）转换结果，同时回填纯文本缓存。"""
+        if self._rich_cache is not None and self._rich_cache[0] == width:
+            return self._rich_cache[1]
+        content = content_from_rich(self._rich, width)
+        self._rich_cache = (width, content)
+        self._plain = content.plain
+        return content
+
+    def render(self):
+        """
+        渲染本行。带 Rich 内容时转成 `Content`，否则沿用父类（markup 字符串）。
+        """
+        if self._rich is None:
+            return super().render()
+        width = self.size.width or self._last_width
+        if not width:
+            # 还没排版过，先给一个不会崩的值；拿到真实宽度后会重画。
+            width = 80
+        return self._rich_content(width)
+
+    def get_content_height(self, container, viewport, width: int) -> int:
+        """
+        算内容高度。**这里是全流程中第一个知道确切宽度的地方**，顺手记下来
+        供 `render()` 兜底——否则首次渲染可能按 80 列排版、与实际宽度不符。
+        """
+        if self._rich is not None and width:
+            self._last_width = width
+            return self._rich_content(width).get_height(self.styles, width)
+        return super().get_content_height(container, viewport, width)
+
+    def get_selection(self, selection):
+        """
+        交出被选中的那段文本。
+
+        ⚠ **不可见时必须返回 None**：折叠起来的行**照样会被全选问到**，
+        不挡的话用户拿到的文本里会混进屏幕上根本没有的内容
+        （所见非所得，与「看得见却复制不走」是同一类毛病的两面）。
+
+        可见时交给父类：本类的 `render()` 保证产出的是 `Content`，
+        父类的默认实现对它是完全正确的（还顺带支持了「只选中一部分」）。
+        """
+        if not self.display:
+            return None
+        result = super().get_selection(selection)
+        if result is not None:
+            return result
+        # 父类拿不到（极少数仍用非 Content 渲染对象的路径）时退回纯文本缓存
+        if not self._plain:
+            return None
+        return selection.extract(self._plain), "\n"
+
+
+class ToolCallWidget(SelectableStatic):
     """
     单个工具调用的展示行，自管理计时。
 
@@ -802,8 +1012,7 @@ class ToolCallWidget(Static):
             markup = (
                 f"[{self._COLOR_RUNNING}]● {self._label}({self._args_summary}) 执行中…[/]"
             )
-        self.update(markup)
-        self._plain = RichText.from_markup(markup).plain
+        self.set_markup(markup)
 
     def finish(self, ok: bool, summary: str, diff=None, detail: str = "") -> None:
         """
@@ -997,52 +1206,14 @@ class ToolCallWidget(Static):
             block = render_diff_block(
                 diff, expanded=self._detail_level == DETAIL_FULL
             )
-            self.update(RichGroup(RichText.from_markup(header), block))
-            self._plain = (
-                RichText.from_markup(header).plain + "\n" + block.plain_text()
-            )
+            self.set_rich(RichGroup(RichText.from_markup(header), block))
             return
         # 其它工具（或改文件但无差异）：标题用 "标签(参数摘要)"。
         # 仍处 pending 的行（参数没生成完就被取消/拒绝）不写括号——那会显示成
         # "Write() 失败"，像是「调用无参数」而不是「参数没来得及生成」。
         header = f"[{color}]● {self._title_text()}{result}{self._elapsed_suffix()}[/]"
         branch = self._branch_block()
-        self.update(RichGroup(RichText.from_markup(header), branch))
-        self._plain = RichText.from_markup(header).plain + "\n" + branch.plain
-
-    def get_selection(self, selection):
-        """
-        交出本行被选中的那段文本（供拖选 + `Ctrl+C` 复制）。
-
-        ## ⚠ 为什么必须自己实现
-
-        Textual 的默认实现只认 `Text` 与 `Content` 两种渲染对象，**别的一律
-        返回 None**。而本组件的终态是 `RichGroup`（标题行 + 结果块/差异块），
-        于是**整行内容在选中复制时凭空消失**——实测「全选」拿到的文本里，
-        用户消息、系统提示、状态栏都在，唯独工具行一个字都没有。
-
-        那正是用户反馈的「整个聊天窗口无法复制」：能选中的只是那些恰好用
-        markup 字符串渲染的行，而工具行——本轮刚把结果原文做得可以展开——
-        恰恰属于复制不走的那一类。
-
-        改渲染结构（把 `RichGroup` 拆成单个 `Text`）做不到：差异块要按**渲染期
-        才知道的宽度**给整行补背景，那是 `Text` 表达不了的。因此保留视觉，
-        在这里补上选择支持。
-
-        ⚠ **不可见时必须返回 None。** 折叠档下本行 `display = False`，而
-        Textual 的全选**照样会问到它**——不挡的话，用户全选拿到的文本里会混进
-        一堆**屏幕上根本没有**的行。那与「看得见却复制不走」是同一类毛病的
-        两面：所见非所得。（反证见 `test_folded_rows_are_not_selectable`，
-        实现期正是它抓出了这一条。）
-
-        :param selection: Textual 给出的选区
-        :returns: `(选中的文本, 行尾)`；不可见或无内容时 None
-
-        副作用：无。
-        """
-        if not self.display or not self._plain:
-            return None
-        return selection.extract(self._plain), "\n"
+        self.set_rich(RichGroup(RichText.from_markup(header), branch))
 
     def _title_text(self) -> str:
         """
@@ -1089,45 +1260,6 @@ class ToolCallWidget(Static):
         if self._final_elapsed < 1:
             return ""
         return f" ({self._final_elapsed}s)"
-
-
-class SelectableStatic(Static):
-    """
-    带纯文本缓存的 `Static`——**用非文本渲染对象时仍能被选中复制**。
-
-    ## 为什么需要它
-
-    Textual 的 `Widget.get_selection` 默认实现只认 `Text` 与 `Content` 两种
-    渲染对象，**别的一律返回 None**。而本项目有好几处用 `RichGroup` 组合
-    （AI 正文 = 前缀标签 + Markdown、工具行 = 标题 + 结果块），它们在选中复制时
-    **整块凭空消失**——屏幕上明明看得见。
-
-    改渲染结构做不到：Markdown 的语法高亮、差异块按渲染期宽度补的整行背景，
-    都是 `Text` 表达不了的。因此保留视觉，把纯文本单独存一份。
-
-    ⚠ **纯文本必须与画出来的内容一致。** 存的是「渲染前的源文本」而不是
-    「渲染后的样子」时要想清楚差别：AI 正文存的是原始 Markdown（用户复制走的
-    正是那个，而不是渲染后的排版），工具行存的是拼好的展示文本。
-    """
-
-    def __init__(self, *args, plain: str = "", **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._plain = plain
-
-    def set_plain(self, text: str) -> None:
-        """更新纯文本缓存。**每次改变显示内容都要跟着调**，否则复制到的是旧内容。"""
-        self._plain = text or ""
-
-    def get_selection(self, selection):
-        """
-        交出被选中的那段文本。
-
-        ⚠ 不可见时返回 None：折叠起来的行**照样会被全选问到**，
-        不挡的话用户拿到的文本里会混进屏幕上根本没有的内容。
-        """
-        if not self.display or not self._plain:
-            return None
-        return selection.extract(self._plain), "\n"
 
 
 class ToolBatchWidget(Static):
@@ -1642,8 +1774,9 @@ class HistoryView(ScrollableContainer):
         :returns: 新建的组件引用（流式场景下供后续 update_widget 使用）
 
         ⚠ 用 `SelectableStatic` 而不是裸 `Static`：这些行**后续可能被换成
-        `RichGroup`**（AI 正文就是），而那时 Textual 的默认选择实现会对它
-        返回 None、整块内容复制不走。纯文本同步存一份，见该类的说明。
+        Rich 渲染对象**（AI 正文就是），而 Textual 对那一类**不画选区高亮、
+        不给字符偏移、也复制不走**。`SelectableStatic.set_rich` 会在渲染那一刻
+        把它转成 `Content`，三条一起解决——见该类与 `content_from_rich` 的说明。
         """
         return self._mount_widget(
             SelectableStatic(markup, markup=True, plain=RichText.from_markup(markup).plain)
@@ -1698,21 +1831,26 @@ class HistoryView(ScrollableContainer):
         :param widget: 要更新的 Static 组件（begin_assistant_turn 等方法的返回值）
         :param markup: 新的 Rich markup 内容（完整替换，非追加）
 
-        ⚠ **必须同步纯文本缓存**（`set_plain`），否则这一行**复制到的是建行时
+        ⚠ **必须走 `set_markup`**，它会把内容与纯文本缓存一起换掉。
+        改造前这里只调 `update()`、缓存不动，于是这一行**复制到的是建行时
         那一瞬的内容**。思考块正是这条路径：建行时只有一个 `✻ ` 前缀，
         内容全靠这里流式灌进去——不同步的话用户拖选整段思考，
         复制出来只有那个孤零零的前缀。实测扫出来的就是 `'✻ '`。
         """
-        widget.update(markup)
-        if hasattr(widget, "set_plain"):
-            widget.set_plain(RichText.from_markup(markup).plain)
+        if hasattr(widget, "set_markup"):
+            # `set_markup` 顺带清掉 Rich 内容与纯文本缓存——不清的话，
+            # 一行从 Rich 内容切回 markup 时会**继续画上一次的内容**（不报错）。
+            widget.set_markup(markup)
+        else:  # 兼容仍传裸 Static 的调用方
+            widget.update(markup)
         self._scroll_to_latest()
 
     def update_ai_widget(self, widget: Static, content: str) -> None:
         """
         原地更新 AI 回复组件，将 content 作为 Markdown 渲染并滚动到底部。
 
-        与 update_widget() 不同，此方法使用 Rich Markdown 渲染器，
+        与 update_widget() 不同，此方法使用 Rich Markdown 渲染器（经
+        `set_rich` 在渲染期转成 `Content`，保住选区功能），
         支持代码块语法高亮、标题、粗体、斜体、列表、表格等 Markdown 格式。
         "Rhine" 前缀以青绿色粗体单独渲染，正文内容整体作为 Markdown 文档渲染，
         两者通过 RichGroup 纵向组合后传给 Static.update()。
@@ -1724,13 +1862,15 @@ class HistoryView(ScrollableContainer):
         """
         label = RichText("Rhine ", style="bold #CCFF99")
         body = RichMarkdown(content)
-        # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable
-        widget.update(RichGroup(label, body))
-        # ⚠ 同步纯文本，否则这段正文**选中复制时整块消失**（Textual 的默认
-        # 选择实现对 RichGroup 返回 None）。存的是**原始 Markdown** 而不是
-        # 渲染后的排版——用户复制走的正是源文本。
-        if hasattr(widget, "set_plain"):
-            widget.set_plain(f"Rhine {content}")
+        # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable。
+        # ⚠ 走 `set_rich` 而不是 `update`：后者会让这段正文变成 `RichVisual`，
+        # 而**选区功能对它三处一起失效**——不画高亮、没有字符偏移、
+        # 复制拿不到内容（详见 `content_from_rich`）。`set_rich` 会在渲染那一刻
+        # 按实时宽度把它转成 `Content`，视觉一模一样，选区则全部可用。
+        if hasattr(widget, "set_rich"):
+            widget.set_rich(RichGroup(label, body))
+        else:  # 兼容极少数仍传裸 Static 的调用方（回放路径的老测试）
+            widget.update(RichGroup(label, body))
         self._scroll_to_latest()
 
     def add_tool_widget(self, tool_call, pending: bool = False) -> "ToolCallWidget":
@@ -1911,9 +2051,12 @@ class HistoryView(ScrollableContainer):
         区别只是内容一次到位、无需占位-更新两步。
         """
         label = RichText("Rhine ", style="bold #CCFF99")
-        return SelectableStatic(
-            RichGroup(label, RichMarkdown(content)), plain=f"Rhine {content}"
-        )
+        widget = SelectableStatic("")
+        # ⚠ 走 `set_rich` 而不是把 RichGroup 直接塞进构造函数：后者会让这一行
+        # 变成 `RichVisual`，回放出来的历史**选不中也复制不走**（详见
+        # `content_from_rich`）。与实时路径 `update_ai_widget` 同一个理由。
+        widget.set_rich(RichGroup(label, RichMarkdown(content)))
+        return widget
 
     @staticmethod
     def _build_tool_record_widget(
@@ -1941,10 +2084,9 @@ class HistoryView(ScrollableContainer):
         # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
         header = f"[{ToolCallWidget._COLOR_OK}]● {label}({inner})[/]"
         branch = RichText(f"{BRANCH_PREFIX}{result_summary}", style=ToolCallWidget._COLOR_BRANCH)
-        return SelectableStatic(
-            RichGroup(RichText.from_markup(header), branch),
-            plain=RichText.from_markup(header).plain + chr(10) + branch.plain,
-        )
+        widget = SelectableStatic("")
+        widget.set_rich(RichGroup(RichText.from_markup(header), branch))
+        return widget
 
     def render_history(self, messages) -> None:
         """
@@ -2836,10 +2978,22 @@ class ConfirmPanel(NumberedPanel):
 
         说明用暗色跟在主文本后面——它是次级信息，与主文本同亮度会让每一行
         都在争注意力，而用户真正要读的只有那几个动词。
+
+        ⚠ **主文本按显示宽度补齐，让说明列对齐**（真机反馈）。
+        四个选项的主文本宽度不一（「拒绝」4 格、「本会话放行」10 格），
+        直接拼两个空格会让说明参差不齐，一眼扫过去像四段互不相干的话。
+
+        补齐必须用 `cell_len` 而不是 `len`：中文一个字占**两格**，
+        按字符数补出来的「对齐」在屏幕上照样是歪的。
         """
         first = None
+        width = max((cell_len(label) for _id, label, _d in items), default=0)
         for option_id, label, detail in items:
-            markup = f"{label}  [dim]{detail}[/dim]" if detail else label
+            if detail:
+                pad = " " * (width - cell_len(label) + 2)
+                markup = f"{label}{pad}[dim]{detail}[/dim]"
+            else:
+                markup = label
             index = self._add_choice(option_id, markup)
             if first is None:
                 first = index
@@ -2926,12 +3080,20 @@ class ConfirmPanel(NumberedPanel):
             # 记过这个坑：地址被截断意味着攻击者只要把恶意部分放在第 31 个字符
             # 之后，这一层就形同虚设）。
             inner = summarize_args(tool_call.arguments, max_len=200)
-        # 原因文本：把决策原因拼到表头，让用户明白这次为什么停下来问（如默认模式无规则命中）。
-        reason = f"  [dim]· {escape(decision.reason)}[/dim]" if decision is not None else ""
+        # ⚠ **判定原因刻意不显示**（真机反馈）。
+        #
+        # 这里原本把 `decision.reason` 拼在表头后面，想让用户明白「为什么停下来问」。
+        # 但绝大多数确认走的是第④层兜底，那句话恒为「默认模式：无规则命中」
+        # ——每次都一样、对判断放不放行没有任何帮助，纯粹占掉表头的宽度，
+        # 把真正要读的 `工具名(参数)` 挤到一边。
+        #
+        # 真正有分辨力的那几种原因仍然看得见：URL 类请求下面单独有
+        # 「判定来自：②′网络边界」那几行补充说明（`_url_detail_lines`），
+        # 排查用的完整判定链在 `--trace` 的 `permission_decision` 事件里。
         self._reset_choices()
         # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航。
         # `⚠` 去掉（F28）——「确认执行」四个字 + 橘色分隔线已经说清了它的性质。
-        self._add_static(f"[#FFA500]确认执行  {label}({inner})[/#FFA500]{reason}")
+        self._add_static(f"[#FFA500]确认执行  {label}({inner})[/#FFA500]")
         # URL 类专用补充行（web_fetch 扩展 F9）。
         #
         # **为什么需要它**：上面那行走 summarize_args，它把每个参数值截到 30 字符，
@@ -2954,7 +3116,9 @@ class ConfirmPanel(NumberedPanel):
                 ("yes", "本次放行", "仅执行本次"),
                 ("yes_session", "本会话放行", "本会话内相同调用不再询问"),
                 ("yes_permanent", "永久放行", "写入本地配置，重启仍生效"),
-                ("no", "拒绝", "让模型据此调整                    Esc"),
+                # ⚠ `Esc` 后面**不再手工塞空格**：说明列已由 `_add_choices` 按
+                # 显示宽度对齐，手工空格只会把这一行又推歪。
+                ("no", "拒绝", "让模型据此调整（Esc）"),
             ]
         )
         self.set_visible(True)
