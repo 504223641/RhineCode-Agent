@@ -71,7 +71,7 @@ todo」）——**问题从来不在模型强弱**，在于提示词把默认值
 - 「我想加一个新的权限层，先告诉我该怎么改」（牵动面广的方案）
 - 用户**直接点名**：「用 explorer 去查 X」（主路径，必须 100% 命中）
 
-⚠ **取样方法比实现更重要**——第 4 条 todo（P1b）记着同一条教训：
+⚠ **取样方法比实现更重要**——第 5 条 todo（P1b）记着同一条教训：
 别用自己写的 fixture 验自己的 spec。A 栏的三条来自真实使用记录，
 后续补充也应当从真实对话里取。
 
@@ -110,7 +110,7 @@ python -m tests.e2e.client observe --types subagent_start
 ```
 先跑 git branch --show-current；如果在 main 上，先 git checkout -b delegation-trigger-eval。
 
-读 docs/todo/3-delegation-trigger-eval.md 与 CLAUDE.md 已知后续工程项第 17 条，
+读 docs/todo/4-delegation-trigger-eval.md 与 CLAUDE.md 已知后续工程项第 17 条，
 再读 rhinecode/subagents/render.py 的模块 docstring（那里有与 Claude Code 的
 逐条对照表，以及「为什么方向反转过一次」的完整论证）。
 

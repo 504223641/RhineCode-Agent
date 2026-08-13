@@ -100,7 +100,7 @@ RhineCode 现在没有这个：一个十几步的任务跑起来，用户只能�
 ```
 先看 `git branch --show-current`，如果在 main 上就 `git checkout -b todo-list`。
 
-读 `docs/todo/5-todo-list.md`，然后走 `/spec` 做「主对话的待办清单」。
+读 `docs/todo/6-todo-list.md`，然后走 `/spec` 做「主对话的待办清单」。
 
 ⚠ 三件事必须在 spec 阶段定下来，别留到实现期：
 
