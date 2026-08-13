@@ -161,11 +161,17 @@ class RhineApp(App):
     # - `ctrl+c`：`Input` 自带 `ctrl+c → copy`，不用 priority 的话输入框聚焦时
     #   我们的动作根本不触发——而输入框聚焦正是绝大多数时间的状态。
     #
+    # - `shift+tab`（auto-plan 扩展 F5）：Textual 的 `Screen` 自带一条
+    #   `shift+tab → app.focus_previous`（`priority=False`）。不用 priority 的话
+    #   按下去只会把焦点挪到上一个组件，**模式一动不动**——而这个失败形态很难
+    #   自查：切换命令 `/mode` 照常工作，只有真人按键那条路径是坏的。
+    #
     # `ctrl+o` 不需要 priority：没有任何组件占用它。
     BINDINGS = [
         Binding("ctrl+q", "noop", "", show=False, priority=True),
         Binding("ctrl+c", "request_quit", "", show=False, priority=True),
         Binding("ctrl+o", "toggle_expand", "", show=False),
+        Binding("shift+tab", "cycle_preset", "", show=False, priority=True),
     ]
 
     # 两次 `Ctrl+C` 之间的最长间隔（秒）。超过就当成「第一次」重新计数。
@@ -763,23 +769,25 @@ class RhineApp(App):
             pass
 
     def _refresh_status(self) -> None:
-        """刷新状态栏，反映当前 Provider、模型、思考模式、计划模式、权限模式、上下文用量。"""
+        """刷新状态栏，反映当前 Provider、模型、思考模式、运行预设、上下文用量。"""
         # 上下文用量（c8）：随对话增长实时变化，故每次刷新都重新取值；
         # 返回 (文本, 是否高亮) 或 None（工具不可用的 Provider）。
         ctx = self._manager.context_status_line()
-        # 九个值先组成**一份**参数组，再同时喂给 update_status 与纯函数
+        # 各值先组成**一份**参数组，再同时喂给 update_status 与纯函数
         # compose_status_text（trace T44）。
         #
         # ⚠️ 不要在下面手抄第二份参数清单：`update_status` 与 `compose_status_text`
-        # 是同名九参数，抄一遍会让「新增状态栏字段」这个维护点从两处涨到三处，
+        # 是同名同签名，抄一遍会让「新增状态栏字段」这个维护点从两处涨到三处，
         # 而漏改的后果是记录里的状态栏文本与用户实际看到的不一致——最坏的一种
         # 观测设施失效（它撒谎但不报错）。
         status_args = dict(
             provider=self._config.protocol,
             model=self._config.model,
             thinking_effort=self._manager.thinking_effort,
-            plan_mode=self._manager.plan_mode,
-            permission_mode=self._manager.permission_mode_value,
+            # auto-plan 扩展：取**推导好的预设**，不再分别取 plan_mode 与权限档。
+            # 在这里拼一次「哪个预设」等于把 spec N5 的唯一推导点复制成两处，
+            # 而两处迟早分叉——表现为状态栏说 auto、实际在规划阶段。
+            preset=self._manager.preset_value,
             # MCP 连接状态（c7）：启动后不变，随每次刷新一并带上即可。
             mcp_status=self._manager.mcp_status_line(),
             context_status=ctx[0] if ctx else None,
@@ -943,10 +951,8 @@ class RhineApp(App):
         """按目标模式调用对应领域方法，返回供界面显示的结果文本。"""
         if target == ModeTarget.THINKING:
             return self._manager.cycle_thinking()
-        if target == ModeTarget.PLAN:
-            return self._manager.toggle_plan()
-        if target == ModeTarget.PERMISSION:
-            return self._manager.cycle_permission()
+        if target == ModeTarget.PRESET:
+            return self._manager.cycle_preset()
         # 未知枚举值明确报错（不静默选默认分支）：新增 ModeTarget 时必须同步这里
         raise ValueError(f"未知的模式目标：{target!r}")
 
@@ -1318,6 +1324,24 @@ class RhineApp(App):
         退出行为来自 Textual 自带的 priority 绑定，不覆盖是去不掉的。
         绑到一个空动作上，按下去就真的什么都不发生。
         """
+
+    def action_cycle_preset(self) -> None:
+        """
+        在 `auto` 与 `plan` 两个预设间循环（`Shift+Tab`，auto-plan 扩展 F5/F6）。
+
+        与 `/mode` 命令走**同一个**领域方法 `cycle_preset()`，两条入口的行为
+        逐字相同——各自实现一遍的话，迟早出现「命令切得动、按键切不动」这类
+        只在一条路径上现形的分叉。
+
+        ⚠ **本动作不得碰焦点**（spec F5）。`Shift+Tab` 在 Textual 里原本是
+        「焦点移到上一个组件」，我们抢占了它；抢占之后再自己去动焦点，
+        等于把被抢掉的行为又还回去一半，用户会看到「模式变了、光标也跑了」。
+        与 `Ctrl+O` 的既有做法一致（那条同样只改状态、不动焦点）。
+
+        副作用：改写权限引擎档位与 `plan_mode`；刷新状态栏；向历史区写一条回显。
+        """
+        self.show_message(self.switch_mode(ModeTarget.PRESET))
+        self._refresh_status()
 
     def action_toggle_expand(self) -> None:
         """
