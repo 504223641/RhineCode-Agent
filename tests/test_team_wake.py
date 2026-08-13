@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 import time
 import unittest
@@ -80,6 +81,34 @@ def _start(runtime, team, tasks, name: str):
     )
     thread.start()
     return record, thread
+
+
+def _count_type(path, event_type: str) -> int:
+    """
+    数记录文件里某一类事件的条数，**可以在它还在被写的时候调用**。
+
+    :param path: 记录文件路径（可能还不存在）
+    :returns: 已经完整落盘的该类事件条数
+
+    记录器每写一条就 flush，因此边写边读是安全的；但最后一行仍可能只写了
+    一半，故逐行容错解析——**解不动就当它还没写完**，下一轮再看。
+    直接 `json.loads` 整个文件会偶发炸在这半行上，而那种红与判据毫无关系。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    n = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            if json.loads(line).get("type") == event_type:
+                n += 1
+        except ValueError:
+            continue
+    return n
 
 
 def _wait_until(predicate, timeout: float = 5.0) -> bool:
@@ -369,7 +398,6 @@ class WakeTraceTest(unittest.TestCase):
 
     def _run_with_wake(self):
         """跑一个会待命一次、被唤醒一次的队员，返回落盘的记录。"""
-        import json
         import tempfile
         from pathlib import Path
 
@@ -410,11 +438,33 @@ class WakeTraceTest(unittest.TestCase):
             self.assertIs(entry.state, MemberState.IDLE, "队员应当进入待命")
 
             team.send(MAIN_NAME, "alice", "接着干")
-            thread.join(timeout=10)
+
+            # ⚠ 判据是「续跑那一轮**跑完了**」，不是「线程结束了」。
+            #
+            # 这里原先写的是 `thread.join(timeout=10)`，而队员干完之后会回到
+            # 待命、线程**本来就不会退出**——于是那 10 秒每次都白等满，
+            # 两条用例合计 20 秒，占全套件的 8%。而且它连「跑完没有」都没验：
+            # join 超时不抛，后面的断言直接读文件，跑没跑完全靠那 10 秒赌。
+            #
+            # 换成等记录里出现第二条 `subagent_end`——**与下面的断言同源**，
+            # 因此不存在「等的东西和判的东西不是一回事」的缝。
+            self.assertTrue(
+                _wait_until(lambda: _count_type(path, "subagent_end") >= 2, timeout=10),
+                "续跑轮没有在 10 秒内跑完（记录里始终只有一条 subagent_end）",
+            )
         finally:
             # 无论判据成不成立都要放开句柄，否则清理必然失败
             try:
                 rec.close()
+            except Exception:  # noqa: BLE001
+                pass
+            # 收尾：清空花名册会唤醒待命队员，让它拿到 `None` 后干净退出——
+            # 不做的话这个 daemon 线程会一直挂到进程结束。
+            # 这里**不对退出结果下断言**：那是
+            # `test_clear_releases_a_standby_member` 的职责，本用例只管埋点。
+            try:
+                team.clear()
+                thread.join(timeout=5)
             except Exception:  # noqa: BLE001
                 pass
         return [

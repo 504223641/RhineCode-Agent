@@ -9,6 +9,7 @@
 """
 
 import locale
+import os
 import subprocess
 
 from rhinecode.tools.base import Tool, ToolResult
@@ -17,6 +18,13 @@ from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_c
 # 命令执行的默认超时（秒）。超过则终止子进程并返回超时错误。
 # 定义为模块常量，便于后续统一调整；本章不暴露为 YAML 配置项。
 DEFAULT_TIMEOUT = 30
+
+# 超时后清理子进程树的两个上限（秒）。
+#
+# ⚠ 它们不是「命令的超时」，而是**收尾动作自己的超时**：杀进程树、把管道读干
+# 这两步再慢也不能让调用方无限期等下去——那正是本模块要修的病。
+KILL_TIMEOUT = 5
+DRAIN_TIMEOUT = 5
 
 # 输出截断保护：单路输出（stdout/stderr）行数超过 RUN_HEAD+RUN_TAIL 时，
 # 只保留前 RUN_HEAD 行与后 RUN_TAIL 行，中间以省略提示替代，避免长输出爆 token。
@@ -54,6 +62,151 @@ def decode_subprocess_output(raw: bytes) -> str:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode(locale.getpreferredencoding(False), errors="replace")
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """
+    尽力杀掉 `proc` 及其**全部后代进程**。
+
+    :param proc: 已启动、可能仍在运行的子进程
+    :returns: 无
+
+    ## 为什么不能只 `proc.kill()`
+
+    `shell=True` 起来的是 `cmd.exe`（POSIX 下是 `/bin/sh`），真正干活的是它的
+    **子进程**。只杀壳层的话孙子进程照样活着，而且它**继承了 stdout/stderr
+    管道的写端**——管道要等最后一个写端关闭才会 EOF，于是 `communicate()`
+    仍要一直阻塞到孙子进程自己跑完。
+
+    净效果是「超时参数只改变返回的文案，不改变实际等到什么时候」。实测对照
+    （子命令 `sleep 8`，`timeout=1`）：
+
+    | 形态 | 实际返回耗时 |
+    | --- | --- |
+    | `shell=True` + 捕获输出 | **8.05s** |
+    | `shell=True` + 不捕获输出 | 1.01s |
+    | 不用 shell + 捕获输出 | 1.01s |
+
+    只有「shell + 捕获输出」这一格中招，而那正是本项目两个调用点的形态。
+
+    :raises: 不抛异常。杀不掉也只是退回原来的行为，不该让收尾把调用方掀翻。
+
+    副作用：终止一批操作系统进程；Windows 上会临时起一个 `taskkill` 子进程。
+    """
+    if proc.poll() is not None:
+        return
+
+    try:
+        if os.name == "nt":
+            # Windows 没有进程组语义可直接用，`taskkill /T` 按父子关系整棵杀。
+            # 它自己也带超时——收尾工具卡住同样不能拖住调用方。
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=KILL_TIMEOUT,
+            )
+        else:
+            # POSIX：子进程在 `run_shell_captured` 里被放进了独立 session，
+            # 因此它的 pgid 就是它自己的 pid，整组杀不会波及我们。
+            pgid = os.getpgid(proc.pid)
+            # ⚠ 双保险：万一 start_new_session 没生效，pgid 会等于**我们自己**的，
+            # 那一下 killpg 杀的就是整个应用（连同测试进程）。宁可不杀。
+            if pgid != os.getpgid(0):
+                os.killpg(pgid, 9)
+    except Exception:  # noqa: BLE001 —— 进程已退出 / 权限不足 / taskkill 缺失
+        pass
+
+    # 兜底：整棵树没杀成时，至少把直接子进程收掉。
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def run_shell_captured(
+    command: str,
+    *,
+    cwd,
+    timeout: float,
+    stdin_bytes: bytes = None,
+) -> subprocess.CompletedProcess:
+    """
+    以 shell 方式跑一条命令并捕获输出，**超时会真的把整棵进程树杀掉**。
+
+    :param command: 要执行的命令串（交给 shell 解释）
+    :param cwd: 工作目录
+    :param timeout: 超时秒数
+    :param stdin_bytes: 要写进子进程标准输入的字节；`None` 表示把标准输入指到
+                        空设备（见下面「为什么默认 DEVNULL」）
+    :returns: 与 `subprocess.run` 同形的 `CompletedProcess`，输出是**原始字节**
+              （由调用方用 `decode_subprocess_output` 自己解码）
+    :raises subprocess.TimeoutExpired: 超时。**抛出前进程树已被清理**，
+            因此调用方接住它时命令是真的停了，不是「文案上停了」
+
+    执行步骤：
+    1. `Popen` 起进程（POSIX 上自成 session，为的是超时后能整组杀）；
+    2. `communicate` 等它跑完，带超时；
+    3. 超时 → 杀进程树 → 再给一小段时间把管道读干 → 原样抛 `TimeoutExpired`。
+
+    ## 为什么默认 `stdin=DEVNULL`（`stdin_bytes` 为 `None` 时）
+
+    两条独立理由，都实测踩过：
+
+    1. **不让子进程抢用户的键盘**。不给 stdin 的话子进程会**继承**我们的终端
+       输入句柄，一个等输入的命令（`git commit` 开编辑器、`npm init`……）
+       会和 Textual 的输入读取器抢同一批按键，而且要一直卡到 timeout；
+    2. **不让子进程改掉控制台输入模式**。Windows 上控制台输入模式是**整个
+       控制台共享**的属性，`shell=True` 起的 `cmd.exe` 拿到真控制台句柄后，
+       它对模式的改动会留给我们——一旦 `ENABLE_PROCESSED_INPUT` 被重新打开，
+       此后的 `Ctrl+C` 就从「按键」变成 `CTRL_C_EVENT`/`SIGINT`，连按两次
+       退出的判定被整个跳过。指到 NUL 之后子进程的标准输入不再是控制台。
+       （`tui/app.py` 的 `_install_sigint_guard` 是同一问题的另一半兜底。）
+
+    ## 刻意不传 `text=True`
+
+    由 `decode_subprocess_output` 自己按 UTF-8 优先解码，否则中文输出会在
+    subprocess 的读取线程里解码失败并被静默吞成空串。
+
+    **本函数是公开的，因为 c12 的 Hook 命令动作复用它**（`hooks/actions.py`），
+    与隔壁 `decode_subprocess_output` 同一个理由：两处都要「起 shell、捕获输出、
+    带超时」，各写一份就是典型的「改一处漏一处」——而这次漏改的表现是
+    **超时形同虚设且不报错**。
+
+    副作用：起一个子进程，它可以读写文件、访问网络。
+    """
+    popen_kwargs = {}
+    if os.name != "nt":
+        # POSIX：让子进程自成 session/进程组，超时后才能整组杀掉。
+        # ⚠ 不加这一条而直接 killpg，杀的是**我们自己**所在的进程组——
+        # 那不是「命令没停下来」，那是把整个应用连同测试进程一起干掉。
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **popen_kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(stdin_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        try:
+            # 树已杀干净的话这一步立刻返回；给它一个上限只是为了
+            # 「万一还是关不掉」时不至于把病重新引回来。
+            proc.communicate(timeout=DRAIN_TIMEOUT)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    except BaseException:
+        # 调用方被取消 / 进程被中断时也不留孤儿进程树。
+        _terminate_process_tree(proc)
+        raise
+
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
 def _clip(text: str) -> str:
@@ -146,28 +299,13 @@ class RunCommandTool(Tool):
 
             # 显式固定 cwd，避免调用方未来改变进程目录后命令跑到工作区外。
             #
-            # ⚠ `stdin=DEVNULL` 不可省，两条独立理由：
-            #
-            # 1. **不让子进程抢用户的键盘**。不给 stdin 的话子进程会**继承**我们的
-            #    终端输入句柄，一个等输入的命令（`git commit` 开编辑器、
-            #    `npm init`……）会和 Textual 的输入读取器抢同一批按键，
-            #    而且要一直卡到 timeout；
-            # 2. **不让子进程改掉控制台输入模式**。Windows 上控制台输入模式是
-            #    **整个控制台共享**的属性，`shell=True` 起的 `cmd.exe` 拿到的若是
-            #    真控制台句柄，它对模式的改动会留给我们——一旦
-            #    `ENABLE_PROCESSED_INPUT` 被重新打开，此后的 `Ctrl+C` 就从「按键」
-            #    变成 `CTRL_C_EVENT`/`SIGINT`，连按两次退出的判定被整个跳过。
-            #    指到 NUL 之后子进程的标准输入不再是控制台，也就碰不到那个模式。
-            #    （`tui/app.py` 的 `_install_sigint_guard` 是同一问题的另一半兜底。）
-            #
-            # 刻意不传 text=True：由 decode_subprocess_output 自己按 UTF-8 优先解码，
-            # 否则中文输出会在 subprocess 的读取线程里解码失败并被静默吞成空串。
-            proc = subprocess.run(
+            # `stdin=DEVNULL`、不传 `text=True`、以及**超时后杀整棵进程树**
+            # 三条约束全部收在 `run_shell_captured` 里（各自的理由见该函数
+            # 的 docstring）——尤其最后一条：直接用 `subprocess.run` 的话，
+            # 超时只改变返回的文案，实际仍要等到命令自己跑完。
+            proc = run_shell_captured(
                 command,
-                shell=True,
                 cwd=_require_cwd(cwd),
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
                 timeout=timeout,
             )
 

@@ -156,8 +156,11 @@ class CommandActionTest(ScriptMixin, unittest.TestCase):
 
     def test_launch_failure_is_not_an_exception(self):
         """启动失败必须转成 ok=False，绝不向上抛——否则会污染 Agent 主流程。"""
+        # ⚠ 打桩打在 `run_shell_captured` 上而不是 `subprocess.run`：起子进程这件事
+        # 已经收进那个函数（它负责超时后杀掉整棵进程树，见 test_subprocess_timeout.py）。
+        # 继续打 `subprocess.run` 不会报错，只是**桩子失效**——命令会被真的执行。
         with mock.patch.object(
-            hook_actions.subprocess, "run", side_effect=OSError("boom")
+            hook_actions, "run_shell_captured", side_effect=OSError("boom")
         ):
             outcome = run_action(CommandAction("whatever", 5), _payload())
         self.assertFalse(outcome.ok)
@@ -177,14 +180,14 @@ class BlacklistTest(unittest.TestCase):
         项目级那份可能来自别人的仓库——一条挂在 session_start 上的 `rm -rf ~`
         会在启动那一刻就跑起来。
         """
-        with mock.patch.object(hook_actions.subprocess, "run") as fake_run:
+        with mock.patch.object(hook_actions, "run_shell_captured") as fake_run:
             outcome = run_action(CommandAction("rm -rf ~", 30), _payload())
         fake_run.assert_not_called()
         self.assertFalse(outcome.ok)
         self.assertIn("黑名单", outcome.detail)
 
     def test_force_push_blocked(self):
-        with mock.patch.object(hook_actions.subprocess, "run") as fake_run:
+        with mock.patch.object(hook_actions, "run_shell_captured") as fake_run:
             outcome = run_action(
                 CommandAction("git push --force origin main", 30), _payload()
             )
