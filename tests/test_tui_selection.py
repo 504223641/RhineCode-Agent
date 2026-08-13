@@ -225,3 +225,58 @@ class OtherContentSelectionTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClipboardTest(unittest.TestCase):
+    """
+    系统剪贴板写入（验收期新增）。
+
+    Textual 的 `copy_to_clipboard` 走 **OSC 52 转义序列**（由终端代为写剪贴板），
+    好处是天然支持 SSH，代价是**很多终端出于安全默认关闭它**——而应用这一端
+    只是往标准输出写了几个字节，**成没成功它根本不知道**。用户侧的表现就是
+    「选中了、按了 Ctrl+C、什么也没发生」，且无任何报错。
+
+    因此再直接调一次操作系统的剪贴板，两条路一起走。
+    """
+
+    def test_round_trip(self) -> None:
+        """
+        写进去能原样读回来——含中文、符号与换行。
+
+        ⚠ 实现期在这里踩过一个坑：Win32 那条路要**显式声明 `ctypes` 的返回
+        类型**。默认返回类型是 32 位 `int`，而那几个函数返回的是 64 位句柄，
+        高位被直接截断，于是后续每一步都在操作垃圾地址——表现是「函数都调了、
+        全都返回失败」，而且不抛异常。实测不声明时本条必红。
+        """
+        import ctypes
+        import sys
+
+        from rhinecode.tui.clipboard import copy_text
+
+        if sys.platform != "win32":
+            self.skipTest("读回验证只在 Windows 上做（其余平台要装外部工具）")
+
+        text = "RhineCode 剪贴板 ✓\n第二行 with ascii"
+        self.assertTrue(copy_text(text), "写入应当成功")
+
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        user32.GetClipboardData.argtypes = [ctypes.c_uint]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard(None)
+        try:
+            handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
+            pointer = kernel32.GlobalLock(handle)
+            got = ctypes.wstring_at(pointer)
+            kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+
+        self.assertEqual(got, text)
+
+    def test_empty_text_is_a_no_op(self) -> None:
+        """没什么可复制时直接返回 False，不去动系统剪贴板。"""
+        from rhinecode.tui.clipboard import copy_text
+
+        self.assertFalse(copy_text(""))

@@ -115,11 +115,16 @@ class MountingTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 children_of(view),
-                ["ToolBatchWidget", "ToolCallWidget", "Static"],
+                # ⚠ 系统行的类型是 `SelectableStatic` 而不是裸 `Static`：
+                # 历史区各行都要能被选中复制，而 Textual 的默认选择实现
+                # 对非文本渲染对象返回 None（见 tests/test_tui_selection.py）。
+                ["ToolBatchWidget", "ToolCallWidget", "SelectableStatic"],
                 "批次不得因为后面挂了一条系统行而从 DOM 掉出去",
             )
             # 折叠档下用户实际看到的只有聚合行与那条系统行
-            self.assertEqual(visible_children_of(view), ["ToolBatchWidget", "Static"])
+            self.assertEqual(
+                visible_children_of(view), ["ToolBatchWidget", "SelectableStatic"]
+            )
 
     async def test_widget_renders_before_on_mount(self) -> None:
         """

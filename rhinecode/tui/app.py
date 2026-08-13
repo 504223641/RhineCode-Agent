@@ -77,6 +77,7 @@ from rhinecode.trace import (
     agent_event_payload,
     full_text,
 )
+from rhinecode.tui.clipboard import copy_text
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
@@ -1492,7 +1493,16 @@ class RhineApp(App):
                 selected = self.screen.get_selected_text() or ""
             if not selected:
                 return False
+            # **两条路一起走，只要有一条成了就行。**
+            #
+            # `copy_to_clipboard` 走 OSC 52 转义序列（由终端代为写剪贴板），
+            # 好处是天然支持 SSH，代价是**很多终端出于安全默认关闭它**——
+            # 而应用这一端只是往标准输出写了几个字节，**成没成功它根本不知道**。
+            # 用户侧的表现就是「选中了、按了 Ctrl+C、什么也没发生」，且无任何报错。
+            #
+            # 因此再直接调一次操作系统的剪贴板（见 `tui/clipboard.py`）。
             self.copy_to_clipboard(selected)
+            copy_text(selected)
             return True
         except Exception:  # noqa: BLE001 —— 见上：复制失败不阻断退出路径
             return False

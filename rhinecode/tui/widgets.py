@@ -1081,6 +1081,45 @@ class ToolCallWidget(Static):
         return f" ({self._final_elapsed}s)"
 
 
+class SelectableStatic(Static):
+    """
+    带纯文本缓存的 `Static`——**用非文本渲染对象时仍能被选中复制**。
+
+    ## 为什么需要它
+
+    Textual 的 `Widget.get_selection` 默认实现只认 `Text` 与 `Content` 两种
+    渲染对象，**别的一律返回 None**。而本项目有好几处用 `RichGroup` 组合
+    （AI 正文 = 前缀标签 + Markdown、工具行 = 标题 + 结果块），它们在选中复制时
+    **整块凭空消失**——屏幕上明明看得见。
+
+    改渲染结构做不到：Markdown 的语法高亮、差异块按渲染期宽度补的整行背景，
+    都是 `Text` 表达不了的。因此保留视觉，把纯文本单独存一份。
+
+    ⚠ **纯文本必须与画出来的内容一致。** 存的是「渲染前的源文本」而不是
+    「渲染后的样子」时要想清楚差别：AI 正文存的是原始 Markdown（用户复制走的
+    正是那个，而不是渲染后的排版），工具行存的是拼好的展示文本。
+    """
+
+    def __init__(self, *args, plain: str = "", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._plain = plain
+
+    def set_plain(self, text: str) -> None:
+        """更新纯文本缓存。**每次改变显示内容都要跟着调**，否则复制到的是旧内容。"""
+        self._plain = text or ""
+
+    def get_selection(self, selection):
+        """
+        交出被选中的那段文本。
+
+        ⚠ 不可见时返回 None：折叠起来的行**照样会被全选问到**，
+        不挡的话用户拿到的文本里会混进屏幕上根本没有的内容。
+        """
+        if not self.display or not self._plain:
+            return None
+        return selection.extract(self._plain), "\n"
+
+
 class ToolBatchWidget(Static):
     """
     一批**连续的只读检索调用**在历史区的呈现（tui-activity-fold 扩展 A 组）。
@@ -1583,9 +1622,15 @@ class HistoryView(ScrollableContainer):
         在历史区末尾添加一个新的 Static 消息组件并自动滚动到底部。
 
         :param markup: Rich markup 格式的显示内容
-        :returns: 新建的 Static 组件引用（流式场景下供后续 update_widget 使用）
+        :returns: 新建的组件引用（流式场景下供后续 update_widget 使用）
+
+        ⚠ 用 `SelectableStatic` 而不是裸 `Static`：这些行**后续可能被换成
+        `RichGroup`**（AI 正文就是），而那时 Textual 的默认选择实现会对它
+        返回 None、整块内容复制不走。纯文本同步存一份，见该类的说明。
         """
-        return self._mount_widget(Static(markup, markup=True))
+        return self._mount_widget(
+            SelectableStatic(markup, markup=True, plain=RichText.from_markup(markup).plain)
+        )
 
     @staticmethod
     def _build_user_widget(text: str) -> "UserMessageWidget":
@@ -1657,6 +1702,11 @@ class HistoryView(ScrollableContainer):
         body = RichMarkdown(content)
         # RichGroup 将前缀标签和 Markdown 正文纵向组合为单个 renderable
         widget.update(RichGroup(label, body))
+        # ⚠ 同步纯文本，否则这段正文**选中复制时整块消失**（Textual 的默认
+        # 选择实现对 RichGroup 返回 None）。存的是**原始 Markdown** 而不是
+        # 渲染后的排版——用户复制走的正是源文本。
+        if hasattr(widget, "set_plain"):
+            widget.set_plain(f"Rhine {content}")
         self._scroll_to_latest()
 
     def add_tool_widget(self, tool_call, pending: bool = False) -> "ToolCallWidget":
@@ -1837,7 +1887,9 @@ class HistoryView(ScrollableContainer):
         区别只是内容一次到位、无需占位-更新两步。
         """
         label = RichText("Rhine ", style="bold #CCFF99")
-        return Static(RichGroup(label, RichMarkdown(content)))
+        return SelectableStatic(
+            RichGroup(label, RichMarkdown(content)), plain=f"Rhine {content}"
+        )
 
     @staticmethod
     def _build_tool_record_widget(
@@ -1865,7 +1917,10 @@ class HistoryView(ScrollableContainer):
         # 纯文本渲染天然免转义（与 ToolCallWidget.finish 的 branch 同一做法）。
         header = f"[{ToolCallWidget._COLOR_OK}]● {label}({inner})[/]"
         branch = RichText(f"{BRANCH_PREFIX}{result_summary}", style=ToolCallWidget._COLOR_BRANCH)
-        return Static(RichGroup(RichText.from_markup(header), branch))
+        return SelectableStatic(
+            RichGroup(RichText.from_markup(header), branch),
+            plain=RichText.from_markup(header).plain + chr(10) + branch.plain,
+        )
 
     def render_history(self, messages) -> None:
         """
