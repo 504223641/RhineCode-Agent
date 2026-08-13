@@ -46,8 +46,17 @@ def _prompts(panel) -> list[str]:
     return [str(option.prompt) for option in panel._options]
 
 
-def _decision(reason: str = "默认模式下无规则命中"):
-    return SimpleNamespace(reason=reason, kind="path", host="", layer=None)
+def _decision(reason: str = "默认模式下无规则命中", layer: str = "mode"):
+    """
+    造一个决策结果。
+
+    ⚠ `layer` 缺省是 `"mode"`（第④层兜底）——**那才是真实世界里绝大多数
+    确认面板的来源**，也是「原因恒定、没有分辨力」那条规则适用的场合。
+    要验「别的层的原因仍然显示」，显式传 `layer="hook"` 之类。
+    """
+    return SimpleNamespace(
+        reason=reason, kind="path", host="", layer=SimpleNamespace(value=layer)
+    )
 
 
 CLARIFY_OPTIONS = [
@@ -283,6 +292,31 @@ class NoEmojiTest(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
             self.assertNotIn("无规则命中", _prompts(panel)[0])
+
+    async def test_confirm_header_keeps_reasons_from_other_layers(self) -> None:
+        """
+        **反证**：只压第④层那句恒定的兜底话，**别的层的原因必须留着**。
+
+        Hook / 规则 / 沙箱 / 网络边界给出的原因是**这一次特有**的，而且往往是
+        用户唯一能看到它的地方——比如「Hook 规则「x」（来源：y）要求这次调用
+        由你确认」。一刀砍掉的后果实测过：`test_e2e_hooks` 场景 2 当场红，
+        **用户再也看不出这次面板是哪条 Hook 规则要求弹的**。
+
+        没有这条反证，把上一条实现成「无条件不显示」照样全绿。
+        """
+        app = _Harness()
+        async with app.run_test() as pilot:
+            panel = app.query_one(ConfirmPanel)
+            panel.set_primary_args({"read_file": "path"})
+            panel.show_for(
+                ToolCall(id="c1", name="read_file", arguments={"path": "a.md"}),
+                None,
+                _decision("Hook 规则「审计」要求这次调用由你确认。涉及敏感文件", layer="hook"),
+            )
+            await pilot.pause()
+            header = _prompts(panel)[0]
+            self.assertIn("Hook 规则", header)
+            self.assertIn("敏感文件", header)
 
     async def test_option_hints_line_up(self) -> None:
         """

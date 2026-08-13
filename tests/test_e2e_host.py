@@ -918,7 +918,14 @@ class EncodingTest(HostFixture):
 
         # status 的面板 display 是**含 markup 标记的原始字符串**，中文原样可读
         panel = self.status()["panel"]
-        self.assertIn("[dim]", panel["display"], "原文保留 markup 标记")
+        # ⚠ 判据从 `[dim]` 换成 `[#FFA500]`（tui-activity-fold 验收期）：
+        # 表头原本在工具名后面拼一段 `[dim]· 判定原因[/dim]`，那是当时唯一的
+        # `[dim]`。真机反馈把**第④层那句恒定的兜底话**（「默认模式：无规则命中」）
+        # 撤了，于是这里没有 `[dim]` 了。
+        # **这条判据要的是「原文保留 markup 标记、不做渲染」**，换一个仍然存在
+        # 的标记即可——别顺手删掉它。
+        # （同一处判据在 `test_e2e_control.py` 里还有一份，两处一起改的。）
+        self.assertIn("[#FFA500]", panel["display"], "原文保留 markup 标记")
         self.assertIn("确认执行", panel["display"], "中文原样可读")
 
         self.answer("once")

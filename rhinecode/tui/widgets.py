@@ -714,6 +714,31 @@ def resolve_call_title(tool_call, primary_args: "Optional[dict]" = None) -> "tup
     return escape(label), escape(inner)
 
 
+class DetailLevelClicked(TextualMessage):
+    """
+    某一行被鼠标点开/收起了，携带它切到的**新档位**。
+
+    ## 为什么要往上报（真机反馈）
+
+    `Ctrl+O` 是**全局**档位，由 `RhineApp._detail_level` 保管；鼠标点击是
+    **单行**的，只改那一行。两者各记各的，于是出现这个现象——
+
+    > 「当我先点击展开后，得按两下 `Ctrl+O` 才能切换到第 3 档。」
+
+    因为点击把那一行推到了逐条档，而全局档位仍停在折叠：第一下 `Ctrl+O`
+    只是把全局从折叠推到逐条（那一行**看不出任何变化**），第二下才到全文。
+    用户按下去没反应，会以为是按键丢了。
+
+    修法是让点击**把全局档位也带到同一处**——此后 `Ctrl+O` 接着往下走。
+    ⚠ **只同步数字，不重新广播**：广播会把满屏的批次一起摊开，
+    而「点一下只开这一个」正是鼠标存在的理由。
+    """
+
+    def __init__(self, level: int) -> None:
+        super().__init__()
+        self.level = level
+
+
 class SelectableStatic(Static):
     """
     **能被拖选、能被高亮、能被复制**的 `Static`——即便内容来自 Rich 渲染对象。
@@ -1115,6 +1140,9 @@ class ToolCallWidget(SelectableStatic):
             return
         nxt = DETAIL_ITEMS if self._detail_level == DETAIL_FULL else DETAIL_FULL
         self.set_detail_level(nxt)
+        # 把全局档位带到同一处，否则下一次 `Ctrl+O` 会先「补」上这一步、
+        # 按下去看不出任何变化（见 `DetailLevelClicked` 的说明）。
+        self.post_message(DetailLevelClicked(nxt))
 
     def set_detail_level(self, level: int) -> None:
         """
@@ -1262,7 +1290,7 @@ class ToolCallWidget(SelectableStatic):
         return f" ({self._final_elapsed}s)"
 
 
-class ToolBatchWidget(Static):
+class ToolBatchWidget(SelectableStatic):
     """
     一批**连续的只读检索调用**在历史区的呈现（tui-activity-fold 扩展 A 组）。
 
@@ -1451,6 +1479,7 @@ class ToolBatchWidget(Static):
             return
         nxt = DETAIL_FOLDED if self._detail_level != DETAIL_FOLDED else DETAIL_ITEMS
         self.set_detail_level(nxt)
+        self.post_message(DetailLevelClicked(nxt))
 
     def set_detail_level(self, level: int) -> None:
         """
@@ -1481,13 +1510,30 @@ class ToolBatchWidget(Static):
         单独抽出来是为了让 trace 负载与界面显示同源——各拼一遍的话，
         记录里的聚合语与用户看到的会悄悄不一致。
 
-        ⚠ 未封闭时的兜底文案**必须与 `_repaint` 里那句一致**。这正是「同源」
-        要防的事：渲染那边写了 `or 执行中…`、这边直接返回空串的话，
-        一个刚建好还没进执行态的批次，界面上显示「执行中…」而记录里是空。
+        ⚠ **实现就在 `_compose_head`，两边共用同一处**。这正是「同源」要防的事：
+        渲染那边写「已完成的聚合语 · 进行时」、这边只返回进行时的话，
+        记录里的聚合语与用户看到的会悄悄不一致——而两边单看都是对的。
         """
-        if not self._batch_closed:
-            return self._running_text or DEFAULT_BATCH_VERB
-        return compose_batch_summary(self._entries)
+        return self._compose_head()
+
+    def _compose_head(self) -> str:
+        """
+        聚合行首行的**纯文本**（未转义）。渲染与埋点共用这一处。
+
+        两态：
+        - **未封闭**：`已落定的聚合语 · 进行时`，例如
+          `查找文件 1 次 · 读取 5 个文件 · 读取中…`。
+          ⚠ 前半截不可省（真机反馈：「上面一行不会实时更新状态」），
+          且**只统计已落定的调用**——正在跑的那一次由进行时表达，
+          算进计数会让数字比实际完成量多一个。
+        - **已封闭**：完整聚合语。
+        """
+        if self._batch_closed:
+            return compose_batch_summary(self._entries)
+        done = [(name, ok) for name, ok in self._entries if ok is not None]
+        summary = compose_batch_summary(done)
+        head = self._running_text or DEFAULT_BATCH_VERB
+        return f"{summary}{SEGMENT_SEP}{head}" if summary else head
 
     def _has_failure(self) -> bool:
         """本批次里是否有已落定的失败调用（F6）。"""
@@ -1505,30 +1551,31 @@ class ToolBatchWidget(Static):
         color = ToolCallWidget._COLOR_FAIL if self._has_failure() else ToolCallWidget._COLOR_OK
 
         if not self._batch_closed:
-            # 未封闭：进行时 + 当前调用的参数。**不显示耗时**——那由状态行统一
-            # 承担（F5），两处各显示一份会让用户去比对两个不相等的数字。
-            head = self._running_text or DEFAULT_BATCH_VERB
-            lines = [f"[{ToolCallWidget._COLOR_RUNNING}]● {escape(head)}[/]"]
+            # 未封闭：**已完成的聚合语 + 进行时**，下面一行是当前这次调用的参数。
+            # **不显示耗时**——那由状态行统一承担（F5），两处各显示一份会让用户
+            # 去比对两个不相等的数字。
+            #
+            # ⚠ 首行文案走 `_compose_head`（与埋点共用一处），别在这里另拼一遍。
+            lines = [f"[{ToolCallWidget._COLOR_RUNNING}]● {escape(self._compose_head())}[/]"]
             if self._running_arg:
                 lines.append(
                     f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._running_arg)}[/]"
                 )
-            self.update("\n".join(lines))
+            self.set_markup("\n".join(lines))
             return
 
         # 已封闭：只写聚合语。
         # ⚠ **不再附档位提示**（tui-activity-fold 验收期修订）：那句话说的是一个
         # 全局快捷键，而一屏上可能有好几个批次——重复到第二次就没有信息量了。
         # 发现性改由输入框占位符承担，见 `NEXT_LEVEL_HINT` 的注释。
-        summary = compose_batch_summary(self._entries)
-        lines = [f"[{color}]● {escape(summary)}[/]"]
+        lines = [f"[{color}]● {escape(self._compose_head())}[/]"]
         # F4：只有一次调用时，聚合行下方保留一条从属行放主参数值——
         # 单次时那个信息放得下，不给是纯损失；多次时十个文件名塞不进一行。
         if len(self._entries) == 1 and self._single_arg:
             lines.append(
                 f"[{SECONDARY_COLOR}]{BRANCH_PREFIX}{escape(self._single_arg)}[/]"
             )
-        self.update("\n".join(lines))
+        self.set_markup("\n".join(lines))
 
 
 # `_mount_widget` 的返回类型占位：挂什么组件就原样返回什么组件（见其 docstring）
@@ -3080,20 +3127,31 @@ class ConfirmPanel(NumberedPanel):
             # 记过这个坑：地址被截断意味着攻击者只要把恶意部分放在第 31 个字符
             # 之后，这一层就形同虚设）。
             inner = summarize_args(tool_call.arguments, max_len=200)
-        # ⚠ **判定原因刻意不显示**（真机反馈）。
+        # 判定原因：**只在它有分辨力的时候才显示**（真机反馈后收窄，不是一刀砍掉）。
         #
-        # 这里原本把 `decision.reason` 拼在表头后面，想让用户明白「为什么停下来问」。
-        # 但绝大多数确认走的是第④层兜底，那句话恒为「默认模式：无规则命中」
-        # ——每次都一样、对判断放不放行没有任何帮助，纯粹占掉表头的宽度，
-        # 把真正要读的 `工具名(参数)` 挤到一边。
+        # 原本无条件拼在表头后面。问题是绝大多数确认走的是**第④层兜底**，
+        # 那句话恒为「默认模式：无规则命中」——每次都一样、对判断放不放行
+        # 没有任何帮助，纯粹占掉表头宽度，把真正要读的 `工具名(参数)` 挤到一边。
         #
-        # 真正有分辨力的那几种原因仍然看得见：URL 类请求下面单独有
-        # 「判定来自：②′网络边界」那几行补充说明（`_url_detail_lines`），
-        # 排查用的完整判定链在 `--trace` 的 `permission_decision` 事件里。
+        # ⚠ **但不能因此整段删掉。** 别的层给出的原因是**这一次特有**的，
+        # 而且往往是用户唯一能看到它的地方：
+        #   - `hook` → 「Hook 规则「x」（来源：y）要求这次调用由你确认。<自定义原因>」
+        #   - `rule` / `sandbox` / `network` → 具体命中了哪条、越了哪个界
+        # 一刀砍掉的后果实测过：`test_e2e_hooks` 场景 2 当场红——**用户再也
+        # 看不出这次面板是哪条 Hook 规则要求弹的**。
+        #
+        # 因此判据是「原因来自哪一层」，不是「有没有原因」。
+        layer = getattr(decision, "layer", None) if decision is not None else None
+        layer_value = str(getattr(layer, "value", layer) or "")
+        reason = (
+            f"  [dim]· {escape(decision.reason)}[/dim]"
+            if decision is not None and decision.reason and layer_value != "mode"
+            else ""
+        )
         self._reset_choices()
         # 橘色表头：醒目提示这是有副作用的操作；disabled 使其不可被选中/跳过导航。
         # `⚠` 去掉（F28）——「确认执行」四个字 + 橘色分隔线已经说清了它的性质。
-        self._add_static(f"[#FFA500]确认执行  {label}({inner})[/#FFA500]")
+        self._add_static(f"[#FFA500]确认执行  {label}({inner})[/#FFA500]{reason}")
         # URL 类专用补充行（web_fetch 扩展 F9）。
         #
         # **为什么需要它**：上面那行走 summarize_args，它把每个参数值截到 30 字符，

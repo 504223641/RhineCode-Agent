@@ -362,6 +362,75 @@ class ClickToExpandTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(widget._detail_level, DETAIL_ITEMS, "再点一次回到逐条")
 
+    async def test_click_then_one_key_press_reaches_the_next_level(self) -> None:
+        """
+        **点开一行之后，`Ctrl+O` 只需按一次就到下一档**（真机反馈）。
+
+        `Ctrl+O` 的档位由 `RhineApp._detail_level` 保管，而点击只改被点的那一行。
+        两者各记各的话就出现这个现象——点击把那一行推到了逐条档，而全局仍停在
+        折叠：第一下 `Ctrl+O` 只是把全局从折叠推到逐条（**那一行看不出任何
+        变化**），第二下才到全文。用户原话：
+        「先点击展开后得按两下 ctrl+o 才能切换到 3 档」。
+
+        ⚠ 这条必须用**真实 App**（`_make_app`），不能用只挂历史区的
+        `_Harness`：同步靠的是一条 Textual 消息，接收方在 `RhineApp` 上，
+        换成裸壳应用的话消息**没人收，测试照样绿**。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ToolBatchWidget as _Batch
+
+        app, _ = _make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            view.set_primary_args(PRIMARY)
+            view.set_fold_groups(FOLD)
+            view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            await pilot.pause()
+            batch = view.query_one(_Batch)
+
+            await pilot.click(batch)
+            await pilot.pause()
+            self.assertEqual(batch._detail_level, DETAIL_ITEMS, "点击先摊开这一批")
+
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            self.assertEqual(
+                batch._detail_level,
+                DETAIL_FULL,
+                "点开之后按一次 Ctrl+O 就该到全文档，而不是先补一步逐条",
+            )
+
+    async def test_click_does_not_broadcast_to_other_batches(self) -> None:
+        """
+        **反证**：同步的只是那个数字，**不重新广播**。
+
+        广播会把满屏的批次一起摊开，而「点一下只开这一个」正是鼠标存在的理由。
+        没有这条的话，上一条用「把全局档位广播下去」也能做到，
+        而那是个明显更糟的实现。
+        """
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ToolBatchWidget as _Batch
+
+        app, _ = _make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = app.query_one(HistoryView)
+            view.set_primary_args(PRIMARY)
+            view.set_fold_groups(FOLD)
+            view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            await pilot.pause()
+            view.append_system("断开")
+            view.add_tool_widget(call("c2", "read_file", path="b.py"))
+            await pilot.pause()
+
+            first, second = list(view.query(_Batch))
+            await pilot.click(first)
+            await pilot.pause()
+
+            self.assertEqual(first._detail_level, DETAIL_ITEMS)
+            self.assertEqual(
+                second._detail_level, DETAIL_FOLDED, "没点的那批一动不动"
+            )
+
     async def test_global_key_still_overrides_individual_clicks(self) -> None:
         """
         **`Ctrl+O` 仍是全局的**：点开过的单个批次，全局切档时要跟着走。

@@ -341,6 +341,45 @@ class SummaryTextTest(unittest.IsolatedAsyncioTestCase):
             # AC8：批次块内不出现耗时——那由底部的状态行统一承担
             self.assertNotIn("s", summary_of(batch).replace("搜索中…", ""))
 
+    async def test_running_line_counts_what_is_already_done(self) -> None:
+        """
+        **运行期间那一行要跟着涨**（真机反馈）。
+
+        改造前它整段只写「读取中…」，从第一次调用到第七次一字不变——
+        用户看到的是一行**一直不动的字**，只有下面那个文件名在闪。
+        用户原话：「上面一行不会实时更新状态」。
+
+        ⚠ 判据同时钉住**两个方向**：
+        ① 已落定的调用要计进去（否则这一行仍然是静的）；
+        ② **正在跑的那一次不能计**——它由后半截的进行时表达，
+           算进去会让数字比实际完成量多一个（第一次调用刚开始就显示
+           「读取 1 个文件」，而它一个字节都还没读到）。
+        """
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = await prepared(app)
+            batch = None
+            for i in range(1, 4):
+                tc = call(f"c{i}", "read_file", path=f"f{i}.py")
+                widget = view.add_tool_widget(tc)
+                widget.begin_running(tc)
+                await pilot.pause()
+                batch = view.query_one(ToolBatchWidget)
+                # 第 i 次刚开始跑：已落定的是 i-1 次
+                head = summary_of(batch)
+                if i == 1:
+                    self.assertEqual(head, "读取中…", "第一次刚开始时不该有计数")
+                else:
+                    self.assertIn(f"读取 {i - 1} 个文件", head)
+                    self.assertIn("读取中…", head)
+                widget.finish(True, "读取 30 行")
+                await pilot.pause()
+                self.assertIn(
+                    f"读取 {i} 个文件",
+                    summary_of(batch),
+                    "落定之后计数必须涨",
+                )
+
     async def test_closed_shows_counts_in_occurrence_order(self) -> None:
         """AC5：分组计数，且顺序与实际发生时序一致。"""
         app = _Harness()

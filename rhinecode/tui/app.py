@@ -83,7 +83,7 @@ from rhinecode.tui.widgets import (
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
     ClarifyPanel, SessionPanel, StatusLine, OverlayPanel, compose_status_text,
     # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
-    DETAIL_CYCLE, DETAIL_FOLDED,
+    DETAIL_CYCLE, DETAIL_FOLDED, DetailLevelClicked,
     # ⚠️ **必须用 widgets 的 escape，不能 `from rich.markup import escape`**。
     # 这里唯一的用途是转义**流式累积中的思考文本**，而它是最不该用 rich 那版的地方：
     # 「流式累积」意味着任何一帧都是在**任意位置**被截断的模型自由文本，
@@ -1353,6 +1353,23 @@ class RhineApp(App):
         # 遍历组件**：那样只覆盖「此刻挂着的」，切档之后新产生的又会是折叠的。
         self.query_one(HistoryView).set_detail_level(self._detail_level)
 
+    def on_detail_level_clicked(self, event: "DetailLevelClicked") -> None:
+        """
+        某一行被鼠标点开/收起了：**把全局档位同步到它切到的那一档**。
+
+        不同步的话，点击与 `Ctrl+O` 会各记各的档位——用户点开一行之后再按
+        `Ctrl+O`，第一下只是把全局从折叠推到逐条（那一行看不出任何变化），
+        得按第二下才到全文。用户原话：「先点击展开后得按两下 ctrl+o
+        才能切换到 3 档」。
+
+        ⚠ **只同步数字，不重新广播**（不调 `HistoryView.set_detail_level`）：
+        广播会把满屏的批次一起摊开，而「点一下只开这一个」正是鼠标存在的理由。
+        下一次 `Ctrl+O` 才是广播的时机。
+
+        副作用：改 `self._detail_level`。
+        """
+        self._detail_level = event.level
+
     def on_overlay_panel_visibility_changed(
         self, _event: "OverlayPanel.VisibilityChanged"
     ) -> None:
@@ -2289,17 +2306,41 @@ class RhineApp(App):
         # `source` 记录**这次结算走的是哪条路径**，缺省 human（面板按键路径）。
         # 结算方（`_resolve_interaction`）可以覆写它，见该方法的说明。
         box = {"event": threading.Event(), "result": default, "kind": kind, "source": "human"}
-        self._pending_interaction = box
-        # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
-        self._busy_hint_shown = False
-        # 状态行切到等待语义并**撤下中断提示**（tui-activity-fold F18）：
-        # 面板有自己的取消方式，两套提示同屏会误导用户去按 Esc。
-        # ⚠ 耗时**继续累计**——那段等待确实在这次回合内，用户等了多久就是多久。
-        # 三类交互（确认 / 澄清 / 审批）共用本入口，改这一处即可。
-        self.call_from_thread(
-            self.query_one(StatusLine).set_phase, "等待确认", False
-        )
-        self.call_from_thread(show_fn)
+
+        def _arm() -> None:
+            """
+            **在主线程上一次做完三件事**：登记待决盒 → 改状态行 → 弹面板。
+
+            ## ⚠ 为什么必须是一次，而且必须包含登记（真机 + 全量测试实测）
+
+            改造前 `self._pending_interaction = box` 写在**工作线程**上、
+            `call_from_thread(show_fn)` 之前。于是存在一个真实的窗口：
+            **程序已经认为「正在等你应答」，而面板还没画出来。**
+            那一瞬间用户（或端到端驱动）看到的是「三态是 pending，但屏幕上
+            什么都没有」。
+
+            tui-activity-fold 把这个窗口拉宽了——F18 要在弹面板前先把状态行
+            切到「等待确认」，那是**第二次**跨线程往返。全量测试因此开始偶发红：
+            `wait` 返回 pending 之后立刻取快照，`panel_visible` 是 `False`、
+            `focused` 还是 `InputBar`。单跑必过、全量偶发，正是竞态的典型形态。
+
+            合成一次之后窗口整个消失：登记与显示在同一个主线程回合内完成，
+            外部**不可能**观察到「pending 但没有面板」这个中间态。
+            顺带省掉一次跨线程往返，面板出得更快。
+
+            ⚠ 别把登记挪回工作线程去「省事」——那正是窗口的来源。
+            """
+            self._pending_interaction = box
+            # 新面板弹出：复位提示标志，这一次面板期间可以再提示一次。
+            self._busy_hint_shown = False
+            # 状态行切到等待语义并**撤下中断提示**（tui-activity-fold F18）：
+            # 面板有自己的取消方式，两套提示同屏会误导用户去按 Esc。
+            # ⚠ 耗时**继续累计**——那段等待确实在这次回合内，用户等了多久就是多久。
+            # 三类交互（确认 / 澄清 / 审批）共用本入口，改这一处即可。
+            self.query_one(StatusLine).set_phase("等待确认", False)
+            show_fn()
+
+        self.call_from_thread(_arm)
         # c12 `notification`：面板**已经弹出之后**才分发。
         #
         # 放在 `show_fn` 之后而不是之前，是因为 Hook 动作可能跑上几十秒；
