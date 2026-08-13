@@ -275,6 +275,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 启动接线中 `LoadSkillTool` 必须在算 `known_tools` **之前**注册，且整段 Skill 校验必须夹在 `MCPAddServerTool` 注册之后、`connect_all` 之前（两头都不能挪，理由见 `__main__.py` 注释）
 - 状态栏/历史区文本含字面 `[`（如 `[provider]`）→ 必须转义为 `\[`，否则被 Textual markup 当标签吞掉
 - **任何往 markup 串里嵌纯文本的地方，一律用 `tui/widgets.py` 的 `escape`，绝不要 `from rich.markup import escape`**：rich 那版只转义「看起来像完整标签」的 `[...]`（正则要求闭合的 `]`），因此**被截断的括号会被它整个放过**；而 Textual 的 Content markup 比 Rich 严格，会把落单的 `[` 当标签开头并抛 `MarkupError`——抛出点在 `OptionList.get_content_height` 这类**布局阶段的主线程**调用里，不在业务调用栈上，没有任何 try/except 兜得住，**Textual 直接拆掉整个 app、程序退出**。真实现场：`summarize_args` 先截断后转义，把 `allowed_tools: [read_file, glob_files, …]` 切成 `allowed_tools: [read_file, glo…`，`edit_file` 的 `old_string`+`new_string` 天然成对凑够两个未闭合括号（一个不够，实测 Textual 容忍），确认面板一弹就崩。护栏见 `tests/test_tui_markup_escape.py`（含现场重演与「旧口径确实会崩」的反证）
+- **要起 shell 子进程 → 一律走 `tools/run_command.py` 的 `run_shell_captured`，别直接 `subprocess.run`** → 目前两个调用方：`tools/run_command.py` 自己与 `hooks/actions.py`。⚠ **`subprocess.run(shell=True, capture_output=True, timeout=T)` 这个组合下 `timeout` 是假的**：超时后 Python 只杀 shell 壳层，孙子进程仍握着输出管道的写端，`communicate()` 要一直阻塞到它自己跑完——`timeout=1` 的调用在命令 `sleep 30` 时**真的等 30 秒**，然后返回一句「超时」。实测对照（`sleep 8` + `timeout=1`）：shell+捕获 **8.05s** / shell+不捕获 1.01s / 无 shell+捕获 1.01s，只有本项目在用的那一格中招。危害不止是慢：Hook 挂在 `pre_tool_use` 上时等待发生在**每一次工具调用之前**（与 hooks 那条「加锁临界区只做纯内存读写」是同一隐患的两半），而且调用方已按「超时终止」往下走了，被以为终止的命令其实还在读写文件。**漏改不报错**——所有既有用例断言的都是「返回了超时文案」，那一条改坏了也成立，唯一会变的只有墙上的钟。护栏见 `tests/test_subprocess_timeout.py`（含「朴素写法必须慢」的反证与「进程真的死了」的独立一条）
 - **工具主动裁剪了 `output` → 必须同时填 `full_output`（trace 完整性）** → `tools/base.py` 的 `ToolResult.full_output` + 该工具的 `execute`。Hook 侧同型：`ActionOutcome.full_detail`。**漏填不报错**，只是那段内容**永久消失且无人察觉**——记录看起来是完整的，因为被裁掉的地方连痕迹都没有（`_clip` 留下的「…（省略中间 k 行）…」是给模型看的提示，它不告诉你被省掉的**内容**是什么）。目前唯二的填写方是 `run_command`（前 30 + 后 10 行）与 `hooks/actions.py`（`DETAIL_LIMIT`）。⚠️ **这两处的裁剪本身要保留**：它们省的是模型的 token 预算，删掉会让一次 `pytest` 输出撑爆上下文。护栏见 `tests/test_trace_full_output.py`
 - **新增「会话切换」入口（`/clear` / `/resume` 之外的第三条）→ 必须走 `cancel_all_for_session_switch`（c13/c15）** → 它一个方法里做**两件事**：取消还在跑的 + `tasks.begin_session()` 开新的会话代。只做前一件不报错，但**上一段对话里已经跑完、还没交付的结论会流进新对话**——`take_deliverables` 的判据是「终态且未交付」，压根不看这条任务属于哪一段对话。真实模型撞到过：`/clear` 之后模型坚称上一段的子 Agent 还在跑、一次委派都没发起，trace 上的物证是清空后第一轮请求「消息 3 条」（本该只有用户那 1 条）。⚠ **别改成「切换时把当前任务标成已交付」**：取消是异步的，被取消的子 Agent 可能在切换返回之后才走到终态，那种写法覆盖不到它；代号盖在**创建**那一刻才与时机无关。⚠ C15 的待命队员让这条路径成了**常态**——清空会唤醒它们让线程退出，那恰好把它们变成「终态且未交付」。护栏见 `tests/test_clear_stale_deliverables.py`（含「切换之后才跑完」的时序反证，以及「新会话里的结论照常送达」的反向反证）
 - **子 Agent 每一种「开始运行」都要经 `_emit_start`（c15）** → `subagents/runner.py` 现在有**两个**调用点：首轮委派与**被消息唤醒的续跑轮**（`kind=wake`）。**漏一个不报错**，只是记录里出现「一条 `subagent_end` 找不到对应的 start」——真实模型验收撞到过：一个队员被叫醒两次，时间线上 1 条 start 配 3 条 end，而 `_next_round_record` 每轮发新 `task_id`，读的人对不上号。比对不上号更要紧的是**那一轮的运行条件（工具集 / 权限档 / 工作目录）一处都没记**。抽成一份函数正是为了防同一个坑的下一次：两处各拼一次负载的话，将来给 start 加字段必然只加到一处。护栏见 `tests/test_team_wake.py::WakeTraceTest`（含「不能只补空壳事件让计数配平」的第二条）
@@ -425,8 +426,15 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 2504 项，skipped 4
+python -m unittest discover -s tests      # 2649 项，skipped 4，约 3.5 分钟
 ```
+
+**跑满几分钟是正常的**，且几乎全是「为验真实行为付的真实代价」：实测
+84% 的时间花在真起子进程（e2e 宿主 / `git` / `run_command`）、真跑一个
+Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
+⚠ 觉得慢想动手之前先量一遍再动——2026-08-14 那次量出来的两个热点
+（Hook 命令超时空等、`join` 一个本就不会退出的线程）**都不是「测试写得慢」，
+一个是产品缺陷、一个是判据本身就没验到东西**。
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
 慢速专项（需 `RHINE_E2E_SLOW=1`）。**本机需装 git**——有预置依赖真实提交历史，
