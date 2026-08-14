@@ -70,6 +70,7 @@ class TraceEventType(str, Enum):
     AUTO_WAKE = "auto_wake"                      # c15：主对话的一次自动唤起
     UI_TOOL_BATCH = "ui_tool_batch"              # tui-activity-fold：一批工具调用归并成一行
     UI_DETAIL_LEVEL = "ui_detail_level"          # tui-activity-fold：展开档位的切换
+    CLASSIFIER_VERDICT = "classifier_verdict"    # c16：一次分类器审查的输入、结论与熔断状态
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,10 @@ SCOPE_MAIN = "main"
 SCOPE_SUMMARY = "summary"
 SCOPE_MEMORY = "memory"
 SCOPE_WEB_EXTRACT = "web_extract"
+# c16：分类器审查的请求。它与主对话**共用不了同一个作用域**——一次跑命令可能
+# 触发一到两次分类器请求，不区分的话读时间线的人会看到「用户只说了一句话却发了
+# 五轮请求」，而那些请求既不在对话历史里、也不消耗迭代预算。
+SCOPE_CLASSIFIER = "classifier"
 
 
 def isolated_scope(name: str) -> str:
