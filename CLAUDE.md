@@ -82,6 +82,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 - **网络访问工具 `web_fetch`** ——给一个地址与一段「要提取什么」的说明，取回正文并按提问抽取要点。它同时在权限管线里新增了**②′网络边界层**（结构性硬校验 + 域名策略），并把抓回的内容当作不可信输入对待。行为细节见 [`docs/extensions/web-fetch/`](docs/extensions/web-fetch/spec.md)。
 - **保护路径层 ②″** ——`.rhinecode/` 下的配置（`permissions.yaml` / `hooks.yaml` / `mcp.yaml` / `agents/` / `skills/` / `memory/`）与 `.git/` 的**写入必须过人眼**。它们决定「以后会发生什么」，而此前的写入没有任何特殊待遇——放行档下模型可以直接改写自己的权限配置（**持久化提权、下次启动生效**）。绕过的不是某一层，是 C11–C15 全部安全论证共同的前提「配置由人写下」。⚠ 它**不是管线里的一站而是出口处的收紧器**：只把非 DENY 的结论升级为 ASK，绝不降级任何 DENY——做成「②之后③之前」的短路站会把③层的 deny 与④严格档的 DENY 一起吞掉，两处都是放宽。行为细节见 [`docs/extensions/protected-paths/`](docs/extensions/protected-paths/spec.md)。
+- **auto / plan 两模式** ——用户界面上只剩两个模式（`Shift+Tab` 两态 + `/mode`），底层的「权限档 × 规划阶段」两条正交轴一个字没改，预设只是它们的一个固定组合（结构对齐 Codex 的 preset）。`auto` = 放行档 + 规划阶段关，`plan` = **同一档位** + 规划阶段开（「只读」由规划阶段的工具过滤保证，**不靠权限档**——获批是回合中途发生的，动档位就要从 Agent 循环里改共享单例）。⚠ **`/perm` 已删除**，`strict` / `default` 保留在枚举里但退出用户切换循环。连带堵掉一处泄漏：`run_command` 子进程按黑名单**过滤敏感环境变量**（命令全放行之后，一句打印环境的命令就能拿到 API Key）。行为细节见 [`docs/extensions/auto-plan/`](docs/extensions/auto-plan/spec.md)。
+
 - **Skill 作者期** ——对齐改造让 Skill **可导入**，这个扩展让它**可创作**。两件事：① **体检**（`skills/audit.py`，纯函数零 IO）八项检查，产出**可操作建议**（「建议改成 xxx」而非「警告：xxx」），并入 `/skills` 报告作为第四类反馈；② 内置 **`skill-creator`** 样板（目录型，带完整字段手册作随附资源），承担创作 / 适配外部 Skill / 按建议修复三种用途，全部落盘走完整权限管线。另有 **R 系列增补**专治「Skill 写对了却没被自动加载」——清单表头从「公告」改成「指令」（照 Claude Code 口径：命中就先加载、**用它替代默认做法**、用户不必点名、拿不准就加载）、修掉 `load_skill` 一处**压制加载**的过期描述、内置样板说明改**触发词前置**、清单超预算时**保名字只砍描述**。⚠️ 「模型欠触发 Skill」是**已知的系统性偏差**（Anthropic 官方指导：描述要写得「有点 pushy」），不是本项目独有的 bug。行为细节见 [`docs/extensions/skill-authoring/`](docs/extensions/skill-authoring/spec.md)。
 
 另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成二十九类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
@@ -160,6 +162,12 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - **新增 worktree 行为记录事件（c14）** → `trace/models.py` 的枚举 + `trace/reader.py` 的 `SUMMARIZERS`。与既有那条同一个坑，漏后者只显示成「（未登记类型）」
 - **改动「隔离成果怎么交回来」的说法（c14）** → `worktree/render.py` 的 `render_delivery` + `tools/run_agent.py` 的 `description`。**两处必须同口径**（不要写「不要提交」/ 不要自己进工作区目录抄文件）——主 Agent 在**两个不同时刻**读到同一条约束：委派前读工具描述、委派后读交付信息，一处强一处弱等于白改。这与 C11 的「Skill 清单表头 ↔ `load_skill.description`」、C13 的「角色清单表头 ↔ `run_agent.description`」是**同一个坑的第三次**。真实模型实测两次撞到：主 Agent 从用户那句「我这边的改动先不提交」推断出「让子 Agent 也别提交」，成果全部搁浅、`git merge` 拿不到东西，而它照样报「已完成」。护栏见 `tests/test_worktree_render.py::ToolDescriptionSameVoiceTest`
 - **新增②″保护路径的保护范围 / 排除项（protected-paths）** → `permission/protected.py` 的 `PROTECTED_RELATIVE` / `EXCLUDED_RELATIVE` + **同文件的 `_WHY`**。⚠ **漏 `_WHY` 不报错**，只是确认面板上那行退回泛泛的兜底说法（「它决定 RhineCode 以后的行为」），用户看不出**这个文件为什么特殊**——而那正是他决定放不放行的唯一依据。⚠ **另一条**：`EXCLUDED_RELATIVE` 与 `path_guard._RUNTIME_ARTIFACT_RELATIVE` **取值恰好相同但刻意不合一**（一个是「搜索时跳过」，一个是「写入不必过人眼」）。合一的具体后果：将来出现一个「不该进搜索结果、但改了会变天」的目录时，把它加进那张表会**静默地把它从保护范围里摘掉**。两处都写了注释互相指认。⚠ **第三条**：`worktrees/` 与 `memory/` **刻意不在排除清单里**，理由写在 `EXCLUDED_RELATIVE` 上方，别当成漏改顺手补上
+- **新增运行预设（auto-plan）** → `presets.py` 的 `PRESET_AXES` + `PRESET_CYCLE` 两张表。⚠ **`PRESET_AXES` 里的档位字段看起来是冗余的，别删**：当前两个预设的档位恰好相同（都是放行档），于是那一列「怎么看都没用」——但它是「预设 = 两条轴的组合」这个结构的唯一落点，也是「切过去再切回来两条轴逐字复原」唯一的可断言对象。删掉之后，新增一个档位不同的预设会**静默地不生效**（切过去了、规划阶段也变了，唯独档位没变），而界面上完全看不出来。同理 `cycle_preset` 里那句当前是空操作的 `set_mode` 也不能省。护栏见 `tests/test_presets.py`
+
+- **审批回调里绝不能出现 `set_mode`（auto-plan）** → `conversation.py` 的 `_approve_plan_then_exit`。⚠ **这条只有结构护栏挡得住**：两个预设的档位本来就相同，所以「顺手补一句 `set_mode(PERMISSIVE)`」在**行为上看不出任何区别**，断言档位没变的那条用例照样绿（变异实测确认）。而它是被明令禁止的形态——那句话跑在工作线程上、改的是单实例共享的引擎，且会让回合中途前后两次委派的同名角色拿到不同档位。护栏见 `tests/test_auto_plan_integration.py::test_approval_path_does_not_mention_set_mode`
+
+- **新增起 shell 子进程的调用方（auto-plan）** → 一律走 `tools/run_command.py` 的 `run_shell_captured`，敏感环境变量的过滤收在**它内部**。⚠ 匹配片段有两个**不能用**的：**裸 `AUTH`** 会命中 `SSH_AUTH_SOCK`（ssh-agent 的 socket **路径**、不是密钥，却是 ssh 方式 `git push` 的唯一依靠，剔掉后报 `Permission denied (publickey)` 而**根因不可见**），**裸 `KEY`** 会命中 `SSH_KEY_PATH`。故用 `AUTHORIZATION` 与具体的 `*_KEY` 组合。**刻意不建豁免名单**——调研过 `GITHUB_TOKEN`，实测 `gh` 走 keyring，过滤它代价为零。护栏见 `tests/test_env_filter.py`
+
 - **②″保护路径的「本会话放行」是成对维护点（protected-paths）** → `tui/widgets.py` 的 `ConfirmPanel.show_for` 三选项分支 + `conversation.py` 的 `_build_ask` 豁免分支。**只改一处都不报错**：只改面板 → 不给「永久放行」了，但「本会话放行」仍写③层规则，用户点了之后下次还弹；只改协调层 → 面板仍显示一个点了没用的「永久放行」。⚠ 那条豁免**刻意只在内存、只对单个文件、关程序即失效**——落盘的豁免本身就是一份「能改变以后会发生什么」的配置，绕一圈又回到本扩展要解决的原问题
 - **新增「不该进搜索结果」的运行期产物目录** → `tools/path_guard.py` 的 `_RUNTIME_ARTIFACT_RELATIVE` 一处即可（`grep_content` 与 `glob_files` 都取 `runtime_artifact_dirs_of`）。⚠ 它与 `SKIP_DIRS` **刻意分开**：那张表按**目录名**匹配，这里必须按**路径相等**判断，否则会误伤用户自己叫 `sessions` / `context` 的业务目录。`.rhinecode/memory/` 与 `.rhinecode/agents/` **刻意不在表内**（前者是刻意写下的项目知识、后者是用户写的角色定义），`test_search_artifact_exclusion.py` 有用例钉住这个「刻意」，免得后来的人当成漏改顺手补上
 - **改动角色正文里「结论怎么回流」的说法（c13）** → 必须与 `runner._extract_conclusion` 的实际口径一致：它取的是**最后一条 assistant 消息的全文**，不是「最后一段」。三个内置角色正文 + `SUBAGENT_CONVENTIONS` 都得同口径。**说错了不报错**，只是模型照着字面理解、在结论前面写一堆过程叙述，而那些全都会被带回主对话（真实模型实测过）。护栏见 `test_subagent_builtin.py::test_body_says_the_whole_reply_is_returned`
@@ -331,8 +339,8 @@ python -m tests.e2e.host --mode live --idle-timeout 600          # 真实模型�
 # ② 用瘦客户端驱动它（每次调用都是独立进程，无状态、无重试）
 #
 # ⚠ **从 Git Bash 驱动时必须 `MSYS_NO_PATHCONV=1`。** MSYS 的路径转换对「以 `/`
-#   开头的参数」无条件生效，于是 `send "/perm"` 会被改写成
-#   `send "C:/Program Files/Git/perm"`——斜杠命令**根本没送到应用**，而是当成
+#   开头的参数」无条件生效，于是 `send "/mode"` 会被改写成
+#   `send "C:/Program Files/Git/mode"`——斜杠命令**根本没送到应用**，而是当成
 #   普通消息发出去。live 模式下那是**真的花钱调一次模型**，而且模型会一本正经
 #   地解释「我无法访问那个路径」，看起来像产品出了问题。实测踩过。
 python -m tests.e2e.client hosts                 # 列出当前宿主（排障用，不需要宿主活着）
@@ -357,8 +365,7 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 
 - `/help`（别名 `/h`）：按稳定顺序列出全部非隐藏命令的规范名、别名、描述、用法、类型与参数提示（c10）。
 - `/think`：在 off / high / max 间循环切换思考模式（Anthropic / DeepSeek 生效）。
-- `/plan`：切换 Plan Mode，先规划、澄清和审批，再执行（DeepSeek 工具模式生效）。
-- `/perm`（别名 `/permissions`、`/allowed-tools`）：在 默认 / 严格 / 放行 间循环切换权限模式，只影响「规则未命中」的灰色地带兜底（DeepSeek 工具模式生效）。**注意一处例外**：放行档对**网络访问**不生效——未建立域名白名单时仍然弹确认（web_fetch 扩展 F7；其余工具在放行档下的行为逐字不变）。
+- `/mode`（别名 `/plan`）：在 **auto** 与 **plan** 两个模式间切换，等价于 `Shift+Tab`（DeepSeek 工具模式生效，auto-plan 扩展）。`auto` = 放行档 + 规划阶段关（放手干活）；`plan` = 同一档位 + 规划阶段开（先规划、澄清和审批，再执行）。**计划获批后自动回到 `auto`，被拒则留在 `plan`**。⚠ **`/perm` 已删除**——权限档不再有运行期切换入口，`strict` / `default` 只能经 `permissions.yaml` 与角色定义的 `permission_mode` 抵达（手法对齐 Claude Code 的 `dontAsk`）。**注意一处例外**：放行档对**网络访问**不生效——未建立域名白名单时仍然弹确认（web_fetch 扩展 F7；其余工具在放行档下的行为逐字不变）。
 - `/mcp`：查看各 MCP Server 的连接状态、传输类型、注册工具数与失败原因（纯只读，不改状态）。
 - `/context`（别名 `/ctx`）：查看当前上下文近似用量（估算 token / 窗口上限 / 余量 / 已存盘工具结果数 / 是否熔断），纯只读（DeepSeek 工具模式生效）。
 - `/compact`：手动触发第二层 LLM 摘要压缩，无余量阈值——主动触发即尝试；历史尚无够旧的早段可摘要时如实回「无可摘要的早段」（DeepSeek 工具模式生效）。
@@ -464,8 +471,8 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
 1. **危险命令黑名单**（`permission/blacklist.py`）：正则拦截 `rm -rf` / `git push --force` / fork 炸弹 / `format`、`Remove-Item -Recurse -Force` 等已知高危命令，复合命令逐段+整条双重检查；**不可被任何配置或权限模式放开**。
 2. **路径沙箱**（复用 `path_guard`）：文件、glob、grep 工具以启动时的当前工作目录为项目根；拒绝含 `..`、解析后越界的绝对路径、指向项目外的符号链接。
 3. **可配置规则**：三层 YAML 的 allow/deny，deny 永远优先。命令类规则的两侧用**一对语义相反**的判定，这个不对称是刻意的：**deny 走「整条 + 任一段」**（与①同口径，一个 `&&` 藏不住东西），**allow 走「每一段都得命中」**（每段可由**不同**的 allow 规则覆盖）。判据只有一条——拆段的效果必须朝「更严」走：deny 那边多命中一次是多拦一次，allow 这边多命中一次是少弹一次面板。把任一侧换成对面那个函数都会静默放宽权限。⚠ 两侧的**拆分口径也不同**：allow 侧认引号（`split_commands_quoted`），①与 deny 侧仍是朴素拆分——把引号感知搬进后者等于放宽①黑名单。
-4. **权限模式**（`/perm`）：严格/默认/放行，只兜底「规则未命中」的灰色地带，翻不了①②③的 deny。
-5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次/本会话/永久/拒绝）。
+4. **权限模式**：严格/默认/放行，只兜底「规则未命中」的灰色地带，翻不了①②③的 deny。⚠ **auto-plan 扩展起，主对话的启动档是「放行」**（`auto` 预设的档位），且**运行期不可切换**（`/perm` 已删除）。因此**缺省体验是「工作区内的文件写入与命令执行都不弹面板」**——此前缺省是「默认档、灰色地带交人工确认」。缺省下仍然会弹面板的只剩三类：**②″保护路径**的写入、**网络访问**（未建域名白名单时）、以及用户自己写的 Hook `ask` 规则。要更严只能写 `permissions.yaml` 的 `deny` 规则，或给子 Agent 角色声明更严的 `permission_mode`。
+5. **人在回路**：判定为「问用户」时弹确认面板，四选项（本次/本会话/永久/拒绝）；②″保护路径的场景下只有三个（无「永久放行」，理由见下）。
 
 **外加一道出口处的收紧器：②″保护路径**（protected-paths 扩展）。它不在上面那条短路序列里——`decide` 先跑完既有五层（`_decide_core`），再由 `_apply_protected` 按结果收紧：`.rhinecode/` 下的配置与 `.git/` 的**写入**，结论非 DENY 时一律升级为 ASK。见下方「保护路径（②″）五条」。
 
@@ -516,9 +523,23 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
   （Hook 动作直接执行、不经模型也不经人在回路；角色正文只是「发给模型的文本」），
   故只列名字、不逐条列出正文，且走普通通道而非醒目警告通道——用同一条会稀释掉
   Hook 那条警告的分量。**但评审 `.rhinecode/agents/` 仍应与评审代码同等对待。**
-  ④ **缺省配置下子 Agent 实际只能做只读的事**。判 ASK 自动拒绝意味着写文件、跑命令
-  都会被挡下。要让它能写，用户必须在 `permissions.yaml` 里写 allow 规则，
-  或 `/perm` 切到放行档之后再委派。这是刻意选择的偏严方向。
+  ④ ⚠ **这一条已被 auto-plan 扩展推翻，原文保留在下面供追溯。**
+
+  **原文（2026-08-14 前成立）**：「缺省配置下子 Agent 实际只能做只读的事。判 ASK
+  自动拒绝意味着写文件、跑命令都会被挡下。要让它能写，用户必须在
+  `permissions.yaml` 里写 allow 规则，或切到放行档之后再委派。」
+
+  **现在（auto-plan 扩展之后）**：缺省预设是 `auto`，其档位就是放行档。子 Agent
+  的生效档位是 `min(主对话档, 角色声明档)` = 放行档，于是它**能写文件、能跑命令**
+  ——而且是后台、并行、非交互、用户不在场。「判 ASK 自动拒绝」这条机制一个字没变，
+  变的是**缺省档下几乎判不出 ASK 了**。
+
+  **这是设计后果不是回归**，但必须写下来，否则下一个人会当成缺陷去「修」。
+  想保持旧行为，给角色声明 `permission_mode: strict` 或 `default`——`narrower_mode`
+  取更严的那个，声明放行档则不产生任何提权效果。
+
+  ⚠ **本条落地后，②″保护路径的分量显著上升**：它成了「用户不在场时，
+  后台并行的子 Agent 改不了 RhineCode 自己的配置」这件事的**唯一**依据。
   ⑤ **子 Agent 的结论会进入主历史**。它读过的文件内容若被写进结论，就会随结论
   一并回到主对话——与 c8 摘要「deny 只挡新读取、挡不住已在历史里的内容」同理。
   ⑥ **Hook 对子 Agent 全量生效**（工具级三事件）。不生效的话主 Agent 只要把
@@ -559,8 +580,9 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
   同先例）。它们不读写文件、不执行命令，副作用限于改本进程内存里的清单与信箱，
   没有可映射的 Bash / Read / Edit / Write 语义。
   它们**仍然过一次 `engine.decide`**，只是**对第④层（权限档兜底）整层免疫**
-  ——④判 ASK 或 DENY 都按放行处理（不弹面板、也不被 `/perm 严格` 关掉）。
-  ⚠ **`/perm 严格` 不是关掉它们的手段**：④对这七个工具而言不是「灰色地带更
+  ——④判 ASK 或 DENY 都按放行处理（不弹面板、也不被收紧权限档关掉）。
+  ⚠ **收紧权限档不是关掉它们的手段**（auto-plan 扩展删掉 `/perm` 之后运行期
+  已无处收紧，但经角色定义声明 `strict` 仍可抵达，结论不变）：④对这七个工具而言不是「灰色地带更
   谨慎」而是「功能整个关掉」（它们走 `other` 分支，③层绝大多数情况不表态，
   ④是唯一会说话的那一层）。实测代价：内置 `explorer` / `planner` 声明
   `permission_mode: strict`，而引擎有只读短路（只读工具不进④层），于是
@@ -621,6 +643,8 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
 2. ~~Plan Mode 规划阶段的工具阶段强校验~~ **已于 2026-07-29 修复**：规划阶段（`plan_mode and not execution_phase`）夹带的非只读工具现在在 `_execute` 的预扫里被独立通道 `plan_blocked` 挡下并回灌「先用 present_plan 提交计划」，trace outcome 为 `plan_blocked`（与 `out_of_scope` **刻意分开**——两处过滤职责不同，回灌指引也不同）。原缺陷有真实观测样本：规划阶段那轮 `tool_names` 里没有 `run_command`，模型仍凭先验调了出来，而当时唯一的守卫只查 Skill 白名单，于是 `outcome=executed`。护栏见 `tests/test_plan_stage_guard.py`（含「放行权限模式下也挡得住」与「获批后放行」两条反证）。
 3. `write_file` / `edit_file` 的文件系统级原子写入。
 4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问——C6 的应用层黑名单+路径沙箱已覆盖命令与文件工具的常见高危场景，但管不住子进程内部的间接访问。
+
+   ⚠ **别指望照抄上游：Claude Code 与 Codex 都不支持原生 Windows 沙箱。** 前者官方原话是 *Native Windows is not supported*（要沙箱得走 WSL2），后者文档只写 macOS Seatbelt 与 Linux Landlock/seccomp。而 Windows 是本项目的主力平台，所以这一条在这里比在它们那里更贵：要么只做 macOS/Linux、要么要求 WSL2、要么自己啃 AppContainer 而无现成参考。**它也不是 auto 预设的前提**——auto-plan 扩展评审时用户明确选了「命令一律放行」，收窄手段是分类器（`docs/todo/` 的分类器那条）而不是沙箱。
 5. 权限系统后续项：~~网络请求限制~~ **已于 2026-07-29 由 web_fetch 扩展兑现**（②′网络边界层：结构性硬校验 + 域名策略，见 `docs/extensions/web-fetch/`）；~~模型能改写自己的权限配置~~ **已于 2026-08-14 由 protected-paths 扩展兑现**（②″保护路径收紧器，见 `docs/extensions/protected-paths/`）。资源配额、审计日志仍留待后续章节。
 
    **②″保护路径明确没覆盖的三个缺口**（都是 spec 里写下的「不做的事」，登记在此免得将来有人以为是漏洞）：① **`run_command` 的旁路**——`echo >> .rhinecode/hooks.yaml` 绕得过，与本条已知项 #4（OS 级沙箱）同源，真正的堵法是分类器审查；② **MCP 工具**——落 `other` 分支、无路径判定，且 MCP Server 是装配期以主项目根为工作目录启动的外部进程；③ **保护清单不可配置**——用户自定义保护路径是合理需求，但那份配置本身又要被保护，且它与本层「不可被配置放开」的性质需要单独论证。
