@@ -392,6 +392,8 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 
 运行中按 `Esc` 会请求取消当前 Agent Loop；如果正在等待确认或澄清，则由当前面板处理取消。
 
+**`Shift+Tab` 切换模式时不往聊天区写东西**——反馈是状态栏那一格变了（`[AUTO]` ⇄ `[PLAN]`）。⚠ 只有**切不动**时（非 DeepSeek Provider）才写一条提示，否则按下去毫无反应、分不清是「没生效」还是「键没被接住」。`/mode` 那条入口**仍然照常回显**，这不是分叉：敲了一条命令却没有任何回应看起来就是没执行，而按键有状态栏当回执。护栏见 `tests/test_auto_plan_integration.py::ShiftTabDoesNotEchoTest`（含两个方向的反证）。
+
 `Ctrl+O` 在「折叠 / 展开」之间切换**一个全局开关**——同时管子 Agent 活动区
 （展开后列出每个队员最近的工具调用）与历史区里被折叠的长工具结果 / diff 块。
 它**不改变焦点**（tui-display 扩展 F5/F41）。

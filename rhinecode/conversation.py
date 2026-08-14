@@ -102,6 +102,18 @@ ClarifyCallback = Callable[[str, list[ClarifyOption]], Optional[str]]
 ApprovePlanCallback = Callable[[str], bool]
 
 
+# 预设切换在**当前 Provider 上根本不可用**时的提示（auto-plan 扩展）。
+#
+# ⚠ **它是个具名常量，因为按键入口要按它分支。** `Shift+Tab` 切换成功时
+# **不往历史区写任何东西**（状态栏的 `[AUTO]` / `[PLAN]` 已经说了，
+# 再写一条就是同一件事说两遍）；但**切不动的时候必须写**——
+# 否则用户按下去毫无反应，分不清是「没生效」还是「键没被接住」。
+#
+# 用常量而不是在按键那侧比较字面量：字面量比较会在有人改文案时静默失配，
+# 表现为「切不动时也不再提示」，而那正是这条分支存在的全部理由。
+PRESET_SWITCH_UNAVAILABLE = "当前 Provider 不支持模式切换"
+
+
 # 独立模式子对话「未产出结果」时，按停止原因给出的回流文案（c11）。
 # 每种原因都要能让用户一眼看出「为什么没结果」，而不是一句笼统的失败。
 _ISOLATED_FAILURE_TEXT = {
@@ -722,7 +734,7 @@ class ConversationManager:
         """
         # 预设依赖工具能力（无工具则两条轴都无可控对象），与改造前的 toggle_plan 同口径
         if not self._tools_enabled:
-            return "当前 Provider 不支持模式切换"
+            return PRESET_SWITCH_UNAVAILABLE
         target = presets.next_preset(self.preset)
         mode, planning = presets.axes_of(target)
         # ⚠ **明知 `set_mode` 当前是空操作也要写。**

@@ -39,7 +39,11 @@ from rhinecode.commands import (
     ReportTarget,
 )
 from rhinecode.commands.skill_commands import build_skill_command_specs
-from rhinecode.conversation import ConversationManager, SessionListRequest
+from rhinecode.conversation import (
+    PRESET_SWITCH_UNAVAILABLE,
+    ConversationManager,
+    SessionListRequest,
+)
 from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
 from rhinecode.commands.parser import InputKind, parse_input
 from rhinecode.hooks import HookEventType
@@ -1369,9 +1373,30 @@ class RhineApp(App):
         等于把被抢掉的行为又还回去一半，用户会看到「模式变了、光标也跑了」。
         与 `Ctrl+O` 的既有做法一致（那条同样只改状态、不动焦点）。
 
-        副作用：改写权限引擎档位与 `plan_mode`；刷新状态栏；向历史区写一条回显。
+        ## ⚠ 切换成功时**不往历史区写东西**
+
+        按键的反馈就是**状态栏那一格变了**（`[AUTO]` ⇄ `[PLAN]`，右区常驻）。
+        再往聊天区写一条「模式：plan」是同一件事说两遍，而聊天区是对话内容、
+        不是状态显示——这与 tui-display F31 给 `Ctrl+C` 提示定的口径一致
+        （那条同样只活在状态栏左区，**刻意不进聊天区**）。
+
+        **但切不动的时候必须写。** 非 DeepSeek Provider 上两条轴都无可控对象，
+        此时若也保持安静，用户按下去会毫无反应——分不清是「没生效」还是
+        「这个键压根没被接住」。判据走具名常量 `PRESET_SWITCH_UNAVAILABLE`，
+        不比字面量（有人改文案时字面量比较会静默失配，表现为
+        「切不动时也不再提示」，而那正是这条分支存在的全部理由）。
+
+        ⚠ **`/mode` 那条入口仍然照常回显**，这不是分叉：用户**敲了一条命令**，
+        一条命令不给任何回应看起来就是没执行；而按键有状态栏当回执。
+        两条入口共用的是**领域行为**（`cycle_preset` 写哪两条轴），
+        本来就不包括「界面上怎么回执」。
+
+        副作用：改写权限引擎档位与 `plan_mode`；刷新状态栏；
+                仅在切换不可用时向历史区写一条提示。
         """
-        self.show_message(self.switch_mode(ModeTarget.PRESET))
+        result = self.switch_mode(ModeTarget.PRESET)
+        if result == PRESET_SWITCH_UNAVAILABLE:
+            self.show_message(result)
         self._refresh_status()
 
     def action_toggle_expand(self) -> None:
