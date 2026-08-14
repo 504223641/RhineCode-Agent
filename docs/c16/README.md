@@ -11,6 +11,7 @@
 | [`plan.md`](plan.md) | 怎么做：新叶子包 `classifier/` 的十个模块、既有模块 13 处改动、13 个技术决策 |
 | [`task.md`](task.md) | 按什么顺序做：36 个任务分八阶段，每个带验证方式 |
 | [`checklist.md`](checklist.md) | 做对了没：13 节 80 余条可观测判据 + 7 个端到端场景 |
+| [`acceptance/live.md`](acceptance/live.md) | **真实模型实跑记录**：7 个场景的 trace 原文与判断，含一个真机才抓得到的缺陷与三条方法论发现 |
 
 ## 零基础版：这一章到底加了什么
 
