@@ -271,5 +271,64 @@ class RoleModeStillNarrowsTest(unittest.TestCase):
         )
 
 
+class ShiftTabDoesNotEchoTest(unittest.TestCase):
+    """
+    `Shift+Tab` 切换成功时**不往历史区写东西**（状态栏已经显示了模式）。
+
+    ## 为什么值得一条护栏
+
+    这是「同一件事说两遍」的那种问题——**加回去不会有任何东西报错**，
+    只是聊天区多出一行状态信息。而聊天区是对话内容、不是状态显示，
+    与 tui-display F31 给 `Ctrl+C` 提示定的口径一致
+    （那条同样只活在状态栏左区，刻意不进聊天区）。
+
+    ## ⚠ 但「切不动」那一支必须留着
+
+    非 DeepSeek Provider 上两条轴都无可控对象。此时若也保持安静，
+    用户按下去毫无反应，分不清是「没生效」还是「这个键压根没被接住」。
+    """
+
+    def test_action_shows_message_only_when_unavailable(self) -> None:
+        """
+        结构护栏：按键动作里那次 `show_message` 被一个**条件**包着，
+        且判据是具名常量而不是字面量。
+
+        字面量比较会在有人改文案时静默失配，表现为「切不动时也不再提示」
+        ——而那正是这条分支存在的全部理由。
+        """
+        import inspect
+
+        from rhinecode.conversation import PRESET_SWITCH_UNAVAILABLE
+        from rhinecode.tui.app import RhineApp
+
+        source = inspect.getsource(RhineApp.action_cycle_preset)
+        self.assertIn("PRESET_SWITCH_UNAVAILABLE", source)
+        # 反证：不得无条件回显。
+        self.assertNotIn(
+            "self.show_message(self.switch_mode(ModeTarget.PRESET))",
+            source,
+            "Shift+Tab 切换成功时不该往历史区写东西——状态栏已经显示模式了",
+        )
+        self.assertTrue(PRESET_SWITCH_UNAVAILABLE)
+
+    def test_slash_mode_still_echoes(self) -> None:
+        """
+        ⚠ 反证：`/mode` 那条入口**仍然照常回显**。
+
+        这不是两条入口的分叉：用户**敲了一条命令**，一条命令不给任何回应
+        看起来就是没执行；而按键有状态栏当回执。两条入口共用的是
+        **领域行为**（`cycle_preset` 写哪两条轴），本来就不包括
+        「界面上怎么回执」。
+
+        没有这一条的话，「顺手把 /mode 也改安静」会让一条命令看起来坏掉。
+        """
+        import inspect
+
+        from rhinecode.commands import builtins
+
+        source = inspect.getsource(builtins._handle_mode)
+        self.assertIn("show_message", source)
+
+
 if __name__ == "__main__":
     unittest.main()

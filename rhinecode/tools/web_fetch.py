@@ -63,6 +63,10 @@ class WebFetchTool(Tool):
     read_only = False
     # 显示地址而不是 prompt：地址决定「去了哪」，也是用户放不放行的依据
     primary_arg = "url"
+    # c16：网络类要经分类器审查。域名策略只看得到主机名，看不出地址里夹带了
+    # 什么——而**地址本身就是发出去的数据**（查询参数里塞一段密钥，抓回来什么
+    # 都不重要，它在发出请求的那一刻就已经泄漏了）。
+    classifier_scope = "url"
 
     def __init__(self, manager) -> None:
         """

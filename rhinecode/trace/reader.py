@@ -153,6 +153,11 @@ def _s_permission_decision(r: dict) -> str:
     # 已经看得见了。
     if r.get("protected_exempt"):
         mark += "保护路径已豁免 "
+    # c16：这条结论是分类器改的。进摘要行的判据同上——不标的话，一条被分类器
+    # 拦下的命令显示成 `deny（④模式）`，而④在放行档下只会给 ALLOW，
+    # 读的人会以为用户切到了严格档。
+    if r.get("classifier"):
+        mark += f"分类器={r.get('classifier')} "
     return (
         f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"
@@ -410,6 +415,39 @@ def _s_worktree_cleanup(r: dict) -> str:
     )
 
 
+# c16：分类器审查的一次判定。
+#
+# 进摘要行的判据与本文件其余各条一样——「排查时第一眼要不要看到它」：
+#
+# - `staged`（跑没跑第二阶段）要：**它直接对应这次判定花了多少钱**。
+#   一条 `staged=False` 的记录说明只花了一个 token 的输出，两阶段过滤生效了；
+#   满屏 `staged=True` 说明第一阶段在无差别标记，那是个真问题。
+# - `cached` 要：不标的话读的人会以为分类器每次都真的问了模型，
+#   而一次命中缓存的判定**根本没发请求**——「为什么这个地址没被重新审查」
+#   的答案就在这里。
+# - `breaker_tripped` 要：熔断之后每一条判定都是 FAILED，不标的话时间线上
+#   看起来像「分类器突然开始拒绝一切」。
+#
+# `stage1_raw`（第一阶段的原始输出）**刻意不进摘要行**：它只在排查
+# 「为什么这条明明该过却进了第二阶段」时才有用，那时用 `--seq` 展开即可；
+# 每条都带着它会把时间线挤没。`specifier` 同理只取前 50 字，完整内容在负载里。
+def _s_classifier_verdict(r: dict) -> str:
+    """一次分类器审查（c16）。"""
+    marks = ""
+    if r.get("cached"):
+        marks += "缓存 "
+    if r.get("staged"):
+        marks += "二阶段 "
+    if r.get("breaker_tripped"):
+        marks += f"⚠已熔断({r.get('breaker_reason')}) "
+    return (
+        f"{marks}{r.get('scope_kind')}/{r.get('tool')} → {r.get('verdict')}"
+        f" · {r.get('elapsed_ms', 0)}ms"
+        f" · {_text_of(r.get('specifier'), 50)}"
+        f" · {_text_of(r.get('reason'), 40)}"
+    )
+
+
 SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.SESSION_START.value: _s_session_start,
     TraceEventType.SESSION_END.value: _s_session_end,
@@ -440,6 +478,7 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.AUTO_WAKE.value: _s_auto_wake,
     TraceEventType.UI_TOOL_BATCH.value: _s_ui_tool_batch,
     TraceEventType.UI_DETAIL_LEVEL.value: _s_ui_detail_level,
+    TraceEventType.CLASSIFIER_VERDICT.value: _s_classifier_verdict,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」

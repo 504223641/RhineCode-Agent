@@ -63,6 +63,18 @@ from rhinecode.trace import (
     redact_config,
 )
 from rhinecode.trace.tracing_provider import TracingProvider
+# c16：分类器审查。`is_broad_command_allow` / `why_broad` 收的是两个字符串，
+# 由本层从 `Rule` 上取字段——那是刻意的，见 `classifier/broad.py` 的模块 docstring
+# （让分类器包 import `permission` 会连带把引擎与 `rhinecode.tools` 拉起来，
+#  它就不再是叶子包了）。
+from rhinecode.classifier import (
+    ClassifierConfig,
+    ClassifierService,
+    is_broad_command_allow,
+    why_broad,
+)
+from rhinecode.classifier.render import render_dropped_rules
+from rhinecode.permission.rules import RuleSet
 from rhinecode.tui.app import RhineApp
 
 
@@ -333,6 +345,88 @@ def build_app(
     load_skill_tool.run_fork = manager.run_forked_for_model
     load_skill_tool.on_activated = manager.on_skill_activated
 
+    # ⑤″ 安全审查分类器（c16）。
+    #
+    # **位置卡在协调层之后、子 Agent 装配之前**，两头都有理由：
+    # - 不能提前：本段要读 `manager.permission_engine` 的规则集（丢弃过宽的
+    #   命令放行规则），而引擎是协调层构造的；
+    # - 不能推后到子 Agent 之后：`SubAgentRuntime` 要拿到 service 才能让
+    #   子 Agent 也走分类器（spec F23——否则主 Agent 只要把「跑 git push」
+    #   委派出去就绕过了整层）。
+    #
+    # 与 `tool_registry is not None` 同生共死：分类器只审查三类工具动作，
+    # 非工具模式下那三个工具压根不注册，整段没有意义。
+    classifier_service = None
+    if tool_registry is not None and cfg.classifier_enabled:
+        # 分类器用**独立的 Provider 副本**：模型可能不同（`classifier.model`），
+        # 且它必须带超时——只在调用方计时是假超时（见 `provider/deepseek.py`）。
+        #
+        # ⚠ 走 `factory` 而不是 `create_provider`：第 ② 步那层依赖注入的全部
+        # 意义就是「测试能换掉真实网络」，这里绕过去的话，一次端到端测试会
+        # **静默连上真实网络**——`_provider_for` 那条旁路踩过同一个坑。
+        # ⚠ **显式构造而不是 `dataclasses.replace(cfg, ...)`**，两条理由：
+        #
+        # ① `replace` 要求真正的 dataclass 实例，而本函数的 `cfg` 在若干启动
+        #    测试里是 `MagicMock`——那会当场 `TypeError` 把整个启动炸掉。
+        # ② 更要紧的是**说清楚分类器继承了什么**。它只需要「连得上哪个模型」
+        #    这四样加一个超时；`debug_log` / `context_window` / `web_fetch_enabled`
+        #    这些对一次性判定毫无意义，复制过去只会让人以为它们有用。
+        classifier_cfg = Config(
+            protocol=cfg.protocol,
+            # 留空时跟主对话同一个模型（spec F25）。
+            model=cfg.classifier_model or cfg.model,
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+            # ⚠ 超时必须落到 SDK 客户端上——只在调用方计时是假超时，
+            # 第一个数据块永远不到达时外面的计时器一点用都没有。
+            request_timeout=cfg.classifier_timeout,
+        )
+        try:
+            classifier_provider = factory(classifier_cfg)
+        except Exception as exc:  # noqa: BLE001
+            # ⚠ **整段 fail-safe**：分类器建不起来绝不能阻断启动。
+            # 但**必须说出来**——静默不启用等于静默关掉一层安全机制，
+            # 用户会以为它在保护自己（与「熔断必须可见」是同一条原则）。
+            manager.add_startup_notice(
+                f"警告：安全审查分类器未能启动（{exc}），本次运行不做分类器审查。"
+            )
+        else:
+            if recorder.enabled:
+                classifier_provider = TracingProvider(
+                    classifier_provider, recorder, classifier_cfg.model
+                )
+            classifier_service = ClassifierService(
+                classifier_provider,
+                ClassifierConfig(
+                    enabled=True,
+                    model=classifier_cfg.model,
+                    timeout=cfg.classifier_timeout,
+                ),
+                recorder=recorder,
+            )
+            manager.classifier = classifier_service
+
+            # F20/F21：丢弃过宽的命令放行规则并逐条告知。
+            #
+            # ⚠ **只动 `file_ruleset`**。会话级与本次执行级规则不受影响——
+            # 确认面板生成的规则用的是**完整命令串原文**
+            # （`permission/adapter.py` 的 `to_allow_rule` 对命令类返回
+            # `request.specifier`），天然是窄的；而 `policy_ruleset` 是域名
+            # 白名单，spec F22 明确不动它（丢弃会连带改变②′层的行为）。
+            engine = manager.permission_engine
+            kept, dropped = [], []
+            for rule in engine.file_ruleset.rules:
+                if rule.effect == "allow" and is_broad_command_allow(
+                    rule.tool, rule.pattern
+                ):
+                    text = f"{rule.tool}({rule.pattern})" if rule.pattern else rule.tool
+                    dropped.append((text, rule.source, why_broad(rule.tool, rule.pattern)))
+                else:
+                    kept.append(rule)
+            if dropped:
+                engine.file_ruleset = RuleSet(kept)
+                manager.add_startup_notice(render_dropped_rules(dropped))
+
     # ⑤' 子 Agent 系统（c13）。
     #
     # **位置卡在协调层之后、`session_start` 快照之前**，两头都不能挪：
@@ -407,6 +501,11 @@ def build_app(
             # 含网络访问工具时才注入它（spec F7 的例外），这里只负责把文本递过去。
             untrusted_section=UNTRUSTED_CONTENT if cfg.web_fetch_enabled else "",
             thinking_effort=manager.thinking_effort,
+            # c16：共用主对话那一个分类器实例（F23），并把主对话历史作为
+            # 取用户消息的来源（F9）。两者都用回调/共享对象而不是快照——
+            # 委派可能在排队，快照会绑住一份陈旧的历史。
+            classifier=classifier_service,
+            principal_history=lambda: manager.history,
             # c15：运行器据它做待命/唤醒、注入队友消息、绑定协作身份。
             team=team_service,
         )

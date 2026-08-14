@@ -58,6 +58,12 @@ class SendMessageTool(Tool):
     plan_safe = True
     # 显示收件人：一屏里同时躺着好几条消息时，「发给谁」是唯一分得开它们的东西
     primary_arg = "to"
+    # c16：消息类要经分类器审查。C15 已登记过这条通路的代价——队员读到的敏感
+    # 内容可以被主动送进另一个队员或主对话的历史，而这条路上此前没有任何判定。
+    # ⚠ 被拦时消息**不投递**，且待命的收件人**不会被唤醒**（消息是唤醒的唯一
+    # 手段），所以回灌文案必须让发送方知道这件事——见 `classifier/render.py`
+    # 的 `MESSAGE_NOT_DELIVERED`。
+    classifier_scope = "message"
 
     # ## ⚠ 与 `team/render.py` 的标记块同口径（见模块 docstring）
     #

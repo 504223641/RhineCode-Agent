@@ -33,6 +33,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from rhinecode.classifier.prompt import CLASSIFIER_MARKER
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
 
 
@@ -189,6 +190,29 @@ class _CallLog:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+def is_classifier_request(system: Optional[str]) -> bool:
+    """
+    判断一次 provider 调用是不是 c16 分类器发出的。
+
+    :param system: 本次调用的系统提示
+    :returns: 是分类器请求返回 True
+
+    ## 为什么需要这个判断
+
+    分类器与主对话**共用同一个 `provider_factory`**。那是刻意的：绕过注入的
+    工厂会让一次端到端测试**静默连上真实网络**（`_provider_for` 那条旁路
+    踩过同一个坑，`bootstrap.py` 里写着）。
+
+    代价是剧本 Provider 必须自己分辨两种请求——它按**调用次序**取轮次，
+    分类器每判定一次就会吃掉一轮主对话的剧本。真实撞到过：C15 的并行组队
+    剧本在分类器接进来之后整个错位，表现是「一条队友消息都没发出去」，
+    看起来像协作功能坏了。
+
+    副作用：无（纯函数）。
+    """
+    return bool(system) and CLASSIFIER_MARKER in system
+
+
 class ScriptedProvider(BaseProvider):
     """
     按剧本作答的假 Provider。
@@ -215,6 +239,16 @@ class ScriptedProvider(BaseProvider):
         self._turns = list(turns or [])
         self._fallback = list(fallback) if fallback is not None else [text(FALLBACK_MARKER), done()]
         self._log = _CallLog()
+        # c16：分类器请求的应答。缺省一律放行（`pass`），使**既有的每一份剧本
+        # 一字不用改**——分类器接进来之前它们的行为就是「命令照跑」。
+        #
+        # 要验「分类器拦下了什么」的剧本可以把它换成 `"block"`，
+        # 或直接覆写 `classifier_reply`。
+        self.classifier_verdict = "pass"
+        # 分类器被调了几次。**这是 spec AC3/AC12 那几条反证的唯一依据**——
+        # 「allow 规则短路时零次调用」与「第一阶段通过时第二阶段零次调用」
+        # 都只能靠计数分辨，断言结果的话两种情形看不出区别。
+        self.classifier_calls = 0
 
     @property
     def calls(self) -> list[RecordedCall]:
@@ -244,6 +278,10 @@ class ScriptedProvider(BaseProvider):
         :returns: StreamChunk 迭代器
         副作用：往 `calls` 追加一条 `RecordedCall`。**不发起任何网络请求**。
         """
+        # ⓪ 分类器请求走独立通道，**不消耗剧本轮次**（c16）。见 `classifier_reply`。
+        if is_classifier_request(system):
+            yield from self.classifier_reply(messages, system)
+            return
         # ① 临界区：只做 append 与取序号，不做任何调度（spec N6）
         with self._log.lock:
             index = len(self._log.items)
@@ -261,6 +299,35 @@ class ScriptedProvider(BaseProvider):
         chunks = self._turns[index] if index < len(self._turns) else self._fallback
         for chunk in chunks:
             yield chunk
+
+    def classifier_reply(
+        self, messages: list[Message], system: Optional[str]
+    ) -> Iterator[StreamChunk]:
+        """
+        应答一次分类器请求（c16）。**不消耗剧本轮次、不进 `calls`。**
+
+        :param messages: 分类器的请求消息
+        :param system: 分类器的系统提示（据它分辨是第一阶段还是第二阶段）
+        :returns: StreamChunk 迭代器
+
+        副作用：`classifier_calls` 加一。
+
+        缺省一律回 `pass`，理由见 `__init__` 里 `classifier_verdict` 的说明：
+        既有剧本在分类器接进来之前的行为就是「命令照跑」，缺省放行使它们
+        **一字不用改**。
+
+        第二阶段要求「结论 + 理由」两行格式，所以这里按系统提示里有没有
+        「复核」二字分别作答——回错格式会走进 `parse_stage2` 的
+        「看不懂」分支，那条路通往拒绝，会让剧本莫名其妙地失败。
+        """
+        with self._log.lock:
+            self.classifier_calls += 1
+        verdict = self.classifier_verdict
+        if system and "复核" in system:
+            yield text(f"结论: {verdict}\n理由: 剧本固定应答")
+        else:
+            yield text(verdict)
+        yield done()
 
 
 class CountingProviderFactory:
@@ -351,6 +418,14 @@ class ScopedScriptedProvider(BaseProvider):
         # 每个作用域各自的轮次游标。**必须与 `_log.lock` 同一把锁保护**——
         # 取游标与记调用是同一件事的两半，分两把锁会让两者错位。
         self._cursor: dict[str, int] = {}
+        # c16：分类器应答与计数，语义与 `ScriptedProvider` 上那两个字段完全一致。
+        # **刻意不抽公共基类**：两个类的其余部分（游标是全局的还是按作用域的）
+        # 差别足够大，为两个字段造一层继承会让「这两个类到底哪不一样」更难看清。
+        self.classifier_verdict = "pass"
+        self.classifier_calls = 0
+
+    # 分类器应答复用 `ScriptedProvider` 的实现（两个类的这部分逐字相同）。
+    classifier_reply = ScriptedProvider.classifier_reply
 
     @property
     def calls(self) -> list[RecordedCall]:
@@ -386,6 +461,16 @@ class ScopedScriptedProvider(BaseProvider):
         :returns: StreamChunk 迭代器
         副作用：往 `calls` 追加一条 `RecordedCall`；推进该作用域的游标。
         """
+        # ⓪ 分类器请求走独立通道，**不推进任何作用域的游标**（c16）。
+        #
+        # ⚠ 这一条在本类上比在 `ScriptedProvider` 上更要紧：这里的游标是**按作用域**
+        # 分开的，而分类器请求跑在**发起它的那个 Agent 的线程**上——于是它会去推进
+        # 那个队员的游标。真实撞到过：C15 的并行组队剧本因此整个错位，
+        # 表现是「一条队友消息都没发出去」，看起来像协作功能坏了。
+        if is_classifier_request(system):
+            yield from self.classifier_reply(messages, system)
+            return
+
         scope = _current_scope()
 
         # ① 临界区：取游标 + 记调用，只做纯内存操作，不做任何调度

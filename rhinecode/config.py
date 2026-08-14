@@ -66,6 +66,26 @@ api_key: YOUR_API_KEY
 #   # 建好工作区后要**软链**进去的目录（共享同一份，省空间省时间）。
 #   # 适合大型依赖目录，如 node_modules / .venv。
 #   link: []
+
+# ---- 安全审查分类器（c16）----
+# auto 档下，跑命令 / 访问网络 / 给队友发消息这三类动作在执行前先问一个
+# **独立的分类器模型**「这该不该做」。文件读写不进分类器（那一侧由路径沙箱
+# 物理保证边界）。
+#
+# ⚠ 你写在 permissions.yaml 里的 deny 规则仍然压得过它；
+#   你写的 allow 规则会**直接短路**它（连模型调用都不会发生）——
+#   因此启用分类器时，过宽的命令放行规则（如 Bash(python *)）会被暂时丢弃，
+#   启动时会逐条告诉你是哪些、为什么。
+# classifier:
+#   # 总开关，缺省开。关掉之后这三类回到「命令一律放行、网络每次弹面板、
+#   # 队友消息直接投递」，且过宽的放行规则不再被丢弃。
+#   enabled: true
+#   # 分类器用哪个模型。留空 = 跟主对话同一个。跑命令是高频操作，
+#   # 每次多一次往返有感，可以在这里换一个更便宜的。
+#   model:
+#   # 单次判定超时（秒）。超时按调用失败处理：未熔断时拒绝该次动作，
+#   # 连续 3 次失败则停用分类器并改为逐次确认。
+#   timeout: 10
 """
 
 
@@ -144,6 +164,22 @@ class Config:
     worktree_cleanup_days: int = 7
     worktree_copy: tuple = ()
     worktree_link: tuple = ()
+    # c16：安全审查分类器。整段可缺省 = 「开、跟主模型、10 秒」。
+    classifier_enabled: bool = True
+    classifier_model: str = ""
+    classifier_timeout: float = 10.0
+    # c16：Provider 客户端的请求超时（秒）。**缺省 None = 不传给 SDK**，
+    # 行为与本章之前逐字一致。
+    #
+    # ⚠ **它刻意不在配置模板里**：这不是给用户调的旋钮，而是装配层给
+    # **分类器专用的那个 Provider 副本**设超时用的。分类器的超时必须落到
+    # SDK 客户端上——只在调用方计时是假超时，第一个数据块永远不到达时
+    # 外面的计时器一点用都没有（`run_shell_captured` 那次
+    # 「shell+捕获下 timeout 是假的」是同一个教训）。
+    #
+    # ⚠ 也刻意**不给主对话用**：主对话的一次请求可能生成几分钟
+    # （模型在吐一份大文件的内容），给它设超时会把正常工作腰斩。
+    request_timeout: "float | None" = None
 
 
 def _parse_int(
@@ -174,6 +210,35 @@ def _parse_int(
         if text.isdigit() or (allow_zero and negative):
             n = int(text)
             return n if (allow_zero or n > 0) else default
+    return default
+
+
+def _parse_float(value: Any, default: float) -> float:
+    """
+    把配置值解析为正浮点数，fail-safe：非法/缺失/非正数一律回退默认值，不抛异常（c16）。
+
+    :param value: 原始配置值（可能是数字、数字字符串，或任意非法值）
+    :param default: 回退默认值
+    :returns: 解析出的浮点数；无法解析时返回 default
+
+    与 `_parse_int` 同口径（不抛错），理由也相同：超时是可选调优项，
+    写错了最坏是超时时长不对，不该阻断启动。
+
+    ⚠ bool 要先排除：它是 int 的子类，`True` 会被静默当成 1.0 秒——
+    那会让每一次分类器判定都超时，而配置文件看起来「写了个值」。
+
+    副作用：无（纯函数）。
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else default
+    if isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return default
+        return parsed if parsed > 0 else default
     return default
 
 
@@ -266,6 +331,25 @@ def load(path: str) -> Config:
     worktree_copy = _parse_str_list(worktree_raw.get("copy"))
     worktree_link = _parse_str_list(worktree_raw.get("link"))
 
+    # c16：classifier 段整段可缺省。
+    #
+    # ⚠ **两个字段刻意用两种口径**，别顺手统一：
+    # - `enabled` 走 `_parse_bool`（**非法值抛错**），与 `web_fetch_enabled` 同口径
+    #   ——它是**安全开关**，一个开关被写成 "maybe" 是明确的配置错误，
+    #   静默回退会让用户以为自己关掉了分类器而实际上没关（或反过来）。
+    # - `timeout` 走回退默认（**不抛错**），与 `context_window` 同口径
+    #   ——它是调优项，写错了最坏是超时时长不对，不该阻断启动。
+    classifier_raw = data.get("classifier")
+    if not isinstance(classifier_raw, dict):
+        classifier_raw = {}
+    classifier_enabled = _parse_bool(
+        classifier_raw.get("enabled", True), "classifier.enabled"
+    )
+    classifier_model = str(classifier_raw.get("model") or "").strip()
+    classifier_timeout = _parse_float(
+        classifier_raw.get("timeout", 10.0), 10.0
+    )
+
     return Config(
         protocol=data["protocol"],
         model=data["model"],
@@ -277,4 +361,7 @@ def load(path: str) -> Config:
         worktree_cleanup_days=worktree_cleanup_days,
         worktree_copy=worktree_copy,
         worktree_link=worktree_link,
+        classifier_enabled=classifier_enabled,
+        classifier_model=classifier_model,
+        classifier_timeout=classifier_timeout,
     )

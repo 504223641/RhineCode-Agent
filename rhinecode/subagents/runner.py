@@ -209,6 +209,21 @@ class SubAgentRuntime:
     :param team: 协作服务门面（c15）。`None` 表示协作能力未启用——
         那时子 Agent 跑完即结束，没有队友消息注入、没有待命与唤醒，
         行为与 C13/C14 **逐字一致**（spec N5 零回归的落点）。
+    :param classifier: 安全审查分类器（c16，共享）。`None` = 未启用。
+
+        ⚠ **子 Agent 必须与主对话共用同一个实例**（spec F23）：不共用的话，
+        主 Agent 只要把「跑 git push」委派出去就绕过了整层——与 C13 第 ⑥ 条
+        「Hook 对子 Agent 全量生效」是同一个理由。
+        共用还让熔断计数是全局的：三个子 Agent 各被拦一次就该熔断，
+        而不是各自攒到 3 次。
+    :param principal_history: 取**主对话历史**的回调（c16 F9）。
+
+        ⚠ 子 Agent 自己的历史里没有真人发言——它收到的「任务描述」是主模型
+        写的。把那段文字当成用户的话，等于让模型给自己签授权书：用户说
+        「别提交」，模型在委派时写一句「请提交代码」，边界就没了。
+
+        **是回调而不是取值**：委派可能在排队，取值型会绑住一份陈旧的历史快照，
+        而用户可能在排队期间又说了一句新的边界。与 `main_mode` 同一条理由。
     """
 
     provider_for: Callable[[Optional[str]], BaseProvider]
@@ -223,6 +238,10 @@ class SubAgentRuntime:
     untrusted_section: str = ""
     thinking_effort: str = "off"
     team: object = None
+    # c16：共享的分类器与「主对话历史」取值回调。两者都缺省 None，
+    # 不传等于本章不启用、行为逐字回到 C15。
+    classifier: object = None
+    principal_history: Optional[Callable[[], list]] = None
     network_tool_names: frozenset = field(
         default_factory=lambda: frozenset({"web_fetch"})
     )
@@ -771,6 +790,17 @@ def run_subagent(
                     # 与 C13/C14 逐字一致。
                     subagent_gate=(
                         TeamGate(team, member_name) if team is not None else None
+                    ),
+                    # c16 F23：子 Agent 与主对话**共用同一个分类器**。
+                    # 不共用的话，主 Agent 把「跑 git push」委派出去就绕过整层。
+                    classifier=runtime.classifier,
+                    # c16 F9：取用户消息用**主对话的历史**。子 Agent 自己的历史
+                    # 里没有真人发言——它的第一条 user 消息是主模型写的任务描述，
+                    # 当成用户的话等于让模型给自己签授权书。
+                    classifier_principal_history=(
+                        runtime.principal_history()
+                        if runtime.principal_history is not None
+                        else None
                     ),
                 ),
             )
