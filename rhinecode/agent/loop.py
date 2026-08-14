@@ -567,9 +567,15 @@ class Agent:
         「两类走这条、一类走那条」少一个会漏改的地方**。
 
         ⚠ **参数名与工具的 `parameters` 是成对维护点**：这里写的
-        `command` / `url` / `body` / `to` 必须与三个工具声明的一致。
+        `command` / `url` / `message` / `to` 必须与三个工具声明的一致。
         改了工具的参数名而漏改这里不会报错，只表现为分类器收到一个空的
         待判内容——然后它会因为「看不出有什么问题」而放行。
+
+        ⚠ **实现期真的踩过**：这里一度写成 `args.get("body")`，而
+        `send_message` 的参数叫 `message`。表现正是上面预言的那样——
+        分类器拿到空正文、判定毫无意义，而没有任何东西报错。
+        护栏见 `tests/test_classifier_message.py::ArgumentNameTest`
+        （拿工具真实声明的 `parameters` 逐个比对）。
         """
         args = tc.arguments or {}
         scope = tool.classifier_scope
@@ -585,7 +591,7 @@ class Agent:
                 host, port = "", 0
             recipient = ""
         elif scope == SCOPE_MESSAGE:
-            specifier = str(args.get("body") or "")
+            specifier = str(args.get("message") or "")
             recipient = str(args.get("to") or "")
         else:
             specifier = str(args.get("command") or "")
