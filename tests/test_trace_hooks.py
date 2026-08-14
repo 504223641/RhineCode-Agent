@@ -917,6 +917,16 @@ class AllTypesTest(TraceHookBase):
             # tui-activity-fold 界面两类
             T.UI_TOOL_BATCH: {"summary": "搜索内容 3 次 · 读取 2 个文件", "calls": 5},
             T.UI_DETAIL_LEVEL: {"level": 1},
+            # c16 分类器一类
+            T.CLASSIFIER_VERDICT: {
+                "scope_kind": "command", "tool": "run_command",
+                "specifier": "git push origin main", "recipient": "", "host": "",
+                "cwd": "/proj", "verdict": "block",
+                "reason": "用户说过这次改动先别提交", "staged": True,
+                "cached": False, "elapsed_ms": 820, "stage1_raw": "block",
+                "breaker_tripped": False, "breaker_reason": "none",
+                "breaker_detail": "",
+            },
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

@@ -350,6 +350,10 @@ class ConversationManager:
         # 闸门退化成原来的 `SubAgentGate`，队员跑完即结束，没有自动唤起。
         # 不启用时行为与 C13/C14 **逐字一致**（spec N5 零回归的落点）。
         self.team_service = team_service
+        # c16：安全审查分类器。由装配层在构造之后属性注入（与 `team_service`
+        # 同形态）。为 `None` 时本章整体不启用，三类动作的行为与本章之前**逐字一致**
+        # ——`RunOptions.classifier` 缺省 None，循环里那两处判断整个跳过。
+        self.classifier = None
 
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
@@ -1518,6 +1522,15 @@ class ConversationManager:
                     allow_summary=False,  # 只跑 C8 第一层（F21）
                     # 防嵌套：子对话里看不到加载工具，也调不动它。
                     excluded_tools=self.skill_manager.fork_excluded_tools(),
+                    # c16：fork 子对话同样要过分类器——否则「把跑命令包进一个
+                    # Skill」就能整层绕过。
+                    classifier=self.classifier,
+                    # ⚠ **取用户消息用主对话的历史**：fork 子对话是空白历史起步，
+                    # 它的第一条 user 消息是 Skill 正文（模型/作者写的），
+                    # 不是真人说的话。不传的话，用户在主对话里说过的
+                    # 「这次改动先别提交」在 Skill 里完全失效——
+                    # 而那正是「把命令包进 Skill」这条绕过路径的入口。
+                    classifier_principal_history=self.history,
                 ),
             )
 
@@ -1641,8 +1654,19 @@ class ConversationManager:
             if self.confirm_callback is None:
                 return False
             choice = self.confirm_callback(tool_call, tool, decision)
+            # c16 F15：用户在面板上批准一次 → 解除分类器熔断。
+            #
+            # ⚠ **位置在 DENY 判断之前是刻意的**：只有非拒绝才算「批准」，
+            # 所以下面那行放在 `if choice == DENY: return False` 之后。
+            # 写在前面（无论选什么都重置）会让用户点「拒绝」也把熔断解除掉——
+            # 那与他刚表达的意思正相反，而界面上完全看不出来。
             if choice == ConfirmDecision.DENY:
                 return False
+            if self.classifier is not None:
+                # 对齐官方：Approving the prompted action resumes auto mode.
+                # 熔断的两种成因（拦太多 / 连不上）都由这一下解除——
+                # 前者是「用户接手做了一次决定」，后者是「他愿意再试一次」。
+                self.classifier.note_manual_approval()
             if choice == ConfirmDecision.ALLOW:
                 return True
             # 本会话 / 永久：构造与本次调用同口径的 allow 规则。
@@ -1838,6 +1862,9 @@ class ConversationManager:
                 # `unattended=True` 决定「用哪条文案说这件事」。
                 interactive=not unattended,
                 unattended=unattended,
+                # c16：主对话的分类器审查。取用户消息的来源就是本次运行自己的
+                # 历史，因此 `classifier_principal_history` 不必传（缺省即此）。
+                classifier=self.classifier,
             ),
         )
         return self._wrap_events(events, extra_skill=grant_skill)

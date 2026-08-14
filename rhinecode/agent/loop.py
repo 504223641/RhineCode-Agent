@@ -607,6 +607,7 @@ class Agent:
         tc: ToolCall,
         decision: DecisionResult,
         cwd: Optional[Path],
+        origin_layer: Optional[Layer] = None,
     ) -> "tuple[DecisionResult, list[AgentEvent], str]":
         """
         c16：在权限结论之上叠加一次分类器审查。
@@ -616,6 +617,17 @@ class Agent:
         :param tc: 本次调用
         :param decision: 权限管线（含 Hook 升级）之后的结论
         :param cwd: 本次运行的工作目录
+        :param origin_layer: **判据用的层**，缺省取 `decision.layer`。
+
+            只有 `system_serial` 分支要显式传：那条分支会把④层的结论降级成
+            ALLOW，此时 `decision.layer` 仍是 MODE、判据成立——但如果 Hook
+            紧接着把它升级成了 `ASK @ HOOK`，判据就该按 HOOK 算（结论不再来自
+            ④层，分类器不该介入）。
+
+            ⚠ **别改成在函数里重造一个带 `raw.layer` 的 `DecisionResult`**：
+            那样会把 Hook 打上的层标抹掉，于是一次「用户写的 Hook 规则说要问
+            我一下」的调用会被当成④层兜底、照样送进分类器，
+            而面板上显示的命中层也退回④——两处都错，且都不报错。
         :returns: `(生效后的结论, 要产出的界面提示, 记录用的标记)`；
                   标记取值 `""`（未审）/ `"allow"` / `"block"` / `"failed"`
 
@@ -659,7 +671,8 @@ class Agent:
         """
         if review is None or not tool.classifier_scope:
             return decision, [], ""
-        if decision.layer is not Layer.MODE:
+        judged_layer = origin_layer if origin_layer is not None else decision.layer
+        if judged_layer is not Layer.MODE:
             # ③层已经定论（含用户写的 allow / deny 与只读短路）→ **零次调用**。
             return decision, [], ""
 
@@ -1454,12 +1467,16 @@ class Agent:
                 system_decision = self._apply_hook_ask(system_decision, hook_verdict)
                 # ── c16：分类器审查（消息类走这条分支）──
                 #
-                # ⚠ **判据用 `raw.layer` 而不是 `system_decision.layer`。**
-                # 上面那段降级会把④层的结论改写成 ALLOW 但**保留原 layer**，
-                # 所以这里两者恰好相同——但那是巧合，不是契约。将来若有人给
-                # 降级分支换一个 layer（比如标成 HOOK 或新造一个），
-                # 用 `system_decision.layer` 判断会**静默地永远不成立**，
-                # 表现为「消息类的分类器一次都没跑过」，而配置与界面上都看不出来。
+                # ⚠ **判据层显式传 `system_decision.layer`，而不是让它默认取。**
+                #
+                # 这条分支把④层的结论降级成 ALLOW 时**保留了原 layer**，所以
+                # 默认取值恰好也对——但那是巧合不是契约。显式传进去，是为了让
+                # 「判据是哪个层」这件事在调用点就写着，将来给降级分支换 layer
+                # 时一眼看得见。
+                #
+                # ⚠ 同时这也保证了 **Hook 的 ASK 不会被分类器接管**：
+                # `_apply_hook_ask` 把层改成 HOOK 之后判据自然不成立——
+                # 那是用户针对这件事写下的规则，该弹面板，不该再问模型一遍。
                 #
                 # ⚠ 与下面普通分支那处是**成对维护点**：两处共用
                 # `_apply_classifier`，但触发判断各写一次。改动触发条件时两处齐改。
@@ -1467,14 +1484,9 @@ class Agent:
                     review,
                     tool,
                     tc,
-                    DecisionResult(
-                        system_decision.decision,
-                        raw.layer,
-                        system_decision.reason,
-                        kind=system_decision.kind,
-                        host=system_decision.host,
-                    ),
+                    system_decision,
                     cwd,
+                    origin_layer=system_decision.layer,
                 )
                 for notice in system_notices:
                     yield notice

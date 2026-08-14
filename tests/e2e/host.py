@@ -433,6 +433,17 @@ def make_config(args: argparse.Namespace) -> Config:
         return cfg
 
     # scripted：给了 --config 就以它为准（但 api_key 换成假值），否则用写死的默认
+    #
+    # ⚠ **分类器在 scripted 模式下照常启用**（c16），这是刻意的。
+    #
+    # 分类器与主对话共用同一个 `provider_factory`（绕过注入的工厂会让一次端到端
+    # 测试**静默连上真实网络**），所以它的请求也会落到剧本模型上。
+    # 剧本模型据系统提示里的标记**自己应答分类器请求、不消耗剧本轮次**
+    # （见 `tests/e2e/scripted.py` 的 `is_classifier_request`），
+    # 因此既有的每一份剧本一字不用改，而这条路径**真的被跑到**了。
+    #
+    # 早先这里曾改成强制关闭，那是错的方向：关掉等于让驱动设施完全不覆盖
+    # 本章新增的判定层，而剧本错位的根因在剧本模型那一侧、该在那一侧解决。
     if args.config:
         path = Path(args.config)
         if not path.is_file():
