@@ -359,6 +359,9 @@ class RunCommandTool(Tool):
     # c14：本工具碰路径/起子进程，必须知道调用者的工作目录。
     workspace_aware = True
     primary_arg = "command"
+    # c16：命令类要经分类器审查。第②层路径沙箱管得住文件工具，
+    # 但管不住子进程自己 open 的文件——这正是分类器补的那个洞。
+    classifier_scope = "command"
 
     def execute(self, args: dict, cwd=None) -> ToolResult:
         """

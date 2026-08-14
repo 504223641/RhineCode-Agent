@@ -48,10 +48,26 @@ class DeepSeekProvider(BaseProvider):
 
         :param config: 包含 api_key、base_url、model 的配置对象
         """
-        self._client = openai.OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-        )
+        # c16：`request_timeout` 非 None 时把超时交给 SDK 客户端。
+        #
+        # ⚠ **超时必须落在这一层，不能只在调用方计时。** 调用方那种写法在
+        # 「第一个数据块永远不到达」时完全无效——它还没开始迭代，计时器根本
+        # 没有可中断的对象。本项目踩过同型的坑：
+        # `subprocess.run(shell=True, capture_output=True, timeout=T)` 这个组合下
+        # `timeout` 是假的，实测 `timeout=1` 在命令 `sleep 8` 时真的等了 8 秒
+        # （见 `tools/run_command.py` 与 `tests/test_subprocess_timeout.py`）。
+        #
+        # ⚠ **不能无条件传。** 在这个 SDK 里显式传 `timeout=None` 的语义是
+        # 「不设超时」，与「用 SDK 的默认值」**不是一回事**。因此缺省不传，
+        # 使既有行为逐字不变。
+        #
+        # 当前唯一的传入方是装配层给**分类器专用**的那个 Provider 副本
+        # （`bootstrap.py`）。主对话刻意不设超时：它的一次请求可能生成几分钟
+        # （模型在吐一份大文件的内容），设超时会把正常工作腰斩。
+        client_kwargs = {"api_key": config.api_key, "base_url": config.base_url}
+        if getattr(config, "request_timeout", None) is not None:
+            client_kwargs["timeout"] = config.request_timeout
+        self._client = openai.OpenAI(**client_kwargs)
         self._model = config.model
 
     def _to_sdk_messages(self, messages: list[Message]) -> list[dict]:

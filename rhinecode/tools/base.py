@@ -164,6 +164,30 @@ class Tool(ABC):
                  与 `_TOOL_LABELS`（内部名 → 展示标签）的分工：那张表在展示层，
                  因为它是纯粹的用词选择；这个字段在工具本体，因为**只有工具自己
                  知道哪个参数最重要**，而且改参数时它就在眼前、不容易漏。
+
+    - classifier_scope：**这个工具要不要经过分类器审查，以及算哪一类**（c16）。
+                 缺省空串 = 不审查，那是绝大多数工具的情况。
+
+                 三个有效取值（见 `classifier/models.py` 的 `SCOPE_*` 常量）：
+
+                 | 取值 | 谁在用 | 为什么要审 |
+                 | --- | --- | --- |
+                 | `"command"` | `run_command` | 第②层沙箱管不到子进程内部自己 open 的文件 |
+                 | `"url"` | `web_fetch` | **地址本身就是发出去的数据**，缺省又不建立域名白名单 |
+                 | `"message"` | `send_message` | 这条通路上此前没有任何判定，队员可以把读到的内容原样转给别人 |
+
+                 ⚠ **文件读写刻意不在其中**：那一侧的边界由第②层路径沙箱**物理
+                 保证**（越界是根本写不出去，不是判断），配置类文件另有②″保护路径
+                 要求过人眼。改成走分类器是把硬边界换成软判断。
+
+                 ⚠ **这是成对维护点**：新增一类要审查的动作时，这里声明之后，
+                 `agent/loop.py` 的两条判定分支与 `classifier/prompt.py` 的待判动作
+                 段落都要认得它——漏改不报错，只表现为「声明了但从不被审查」，
+                 而配置和界面上都看不出异常。
+
+                 之所以做成工具自己声明的标志、而不是在分类器里按名字硬编码：
+                 与 `system_serial` 同一条理由——那会让分类器包认识具体工具的
+                 名字，而它现在是个只依赖 provider 的叶子包。
     """
 
     name: str = ""
@@ -173,6 +197,8 @@ class Tool(ABC):
     system_serial: bool = False
     plan_safe: bool = False
     workspace_aware: bool = False
+    # c16：空串 = 不进分类器。取值见上方类 docstring 的那张表。
+    classifier_scope: str = ""
     primary_arg: str = ""
 
     @abstractmethod
