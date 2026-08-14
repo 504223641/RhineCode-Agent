@@ -316,7 +316,10 @@ def build_builtin_registry() -> CommandRegistry:
             CommandSpec(
                 name="/mode",
                 aliases=("/plan",),
-                description="切换运行模式：auto（放手干活）⇄ plan（先规划再执行）；等价于 Shift+Tab",
+                # 「互换」一律用 `↔`（符号白名单 F29）：此处原为 `⇄`，是全项目唯一一处
+        # ——`[AUTO] ↔ [PLAN]`、「逐条 ↔ 全文」、「折叠 ↔ 逐条」用的都是 `↔`。
+        # 两个符号一个意思，正是白名单「语义互不重叠」那条判据要挡的形态。
+        description="切换运行模式：auto（放手干活）↔ plan（先规划再执行）；等价于 Shift+Tab",
                 usage="/mode",
                 command_type=CommandType.UI,
                 handler=_handle_mode,

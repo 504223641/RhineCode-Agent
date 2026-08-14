@@ -207,6 +207,8 @@ class ContentTest(unittest.IsolatedAsyncioTestCase):
         """
         无数据的段整段隐藏（与状态栏各段的既有做法一致）——
         不写 `↑0 tokens`，那是纯噪音。
+
+        两侧**各自**隐藏：只有输入还没有输出时（第一轮尚未答完）不写 `↓0`。
         """
         app = _Harness()
         async with app.run_test(size=(120, 40)) as pilot:
@@ -214,39 +216,73 @@ class ContentTest(unittest.IsolatedAsyncioTestCase):
             line.start()
             await pilot.pause()
             self.assertNotIn("↑", line.compose_text())
+            self.assertNotIn("↓", line.compose_text())
 
-            line.add_tokens(2100)
+            line.set_usage(2100, 0)
             await pilot.pause()
             self.assertIn("↑", line.compose_text())
             self.assertIn("2.1k", line.compose_text())
+            self.assertNotIn("↓", line.compose_text(), "没有输出就不该出现 ↓")
 
-    async def test_tokens_accumulate_across_rounds(self) -> None:
+    async def test_input_takes_the_latest_round_and_output_accumulates(self) -> None:
         """
-        AC16：token 是**跨轮累加**的本回合总量，不是最后一轮的量。
+        **两侧口径不同，这条是它的判据**：输入取最近一轮、输出跨轮累加。
 
-        ⚠ 它**跳变式**更新（每轮流末尾才到一次），与耗时的持续滚动节奏不同
-        ——那是 Provider 协议限制，属已知行为而非缺陷。
+        ## 为什么不对称，以及为什么必须钉住
+
+        每一轮请求都要把**整段历史重发一遍**，所以输入累加等于同一段历史算很
+        多遍——那个数字既不是花费也不是上下文。输出每一轮都是**新产出**，
+        累加起来才正好回答「模型这一回合总共生成了多少」。
+        一句话：**输入重发所以只能看当下，输出新增所以可以累加。**
+
+        ⚠ 「顺手把两边统一成累加」在界面上看起来毫无问题（数字照样在涨），
+        所以只能靠这条判据挡：给两轮明显不同的输入值，最终必须显示**后一个**，
+        而不是它们的和。
+
+        ## 改这个口径的起因
+
+        此前是「每轮 `total_tokens` 累加」，实测一次 9 轮的运行显示 `↑105.7K`，
+        而底部状态栏的上下文是 `15.9K`，差 6.6 倍。两个 token 数字同屏、量级
+        差这么多，用户第一反应是「有一个算错了」（真实反馈）。现在 `↑` 与状态
+        栏是同一个量（一个是 API 精确值、一个是 c8 估算），两者自然对得上。
+
+        口径与 Claude Code 一致，而且它自己反转过一次：官方状态行文档记着
+        `context_window.total_input_tokens` 是「当前在上下文窗口中的令牌计数，
+        来自最近的 API 响应」，并注明「在 v2.1.132 之前，这些是累积的会话总计」。
         """
         app = _Harness()
         async with app.run_test(size=(120, 40)) as pilot:
             line = app.query_one(StatusLine)
             line.start()
-            line.add_tokens(1000)
-            line.add_tokens(1500)
+            line.set_usage(8000, 1000)
+            line.set_usage(16000, 1500)
             await pilot.pause()
-            self.assertIn("2.5k", line.compose_text())
+
+            text = line.compose_text()
+            # 输入：取后一轮的 16000，**不是** 8000+16000=24000
+            self.assertIn("↑16.0k", text)
+            self.assertNotIn("24.0k", text, "输入不得跨轮累加——同一段历史会被算很多遍")
+            # 输出：1000+1500 累加
+            self.assertIn("↓2.5k", text)
 
     async def test_start_resets_the_counter(self) -> None:
-        """新一轮运行必须从零开始算，不能把上一轮的量带过来。"""
+        """
+        新一轮运行必须从零开始算，不能把上一轮的量带过来。
+
+        ⚠ **输入侧也必须归零**：它平时是「覆写」语义，看起来无所谓——但新一轮
+        的第一次 usage 到达之前，那一格若还留着上一回合的数字，用户会以为
+        新回合一上来就吃掉了那么多上下文。
+        """
         app = _Harness()
         async with app.run_test(size=(120, 40)) as pilot:
             line = app.query_one(StatusLine)
             line.start()
-            line.add_tokens(5000)
+            line.set_usage(5000, 800)
             line.stop()
             line.start()
             await pilot.pause()
             self.assertNotIn("↑", line.compose_text())
+            self.assertNotIn("↓", line.compose_text())
 
     async def test_waiting_phase_drops_the_interrupt_hint(self) -> None:
         """

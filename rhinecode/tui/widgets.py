@@ -2690,7 +2690,10 @@ class StatusLine(Static):
     def __init__(self) -> None:
         super().__init__("", markup=True)
         self._start_time = 0.0
-        self._tokens = 0
+        # 输入侧取**最近一轮**的值、输出侧**跨轮累加**，两者口径不同且都是刻意的
+        # ——理由见 `set_usage`。
+        self._input_tokens = 0
+        self._output_tokens = 0
         self._frame_index = 0
         self._phase = "处理中…"
         self._interruptible = True
@@ -2713,7 +2716,8 @@ class StatusLine(Static):
         副作用：起一个主线程定时器、重绘自身。
         """
         self._start_time = monotonic()
-        self._tokens = 0
+        self._input_tokens = 0
+        self._output_tokens = 0
         self._frame_index = 0
         self._phase = "处理中…"
         self._interruptible = True
@@ -2735,18 +2739,51 @@ class StatusLine(Static):
         self._active = False
         self.update("")
 
-    def add_tokens(self, count: int) -> None:
+    def set_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         """
-        累加本回合的 token 用量。
+        更新本回合的 token 用量，**输入与输出分开**（`↑` / `↓`）。
 
-        ⚠ **它是跳变式更新，不是持续滚动**（F17）：Provider 协议只在**每轮
-        流末尾**产出一次用量。这与耗时那一段的节奏不同，是**已知且如实记录**
-        的行为，不是缺陷。
+        :param prompt_tokens: 本轮的输入 token（`usage.prompt_tokens`）
+        :param completion_tokens: 本轮的输出 token（`usage.completion_tokens`）
 
-        :param count: 本轮的 token 数；非正数忽略
+        ## ⚠ 两侧的口径**故意不同**，这是本方法最容易被「顺手统一」掉的地方
+
+        - **输入取最近一轮的值，不累加。** 每一轮请求都要把**整段历史重发一遍**，
+          累加等于把同一段历史重复计入很多次，得到的数字既不是花费也不是上下文。
+          取最近一轮，它的含义就变得很干净：**当前这段对话有多大**。
+        - **输出跨轮累加。** 每一轮的输出都是**新产出**的内容，不存在重复计入，
+          累加起来正好回答「模型这一回合总共生成了多少」。
+
+        换句话说，不对称不是疏忽：**输入重发所以只能看当下，输出新增所以可以累加**。
+
+        ## 与底部状态栏的关系
+
+        `↑` 与状态栏那段「上下文：N% · X/Y」现在是**同一个量**（前者是 API 亲口
+        给出的精确值，后者是 c8 的估算），因此两者应当**接近**——实测 `16.0k`
+        对 `15.9K`。这正是改口径的目的：此前 `↑` 是「每轮 total 累加」，
+        同一次 9 轮的运行显示 `105.7K`，与状态栏差 6.6 倍，用户看到两个量级
+        差这么多的 token 数字同屏，第一反应是「有一个算错了」（真实反馈）。
+
+        ## 这个口径对齐 Claude Code，而且它自己也反转过一次
+
+        官方状态行文档里 `context_window.total_input_tokens` /
+        `total_output_tokens` 的说明写着「**当前在上下文窗口中的**令牌计数，
+        来自最近的 API 响应」，并明确记着「**在 v2.1.132 之前，这些是累积的
+        会话总计**」——也就是说 Anthropic 自己把「累加」改成了「取最近一次」。
+        另：它的上下文百分比**只由输入侧算**（`input + cache_creation +
+        cache_read`，不含 output），与本项目状态栏的口径一致。
+
+        ⚠ **它仍是跳变式更新，不是持续滚动**（F17）：Provider 协议只在每轮流
+        末尾产出一次用量。这与耗时那一段的节奏不同，是**已知且如实记录**的行为。
         """
-        if count and count > 0:
-            self._tokens += int(count)
+        if prompt_tokens and prompt_tokens > 0:
+            # 覆写而非累加——见上面「输入取最近一轮」那条。
+            self._input_tokens = int(prompt_tokens)
+        if completion_tokens and completion_tokens > 0:
+            self._output_tokens += int(completion_tokens)
+        if (prompt_tokens and prompt_tokens > 0) or (
+            completion_tokens and completion_tokens > 0
+        ):
             self._repaint()
 
     def set_phase(self, phase: str, interruptible: bool = True) -> None:
@@ -2776,10 +2813,19 @@ class StatusLine(Static):
 
         无数据的段**整段隐藏**（与状态栏各段的既有做法一致）：
         没消耗 token 时不写 `↑ 0 tokens`，不可中断时不写 `esc 中断`。
+
+        ⚠ 输入与输出**合成一段**（`↑16.0k ↓1.2k`）而不是两段，是因为段间的
+        ` · ` 分隔符表达的是「彼此无关的几件事」，而这两个数字是同一件事的两半。
+        两侧**各自隐藏**：只有输入没有输出时（第一轮还没答完）不写 `↓0`。
         """
         segments = [f"{int(monotonic() - self._start_time)}s"]
-        if self._tokens:
-            segments.append(f"↑{format_tokens(self._tokens)}")
+        usage = []
+        if self._input_tokens:
+            usage.append(f"↑{format_tokens(self._input_tokens)}")
+        if self._output_tokens:
+            usage.append(f"↓{format_tokens(self._output_tokens)}")
+        if usage:
+            segments.append(" ".join(usage))
         if self._interruptible:
             segments.append("esc 中断")
         return segments

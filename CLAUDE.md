@@ -175,6 +175,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 - **审批回调里绝不能出现 `set_mode`（auto-plan）** → `conversation.py` 的 `_approve_plan_then_exit`。⚠ **这条只有结构护栏挡得住**：两个预设的档位本来就相同，所以「顺手补一句 `set_mode(PERMISSIVE)`」在**行为上看不出任何区别**，断言档位没变的那条用例照样绿（变异实测确认）。而它是被明令禁止的形态——那句话跑在工作线程上、改的是单实例共享的引擎，且会让回合中途前后两次委派的同名角色拿到不同档位。护栏见 `tests/test_auto_plan_integration.py::test_approval_path_does_not_mention_set_mode`
 
+- **计划审批面板那句说明 ↔ `auto` 预设的档位（auto-plan）** → `tui/app.py` 的 `_show_approve_panel` ↔ `presets.py` 的 `PRESET_AXES[Preset.AUTO]`。那句话是面板上**唯一影响用户决策的信息**：他据此判断「点下去之后还有没有人工闸门」。⚠ **真踩过且活了很久**：面板长期写着「写文件/改文件/运行命令仍会逐个确认」，那是 auto-plan 扩展**之前**的行为——获批即回 `auto`（放行档），那三类操作一次面板都不弹（用户 trace 实录：获批后 `write_file` 与两次 `run_command` 全部 `allow（④模式）`）。**一句过期的安全承诺比没有承诺更危险**，与已知项 18 那次 `deny` 规则失效同一性质。缺省档将来若改回 `default`，这里必须同步改回。护栏见 `tests/test_auto_plan_integration.py::ApprovePanelTellsTheTruthTest`（含「旧承诺不得残留」的反证与钉住档位的那条）
+
 - **新增起 shell 子进程的调用方（auto-plan）** → 一律走 `tools/run_command.py` 的 `run_shell_captured`，敏感环境变量的过滤收在**它内部**。⚠ 匹配片段有两个**不能用**的：**裸 `AUTH`** 会命中 `SSH_AUTH_SOCK`（ssh-agent 的 socket **路径**、不是密钥，却是 ssh 方式 `git push` 的唯一依靠，剔掉后报 `Permission denied (publickey)` 而**根因不可见**），**裸 `KEY`** 会命中 `SSH_KEY_PATH`。故用 `AUTHORIZATION` 与具体的 `*_KEY` 组合。**刻意不建豁免名单**——调研过 `GITHUB_TOKEN`，实测 `gh` 走 keyring，过滤它代价为零。护栏见 `tests/test_env_filter.py`
 
 - **②″保护路径的「本会话放行」是成对维护点（protected-paths）** → `tui/widgets.py` 的 `ConfirmPanel.show_for` 三选项分支 + `conversation.py` 的 `_build_ask` 豁免分支。**只改一处都不报错**：只改面板 → 不给「永久放行」了，但「本会话放行」仍写③层规则，用户点了之后下次还弹；只改协调层 → 面板仍显示一个点了没用的「永久放行」。⚠ 那条豁免**刻意只在内存、只对单个文件、关程序即失效**——落盘的豁免本身就是一份「能改变以后会发生什么」的配置，绕一圈又回到本扩展要解决的原问题
@@ -211,6 +213,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单。
   ⚠ **状态栏那一行是左右两个区**（tui-display F31）：`StatusHint`（贴左边缘，瞬时提示）+ `StatusBar`（右对齐，常驻状态），装在 `#status-row` 里。**常驻状态一律进右区**；只有「刚发生了什么」这类瞬时提示才进左区，且**不能拼进 `compose_status_text`** ——右区整块 `text-align: right`，拼进去只会落在右对齐块的最左边、随其余各段长度在屏幕中间浮动，**判据写成「排在第一段之前」会全绿而屏幕上并不贴左**（真踩过）。左区新增内容要同步 `_refresh_status` 里那行 `set_quit_hint` 同位置的刷新，以及 trace 负载里与 `text` 并列的那个布尔字段（左区不在 `text` 里，漏记等于那两秒的界面反馈没有任何物证）
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+- **状态行的 `↑` 取最近一轮、`↓` 跨轮累加，两侧口径不同是刻意的（tui-activity-fold）** → `tui/widgets.py` 的 `StatusLine.set_usage`。判据一句话：**输入每轮重发所以只能看当下，输出每轮新增所以可以累加**。⚠ 「顺手把两边统一成累加」在界面上看不出问题（数字照样在涨），但那正是改掉的旧口径——它累加每轮 `total_tokens`，同一段历史被重复计入很多次，实测一次 9 轮的运行显示 `↑105.7K`，而状态栏的上下文是 `15.9K`，差 6.6 倍。**用户真的把它当成 bug 报过**（两个 token 数字同屏、量级差好几倍，第一反应就是「有一个算错了」）。现在 `↑` 与 `context/manager.py` 的 `status_line` 是**同一个量**（前者 API 精确值、后者 c8 估算），两者本就该接近——**别再让它们分叉**。口径对齐 Claude Code，且它自己反转过一次：官方状态行文档写 `context_window.total_input_tokens` 是「当前在上下文窗口中的令牌计数，来自最近的 API 响应」，并注明「在 v2.1.132 之前，这些是累积的会话总计」；它的上下文百分比同样**只由输入侧算**。护栏见 `tests/test_tui_status_line.py::test_input_takes_the_latest_round_and_output_accumulates`（含「输入不得累加」的反证）
+
 - **活动区终态行与历史区完成通知的成本数字必须同源（tui-display）** → 两处都经
   `subagents/tasks.py` 的 `TaskManager.row_of` 取快照、再交给
   `tui/widgets.py` 的 `format_activity_cost` 渲染。**各自从 `TaskRecord` 上取字段
@@ -220,11 +224,20 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
   一处；写成两行同样不报错，只是每个子 Agent 在历史区留下重复的两条，
   用户会以为它跑了两次。护栏见 `tests/test_e2e_activity.py::FinishTraceTest`
   （断言该任务名在历史区**恰好出现一次**）
-- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 九个：
+- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 十二个：
   `●`（发生了一件事——工具行、活动行、批次聚合行，状态靠**颜色**区分）、
   `⎿`（从属于上一行）、`>`（当前选中——面板高亮指示符）、
-  `·`（行内分隔，不作行首前缀）、`↑`（token 计数）、`✻`（思考块）、
-  以及 tui-activity-fold 新增的旋转标记三帧 `◇` `◈` `◆`（状态行动画）。
+  `·`（行内分隔，不作行首前缀）、`✻`（思考块）、
+  tui-activity-fold 新增的旋转标记三帧 `◇` `◈` `◆`（状态行动画）、
+  以及四个箭头：`↑`（输入 token）、`↓`（输出 token）、
+  `→`（从 A 到 B / 前后对照）、`↔`（两态互换）。
+  ⚠ **箭头这一组刚补齐过一轮**：`↑` 从登记之日起就没被扫描护栏管过
+  （扫描区间原本不含 Arrows 区块 2190–21FF，与 `●` 那次是同一个坑），
+  加 `↓` 时才发现。补上区间后扫出四处在用的 `→`（`/help` 的 `/think` 描述、
+  `/agents` 的「声明值 → 实际值」、`/hooks` 的「事件 → 动作」、任务回执的
+  「状态 → …」）与一处孤立的 `⇄`——后者已改成 `↔`，因为项目其余地方
+  （`[AUTO] ↔ [PLAN]`、「逐条 ↔ 全文」）表达互换用的都是它，
+  两个符号一个意思正是本表「语义互不重叠」要挡的形态。
   **不在表内的一律不用**，包括为消息分级发明的图形——警告与错误靠**文字前缀**
   （「警告：」「错误：」），那是它们脱离颜色也能辨认的唯一依靠。
   改动要同步三处：本表、`tests/test_tui_symbols.py` 的 `WHITELIST`、

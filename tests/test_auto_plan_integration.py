@@ -330,5 +330,64 @@ class ShiftTabDoesNotEchoTest(unittest.TestCase):
         self.assertIn("show_message", source)
 
 
+class ApprovePanelTellsTheTruthTest(unittest.IsolatedAsyncioTestCase):
+    """
+    计划审批面板上那句说明，必须与**获批之后实际会发生什么**一致。
+
+    ## 这条护栏对应的真实缺陷
+
+    面板长期写着「开始执行  写文件/改文件/运行命令仍会逐个确认」——那是
+    auto-plan 扩展**之前**的行为。扩展之后计划获批即回到 `auto` 预设（放行档），
+    那三类操作一次面板都不弹。用户的 trace 实录：获批后一次 `write_file`、
+    两次 `run_command` 全部 `allow（④模式）`，零确认。
+
+    ## 为什么它比「一句文案写错了」严重
+
+    用户是**据此**点下「开始执行」的：他以为后面还有一道人工闸门，
+    于是对计划本身的审视就松一档。实际上这就是最后一道。
+    项目里已经写下的同类判断是「错误的安全承诺比没有承诺更危险」
+    （见 `CLAUDE.md` 已知项 18 对 `deny` 规则失效那次的定性）。
+
+    ## 判据形态
+
+    正面断言「直接执行 / 不再逐个确认」的意思在，**反面断言那句旧承诺不在**
+    ——只留正面的话，两句话同时出现（改文案时旧的那半没删干净）也会通过。
+    """
+
+    async def test_yes_label_does_not_promise_per_call_confirmation(self) -> None:
+        from tests.test_command_tui import _make_app
+        from rhinecode.tui.widgets import ConfirmPanel
+
+        app, _ = _make_app()
+        async with app.run_test() as pilot:
+            app._show_approve_panel("## 目标\n随便一个计划")
+            await pilot.pause()
+
+            panel = app.query_one(ConfirmPanel)
+            # 按 `id` 取而不是按文字找：表头「计划已就绪，是否开始执行？」里
+            # 同样有「开始执行」四个字，按文字找会取到表头，判据就落空了。
+            yes = next(
+                str(option.prompt) for option in panel._options if option.id == "yes"
+            )
+
+        self.assertIn("不再逐个确认", yes)
+        # ⚠ 反证：旧文案里那句承诺不得残留。缺省档是放行档，它是假的。
+        self.assertNotIn("仍会逐个确认", yes)
+
+    def test_the_claim_matches_the_auto_preset_axis(self) -> None:
+        """
+        文案的依据是 `auto` 预设的**档位**，这条把两者钉在一起。
+
+        缺省档若改回 `default`（灰色地带交人工确认），面板就该改回「仍会逐个
+        确认」——那时本条会红，提醒改文案。没有它的话，两处会各自漂移，
+        而漂移的结果是面板对着一个已经变了的世界继续说旧话。
+        """
+        from rhinecode.presets import PRESET_AXES
+
+        mode, plan_stage = PRESET_AXES[Preset.AUTO]
+        self.assertIs(mode, PermissionMode.PERMISSIVE)
+        self.assertFalse(plan_stage)
+
+
 if __name__ == "__main__":
     unittest.main()
