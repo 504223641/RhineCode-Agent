@@ -117,13 +117,19 @@ def _segments(pattern: str) -> list[str]:
     切不动（引号未闭合）时退回朴素切分——这里的结论只用于「要不要丢弃」，
     偏严一点没有安全代价。
 
+    ⚠ **`posix=False` 是必须的。** posix 模式会把反斜杠当成转义字符吃掉，
+    于是 `C:\\Python311\\python.exe *` 被切成 `CPython311python.exe`，
+    命令名认不出来——**一条写 Windows 绝对路径的宽泛规则就此漏判**，
+    而它是本机最常见的写法。代价是引号会留在 token 里，
+    但本函数只看首段的命令名与「下一段是不是通配」，不受影响。
+
     副作用：无（纯函数）。
     """
     text = str(pattern or "").strip()
     if not text:
         return []
     try:
-        return shlex.split(text, posix=True)
+        return shlex.split(text, posix=False)
     except ValueError:
         return text.split()
 
@@ -192,16 +198,21 @@ def is_broad_command_allow(tool: str, pattern: str) -> bool:
         return False
 
     head = _basename(parts[0])
-
-    # ② 解释器 + 通配。要求通配紧跟在命令名之后——见上方 docstring 的说明。
-    if head in INTERPRETERS:
-        return len(parts) <= 2 and (len(parts) == 1 or parts[1] == "*")
-
-    # ③ 包管理器的 run 类
     second = parts[1].lower() if len(parts) > 1 else ""
+
+    # ③ 包管理器的 run 类。
+    #
+    # ⚠ **必须排在②之前。** 有的命令名同时落在两张表里（`bun` 既是解释器
+    # 又有 `bun run`）。②那一支是「通配紧跟在命令名之后」，遇到
+    # `bun run *` 会因为多了一段而直接返回 False——**漏判且不报错**。
+    # 先试更具体的③，②只作为兜底，两张表就不必互斥了。
     if (head, second) in PACKAGE_RUNNERS:
         return len(parts) <= 3 and (len(parts) <= 2 or parts[2] == "*")
     if (head, "") in PACKAGE_RUNNERS:
+        return len(parts) <= 2 and (len(parts) == 1 or parts[1] == "*")
+
+    # ② 解释器 + 通配。要求通配紧跟在命令名之后——见上方 docstring 的说明。
+    if head in INTERPRETERS:
         return len(parts) <= 2 and (len(parts) == 1 or parts[1] == "*")
 
     return False
