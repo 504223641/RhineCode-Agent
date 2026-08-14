@@ -153,6 +153,11 @@ def _s_permission_decision(r: dict) -> str:
     # 已经看得见了。
     if r.get("protected_exempt"):
         mark += "保护路径已豁免 "
+    # c16：这条结论是分类器改的。进摘要行的判据同上——不标的话，一条被分类器
+    # 拦下的命令显示成 `deny（④模式）`，而④在放行档下只会给 ALLOW，
+    # 读的人会以为用户切到了严格档。
+    if r.get("classifier"):
+        mark += f"分类器={r.get('classifier')} "
     return (
         f"{mark}{r.get('tool')} → {r.get('decision')}（{_LAYER_NAMES.get(layer, layer)}）"
         f" · {_text_of(r.get('reason'), 50)}"

@@ -53,7 +53,20 @@ from rhinecode.hooks import (
     NullHookManager,
 )
 from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
+from rhinecode.classifier import (
+    SCOPE_MESSAGE,
+    SCOPE_URL,
+    ClassifierProtocol,
+    ReviewAction,
+    ReviewSession,
+    VerdictKind,
+)
+from rhinecode.classifier import render as classifier_render
 from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
+# c16：待判动作要带主机与端口（网络判定的缓存键）。复用②′层那份解析，
+# **不在这里另写一份**——`permission/network.py` 的模块 docstring 明写着
+# 「判定期与连接期共用同一份实现」，本处是第三个使用者。
+from rhinecode.permission import network
 from rhinecode.trace import (
     SCOPE_MAIN,
     NullRecorder,
@@ -241,6 +254,20 @@ class RunOptions:
     allow_summary: bool = True
     excluded_tools: frozenset = frozenset()
     interactive: bool = True
+    # c16：安全审查分类器。**缺省 None 即本章之前的行为，不传等于零回归**。
+    #
+    # 非空时，`run()` 会为本次运行建一个 `ReviewSession`（缓存与转录来源绑在
+    # 那上面），三类声明了 `classifier_scope` 的动作在权限结论来自第④层时
+    # 多过一次模型判定。
+    classifier: "Optional[ClassifierProtocol]" = None
+    # c16 F9：**取用户消息的历史来源**。缺省 None = 用本次运行自己的历史
+    # （主对话的情形）。
+    #
+    # ⚠ **子 Agent 必须传主对话的历史**：它自己的历史里没有真人发言，
+    # 它收到的「任务描述」是主模型写的。把那段文字当成用户的话，等于让模型
+    # 给自己签授权书——用户说「别提交」，模型在委派时写一句「请提交代码」，
+    # 边界就没了。
+    classifier_principal_history: "Optional[list]" = None
     # c15 F18/F19：本次运行是不是「无人值守轮」——由队友的消息自动唤起、
     # 用户没有在场。**只影响判 ASK 时回灌哪条文案**，不改变任何权限判定：
     # `interactive=False` 已经决定了「一律拒绝」，本标志只决定「怎么把这件事
@@ -519,6 +546,206 @@ class Agent:
             host=decision.host,
         )
 
+    @staticmethod
+    def _review_action(tool: Tool, tc: ToolCall, cwd: Optional[Path]) -> "ReviewAction":
+        """
+        把一次工具调用翻译成分类器的待判动作（c16）。
+
+        :param tool: 工具（已声明 `classifier_scope`）
+        :param tc: 本次调用
+        :param cwd: 本次运行的工作目录
+        :returns: 待判动作
+
+        副作用：无（纯数据转换）。
+
+        ## 为什么在这里翻译，而不是复用 `PermissionRequest`
+
+        `PermissionRequest` 对**消息类**给不出内容：发消息的工具落 `other` 分支，
+        它的 `specifier` 是空串（`permission/adapter.py` 刻意没把协作工具登记进
+        `_TOOL_MAP`，理由是它们不碰文件也不执行命令、没有可映射的语义）。
+        三类里有一类取不到，那就三类都从 `tc.arguments` 取——**一种取法比
+        「两类走这条、一类走那条」少一个会漏改的地方**。
+
+        ⚠ **参数名与工具的 `parameters` 是成对维护点**：这里写的
+        `command` / `url` / `body` / `to` 必须与三个工具声明的一致。
+        改了工具的参数名而漏改这里不会报错，只表现为分类器收到一个空的
+        待判内容——然后它会因为「看不出有什么问题」而放行。
+        """
+        args = tc.arguments or {}
+        scope = tool.classifier_scope
+        host, port = "", 0
+        if scope == SCOPE_URL:
+            specifier = str(args.get("url") or "")
+            try:
+                _scheme, host, port = network.split_url(specifier)
+            except Exception:  # noqa: BLE001
+                # 解析不出来不影响判定，只是这次不走缓存（`cache_key` 见空主机
+                # 就返回空串）。地址本身仍然原样交给分类器——它恰恰要判
+                # 「这个古怪的地址是什么」。
+                host, port = "", 0
+            recipient = ""
+        elif scope == SCOPE_MESSAGE:
+            specifier = str(args.get("body") or "")
+            recipient = str(args.get("to") or "")
+        else:
+            specifier = str(args.get("command") or "")
+            recipient = ""
+        return ReviewAction(
+            scope=scope,
+            tool_name=tool.name,
+            specifier=specifier,
+            recipient=recipient,
+            host=host,
+            port=port,
+            cwd=str(cwd) if cwd is not None else "",
+        )
+
+    def _apply_classifier(
+        self,
+        review: "Optional[ReviewSession]",
+        tool: Tool,
+        tc: ToolCall,
+        decision: DecisionResult,
+        cwd: Optional[Path],
+    ) -> "tuple[DecisionResult, list[AgentEvent], str]":
+        """
+        c16：在权限结论之上叠加一次分类器审查。
+
+        :param review: 本次运行的判定会话；None = 未启用，原样返回
+        :param tool: 本次调用的工具
+        :param tc: 本次调用
+        :param decision: 权限管线（含 Hook 升级）之后的结论
+        :param cwd: 本次运行的工作目录
+        :returns: `(生效后的结论, 要产出的界面提示, 记录用的标记)`；
+                  标记取值 `""`（未审）/ `"allow"` / `"block"` / `"failed"`
+
+        副作用：可能发起模型请求；可能改变熔断状态。**不抛异常**（门面已收敛）。
+
+        ## ⚠ 触发条件三个，缺一不可
+
+        1. 会话非空（分类器已启用）
+        2. 工具声明了 `classifier_scope`（三类之一）
+        3. **结论来自第④层**（`layer is Layer.MODE`）
+
+        第 3 条是本层全部安全论证的落点，它同时给出两条性质：
+
+        - 用户写的 `deny` 规则**压得过**分类器（③层命中时 layer 是 RULE，不进这里）
+        - 用户写的 `allow` 规则**直接短路**分类器（同上，且**零次模型调用**）
+
+        ⚠ 只读短路给出的也是 `Layer.RULE`，所以只读工具天然不进这里。
+
+        ## ⚠ 网络类是唯一一处分类器可以「放宽」的地方
+
+        三类的基线不同：
+
+        | 类别 | ④层的既有结论 | 分类器能做什么 |
+        | --- | --- | --- |
+        | 命令 | ALLOW（放行档） | 只能变严 |
+        | 消息 | ALLOW（对④层免疫） | 只能变严 |
+        | **网络** | **ASK**（放行档对网络不生效，web_fetch 扩展 F7） | **放行时把 ASK 覆写成 ALLOW** |
+
+        网络那一格是 spec F3 明确要的：用一个真的会看的把关人，换掉一个用户
+        已经不看的面板（用户面对第 20 次确认面板时是不看的）。
+        **因此本章对网络类不再是「只收紧」**，安全边界一节写的是分工版而不是
+        「加进来之后能通过的集合只会变小」——那句话现在只对命令类与消息类成立。
+
+        ## 熔断后的退路按类别分流（F16a）
+
+        - 命令 / 网络 → `ASK`（弹面板，人在回路仍在）
+        - 消息 → **保持原结论**（一律投递，回到本章之前）
+
+        消息类不接面板是刻意的：让用户在毫无上下文的情况下判断「两个子 Agent
+        之间该不该说这句话」是不合理的，而它本来就从不弹面板。
+        """
+        if review is None or not tool.classifier_scope:
+            return decision, [], ""
+        if decision.layer is not Layer.MODE:
+            # ③层已经定论（含用户写的 allow / deny 与只读短路）→ **零次调用**。
+            return decision, [], ""
+
+        action = self._review_action(tool, tc, cwd)
+        verdict = review.review(action)
+        notices: list[AgentEvent] = []
+
+        if verdict.kind is VerdictKind.ALLOW:
+            if decision.decision is Decision.ASK:
+                # 网络类的那一格：把④层的「仍然问一下」换成放行。见上方说明。
+                decision = DecisionResult(
+                    Decision.ALLOW,
+                    Layer.MODE,
+                    f"安全审查通过：{verdict.reason}",
+                    kind=decision.kind,
+                    host=decision.host,
+                )
+            return decision, notices, "allow"
+
+        tripped = review.is_tripped()
+        if verdict.kind is VerdictKind.FAILED and tripped:
+            # 熔断中：不是一次判定，是整层停用。按类别分流退路。
+            if tool.classifier_scope == SCOPE_MESSAGE:
+                return decision, notices, "failed"
+            return (
+                DecisionResult(
+                    Decision.ASK,
+                    Layer.MODE,
+                    "安全审查已停用，交由你确认",
+                    kind=decision.kind,
+                    host=decision.host,
+                ),
+                notices,
+                "failed",
+            )
+
+        # 拦下，或未熔断的一次失败 → 拒绝。
+        #
+        # ⚠ 回灌给模型的是**固定文案**，不是 `verdict.reason`（spec F13）：
+        # 分类器写的理由对模型而言是一份绕过指南（「原来是因为域名不对，
+        # 那我换个域名」）。完整理由只走界面与行为记录两条出口。
+        if tool.classifier_scope == SCOPE_MESSAGE:
+            feedback = classifier_render.MESSAGE_NOT_DELIVERED
+        else:
+            feedback = classifier_render.DENIED_BY_CLASSIFIER
+        if verdict.kind is VerdictKind.FAILED:
+            notices.append(
+                AgentEvent(
+                    type=AgentEventType.NOTICE,
+                    message=classifier_render.render_failed_notice(action, verdict),
+                    level="warning",
+                )
+            )
+        else:
+            notices.append(
+                AgentEvent(
+                    type=AgentEventType.NOTICE,
+                    message=classifier_render.render_denied_notice(action, verdict),
+                    level="warning",
+                )
+            )
+        if tripped:
+            # 本次判定**触发了**熔断（上面那条 FAILED+tripped 分支管的是「已经
+            # 熔断」，走不到这里）。熔断必须可见——静默熔断等于静默关掉一层
+            # 安全机制，比不做还糟（spec F17）。
+            notices.append(
+                AgentEvent(
+                    type=AgentEventType.NOTICE,
+                    message=classifier_render.render_breaker_notice(
+                        review.breaker_state()
+                    ),
+                    level="warning",
+                )
+            )
+        return (
+            DecisionResult(
+                Decision.DENY,
+                Layer.MODE,
+                feedback,
+                kind=decision.kind,
+                host=decision.host,
+            ),
+            notices,
+            "block" if verdict.kind is VerdictKind.BLOCK else "failed",
+        )
+
     # 本层的四个「受保护漏斗」。
     #
     # 记录器**自己**已经保证 emit 不抛（见 recorder.py 的 try/except），所以这一层
@@ -713,6 +940,20 @@ class Agent:
         # 目录，而本项目全程不 chdir，一次运行内它是常量——每次现取只会让
         # 「它到底会不会变」这个问题反复出现在读代码的人脑子里。
         run_cwd = options.cwd if options.cwd is not None else main_project_root()
+        # c16：本次运行的判定会话。缺省 None → 决策预扫里那两处判断整个跳过，
+        # **行为与本章之前逐字一致**。
+        #
+        # 在这里建而不是让协调层建：会话要绑定 `history`（取工具调用）与
+        # 缓存（有效期是「本次运行」），而这两样都只有 `run` 手上有。
+        review_session = (
+            ReviewSession(
+                options.classifier,
+                history,
+                options.classifier_principal_history,
+            )
+            if options.classifier is not None
+            else None
+        )
         wait_rounds = 0               # 已为子 Agent 停留过几次（防无限接力）
         deny_cooldown = False         # 上一轮有工具被用户拒绝 → 本轮不发工具（见 DENIED_BY_USER_FEEDBACK）
 
@@ -732,6 +973,15 @@ class Agent:
                 return
 
             yield AgentEvent(type=AgentEventType.PROGRESS, iteration=iteration)
+
+            # c16 F18：新一轮迭代 = 「有新内容进入对话」，放行缓存作废。
+            #
+            # ⚠ 位置在本轮的一切之前是刻意的：子 Agent 结论的注入、上下文压缩、
+            # 组装请求都会改变历史，而缓存的语义是「这一轮里同一个主机不必重判」。
+            # 放到工具执行前才清的话，本轮的判定会复用**上一轮**的结论——
+            # 而那正好是用户刚说完一句新的边界之后最不该发生的事。
+            if review_session is not None:
+                review_session.begin_iteration()
 
             # 子 Agent 结论的交付点（c13 修订）。**必须在本轮组装请求之前**。
             #
@@ -913,6 +1163,8 @@ class Agent:
                 # c14 F1：本次运行的工作目录。`None` 由各工具的 `require_cwd`
                 # 兜成明确失败，**不会**静默回退到主项目根（spec N2）。
                 cwd=run_cwd,
+                # c16：本次运行的判定会话；None = 不做分类器审查。
+                review=review_session,
             )
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
@@ -985,6 +1237,7 @@ class Agent:
         interactive: bool = True,
         cwd: Optional[Path] = None,
         unattended: bool = False,
+        review: "Optional[ReviewSession]" = None,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -1199,6 +1452,32 @@ class Agent:
                 # 写下的一条规则，那是明确的意愿表达，不是兜底。
                 # 这一支的行为与改造前逐字一致。
                 system_decision = self._apply_hook_ask(system_decision, hook_verdict)
+                # ── c16：分类器审查（消息类走这条分支）──
+                #
+                # ⚠ **判据用 `raw.layer` 而不是 `system_decision.layer`。**
+                # 上面那段降级会把④层的结论改写成 ALLOW 但**保留原 layer**，
+                # 所以这里两者恰好相同——但那是巧合，不是契约。将来若有人给
+                # 降级分支换一个 layer（比如标成 HOOK 或新造一个），
+                # 用 `system_decision.layer` 判断会**静默地永远不成立**，
+                # 表现为「消息类的分类器一次都没跑过」，而配置与界面上都看不出来。
+                #
+                # ⚠ 与下面普通分支那处是**成对维护点**：两处共用
+                # `_apply_classifier`，但触发判断各写一次。改动触发条件时两处齐改。
+                system_decision, system_notices, classifier_mark = self._apply_classifier(
+                    review,
+                    tool,
+                    tc,
+                    DecisionResult(
+                        system_decision.decision,
+                        raw.layer,
+                        system_decision.reason,
+                        kind=system_decision.kind,
+                        host=system_decision.host,
+                    ),
+                    cwd,
+                )
+                for notice in system_notices:
+                    yield notice
                 # ⚠ **这条埋点不可省。**
                 #
                 # 它原本是为了让「绕过引擎」这件事在记录上可见（此前这七个工具
@@ -1229,6 +1508,11 @@ class Agent:
                     #  留着旧名字会让「严格档下 DENY 被降级」这件事记不出来。
                     mode_downgraded=mode_downgraded,
                     cwd=str(request.cwd) if request.cwd is not None else None,
+                    # c16：这条结论是不是分类器改的。空串 = 本次未经分类器。
+                    # 不记的话时间线上只有一条 `deny（④模式）`，读的人会以为
+                    # 是权限档拒的——而权限档对这七个工具整层免疫，
+                    # 那个结论根本不可能来自它。
+                    classifier=classifier_mark,
                 )
                 serial.append((
                     tc,
@@ -1262,6 +1546,19 @@ class Agent:
             # 观测设施撒谎且不报错，排查的人会据此断定「Hook 没生效」。
             # 端到端场景 2 就是靠这条判定层为 `hook` 的记录来验升级的（实测踩过）。
             decision = self._apply_hook_ask(decision, hook_verdict)
+            # ── c16：分类器审查（命令类与网络类走这条分支）──
+            #
+            # ⚠ **位置在 Hook 升级之后、埋点之前**，与 Hook 那条同一个理由：
+            # 记录里必须是**生效的**那个结论。埋在分类器之前的话，一次
+            # 「权限判 ALLOW、分类器拦下」的调用会在记录里留下 `decision=allow`，
+            # 而用户实际看到的是被拒——观测设施撒谎且不报错。
+            #
+            # ⚠ 与上面 system_serial 分支那处是**成对维护点**。
+            decision, classifier_notices, classifier_mark = self._apply_classifier(
+                review, tool, tc, decision, cwd
+            )
+            for notice in classifier_notices:
+                yield notice
             self._safe_emit(
                 TraceEventType.PERMISSION_DECISION,
                 tool=tc.name,
@@ -1296,6 +1593,11 @@ class Agent:
                 # 这个常量 False 是有意义的对照——没有它，把标记写成常量 True
                 # 也能让系统级工具那条护栏通过，标记随即失去意义。
                 mode_downgraded=False,
+                # c16：这条结论是不是分类器改的（空串 = 本次未经分类器）。
+                # ⚠ 不记的话，一条被分类器拦下的命令在时间线上显示成
+                # `deny（④模式）`——而④在放行档下只会给 ALLOW，
+                # 读的人会以为用户切到了严格档。与 `mode_downgraded` 同一条理由。
+                classifier=classifier_mark,
                 # ②″保护路径命中了、但因本会话豁免而没有被升级
                 # （protected-paths 扩展）。不记的话时间线上只剩一条
                 # `allow（④模式）`，读的人会以为用户切到了放行档。

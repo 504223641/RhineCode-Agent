@@ -84,6 +84,16 @@ class ReviewSession:
         """分类器当前是否处于熔断。调用方据此决定 FAILED 走哪条退路（F16a）。"""
         return self._service.is_tripped()
 
+    def breaker_state(self):
+        """
+        取熔断状态快照，供界面渲染熔断提示（F17）。
+
+        直接转发给门面：熔断状态是**会话共享**的（跨主对话与全部子 Agent），
+        不属于本对象。转发而不是让调用方自己去拿门面，是为了让 `_execute`
+        只认识 `ReviewSession` 一个类型。
+        """
+        return self._service.breaker_state()
+
     def review(self, action: ReviewAction) -> Verdict:
         """
         对一次待判动作给出结论。
