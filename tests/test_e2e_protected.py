@@ -19,8 +19,11 @@
 
 ## ⚠ 全部在放行档下跑
 
-每条用例先送两次 `/perm`（默认 → 严格 → 放行）。缺省档下普通写入本来就弹面板，
-那样「保护路径弹面板」这件事**没有任何分辨力**——两种实现都会弹。
+每条用例起宿主时显式传 `--permission-mode permissive`。缺省档下普通写入本来
+就弹面板，那样「保护路径弹面板」这件事**没有任何分辨力**——两种实现都会弹。
+
+（auto-plan 扩展之前这里是送两次 `/perm` 走三档循环；那个命令已删除，
+换成命令行上的显式声明。见下方 `_permissive` 原址的那段说明。）
 
 每条用例起一次宿主（本机约 8–12 秒），因此只挑真正需要「真跑」的场景。
 """
@@ -37,12 +40,15 @@ class ProtectedPathE2ETest(HostFixture):
     """②″保护路径在真实宿主里的行为面。"""
 
     # ------------------------------------------------------------------ #
-    def _permissive(self) -> None:
-        """切到放行档：`/perm` 三档循环是 默认 → 严格 → 放行，所以送两次。"""
-        for _ in range(2):
-            self.send("/perm")
-            res = self.wait(timeout=30)
-            self.assertTrue(res["ok"], res)
+    # auto-plan 扩展：原先这里有个 `_permissive()`，靠送两次 `/perm` 把档位
+    # 循环到放行。那个命令**已被删除**，方法随之失效——而它当时**没有变红**，
+    # 因为 `send` 本身照常成功（未知命令只是被本地提示掉），且放行档恰好成了
+    # 新的启动缺省，用例仍然通过。**那是一次假绿**：方法什么也没做，
+    # 却让人以为「档位是被显式切过去的」。
+    #
+    # 现在改为在起宿主时用 `--permission-mode permissive` 显式声明，本组用例
+    # 的前提因此写在命令行上、看得见，也不再依赖「缺省档恰好是放行」这个
+    # 会随产品变化的巧合。
 
     def _panel(self, res: dict) -> dict:
         return (res["data"].get("state") or {}).get("panel") or {}
@@ -90,8 +96,9 @@ class ProtectedPathE2ETest(HostFixture):
             "--script", "tests.e2e.scripts:PROTECTED_WRITE_CONFIG",
             "--seed", "tests.e2e.scripts:seed_protected_plain",
             "--idle-timeout", "300",
+            # 本组用例的前提：放行档（见上方那段说明）
+            "--permission-mode", "permissive",
         )
-        self._permissive()
         self.send("往 .rhinecode/hooks.yaml 加一条规则")
 
         res = self.wait(timeout=60)
@@ -139,8 +146,9 @@ class ProtectedPathE2ETest(HostFixture):
             "--script", "tests.e2e.scripts:PROTECTED_WRITE_CONFIG",
             "--seed", "tests.e2e.scripts:seed_protected_wide_allow",
             "--idle-timeout", "300",
+            # 本组用例的前提：放行档（见上方那段说明）
+            "--permission-mode", "permissive",
         )
-        self._permissive()
         self.send("往 .rhinecode/hooks.yaml 加一条规则")
 
         res = self.wait(timeout=60)
@@ -172,8 +180,9 @@ class ProtectedPathE2ETest(HostFixture):
             "--script", "tests.e2e.scripts:PROTECTED_ORDINARY_WRITE",
             "--seed", "tests.e2e.scripts:seed_protected_plain",
             "--idle-timeout", "300",
+            # 本组用例的前提：放行档（见上方那段说明）
+            "--permission-mode", "permissive",
         )
-        self._permissive()
         self.send("把 src/app.py 改成 x = 1")
 
         # answer=None：出现任何面板都当场失败
@@ -208,8 +217,9 @@ class ProtectedPathE2ETest(HostFixture):
             "--script", "tests.e2e.scripts:PROTECTED_WRITE_TWICE",
             "--seed", "tests.e2e.scripts:seed_protected_plain",
             "--idle-timeout", "300",
+            # 本组用例的前提：放行档（见上方那段说明）
+            "--permission-mode", "permissive",
         )
-        self._permissive()
         self.send("往 .rhinecode/hooks.yaml 加两条规则")
 
         first = self.wait(timeout=60)
@@ -257,8 +267,9 @@ class ProtectedPathE2ETest(HostFixture):
             "--script", "tests.e2e.scripts:PROTECTED_SUBAGENT_WRITES_CONFIG",
             "--seed", "tests.e2e.scripts:seed_protected_subagent",
             "--idle-timeout", "300",
+            # 本组用例的前提：放行档（见上方那段说明）
+            "--permission-mode", "permissive",
         )
-        self._permissive()
         self.send("让 helper 去加那条 hook 规则")
 
         # 委派不弹面板；子 Agent 的 ASK 自动拒绝，全程无人工介入
@@ -303,8 +314,9 @@ class ProtectedPathE2ETest(HostFixture):
             "--script", "tests.e2e.scripts:PROTECTED_ISOLATED_SUBAGENT",
             "--seed", "tests.e2e.scripts:seed_protected_isolated",
             "--idle-timeout", "300",
+            # 本组用例的前提：放行档（见上方那段说明）
+            "--permission-mode", "permissive",
         )
-        self._permissive()
         self.send("让 builder 在隔离工作区里新建 feature.py")
 
         for _ in range(8):

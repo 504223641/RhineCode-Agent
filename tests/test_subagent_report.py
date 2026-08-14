@@ -80,7 +80,11 @@ class PermissionModeDisplayTest(unittest.TestCase):
             AgentCatalog(specs={"explorer": spec}), effective=PermissionMode.DEFAULT
         )
 
-        self.assertIn("放行", text, "声明值必须可见")
+        # auto-plan 扩展：放行档对用户显示成 `auto（permissive）`——它就是 auto
+        # 预设内部的档位。括号里那个 YAML 值不可省：这一列的用途正是帮用户对照
+        # 自己写的角色定义，只显示 auto 的话他不知道 `permission_mode:` 该填什么。
+        self.assertIn("auto", text, "声明值必须可见")
+        self.assertIn("permissive", text, "还要看得出 YAML 里该写什么")
         self.assertIn("默认", text, "生效值必须可见")
         self.assertIn("受主对话档位限制", text, "还要说明为什么不一样")
 

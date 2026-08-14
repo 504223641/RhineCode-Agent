@@ -6,6 +6,7 @@ from pathlib import Path
 from rhinecode.conversation import ConversationManager
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
 from rhinecode.agent.events import ConfirmDecision, StopReason
+from rhinecode.permission.models import PermissionMode
 from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.edit_file import EditFileTool
 from rhinecode.tools.glob_files import GlobTool
@@ -211,7 +212,18 @@ def manager_with_tool(provider: BaseProvider, tool: RecordingTool) -> Conversati
         api_key="test-key",
         debug_log=False,
     )
-    return ConversationManager(provider, config, registry)
+    manager = ConversationManager(provider, config, registry)
+    # auto-plan 扩展：启动缺省档已从「默认」改为「放行」（auto 预设）。
+    #
+    # 本文件这一组用例验的全是**确认面板那条路径**（fail-closed、四态回调、
+    # 会话级放行规则登记），而那条路径只在④层判 ASK 时才走得到——放行档下
+    # 灰色地带直接 ALLOW，工具照常执行，用例断言的「没执行」当场不成立。
+    #
+    # 显式设回默认档，而不是改判据：**这些用例要测的东西一个字都没变**，
+    # 变的只是「它不再是缺省状态」。跟着改成断言「放行档下直接执行」的话，
+    # 确认面板那条路径就没有任何护栏了。
+    manager.permission_engine.set_mode(PermissionMode.DEFAULT)
+    return manager
 
 
 class PermissionFilterTests(TempWorkspaceTest):

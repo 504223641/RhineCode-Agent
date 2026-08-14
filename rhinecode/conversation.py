@@ -357,7 +357,7 @@ class ConversationManager:
         # 权限规则的加载警告并入启动提示（web_fetch 扩展 F25）。
         #
         # `PermissionEngine.load_errors` 在此之前**全仓零消费者**——警告收集完就死在
-        # 那里。之所以并进 startup_notice 而不是新做一个 /perm 报告：前者是既有字段
+        # 那里。之所以并进 startup_notice 而不是新做一个权限报告命令：前者是既有字段
         # （TUI 挂载时写进聊天区）、零新增维护点，且**不需要用户主动敲命令就能看见**。
         # Hook 的公共字段（session_id / cwd）绑定一次；会话切换时在 clear/_resume_stream
         # 里重新绑定——不重绑的话，`/clear` 之后所有 Hook 负载里的 session_id 仍是旧档，
