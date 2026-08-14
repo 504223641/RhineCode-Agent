@@ -236,6 +236,27 @@ class ContentTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIn("2.5k", line.compose_text())
 
+    async def test_token_segment_says_it_is_cumulative(self) -> None:
+        """
+        token 段要自报「累计」——它与底部状态栏那段上下文用量**不是同一个量**。
+
+        本行累加的是每轮 `total_tokens`（输入 + 输出），而每轮都要把整段历史
+        重发一遍，同一段历史会被重复计入很多次；状态栏那段是**当前**上下文的
+        占用估算、不做累加。实测一次 9 轮的运行：本行 `↑105.7K`、
+        状态栏 `15.9K`，差 6.6 倍。
+
+        两个 token 数字同屏而量级差好几倍，用户的第一反应是「有一个算错了」
+        （提这个问题的正是用户本人）。不标注的话，这里没有任何线索能分辨
+        「这一回合总共来回搬了多少」与「现在占了多少」。
+        """
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            line = app.query_one(StatusLine)
+            line.start()
+            line.add_tokens(2100)
+            await pilot.pause()
+            self.assertIn("累计", line.compose_text())
+
     async def test_start_resets_the_counter(self) -> None:
         """新一轮运行必须从零开始算，不能把上一轮的量带过来。"""
         app = _Harness()

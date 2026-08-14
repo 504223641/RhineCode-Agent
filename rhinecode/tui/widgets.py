@@ -2743,6 +2743,14 @@ class StatusLine(Static):
         流末尾**产出一次用量。这与耗时那一段的节奏不同，是**已知且如实记录**
         的行为，不是缺陷。
 
+        ⚠ **它与底部状态栏那段「上下文：N% · X/Y」不是同一个量，两者不该相等。**
+        本行累加的是每轮 `total_tokens`（输入 + 输出），而每一轮都要把**整段历史
+        重发一遍**，所以同一段历史会被重复计入很多次；状态栏那段是**当前**上下文
+        的占用估算，不做任何累加。实测一次 9 轮的运行：本行 `↑105.7K`、
+        状态栏 `15.9K`，差 6.6 倍——两个数字都是对的，只是问题不同
+        （「这一回合总共来回搬了多少」 vs 「现在占了多少」）。
+        段尾的「累计」二字就是为这件事加的，别当成冗余删掉。
+
         :param count: 本轮的 token 数；非正数忽略
         """
         if count and count > 0:
@@ -2779,7 +2787,10 @@ class StatusLine(Static):
         """
         segments = [f"{int(monotonic() - self._start_time)}s"]
         if self._tokens:
-            segments.append(f"↑{format_tokens(self._tokens)}")
+            # 「累计」二字不可省：状态栏就在下面两行处写着「上下文：N% · X/Y」，
+            # 两个 token 数字同屏且量级差好几倍，不标注的话看起来像其中一个算错了。
+            # 详见 `add_tokens` 的说明。
+            segments.append(f"↑{format_tokens(self._tokens)} 累计")
         if self._interruptible:
             segments.append("esc 中断")
         return segments

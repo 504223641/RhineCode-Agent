@@ -175,6 +175,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 - **审批回调里绝不能出现 `set_mode`（auto-plan）** → `conversation.py` 的 `_approve_plan_then_exit`。⚠ **这条只有结构护栏挡得住**：两个预设的档位本来就相同，所以「顺手补一句 `set_mode(PERMISSIVE)`」在**行为上看不出任何区别**，断言档位没变的那条用例照样绿（变异实测确认）。而它是被明令禁止的形态——那句话跑在工作线程上、改的是单实例共享的引擎，且会让回合中途前后两次委派的同名角色拿到不同档位。护栏见 `tests/test_auto_plan_integration.py::test_approval_path_does_not_mention_set_mode`
 
+- **计划审批面板那句说明 ↔ `auto` 预设的档位（auto-plan）** → `tui/app.py` 的 `_show_approve_panel` ↔ `presets.py` 的 `PRESET_AXES[Preset.AUTO]`。那句话是面板上**唯一影响用户决策的信息**：他据此判断「点下去之后还有没有人工闸门」。⚠ **真踩过且活了很久**：面板长期写着「写文件/改文件/运行命令仍会逐个确认」，那是 auto-plan 扩展**之前**的行为——获批即回 `auto`（放行档），那三类操作一次面板都不弹（用户 trace 实录：获批后 `write_file` 与两次 `run_command` 全部 `allow（④模式）`）。**一句过期的安全承诺比没有承诺更危险**，与已知项 18 那次 `deny` 规则失效同一性质。缺省档将来若改回 `default`，这里必须同步改回。护栏见 `tests/test_auto_plan_integration.py::ApprovePanelTellsTheTruthTest`（含「旧承诺不得残留」的反证与钉住档位的那条）
+
 - **新增起 shell 子进程的调用方（auto-plan）** → 一律走 `tools/run_command.py` 的 `run_shell_captured`，敏感环境变量的过滤收在**它内部**。⚠ 匹配片段有两个**不能用**的：**裸 `AUTH`** 会命中 `SSH_AUTH_SOCK`（ssh-agent 的 socket **路径**、不是密钥，却是 ssh 方式 `git push` 的唯一依靠，剔掉后报 `Permission denied (publickey)` 而**根因不可见**），**裸 `KEY`** 会命中 `SSH_KEY_PATH`。故用 `AUTHORIZATION` 与具体的 `*_KEY` 组合。**刻意不建豁免名单**——调研过 `GITHUB_TOKEN`，实测 `gh` 走 keyring，过滤它代价为零。护栏见 `tests/test_env_filter.py`
 
 - **②″保护路径的「本会话放行」是成对维护点（protected-paths）** → `tui/widgets.py` 的 `ConfirmPanel.show_for` 三选项分支 + `conversation.py` 的 `_build_ask` 豁免分支。**只改一处都不报错**：只改面板 → 不给「永久放行」了，但「本会话放行」仍写③层规则，用户点了之后下次还弹；只改协调层 → 面板仍显示一个点了没用的「永久放行」。⚠ 那条豁免**刻意只在内存、只对单个文件、关程序即失效**——落盘的豁免本身就是一份「能改变以后会发生什么」的配置，绕一圈又回到本扩展要解决的原问题
@@ -211,6 +213,8 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单。
   ⚠ **状态栏那一行是左右两个区**（tui-display F31）：`StatusHint`（贴左边缘，瞬时提示）+ `StatusBar`（右对齐，常驻状态），装在 `#status-row` 里。**常驻状态一律进右区**；只有「刚发生了什么」这类瞬时提示才进左区，且**不能拼进 `compose_status_text`** ——右区整块 `text-align: right`，拼进去只会落在右对齐块的最左边、随其余各段长度在屏幕中间浮动，**判据写成「排在第一段之前」会全绿而屏幕上并不贴左**（真踩过）。左区新增内容要同步 `_refresh_status` 里那行 `set_quit_hint` 同位置的刷新，以及 trace 负载里与 `text` 并列的那个布尔字段（左区不在 `text` 里，漏记等于那两秒的界面反馈没有任何物证）
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
+- **状态行的 `↑` 与状态栏的「上下文」是两个量，别去「统一」它们（tui-activity-fold）** → `tui/widgets.py` 的 `StatusLine._cost_segments` ↔ `context/manager.py` 的 `status_line`。前者累加每轮 `total_tokens`（每轮都要重发整段历史，同一段被重复计入很多次），后者是**当前**上下文占用的估算、不累加。实测一次 9 轮的运行两者是 `↑105.7K` 与 `15.9K`，差 6.6 倍——**两个都是对的**，回答的是不同问题。⚠ 用户真的把它当成 bug 报过（两个 token 数字同屏、量级差好几倍，第一反应就是「有一个算错了」），所以 `↑` 那段带一个「累计」限定，**别当成冗余删掉**；同理也别为了「让它们对上」把某一侧改成对方的口径。真要改口径的话该改的是「累加 total」这个选择本身（它既不等于花费——本项目缓存命中率极高，也不等于上下文），那属于产品决定，不是对齐两个数字。护栏见 `tests/test_tui_status_line.py::test_token_segment_says_it_is_cumulative`
+
 - **活动区终态行与历史区完成通知的成本数字必须同源（tui-display）** → 两处都经
   `subagents/tasks.py` 的 `TaskManager.row_of` 取快照、再交给
   `tui/widgets.py` 的 `format_activity_cost` 渲染。**各自从 `TaskRecord` 上取字段
