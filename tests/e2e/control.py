@@ -385,6 +385,11 @@ class DriverCore:
         self._lock = threading.Lock()
         self._last_action: str = ""
 
+        # 退出编排是否已经跑过。**刻意不进驱动锁**：它只被主线程读写
+        # （`shutdown_on_main` 是本类唯一只能在主线程调用的方法），
+        # 而进锁反而会诱导后来的人在临界区里 `await`，违反不变量①。
+        self._shutdown_done = False
+
     # ------------------------------------------------------------------ #
     # 只读：随时可答，不持驱动锁（不变量②）
     # ------------------------------------------------------------------ #
@@ -1047,7 +1052,21 @@ class DriverCore:
         **为什么要交织在同一个循环里**：结算掉一个面板之后，循环可能**立刻弹出下一个**
         （模型一轮发多个工具调用就是这样）。写成「先结算 N 次，再等忙碌态转假」两段式，
         会在第二段再次挂住。
+
+        ## 幂等：第二次调用直接返回
+
+        测试侧的 `DriverFixture.driving` 把本方法放进了 `finally`，而少数用例
+        **本身就在验关停行为**、会在中途先调一次（`ShutdownTest` 那两条）。
+        于是「同一个 core 上调两次」成了常态，必须明确幂等。
+
+        ⚠ 幂等靠的是这个显式标志，**不是**「反正 `app.exit()` 调两次也没事」——
+        后者是对 Textual 内部实现的假设，升一次版就可能不成立，而失效的表现
+        会是收尾阶段抛一个与用例判据毫不相干的异常。
         """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+
         deadline = time.monotonic() + SHUTDOWN_LIMIT
         app = self.app
         while time.monotonic() < deadline:

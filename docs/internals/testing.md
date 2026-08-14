@@ -54,6 +54,27 @@ Trace 记录器测试（`tests/test_trace_*.py` + `tests/test_bootstrap.py`，�
 
 端到端驱动设施测试（`tests/test_e2e_*.py`，P1a，共 9 个文件 151 条）：协议（编解码往返含中文与字面 markup、越界错误码抛 `ValueError`、四种面板 choice 校验、`clarify`+`keys` 被拒、非法 JSON 不吞）；发现（名片往返、`unpublish` 幂等、坏名片跳过、`resolve_host` 在 0/1/多个时的三种文案、**连不上立即报陈旧**（阈值按实测校准：Windows 上 OS 自己就要 ~2.03 秒才返回 `ConnectionRefusedError`，判据是「不等满调用方给的超时」）、pid 不符识破端口复用）；沙箱与预置（可丢弃校验两条判据 + **非空目录仍通过**、项目根被拒、清理三步与「cwd 在待删目录内时直接 rmtree 在 Windows 必失败」的反证、六个预置函数落盘位置、指纹稳定性与 mtime 敏感性）；假模型（四类块、按轮次、耗尽兜底不抛错不挂起、`tool_names` 与 `dynamic_reminder` 两个取值口径、8 线程×40 次并发计数精确）；断言层（十一项词汇各「通过一次失败一次」、失败诊断含证据序号与**邻域整行**且确实走 `render_timeline`、坏行计数与 reader 一致、**源码护栏**禁止绕过 reader 自行 `json.loads`）；驱动内核（`run_on_main` 超时真生效、三态判据含「面板挂着时忙碌态仍为真但必须判 PENDING」、两终态与超时诊断字段齐备、取消后以 `user_cancelled` 结束且仍可再 send、轮次预算拦截、四类面板各应答一次并断言循环得以继续、`channel`/`keys` 两种来源、跨线程死锁护栏用完成计数、**`shutdown_on_main` 的就地验证 + 反证**（跳过强制结算就卡住）、**最后一段 AI 正文必被记进 `ui_message` 且工具执行时不重复**（P1a 补掉的 P0 缺口，同样有反证）、**记忆更新通知必被记进 `ui_message`**（全阶段复测 O5 补掉的缺口：原先 `_notify_memory` 绕过埋点，使 c9 AC19 在任何 trace 验收里都是盲区）——三条护栏：正向产出、那一行确实出现在历史区、以及**顺序护栏**「渲染失败时不得留下记录」（mock `call_from_thread` 抛异常模拟退出竞态；**前两条只覆盖正常路径，把埋点挪到渲染之前照样全绿**，两个方向都已实测））；宿主（**完整闭环全程不重启**且历史条数取自会话存档、真人提交入口产 `user_input`/`command_dispatch`、`observe` 给出遍历控件取不到的完整 payload、忙碌期查询 <1 秒、挂着面板 quit 也干净退出、空闲超时自退且末条为 `session_end`、装配期致命错误经通道回报文案逐字一致、名片一步连上、陈旧立即失败、指纹随代码变、**四档确认各走一次且 permanent 真写本地配置**、**危险命令即使驱动者放行也在第①层被拦**、被摘工具在两处清单都不见且一致、用户目录在临时目录下、MCP 状态为空、**指定了 `model:` 的 fork Skill 仍走假模型且作用域为 `isolated:*`**、预置的 Skill 与 git 历史真实可见、Skill 激活「第 N 轮激活第 N+1 轮生效」、流错误停止、兜底可识别、中文与字面 `[` 全链路不乱码、无残留、进程内白名单与 MCP 连接复位）。瘦客户端（`test_e2e_client.py`，全阶段复测缺陷 D1 的护栏）：`send_command` 把「宿主没了」的**两种 TCP 形态**（正常退出的 EOF、被强杀的 RST）翻译成同一条可读提示，含 `ConnectionAbortedError`、**收到半截数据后才 RST 仍不得退化成 `JSONDecodeError`**、以及正常路径分块到达不受影响。**反证是结构性的**：断言 `RuntimeError`，而 `ConnectionResetError` 继承 `OSError`——删掉 `except` 当场红。这类缺陷单测里天然不可见（只在真人强杀时出现），不钉住就要等下一次全阶段复测才发现。真实模式 2 条默认 skip（需 `RHINE_E2E_LIVE=1` 与有效凭据）、「连续起停」慢速专项默认 skip（需 `RHINE_E2E_SLOW=1`）。**环境前置：本机需装 git**（`seed_git_repo` 依赖它，缺失时明确抛错而非静默跳过——静默跳过会让依赖提交历史的场景假绿）。
 
+⚠ **驱动内核那 34 条一律经 `DriverFixture.driving()` 起停**（2026-08-15
+`e2e-teardown-hardening`）：它把 `shutdown_on_main` 放进 `finally`，
+并在「用例已失败」时把收尾自身的异常打到 stderr 作为附加信息、
+**绝不替换原始断言错误**。新写驱动用例请照抄这个形态。
+
+把收尾写回函数最后一行的代价**不是「这条红了」而是「整个套件永久挂起
+且失败信息全丢」**：断言抛出 → 强制结算跳过 → 阻塞在确认盒上的工作线程
+醒不过来 → `IsolatedAsyncioTestCase` 收尾调 `loop.shutdown_default_executor()`
+→ Python 3.11 的该方法没有超时参数、永不返回。**2026-08-15 实测复现**：
+旧写法下同一条失败 90 秒不退出、stderr 只有一个 `F`，没有 traceback；
+改造后同一条失败 15 秒跑完全文件、traceback 精确指到行。
+
+配套两处：`DriverCore.shutdown_on_main` 显式幂等（`ShutdownTest` 那两条本身
+就在验关停、会在中途先调一次；⚠ 幂等靠显式标志，**不靠**「`app.exit()` 调两次
+也没事」这种对 Textual 内部实现的假设）；`PanelArmingIsAtomicTest` 的焦点判据
+从「pending 那一瞬间就必须是 `ConfirmPanel`」改成「允许晚一拍、但必须最终到达」
+——**这是改造当场暴露出来的一处错判据**（此前它一失败就是一次挂起，所以从没被
+看见过）：`panel_visible` 读 `display`、在 `_arm` 里同步设好，而 `focused` 读
+`app.focused`，Textual 8.2.7 的 `Widget.focus()` 是 `app.call_later(set_focus)`
+——**结构上就不在那一次主线程调用里**，产品无从合成。原子性只判前者。
+
 **2026-08-09 新增三组**：
 
 - **`test_trace_full_output.py`（6 条）** —— 「任何操作都要有能追溯的完整记录」的落点。

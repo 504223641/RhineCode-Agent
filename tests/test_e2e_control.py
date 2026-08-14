@@ -21,9 +21,12 @@ import asyncio
 import json
 import os
 import shutil
+import sys
 import threading
 import time
+import traceback
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -166,6 +169,70 @@ class DriverFixture(unittest.IsolatedAsyncioTestCase):
             trace_path=self.trace_path,
         )
 
+    @asynccontextmanager
+    async def driving(self, app, size=(120, 40)):
+        """
+        起应用 → 建 `DriverCore` → 用完**一定**收尾，收尾在 `finally` 里。
+
+        用法：
+
+        ```python
+        app, provider = self.assemble(SOME_SCRIPT)
+        async with self.driving(app) as (pilot, core):
+            ...断言...
+        ```
+
+        ## 为什么收尾必须在 `finally` 里（这是本包装存在的唯一理由）
+
+        原先每条用例把 `await core.shutdown_on_main("test")` 写在函数最后一行。
+        **任何一条断言失败，那一行就不会执行**，后果不是「这条红了」而是
+        **整个测试套件永久挂住**：
+
+        ```
+        断言抛出
+          → 强制结算没做，被阻塞在确认盒 `box["event"].wait()` 上的工作线程
+            永远醒不过来
+          → IsolatedAsyncioTestCase 收尾调 loop.shutdown_default_executor()
+          → Python 3.11 的该方法**没有超时参数、永不返回**（3.12 才加了 5 分钟默认值）
+          → 卡死
+        ```
+
+        标准 runner 把 traceback 攒到最后统一打印，而这里根本走不到「最后」——
+        tui-activity-fold 验收期因此连续几次「跑十几分钟不出结果、只看到一串点
+        和一个 F」，**不知道哪条红、更不知道为什么红**，掩盖了两个真实缺陷。
+        挂起的进程还不退出，几个并存时互相争 CPU，把别的时序敏感用例也压翻
+        ——「偶发 flaky」里有一部分是这么来的。
+
+        ## 收尾自己抛异常时，绝不替换原始错误
+
+        这就是下面分成 `except` / `else` 两支而不是写一个 `finally` 的原因：
+
+        - **用例已经失败**：收尾只做尽力而为。它自己抛出的异常打到 stderr 作为
+          **附加**信息，然后 `raise` 把原始断言错误原样放走。
+          用收尾的异常盖掉原始错误比挂起好一点，但仍然把「为什么红」丢了。
+        - **用例通过**：收尾若失败，那本身就是个真问题（关停语义变了），照常抛出。
+
+        :param app: `assemble()` 返回的应用
+        :param size: 终端尺寸，与既有用例一致的 (120, 40)
+        :yields: `(pilot, core)`
+        """
+        async with app.run_test(size=size) as pilot:
+            core = self.make_core(app, pilot, asyncio.get_running_loop())
+            try:
+                yield pilot, core
+            except BaseException:
+                try:
+                    await core.shutdown_on_main("test")
+                except BaseException:  # noqa: BLE001
+                    print(
+                        "⚠ driving() 收尾失败（原始错误见下方，此处仅为附加信息）：",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc(file=sys.stderr)
+                raise
+            else:
+                await core.shutdown_on_main("test")
+
     def view(self) -> TraceView:
         """读一份当前的记录视图（先 flush 由记录器在每次 emit 时保证）。"""
         return TraceView.load(self.trace_path)
@@ -188,7 +255,10 @@ class RunOnMainTest(DriverFixture):
         （后者没有超时参数，会一直阻塞到工作跑完）。
         """
         app, _ = self.assemble([[text("hi"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
+        # 这条用例不驱动会话（没有面板、没有被阻塞的工作线程），本可以直接用
+        # `app.run_test`。仍然走 `driving()` 是为了**不留下第二种写法**——
+        # 留一条例外，下一个人照着它写新用例时就把收尾又漏在最后一行了。
+        async with self.driving(app) as (pilot, core):
             loop = asyncio.get_running_loop()
 
             async def _slow() -> None:
@@ -212,8 +282,7 @@ class StateJudgementTest(DriverFixture):
 
     async def test_idle_then_pending_then_idle(self):
         app, provider = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
 
             snap = await asyncio.to_thread(core.snapshot)
             self.assertEqual(snap["state"], SessionState.IDLE.value)
@@ -235,12 +304,10 @@ class StateJudgementTest(DriverFixture):
             done_wait = await asyncio.to_thread(core.wait, 30.0)
             self.assertEqual(done_wait["data"]["terminal"], SessionState.IDLE.value)
             self.assertFalse((await asyncio.to_thread(core.snapshot))["stream_active"])
-            await core.shutdown_on_main("test")
 
     async def test_send_rejected_when_not_idle(self):
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -250,12 +317,10 @@ class StateJudgementTest(DriverFixture):
 
             await asyncio.to_thread(core.answer, "deny")
             await asyncio.to_thread(core.wait, 30.0)
-            await core.shutdown_on_main("test")
 
     async def test_turn_budget_blocks_send(self):
         app, _ = self.assemble([[text("好"), done()]], turn_budget=1)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             self.assertTrue((await asyncio.to_thread(core.send, "第一句"))["ok"])
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -263,7 +328,6 @@ class StateJudgementTest(DriverFixture):
             self.assertFalse(blocked["ok"])
             self.assertEqual(blocked["error"]["code"], "turn_budget")
             self.assertIn("--max-turns", blocked["error"]["message"], "要给出可照做的下一步")
-            await core.shutdown_on_main("test")
 
 
 class WaitTest(DriverFixture):
@@ -284,8 +348,7 @@ class WaitTest(DriverFixture):
                 yield done()
 
         app, _ = self.assemble(provider=SlowProvider())
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "慢一点")
             timed_out = await asyncio.to_thread(core.wait, 0.6)
 
@@ -299,7 +362,6 @@ class WaitTest(DriverFixture):
 
             slow.set()  # 放行，让它自然结束
             await asyncio.to_thread(core.wait, 30.0)
-            await core.shutdown_on_main("test")
 
 
 class QuiescentWaitTest(DriverFixture):
@@ -324,13 +386,11 @@ class QuiescentWaitTest(DriverFixture):
         它们的行为一个字都不该变。
         """
         app, _ = self.assemble([[text("好的"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "你好")
             res = await asyncio.to_thread(core.wait, 30.0)
             self.assertTrue(res["ok"])
             self.assertEqual(res["data"]["terminal"], SessionState.IDLE.value)
-            await core.shutdown_on_main("test")
 
     async def test_status_reports_background_and_quiescent(self):
         """
@@ -340,8 +400,7 @@ class QuiescentWaitTest(DriverFixture):
         少一个键会让断言以 KeyError 的形式失败在一个和判据无关的地方。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "你好")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -349,7 +408,6 @@ class QuiescentWaitTest(DriverFixture):
             for key in ("subagents", "idle_members", "unread_for_main"):
                 self.assertIn(key, snap["background"], f"background 缺字段 {key}")
             self.assertTrue(snap["quiescent"], "没有后台活动时应当判为静止")
-            await core.shutdown_on_main("test")
 
     async def test_quiescent_waits_for_background_subagents(self):
         """
@@ -360,8 +418,7 @@ class QuiescentWaitTest(DriverFixture):
         **判据本身**：`subagents > 0` 时不算静止。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "你好")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -382,7 +439,6 @@ class QuiescentWaitTest(DriverFixture):
             # 恢复之后立刻能等到
             res = await asyncio.to_thread(core.wait, 5.0, "quiescent")
             self.assertTrue(res["ok"])
-            await core.shutdown_on_main("test")
 
     async def test_quiescent_waits_for_pending_auto_wake(self):
         """
@@ -392,8 +448,7 @@ class QuiescentWaitTest(DriverFixture):
         界面此刻确实空闲，一秒后却开始跑一整轮。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "你好")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -405,7 +460,6 @@ class QuiescentWaitTest(DriverFixture):
                 self.assertIs(res["error"]["data"]["background"]["unread_for_main"], True)
             finally:
                 del manager.team_has_unread_for_main
-            await core.shutdown_on_main("test")
 
     async def test_idle_members_alone_do_not_block_quiescence(self):
         """
@@ -420,8 +474,7 @@ class QuiescentWaitTest(DriverFixture):
         是同一个坑：待命是稳定状态，不是未完成的工作。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "你好")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -435,7 +488,6 @@ class QuiescentWaitTest(DriverFixture):
                 self.assertTrue(snap["quiescent"])
             finally:
                 del manager.team_idle_member_count
-            await core.shutdown_on_main("test")
 
 
 class CancelTest(DriverFixture):
@@ -471,8 +523,7 @@ class CancelTest(DriverFixture):
 
         app, _ = self.assemble(provider=GatedProvider())
         (self.ws / "seed.txt").write_text("内容\n", encoding="utf-8")
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "干个长活")
             # 等它真的忙起来，否则取消会打在一个还没开始的循环上
             deadline = time.monotonic() + 5.0
@@ -502,7 +553,6 @@ class CancelTest(DriverFixture):
             self.assertTrue(again["ok"], "取消后必须仍可再 send")
             after = await asyncio.to_thread(core.wait, 30.0)
             self.assertEqual(after["data"]["terminal"], SessionState.IDLE.value)
-            await core.shutdown_on_main("test")
 
 
 class ShutdownTest(DriverFixture):
@@ -515,12 +565,14 @@ class ShutdownTest(DriverFixture):
 
     async def test_forced_settlement_lets_process_exit(self):
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
             waited = await asyncio.to_thread(core.wait, 30.0)
             self.assertEqual(waited["data"]["terminal"], SessionState.PENDING.value)
 
+            # ⚠ 这一条是**故意在中途**调关停的——被测的就是它本身，后面还要
+            # 接着断言它的效果。`driving()` 退出时会再调一次，靠的是
+            # `shutdown_on_main` 的显式幂等标志（见其 docstring）。
             started = time.monotonic()
             await core.shutdown_on_main("quit")
             elapsed = time.monotonic() - started
@@ -548,8 +600,7 @@ class ShutdownTest(DriverFixture):
         工作线程，而 Python 3.11 的 `shutdown_default_executor` 没有超时参数、永不返回。
         """
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -563,9 +614,10 @@ class ShutdownTest(DriverFixture):
                 "不做强制结算就应当一直卡住——若这条断言失败，说明产品侧的阻塞语义变了，"
                 "shutdown_on_main 的交织循环需要重新评估",
             )
-
-            # 收尾：正常路径退出，别把挂着的面板留给 tearDown
-            await core.shutdown_on_main("quit")
+            # 收尾（正常路径退出、别把挂着的面板留给 tearDown）由 `driving()` 做。
+            # ⚠ 这条用例**必须**依赖那个 finally：上面那句断言正是「面板还挂着、
+            # 工作线程还堵着」的时刻，它一旦红了而收尾没跑，就是本 todo 描述的
+            # 那次永久挂起——挂在验证「不挂起」的用例上。
 
 
 class DeadlockGuardTest(DriverFixture):
@@ -579,8 +631,7 @@ class DeadlockGuardTest(DriverFixture):
 
     async def test_concurrent_snapshot_while_driving(self):
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             completed = [0]
             stop = threading.Event()
             errors: list[Exception] = []
@@ -615,7 +666,6 @@ class DeadlockGuardTest(DriverFixture):
             self.assertFalse(thread.is_alive(), "轮询线程未在上限内退出——疑似死锁")
             self.assertEqual(errors, [])
             self.assertGreater(completed[0], 5, "轮询线程必须持续跑完多次快照，而不是卡住")
-            await core.shutdown_on_main("test")
 
 
 class PanelAnswerTest(DriverFixture):
@@ -623,8 +673,7 @@ class PanelAnswerTest(DriverFixture):
 
     async def test_confirm_panel_full_cycle(self):
         app, provider = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -664,7 +713,6 @@ class PanelAnswerTest(DriverFixture):
             # ③ 被阻塞的循环得以继续：第二轮模型请求发生了，文件也真写了
             self.assertEqual(len(provider.calls), 2, "应答后循环必须继续跑下一轮")
             self.assertTrue((self.ws / "x.txt").is_file())
-            await core.shutdown_on_main("test")
 
     async def test_answer_deny_and_via_keys_sources(self):
         """
@@ -677,8 +725,7 @@ class PanelAnswerTest(DriverFixture):
             [text("都写完了"), done()],
         ]
         app, provider = self.assemble(script)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写两个文件")
             await asyncio.to_thread(core.wait, 30.0)
             first = await asyncio.to_thread(core.answer, "once", "channel")
@@ -697,21 +744,17 @@ class PanelAnswerTest(DriverFixture):
             # via=keys 走的是面板自身的按键路径，结果同样生效
             self.assertTrue((self.ws / "a.txt").is_file())
             self.assertFalse((self.ws / "b.txt").exists(), "第二次选了拒绝，文件不该存在")
-            await core.shutdown_on_main("test")
 
     async def test_answer_when_no_panel(self):
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             res = await asyncio.to_thread(core.answer, "once")
             self.assertFalse(res["ok"])
             self.assertEqual(res["error"]["code"], "not_pending")
-            await core.shutdown_on_main("test")
 
     async def test_bad_choice_is_rejected_before_touching_product(self):
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -725,7 +768,6 @@ class PanelAnswerTest(DriverFixture):
 
             await asyncio.to_thread(core.answer, "deny")
             await asyncio.to_thread(core.wait, 30.0)
-            await core.shutdown_on_main("test")
 
 
 class PlanPanelTest(DriverFixture):
@@ -741,8 +783,7 @@ class PlanPanelTest(DriverFixture):
             [text("按计划执行完毕。"), done()],
         ]
         app, provider = self.assemble(script, plan_mode=True)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "做个计划")
             waited = await asyncio.to_thread(core.wait, 30.0)
             self.assertEqual(waited["data"]["terminal"], SessionState.PENDING.value)
@@ -759,7 +800,6 @@ class PlanPanelTest(DriverFixture):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["source"], "driver")
             self.assertGreaterEqual(len(provider.calls), 2, "批准后循环必须继续")
-            await core.shutdown_on_main("test")
 
     async def test_clarify_panel(self):
         script = [
@@ -780,8 +820,7 @@ class PlanPanelTest(DriverFixture):
             [text("好，按你说的来。"), done()],
         ]
         app, provider = self.assemble(script, plan_mode=True)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "问问我")
             waited = await asyncio.to_thread(core.wait, 30.0)
             self.assertEqual(waited["data"]["terminal"], SessionState.PENDING.value)
@@ -805,7 +844,6 @@ class PlanPanelTest(DriverFixture):
             self.assertEqual(events[0]["source"], "driver")
             self.assertEqual(events[0]["result"], "先改上传", "结算值取自 App 的澄清选项列表")
             self.assertGreaterEqual(len(provider.calls), 2, "澄清后循环必须继续")
-            await core.shutdown_on_main("test")
 
 
 class SessionPanelTest(DriverFixture):
@@ -832,8 +870,7 @@ class SessionPanelTest(DriverFixture):
     async def test_session_panel_select_loads_history(self):
         session_id = self._seed_other_session()
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "/resume")
 
             waited = await asyncio.to_thread(core.wait, 30.0)
@@ -862,13 +899,11 @@ class SessionPanelTest(DriverFixture):
                 any("上一场会话" in (m.content or "") for m in self.result.manager.history),
                 "选中会话后主历史必须换成那一场的内容",
             )
-            await core.shutdown_on_main("test")
 
     async def test_session_panel_cancel(self):
         self._seed_other_session()
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "/resume")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -879,7 +914,6 @@ class SessionPanelTest(DriverFixture):
             events = [e for e in self.interactions() if e["kind"] == "session"]
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["result"], "cancelled")
-            await core.shutdown_on_main("test")
 
 
 class PanelArmingIsAtomicTest(DriverFixture):
@@ -907,41 +941,69 @@ class PanelArmingIsAtomicTest(DriverFixture):
     连跑六次，红了**一次**。也就是说它抓得住这个缺陷，但不保证每次都抓住
     ——全量测试里之所以频繁翻车，是因为并发负载把那个窗口撑大了。
     别因为「单跑绿了」就认为竞态不存在。
+
+    ## ⚠ 焦点**不属于**这条原子性判据，它结构上就晚一拍
+
+    本用例原先在「pending 出现的那一瞬间」同时断言 `panel_visible` 与
+    `focused == "ConfirmPanel"`。**后者是错的判据**，2026-08-15 收尾改造后
+    全量测试当场红出来（此前它一失败就是一次永久挂起，所以从没人见过它）：
+
+    - `panel_visible` 读的是控件的 `display`，`show_fn()` 在 `_arm` 里**同步**设好
+      ——它确实被那一次主线程调用覆盖，是原子的；
+    - `focused` 读的是 `app.focused`，而 Textual 8.2.7 的 `Widget.focus()` 是
+      `self.app.call_later(set_focus, self)`——**排进主循环的下一个回调**，
+      不在 `_arm` 那一次调用里。产品这边无从「合成一次」，除非改 Textual。
+
+    佐证：驱动器自己的 `answer()` 就是**轮询等**两者一起就绪的
+    （`control.py` 的「应答前复核面板就绪」不变量），它从不假设焦点立刻到位。
+    只有这条用例在第一瞬间就断言它。
+
+    所以现在分成两段判：**原子性只判 `panel_visible`**（那才是 `_arm` 承诺的
+    东西，也是回归真正会破坏的那一条），焦点单独判、允许晚一拍但**必须最终到达**
+    ——去掉它会让「焦点永远不落到面板上」这种真回归无人看守。
     """
 
     async def test_pending_never_precedes_the_panel(self):
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
 
             # 一路盯着，直到出现 pending：**它出现的那一刻面板就必须已经在了**。
             #
-            # ⚠ 整段包 try/finally：断言失败时若不收尾，被阻塞在确认盒上的工作
-            # 线程永远醒不过来，`IsolatedAsyncioTestCase` 收尾时的
-            # `shutdown_default_executor()`（Python 3.11 无超时）会**永久挂住**
-            # ——一条失败就把整个套件变成一次挂起，连 traceback 都看不到。
-            # 这一点在本轮实测中反复吃过亏。
+            # ⚠ 这里原先自己包了一层 try/finally 去应答面板——理由是「断言失败时
+            # 若不收尾，被阻塞在确认盒上的工作线程永远醒不过来，收尾时的
+            # `shutdown_default_executor()`（Python 3.11 无超时）会永久挂住」。
+            # 那个理由现在由 `driving()` 统一兜住了（它在 `finally` 里做强制结算，
+            # 挂着的面板会被按最保守的一档结算掉），所以这层去掉。
+            #
+            # **去掉它本身也是修正**：那个 `finally` 里的 `answer` / `wait` 一旦
+            # 自己抛异常，就会把原始断言错误盖掉——正是这个 todo 要避免的第二种
+            # 丢信息方式。
             bad = None
             seen_pending = False
-            try:
-                for _ in range(600):
-                    snap = await asyncio.to_thread(core.snapshot)
-                    if snap["state"] == SessionState.PENDING.value:
-                        seen_pending = True
-                        if not snap["panel_visible"]:
-                            bad = f"宣称 pending 但面板不可见：{snap}"
-                        elif snap["focused"] != "ConfirmPanel":
-                            bad = f"宣称 pending 但焦点还在 {snap['focused']}"
-                        break
-                    await asyncio.sleep(0.005)
-            finally:
-                await asyncio.to_thread(core.answer, "once")
-                await asyncio.to_thread(core.wait, 30.0)
-                await core.shutdown_on_main("test")
+            for _ in range(600):
+                snap = await asyncio.to_thread(core.snapshot)
+                if snap["state"] == SessionState.PENDING.value:
+                    seen_pending = True
+                    if not snap["panel_visible"]:
+                        bad = f"宣称 pending 但面板不可见：{snap}"
+                    break
+                await asyncio.sleep(0.005)
 
             self.assertTrue(seen_pending, "剧本必须真的弹出过确认面板")
             self.assertIsNone(bad, bad)
+
+            # 焦点单独判：允许晚一拍（Textual 的 `focus()` 走 `call_later`），
+            # 但**必须最终到达**——不判它的话，「焦点永远不落到面板上」这种
+            # 真回归就没人看守了，而那会让用户的按键全部打进输入框。
+            focused = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                focused = (await asyncio.to_thread(core.snapshot))["focused"]
+                if focused == "ConfirmPanel":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(focused, "ConfirmPanel", "焦点最终必须落到确认面板上")
 
 
 class FinalTextRecordedTest(DriverFixture):
@@ -963,8 +1025,7 @@ class FinalTextRecordedTest(DriverFixture):
 
     async def test_last_assistant_text_produces_ui_message(self):
         app, _ = self.assemble([[text("这是最后一句结论。"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "说句话")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -977,7 +1038,6 @@ class FinalTextRecordedTest(DriverFixture):
             )
             joined = json.dumps([m.get("text") for m in assistant], ensure_ascii=False)
             self.assertIn("这是最后一句结论", joined)
-            await core.shutdown_on_main("test")
 
     async def test_no_duplicate_ui_message_when_tool_runs(self):
         """
@@ -985,8 +1045,7 @@ class FinalTextRecordedTest(DriverFixture):
         `finally` 那次只该处理它之后新累积的那段。
         """
         app, _ = self.assemble(CONFIRM_SCRIPT)
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "写个文件")
             await asyncio.to_thread(core.wait, 30.0)
             await asyncio.to_thread(core.answer, "once")
@@ -1000,7 +1059,6 @@ class FinalTextRecordedTest(DriverFixture):
             # 剧本两轮各一段正文，恰好两条，且互不重复
             self.assertEqual(len(texts), 2, f"应恰好两条，实际 {texts}")
             self.assertEqual(len(set(map(str, texts))), 2, f"两条不得重复：{texts}")
-            await core.shutdown_on_main("test")
 
 
 class MemoryNotifyRecordedTest(DriverFixture):
@@ -1020,8 +1078,7 @@ class MemoryNotifyRecordedTest(DriverFixture):
 
     async def test_memory_notice_produces_ui_message(self):
         app, _ = self.assemble([[text("好的。"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条记忆）")
 
             systems = [
@@ -1034,13 +1091,11 @@ class MemoryNotifyRecordedTest(DriverFixture):
                 "记忆通知必须产出 source=system 的 ui_message；"
                 f"实际只有：{systems}",
             )
-            await core.shutdown_on_main("test")
 
     async def test_notice_actually_rendered(self):
         """记录里有的那一行，界面上也必须真的有——正向确认两者配套。"""
         app, _ = self.assemble([[text("好的。"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(app._notify_memory, "🧠 已更新记忆（1 条记忆）")
             await pilot.pause()
 
@@ -1049,7 +1104,6 @@ class MemoryNotifyRecordedTest(DriverFixture):
                 _history_text(app),
                 "通知必须真的出现在历史区里",
             )
-            await core.shutdown_on_main("test")
 
     async def test_no_phantom_record_when_render_fails(self):
         """
@@ -1064,8 +1118,7 @@ class MemoryNotifyRecordedTest(DriverFixture):
         撒谎，而且因为异常被吞了，连个错都不报。
         """
         app, _ = self.assemble([[text("好的。"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
 
             def boom(*_args, **_kwargs):
                 raise RuntimeError("模拟应用正在退出")
@@ -1085,14 +1138,12 @@ class MemoryNotifyRecordedTest(DriverFixture):
                 "渲染失败时不得留下记录，否则 trace 里会出现界面上从未有过的行；"
                 f"实际记到了：{phantom}",
             )
-            await core.shutdown_on_main("test")
 
 
 class ObserveTest(DriverFixture):
     async def test_observe_returns_full_payload_and_cursor(self):
         app, _ = self.assemble([[text("你好，我读一下。"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "说句话")
             await asyncio.to_thread(core.wait, 30.0)
 
@@ -1111,7 +1162,6 @@ class ObserveTest(DriverFixture):
             typed = await asyncio.to_thread(core.observe, 0, ["ui_message"])
             self.assertTrue(typed["events"])
             self.assertTrue(all(e["type"] == "ui_message" for e in typed["events"]))
-            await core.shutdown_on_main("test")
 
 
 if __name__ == "__main__":
@@ -1136,8 +1186,7 @@ class KeysAndScreenTest(DriverFixture):
         的话，成功的表现是应用没了，反而不好从同一个进程里断言。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
 
             # ⚠ 这里**直接调**而不是走 `run_on_main`：测试体本身就跑在事件循环
             # 线程上，`run_on_main` 会把协程投给同一个循环再同步等结果——
@@ -1153,7 +1202,6 @@ class KeysAndScreenTest(DriverFixture):
 
             await pilot.pause()
             self.assertEqual(app.query_one(InputBar).value, "abc")
-            await core.shutdown_on_main("test")
 
     async def test_keys_rejects_bad_input(self):
         """
@@ -1164,13 +1212,11 @@ class KeysAndScreenTest(DriverFixture):
         而调用方只看到一次超时——排查方向会被完全带偏。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             for bad in ([], "ctrl+q", [""], [1, 2], ["a"] * 500):
                 res = await asyncio.to_thread(core.keys, bad)
                 self.assertFalse(res["ok"], f"{bad!r} 应当被拒")
                 self.assertEqual(res["error"]["code"], "bad_request")
-            await core.shutdown_on_main("test")
 
     async def test_screen_exports_visible_history_text(self):
         """
@@ -1181,8 +1227,7 @@ class KeysAndScreenTest(DriverFixture):
         而事件照常落盘，那正是 CLAUDE.md 里 `MarkupError` 那条坑的形态。
         """
         app, _ = self.assemble([[text("界面上要出现的这句话"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "说句话")
             await asyncio.to_thread(core.wait, 30.0)
             await pilot.pause()
@@ -1191,13 +1236,11 @@ class KeysAndScreenTest(DriverFixture):
             self.assertTrue(res["ok"], res)
             self.assertIn("界面上要出现的这句话", res["data"]["text"])
             self.assertTrue(res["data"]["widgets"], "widgets 不该为空")
-            await core.shutdown_on_main("test")
 
     async def test_screen_selector_narrows_and_reports_bad_selector(self):
         """选择器能收窄范围；语法错误走 `bad_request` 而不是抛。"""
         app, _ = self.assemble([[text("正文在这里"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await asyncio.to_thread(core.send, "说句话")
             await asyncio.to_thread(core.wait, 30.0)
             await pilot.pause()
@@ -1216,7 +1259,6 @@ class KeysAndScreenTest(DriverFixture):
             bad = await asyncio.to_thread(core.screen, "#!!!not a selector")
             self.assertFalse(bad["ok"])
             self.assertEqual(bad["error"]["code"], "bad_request")
-            await core.shutdown_on_main("test")
 
     async def test_screen_exposes_markup_for_style_assertions(self):
         """
@@ -1226,8 +1268,7 @@ class KeysAndScreenTest(DriverFixture):
         那份意图（比如状态栏里的 `[dim]…[/dim]`），断言它才稳。
         """
         app, _ = self.assemble([[text("好"), done()]])
-        async with app.run_test(size=(120, 40)) as pilot:
-            core = self.make_core(app, pilot, asyncio.get_running_loop())
+        async with self.driving(app) as (pilot, core):
             await pilot.pause()
             res = await asyncio.to_thread(core.screen, "")
             self.assertTrue(res["ok"], res)
@@ -1236,4 +1277,3 @@ class KeysAndScreenTest(DriverFixture):
                 any("[" in m for m in markups),
                 "至少应当有一个控件带 markup 原文（状态栏就有 [dim]）",
             )
-            await core.shutdown_on_main("test")
