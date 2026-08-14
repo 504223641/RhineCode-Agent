@@ -213,7 +213,7 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 - 新增状态栏展示字段 → `tui/widgets.py` 的 `compose_status_text`（渲染）**与 `StatusBar.update_status`（签名 + 转发，两处都要改）** + `tui/app.py` `_refresh_status`（取值传入）；命令触发的刷新由处理函数调 `refresh_status()`，无白名单。
   ⚠ **状态栏那一行是左右两个区**（tui-display F31）：`StatusHint`（贴左边缘，瞬时提示）+ `StatusBar`（右对齐，常驻状态），装在 `#status-row` 里。**常驻状态一律进右区**；只有「刚发生了什么」这类瞬时提示才进左区，且**不能拼进 `compose_status_text`** ——右区整块 `text-align: right`，拼进去只会落在右对齐块的最左边、随其余各段长度在屏幕中间浮动，**判据写成「排在第一段之前」会全绿而屏幕上并不贴左**（真踩过）。左区新增内容要同步 `_refresh_status` 里那行 `set_quit_hint` 同位置的刷新，以及 trace 负载里与 `text` 并列的那个布尔字段（左区不在 `text` 里，漏记等于那两秒的界面反馈没有任何物证）
 - 新增确认/交互态 → `agent/events.py`（枚举）+ `tui/widgets.py`（面板选项 id）+ `tui/app.py`（id→枚举映射）+ `conversation.py`（回调闭包处理）
-- **状态行的 `↑` 与状态栏的「上下文」是两个量，别去「统一」它们（tui-activity-fold）** → `tui/widgets.py` 的 `StatusLine._cost_segments` ↔ `context/manager.py` 的 `status_line`。前者累加每轮 `total_tokens`（每轮都要重发整段历史，同一段被重复计入很多次），后者是**当前**上下文占用的估算、不累加。实测一次 9 轮的运行两者是 `↑105.7K` 与 `15.9K`，差 6.6 倍——**两个都是对的**，回答的是不同问题。⚠ 用户真的把它当成 bug 报过（两个 token 数字同屏、量级差好几倍，第一反应就是「有一个算错了」），所以 `↑` 那段带一个「累计」限定，**别当成冗余删掉**；同理也别为了「让它们对上」把某一侧改成对方的口径。真要改口径的话该改的是「累加 total」这个选择本身（它既不等于花费——本项目缓存命中率极高，也不等于上下文），那属于产品决定，不是对齐两个数字。护栏见 `tests/test_tui_status_line.py::test_token_segment_says_it_is_cumulative`
+- **状态行的 `↑` 取最近一轮、`↓` 跨轮累加，两侧口径不同是刻意的（tui-activity-fold）** → `tui/widgets.py` 的 `StatusLine.set_usage`。判据一句话：**输入每轮重发所以只能看当下，输出每轮新增所以可以累加**。⚠ 「顺手把两边统一成累加」在界面上看不出问题（数字照样在涨），但那正是改掉的旧口径——它累加每轮 `total_tokens`，同一段历史被重复计入很多次，实测一次 9 轮的运行显示 `↑105.7K`，而状态栏的上下文是 `15.9K`，差 6.6 倍。**用户真的把它当成 bug 报过**（两个 token 数字同屏、量级差好几倍，第一反应就是「有一个算错了」）。现在 `↑` 与 `context/manager.py` 的 `status_line` 是**同一个量**（前者 API 精确值、后者 c8 估算），两者本就该接近——**别再让它们分叉**。口径对齐 Claude Code，且它自己反转过一次：官方状态行文档写 `context_window.total_input_tokens` 是「当前在上下文窗口中的令牌计数，来自最近的 API 响应」，并注明「在 v2.1.132 之前，这些是累积的会话总计」；它的上下文百分比同样**只由输入侧算**。护栏见 `tests/test_tui_status_line.py::test_input_takes_the_latest_round_and_output_accumulates`（含「输入不得累加」的反证）
 
 - **活动区终态行与历史区完成通知的成本数字必须同源（tui-display）** → 两处都经
   `subagents/tasks.py` 的 `TaskManager.row_of` 取快照、再交给
@@ -224,11 +224,20 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
   一处；写成两行同样不报错，只是每个子 Agent 在历史区留下重复的两条，
   用户会以为它跑了两次。护栏见 `tests/test_e2e_activity.py::FinishTraceTest`
   （断言该任务名在历史区**恰好出现一次**）
-- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 九个：
+- **界面上的符号有白名单，新增要先进这张表（tui-display F29）** → 十二个：
   `●`（发生了一件事——工具行、活动行、批次聚合行，状态靠**颜色**区分）、
   `⎿`（从属于上一行）、`>`（当前选中——面板高亮指示符）、
-  `·`（行内分隔，不作行首前缀）、`↑`（token 计数）、`✻`（思考块）、
-  以及 tui-activity-fold 新增的旋转标记三帧 `◇` `◈` `◆`（状态行动画）。
+  `·`（行内分隔，不作行首前缀）、`✻`（思考块）、
+  tui-activity-fold 新增的旋转标记三帧 `◇` `◈` `◆`（状态行动画）、
+  以及四个箭头：`↑`（输入 token）、`↓`（输出 token）、
+  `→`（从 A 到 B / 前后对照）、`↔`（两态互换）。
+  ⚠ **箭头这一组刚补齐过一轮**：`↑` 从登记之日起就没被扫描护栏管过
+  （扫描区间原本不含 Arrows 区块 2190–21FF，与 `●` 那次是同一个坑），
+  加 `↓` 时才发现。补上区间后扫出四处在用的 `→`（`/help` 的 `/think` 描述、
+  `/agents` 的「声明值 → 实际值」、`/hooks` 的「事件 → 动作」、任务回执的
+  「状态 → …」）与一处孤立的 `⇄`——后者已改成 `↔`，因为项目其余地方
+  （`[AUTO] ↔ [PLAN]`、「逐条 ↔ 全文」）表达互换用的都是它，
+  两个符号一个意思正是本表「语义互不重叠」要挡的形态。
   **不在表内的一律不用**，包括为消息分级发明的图形——警告与错误靠**文字前缀**
   （「警告：」「错误：」），那是它们脱离颜色也能辨认的唯一依靠。
   改动要同步三处：本表、`tests/test_tui_symbols.py` 的 `WHITELIST`、

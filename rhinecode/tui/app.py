@@ -2150,17 +2150,23 @@ class RhineApp(App):
                     )
 
                 elif etype == AgentEventType.USAGE:
-                    # 本轮 token 用量累加到状态行（tui-activity-fold F15/F17）。
+                    # 本轮 token 用量送进状态行（tui-activity-fold F15/F17）。
                     #
                     # ⚠ **这个事件每轮只在流末尾到达一次**（Provider 协议限制：
                     # OpenAI 兼容协议的 `include_usage` 在流的最后额外发一块
                     # usage）。因此状态行上的 token 是**跳变式**更新，
                     # 而不是像耗时那样持续滚动——这是**已知且如实记录**的行为，
                     # 验收时别误判成「数字不动 = 坏了」（AC16）。
-                    total = getattr(event.usage, "total_tokens", 0) or 0
-                    if total:
+                    #
+                    # ⚠ **这里传的是输入与输出两个分量，不是 `total_tokens`。**
+                    # 「哪个累加、哪个覆写」的判断收在 `StatusLine.set_usage` 里
+                    # （输入重发所以取最近一轮、输出新增所以累加），本处只负责
+                    # 如实转交——在这里先算个和再传过去，等于把那条口径拆成两半。
+                    prompt = getattr(event.usage, "prompt_tokens", 0) or 0
+                    completion = getattr(event.usage, "completion_tokens", 0) or 0
+                    if prompt or completion:
                         self.call_from_thread(
-                            self.query_one(StatusLine).add_tokens, total
+                            self.query_one(StatusLine).set_usage, prompt, completion
                         )
 
                 elif etype == AgentEventType.FINISHED:
