@@ -13,8 +13,8 @@ c4 变化：c3 的工具编排（写死的单轮往返 _stream/_execute 等）�
 
 c10 变化：斜杠命令的解析与分发整体迁出到 rhinecode/commands/ 命令层——
 本类**不再解析任何斜杠文本**（旧 handle_input 已删除），改为暴露一组不依赖
-命令字符串的领域方法（submit_user_message / cycle_thinking / toggle_plan /
-cycle_permission / mcp_report / context_report / memory_report /
+命令字符串的领域方法（submit_user_message / cycle_thinking / cycle_preset /
+mcp_report / context_report / memory_report /
 manual_compact / resume / clear），由 RhineApp（CommandController 实现）调用。
 依赖方向：commands → tui/app → 本类；本类不导入 commands 包（plan 依赖固定）。
 
@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from rhinecode.config import Config
+from rhinecode import presets
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
@@ -162,18 +163,9 @@ class ConversationManager:
     # 各档位对应的中文显示名称
     _EFFORT_LABEL = {"off": "关闭", "high": "高效（high）", "max": "最强（max）"}
 
-    # /perm 命令的三档循环顺序：默认 → 严格 → 放行 → 默认（c6）
-    _PERM_CYCLE = {
-        PermissionMode.DEFAULT: PermissionMode.STRICT,
-        PermissionMode.STRICT: PermissionMode.PERMISSIVE,
-        PermissionMode.PERMISSIVE: PermissionMode.DEFAULT,
-    }
-    # 各权限模式对应的中文显示名称
-    _PERM_LABEL = {
-        PermissionMode.STRICT: "严格（strict）",
-        PermissionMode.DEFAULT: "默认（default）",
-        PermissionMode.PERMISSIVE: "放行（permissive）",
-    }
+    # auto-plan 扩展：权限档的三档循环（`_PERM_CYCLE`）与显示名（`_PERM_LABEL`）
+    # 已随 `/perm` 命令一并删除。状态栏不再展示档位（它恒为放行档），
+    # 需要显示档位的地方（目前只有子 Agent 报告）取 `presets.MODE_LABELS`。
 
     def __init__(
         self,
@@ -260,13 +252,26 @@ class ConversationManager:
         self.history: list[Message] = []
         # 思考模式强度：off（关闭）/ high（高效）/ max（最强）
         self.thinking_effort: str = "off"
-        # Plan Mode 开关：开启时循环只放只读工具并注入引导提示（仅工具可用 Provider 生效）
+        # Plan Mode 开关：开启时循环只放只读工具并注入引导提示（仅工具可用 Provider 生效）。
+        #
+        # auto-plan 扩展起，它是**预设的两条轴之一**：`plan` 预设 = 本标志为真。
+        # 「当前是哪个预设」由 `preset` 属性从它推导，**不另存一份**（spec N5）。
         self.plan_mode: bool = False
         # 权限决策引擎（c6）：启动时加载三层 YAML 规则，持有权限模式与会话级规则。
         # 取代 c5 的「会话级一刀切免确认」标志——本会话放行改为按规则登记（见 _run 的 ask 闭包）。
         # web_fetch 扩展 F4 链路①：总开关要穿过这里才到得了 config.load_all
         # ——`bootstrap.py` 对权限 load_all 是零调用，在装配层透传是做不到的。
+        #
+        # auto-plan 扩展 F3：启动缺省预设是 `auto`，其档位就是 PERMISSIVE，
+        # 故这里**显式传入**而不是吃 `load` 的默认值。
+        #
+        # ⚠ **刻意不改 `PermissionEngine.load` 的默认参数**（它仍是 DEFAULT）：
+        # 大量测试直接 `PermissionEngine(...)` / `.load()` 并依赖 DEFAULT 语义
+        # （「灰色地带交人工确认」是它们断言 ASK 的前提）。改默认值看起来只动一行，
+        # 实际是把所有人的地基换掉，且失败形态是「一批用例断言 ASK 却拿到 ALLOW」，
+        # 排查时根本想不到根因在一个默认参数上。
         self._engine: PermissionEngine = PermissionEngine.load(
+            mode=presets.PRESET_AXES[presets.DEFAULT_PRESET][0],
             user_dir=self._user_dir,
             web_fetch_enabled=config.web_fetch_enabled,
         )
@@ -277,6 +282,10 @@ class ConversationManager:
         self.confirm_callback: Optional[ConfirmCallback] = None
         self.clarify_callback: Optional[ClarifyCallback] = None
         self.approve_plan_callback: Optional[ApprovePlanCallback] = None
+        # 预设在**工作线程**里被改动时通知界面刷新状态栏（auto-plan 扩展 F12）。
+        # 由 TUI 注入，与 `skill_manager.notify_activation` 同一个先例与同一套理由。
+        # 为 None 时静默跳过——非 TUI 调用方（测试、端到端宿主）不需要它。
+        self.notify_preset_change: Optional[Callable[[], None]] = None
 
         # 工具/循环能力仅在 DeepSeek 协议且提供了注册中心时启用（本章范围）
         self._tools_enabled = (self._protocol == "deepseek" and registry is not None)
@@ -348,7 +357,7 @@ class ConversationManager:
         # 权限规则的加载警告并入启动提示（web_fetch 扩展 F25）。
         #
         # `PermissionEngine.load_errors` 在此之前**全仓零消费者**——警告收集完就死在
-        # 那里。之所以并进 startup_notice 而不是新做一个 /perm 报告：前者是既有字段
+        # 那里。之所以并进 startup_notice 而不是新做一个权限报告命令：前者是既有字段
         # （TUI 挂载时写进聊天区）、零新增维护点，且**不需要用户主动敲命令就能看见**。
         # Hook 的公共字段（session_id / cwd）绑定一次；会话切换时在 clear/_resume_stream
         # 里重新绑定——不重绑的话，`/clear` 之后所有 Hook 负载里的 session_id 仍是旧档，
@@ -481,16 +490,36 @@ class ConversationManager:
     @property
     def permission_mode_value(self) -> Optional[str]:
         """
-        当前权限模式的取值字符串（"strict"/"default"/"permissive"），供状态栏展示（c6）。
+        当前权限模式的取值字符串（"strict"/"default"/"permissive"），c6。
 
         仅在工具可用（DeepSeek 工具模式）时有意义——其它 Provider 没有受控工具，
-        权限模式不参与任何判断，故返回 None，让状态栏不展示这一段，避免误导。
+        权限模式不参与任何判断，故返回 None。
+
+        ⚠ **auto-plan 扩展起，这个值不再进状态栏**（`/perm` 已删除，主对话档位
+        恒为放行档，常年显示一个不变的值是纯噪音）。它现在只服务**行为记录**的
+        启动快照——记录要记的是真实档位，与「给用户看什么」是两件事。
+        给用户看的是 `preset_value`。
 
         :returns: 模式值字符串；工具不可用时返回 None
         """
         if not self._tools_enabled:
             return None
         return self._engine.mode.value
+
+    @property
+    def preset_value(self) -> Optional[str]:
+        """
+        当前预设的取值字符串（"auto"/"plan"），供状态栏与行为记录展示。
+
+        与 `permission_mode_value` 同口径：工具不可用的 Provider 返回 None，
+        让状态栏整段不展示——那些 Provider 既没有受控工具也没有 Plan Mode，
+        显示一个模式标记只会误导。
+
+        :returns: 预设值字符串；工具不可用时返回 None
+        """
+        if not self._tools_enabled:
+            return None
+        return self.preset.value
 
     @property
     def tools_enabled(self) -> bool:
@@ -612,30 +641,94 @@ class ConversationManager:
         label = self._EFFORT_LABEL[self.thinking_effort]
         return f"思考模式：{label}"
 
-    def toggle_plan(self) -> str:
+    def _approve_plan_then_exit(self, plan: str) -> bool:
         """
-        切换 Plan Mode 开关（仅工具可用 Provider 生效）。
+        计划审批的包装：转发给 TUI 的审批回调，**获批则退出 plan 预设**。
 
-        :returns: 供界面显示的结果文本；不支持时保持关闭并返回原提示
-        """
-        # Plan Mode 依赖工具能力，仅在工具可用的 Provider（DeepSeek + 注册中心）下生效
-        if not self._tools_enabled:
-            return "当前 Provider 不支持计划模式"
-        self.plan_mode = not self.plan_mode
-        return "计划模式：开启" if self.plan_mode else "计划模式：关闭"
+        auto-plan 扩展 F12/F13/F14。三条语义，逐条说明为什么是这样：
 
-    def cycle_permission(self) -> str:
+        **F12 获批 → 永久回 `auto`。** 批准的语义是「我认可了，去干吧」，
+        而不是「这一次去干、下次还得再提一遍计划」。改造前 `plan_mode` 是个
+        纯粹的持久开关，获批只影响 Agent 循环内那一轮的 `execution_phase`，
+        于是用户批完一个计划、本轮执行完，下一句「继续」又会被抱回规划阶段
+        要求重新提计划。
+
+        **F13 被拒 → 留在 `plan`。** 拒绝意味着方案不对、还得接着规划；
+        自动退出会让下一轮重想时失去保护（模型可以直接动手了）。
+
+        **F14 本轮不受影响。** Agent 循环拿到的 `plan_mode` 是**入参快照**，
+        循环内部另有自己的局部变量 `execution_phase`——回合中途改这个字段，
+        正在跑的那一轮感知不到。这正是想要的：本回合继续把活干完，
+        下一回合起是 `auto`。
+
+        ⚠ **刻意不在这里改 `engine.mode`。** 两个预设的档位本来就相同、
+        不需要改；而在这里改那个**单实例共享**的引擎的档位，正是
+        `CLAUDE.md` 明令禁止的形态（「权限必须 `derive()` 派生，绝不改主引擎
+        的 `mode`」）——它跑在工作线程上，而主线程正在读同一个字段渲染界面，
+        且子 Agent 的档位是按 `min(主对话档, 角色声明档)` 在委派那一刻派生的，
+        回合中途翻转会让前后两次委派的同名角色拿到不同档位而配置上看不出来。
+        护栏见 `test_auto_plan_integration.py::test_approval_does_not_touch_engine_mode`。
+
+        :param plan: 模型提交的计划正文
+        :returns: 用户是否批准（回调缺失时按未批准处理，fail-closed）
+
+        副作用：获批时改写 `plan_mode` 并通知界面刷新状态栏。
         """
-        三档循环切换权限模式（默认 → 严格 → 放行 → 默认，c6）。
+        if self.approve_plan_callback is None:
+            return False
+        approved = self.approve_plan_callback(plan)
+        if approved:
+            self.plan_mode = False
+            # 立刻让状态栏变回 [AUTO]。不通知的话，整个执行阶段状态栏都还写着
+            # [PLAN]——那时它已经在动手改文件了，标记与实际正好相反。
+            # 丢一次通知不会留下错误状态：`_do_stream` 的 finally 里无条件再刷一次。
+            if self.notify_preset_change is not None:
+                self.notify_preset_change()
+        return approved
+
+    @property
+    def preset(self) -> presets.Preset:
+        """
+        当前运行预设（auto-plan 扩展 spec N5：**全系统唯一的推导点**）。
+
+        预设不是独立状态，是从两条既有轴推导出来的值——展示、切换、行为记录
+        全部取这里。各处自己按两条轴拼一遍的话，迟早出现「状态栏说 auto、
+        实际在规划阶段」这种两边各自看都对、合起来对不上的不一致。
+
+        :returns: `Preset.PLAN`（规划阶段开启）或 `Preset.AUTO`
+
+        副作用：无（纯读）。
+        """
+        return presets.preset_of(self.plan_mode)
+
+    def cycle_preset(self) -> str:
+        """
+        在 `auto` 与 `plan` 两个预设间循环（auto-plan 扩展 F5/F6）。
+
+        `Shift+Tab` 与 `/mode`（别名 `/plan`）共用本方法，两条入口行为逐字相同。
+
+        执行步骤：
+        1. 从 `preset` 推导当前预设；
+        2. 取循环里的下一个；
+        3. 按 `axes_of` 把该预设的两条轴取值**依次写回**。
 
         :returns: 供界面显示的结果文本；工具不可用的 Provider 返回原提示
+
+        副作用：改写权限引擎的档位与 `plan_mode`。
         """
-        # 仅在工具可用的 Provider 下有意义（无工具则无可控对象）
+        # 预设依赖工具能力（无工具则两条轴都无可控对象），与改造前的 toggle_plan 同口径
         if not self._tools_enabled:
-            return "当前 Provider 不支持权限模式"
-        self._engine.set_mode(self._PERM_CYCLE[self._engine.mode])
-        label = self._PERM_LABEL[self._engine.mode]
-        return f"权限模式：{label}"
+            return "当前 Provider 不支持模式切换"
+        target = presets.next_preset(self.preset)
+        mode, planning = presets.axes_of(target)
+        # ⚠ **明知 `set_mode` 当前是空操作也要写。**
+        # 两个预设的档位恰好相同（都是 PERMISSIVE），所以这一行现在什么都不改。
+        # 但它是「预设 = 两条轴的组合」这个结构的执行体：省掉它的话，将来加一个
+        # 档位不同的预设时，那个预设会**静默地不生效**——切过去了、规划阶段也变了，
+        # 唯独档位没变，而界面上完全看不出来。
+        self._engine.set_mode(mode)
+        self.plan_mode = planning
+        return f"模式：{target.value}"
 
     def mcp_report(self) -> str:
         """MCP 连接状态只读报告（c7 F16）：纯读不改状态。"""
@@ -1413,7 +1506,9 @@ class ConversationManager:
                 self._engine,
                 self._build_ask(),       # 复用同一份确认实现，避免两套规则登记逻辑
                 self.clarify_callback,
-                self.approve_plan_callback,
+                # auto-plan F12：走包装方法而不是裸回调——获批后要退出 plan 预设。
+                # ⚠ 两处传的必须是**同一个**方法，各写一份逻辑迟早分叉。
+                self._approve_plan_then_exit,
                 self._cancel_event,
                 self._context_manager,
                 None,                    # recorder=None：子对话过程不写会话存档
@@ -1729,7 +1824,8 @@ class ConversationManager:
             self._engine,
             ask,
             self.clarify_callback,
-            self.approve_plan_callback,
+            # auto-plan F12：同上，走包装方法（两处共用同一个实现）。
+            self._approve_plan_then_exit,
             self._cancel_event,
             self._context_manager,
             self.memory_manager.record_message,

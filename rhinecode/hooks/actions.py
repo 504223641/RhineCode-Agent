@@ -238,7 +238,11 @@ def run_command_action(
         # ——`timeout` 只改变返回的文案。而这里的等待发生在 Hook 分发路径上，
         # 一条挂了的 `pre_tool_use` 命令能把整次工具调用拖住任意久
         # （与 `hooks/manager.py` 那条「锁里不做动作执行」是同一隐患的两半）。
-        proc = run_shell_captured(
+        # auto-plan F17：第二个返回值是被剔除的环境变量条数。Hook 侧**不消费它**
+        # ——Hook 的结果面向的是「这条规则做了什么」，而环境过滤是全局一致的行为，
+        # 逐条 Hook 复述一遍只是噪音。过滤本身照常生效（它在 run_shell_captured
+        # 内部完成，两个调用方一视同仁，spec F17b）。
+        proc, _dropped_env = run_shell_captured(
             action.command,
             # c14 F25：命令跑在**触发它的那个 Agent 的工作目录**里。
             # 主对话触发 → 主项目根；隔离子 Agent 触发 → 它的隔离工作区。

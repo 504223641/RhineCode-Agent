@@ -2553,11 +2553,16 @@ class InputBar(Input):
             self.value = ""
 
 
-# 模式标记样式（c10 F29/F30）：
-# - [DEFAULT] 用 dim（中性、低强调），深浅色主题下都可读；
-# - [PLAN] 用加粗的醒目青色（与主题青一致但更饱和），两种主题下均与 DEFAULT 明显区分。
-# N9 可访问性：模式不只靠颜色表达——文字本身就是 [DEFAULT]/[PLAN]，忽略样式也能区分。
-_MODE_DEFAULT_MARKUP = "[dim]\\[DEFAULT][/dim]"
+# 模式标记样式（c10 F29/F30；auto-plan 扩展把 [DEFAULT] 改成 [AUTO]）：
+# - [AUTO] 用 dim（中性、低强调），深浅色主题下都可读；
+# - [PLAN] 用加粗的醒目青色（与主题青一致但更饱和），两种主题下均与 AUTO 明显区分。
+# N9 可访问性：模式不只靠颜色表达——文字本身就是 [AUTO]/[PLAN]，忽略样式也能区分。
+#
+# ⚠ **[AUTO] 刻意保持 dim，不用橘色。** 它是缺省状态，而橘色在本项目里专指
+# 「需要用户留意」（上下文逼近上限、确认面板、原先的放行档）。把一个常年为真的
+# 状态标成橘色，会稀释掉橘色在别处的分量——改造前那段常驻橘色的「权限模式：放行」
+# 正是因为这个原因随本扩展一并删除。
+_MODE_AUTO_MARKUP = "[dim]\\[AUTO][/dim]"
 _MODE_PLAN_MARKUP = "[bold #00D7D7]\\[PLAN][/bold #00D7D7]"
 
 # 「再按一次 Ctrl+C 退出」的提示文本（tui-display 扩展 F31）。
@@ -2591,8 +2596,7 @@ def compose_status_text(
     provider: str,
     model: str,
     thinking_effort: str,
-    plan_mode: bool = False,
-    permission_mode: "str | None" = None,
+    preset: "str | None" = None,
     mcp_status: "str | None" = None,
     context_status: "str | None" = None,
     context_warn: bool = False,
@@ -2602,29 +2606,34 @@ def compose_status_text(
     """
     组装状态栏的 Content markup 文本（纯函数，c10 抽出便于单测）。
 
-    显示格式：\\[protocol] model | 思考模式：X | [DEFAULT]/[PLAN] | 权限模式：X | MCP：… | 上下文：…
+    显示格式：\\[protocol] model | 思考模式：X | [AUTO]/[PLAN] | MCP：… | 上下文：…
     c10 起旧的「计划模式：开/关」文字替换为醒目的模式标记（spec F29–F30）。
 
+    auto-plan 扩展的两处变更：
+
+    - `plan_mode`（布尔）与 `permission_mode`（三档字符串）**两个参数合并为
+      `preset` 一个**。用户界面上只剩两个模式，两个参数拼一个标记等于把
+      预设层的推导又在渲染层做了一遍（spec N5 明令只许有一处推导点）。
+    - **独立的「权限模式：X」整段删除。** `/perm` 删掉之后主对话的档位恒为放行档，
+      也没有任何配置项能改启动档——一个恒定不变的段是纯噪音，且与 [AUTO] 重复。
+      连带去掉它的橘色高亮（理由见 `_MODE_AUTO_MARKUP` 上方的注释）。
+
+    :param preset: 预设取值（"auto" / "plan"）；为 None（工具不可用的 Provider）
+                   时**整段不展示**——那些 Provider 既无受控工具也无 Plan Mode，
+                   显示一个模式标记只会误导。
     :returns: 可交给 Static(markup=True) 渲染的 markup 字符串
     """
     _LABEL = {"off": "关闭", "high": "高效", "max": "最强"}
     state = _LABEL.get(thinking_effort, thinking_effort)
     # Static(markup=True) 走 Textual 的 Content markup：`[xxx]` 会被当成样式标签解析。
-    # 这里 `[provider]`、`[DEFAULT]`、`[PLAN]` 的方括号是想当「字面量」显示的，必须转义
+    # 这里 `[provider]`、`[AUTO]`、`[PLAN]` 的方括号是想当「字面量」显示的，必须转义
     # 开口的 `[`（写成 `\[`），否则会被解析成无效样式标签而整段消失（项目已知坑）。
-    mode_seg = _MODE_PLAN_MARKUP if plan_mode else _MODE_DEFAULT_MARKUP
     text = (
         f" \\[{escape(str(provider))}] {escape(str(model))} | "
-        f"思考模式：{escape(str(state))} | {mode_seg}"
+        f"思考模式：{escape(str(state))}"
     )
-    if permission_mode is not None:
-        _PERM = {"strict": "严格", "default": "默认", "permissive": "放行"}
-        plabel = _PERM.get(permission_mode, permission_mode)
-        seg = f"权限模式：{escape(str(plabel))}"
-        # 放行档影响安全（灰色地带默认放行），用橘色（与确认面板同色）醒目提示。
-        if permission_mode == "permissive":
-            seg = f"[#FFA500]{seg}[/#FFA500]"
-        text += f" | {seg}"
+    if preset is not None:
+        text += f" | {_MODE_PLAN_MARKUP if preset == 'plan' else _MODE_AUTO_MARKUP}"
     # MCP 段（c7）：仅在启用且有 Server 时展示；文本可能含字面 `[`，统一 escape 兜底。
     if mcp_status is not None:
         text += f" | {escape(str(mcp_status))}"
@@ -2839,8 +2848,7 @@ class StatusBar(Static):
         provider: str,
         model: str,
         thinking_effort: str,
-        plan_mode: bool = False,
-        permission_mode: "str | None" = None,
+        preset: "str | None" = None,
         mcp_status: "str | None" = None,
         context_status: "str | None" = None,
         context_warn: bool = False,
@@ -2850,12 +2858,15 @@ class StatusBar(Static):
         """
         刷新状态栏显示内容（文本组装见 compose_status_text 纯函数）。
 
+        ⚠ **成对维护点**：本方法的签名必须与 `compose_status_text` 同步——
+        它只是转发，多一个少一个参数都不报错，只表现为状态栏少一段内容。
+
         :param provider: Provider 协议名（anthropic / openai / deepseek）
         :param model: 当前使用的模型名称
         :param thinking_effort: 思考模式强度（off / high / max）
-        :param plan_mode: 是否处于 Plan Mode（c10 起显示 [DEFAULT] / [PLAN] 标记）
-        :param permission_mode: 权限模式取值（"strict"/"default"/"permissive"）；c6 新增。
-                                为 None（工具不可用的 Provider）时不展示该段，避免误导。
+        :param preset: 运行预设取值（"auto" / "plan"），显示为 [AUTO] / [PLAN] 标记。
+                       为 None（工具不可用的 Provider）时不展示该段，避免误导。
+                       auto-plan 扩展起取代原来的 plan_mode + permission_mode 两个参数。
         :param mcp_status: MCP 连接状态摘要；为 None（未启用 MCP）时不展示该段。
         :param context_status: 上下文用量摘要；为 None（无 ContextManager）时不展示该段。
         :param context_warn: 上下文是否接近上限或已熔断；为真时该段橘色高亮预警。
@@ -2868,8 +2879,7 @@ class StatusBar(Static):
                 provider,
                 model,
                 thinking_effort,
-                plan_mode,
-                permission_mode,
+                preset,
                 mcp_status,
                 context_status,
                 context_warn,

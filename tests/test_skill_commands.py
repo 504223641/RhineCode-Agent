@@ -140,9 +140,10 @@ class ReplaceSkillCommandsTest(unittest.TestCase):
         registry.replace_skill_commands(build_skill_command_specs(_infos("a", "b")))
         registry.replace_skill_commands([])
         self.assertIsNone(registry.resolve("/a"))
-        # 内置命令一个不少（c13 起十五条：C10 十二条 + /skills + /hooks + /agents）。
+        # 内置命令一个不少（auto-plan 扩展起十五条：C10 十二条 + /skills + /hooks
+        # + /agents + /tasks，减去 /plan 与 /perm 合并成的 /mode 那一条）。
         self.assertIsNotNone(registry.resolve("/clear"))
-        self.assertEqual(len(registry.visible_commands()), 16)
+        self.assertEqual(len(registry.visible_commands()), 15)
 
     def test_index_has_no_ghost_entry_for_skipped_spec(self) -> None:
         """

@@ -5,7 +5,7 @@
 1. 纯逻辑：CommandHighlighter 着色规则、compose_status_text 模式标记（无需启动 App）；
 2. Textual 集成：用 App.run_test() / Pilot 驱动真实按键——Tab 单候选补全、
    多候选菜单、参数区 Tab 不改写、菜单 Enter 执行高亮项、未知命令本地提示、
-   /plan 切换状态栏 [DEFAULT]/[PLAN]、/init 双内容提交。
+   /mode（别名 /plan）与 Shift+Tab 切换状态栏 [AUTO]/[PLAN]、/init 双内容提交。
 
 集成测试用 Fake ConversationManager（鸭子类型替身）：不构造 Provider、
 不发网络请求，只记录领域方法调用（spec N8/C25/C26）。
@@ -72,30 +72,55 @@ class HighlighterTests(unittest.TestCase):
 # 纯逻辑：状态栏模式标记（T41，spec F29–F30/N9）
 # ---------------------------------------------------------------------- #
 class StatusTextTests(unittest.TestCase):
-    def test_default_mode_marker(self) -> None:
-        text = compose_status_text("deepseek", "m", "off", plan_mode=False)
-        self.assertIn("\\[DEFAULT]", text)
+    def test_auto_mode_marker(self) -> None:
+        text = compose_status_text("deepseek", "m", "off", preset="auto")
+        self.assertIn("\\[AUTO]", text)
         self.assertIn("[dim]", text)
         self.assertNotIn("计划模式", text)
 
     def test_plan_mode_marker_differs_in_style(self) -> None:
-        default_text = compose_status_text("deepseek", "m", "off", plan_mode=False)
-        plan_text = compose_status_text("deepseek", "m", "off", plan_mode=True)
+        auto_text = compose_status_text("deepseek", "m", "off", preset="auto")
+        plan_text = compose_status_text("deepseek", "m", "off", preset="plan")
         self.assertIn("\\[PLAN]", plan_text)
-        self.assertIn("bold", plan_text)  # PLAN 使用醒目加粗样式，与 dim 的 DEFAULT 不同
-        self.assertNotEqual(default_text, plan_text)
+        self.assertIn("bold", plan_text)  # PLAN 使用醒目加粗样式，与 dim 的 AUTO 不同
+        self.assertNotEqual(auto_text, plan_text)
         # 忽略样式后仍能靠文字区分（N9）
-        self.assertNotIn("\\[PLAN]", default_text)
-        self.assertNotIn("\\[DEFAULT]", plan_text)
+        self.assertNotIn("\\[PLAN]", auto_text)
+        self.assertNotIn("\\[AUTO]", plan_text)
+
+    def test_no_marker_when_tools_unavailable(self) -> None:
+        """
+        auto-plan 扩展：`preset` 为 None（无工具能力的 Provider）时整段不出现。
+
+        那些 Provider 既没有受控工具也没有 Plan Mode，显示一个模式标记只会误导。
+        """
+        text = compose_status_text("anthropic", "m", "off")
+        self.assertNotIn("AUTO", text)
+        self.assertNotIn("PLAN", text)
+
+    def test_permission_mode_segment_is_gone(self) -> None:
+        """
+        auto-plan 扩展 F15（**反证**）：独立的「权限模式」段已整段删除。
+
+        `/perm` 删掉之后主对话档位恒为放行档，一个恒定不变的段是纯噪音，
+        且与 [AUTO] 标记重复。连带那段的橘色也不该再出现——橘色在本项目里
+        专指「需要用户留意」，常年亮着会稀释它在别处（上下文逼近上限、
+        确认面板）的分量。
+        """
+        for preset in ("auto", "plan", None):
+            with self.subTest(preset=preset):
+                text = compose_status_text("deepseek", "m", "off", preset=preset)
+                self.assertNotIn("权限模式", text)
+                self.assertNotIn("#FFA500", text)
 
     def test_other_fields_preserved(self) -> None:
         text = compose_status_text(
             "deepseek", "model-x", "high",
-            plan_mode=False, permission_mode="default",
+            preset="auto",
             mcp_status="MCP：已连接 1/1 · 工具 3",
             context_status="上下文：19% · 12.3K/64K",
         )
-        for expected in ("deepseek", "model-x", "思考模式：高效", "权限模式：默认",
+        for expected in ("deepseek", "model-x", "思考模式：高效",
                          "MCP：已连接 1/1", "上下文：19%"):
             self.assertIn(expected, text)
 
@@ -154,7 +179,37 @@ class FakeManager:
 
     @property
     def permission_mode_value(self):
-        return "default"
+        # 真实档位。auto-plan 扩展起它**不再进状态栏**（只服务 trace 启动快照），
+        # 但仍是协调层的公开属性，替身照样提供。
+        return "permissive"
+
+    @property
+    def preset(self):
+        from rhinecode.presets import preset_of
+
+        return preset_of(self.plan_mode)
+
+    @property
+    def preset_value(self):
+        """
+        状态栏取的就是这个（auto-plan 扩展）。
+
+        ⚠ 刻意**从 `plan_mode` 推导**而不是写死返回 "auto"：写死的话，
+        `/mode` 与 `Shift+Tab` 切换之后状态栏在替身上永远不变，
+        而那正是几条集成用例要看的东西。
+        """
+        from rhinecode.presets import preset_of
+
+        return preset_of(self.plan_mode).value
+
+    def cycle_preset(self) -> str:
+        """auto-plan 扩展：取代改造前的 toggle_plan / cycle_permission。"""
+        from rhinecode.presets import axes_of, next_preset
+
+        target = next_preset(self.preset)
+        _mode, planning = axes_of(target)
+        self.plan_mode = planning
+        return f"模式：{target.value}"
 
     @property
     def tools_enabled(self) -> bool:
@@ -180,12 +235,8 @@ class FakeManager:
     def cycle_thinking(self) -> str:
         return "思考模式：高效（high）"
 
-    def toggle_plan(self) -> str:
-        self.plan_mode = not self.plan_mode
-        return "计划模式：开启" if self.plan_mode else "计划模式：关闭"
-
-    def cycle_permission(self) -> str:
-        return "权限模式：默认（default）"
+    # auto-plan 扩展：`toggle_plan` 与 `cycle_permission` 已被 `cycle_preset`
+    # 取代（定义在上面靠近 preset 属性处，与它们读写的是同一条轴）。
 
     def mcp_report(self) -> str:
         return "MCP 报告"
@@ -450,11 +501,12 @@ class ExecutionInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("未知命令", text)
             self.assertIn("/help", text)
 
-    async def test_plan_toggle_switches_status_marker(self) -> None:
+    async def test_mode_toggle_switches_status_marker(self) -> None:
+        """`/plan`（现在是 `/mode` 的别名）在两个预设间来回切，状态栏跟着变。"""
         app, manager = _make_app()
         async with app.run_test() as pilot:
             bar_widget = app.query_one(StatusBar)
-            self.assertIn("[DEFAULT]", bar_widget.render().plain)
+            self.assertIn("[AUTO]", bar_widget.render().plain)
             bar = app.query_one(InputBar)
             bar.value = "/plan"
             app.query_one(CommandPanel).hide()
@@ -462,11 +514,39 @@ class ExecutionInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(manager.plan_mode)
             self.assertIn("[PLAN]", bar_widget.render().plain)
-            # 再次执行恢复 [DEFAULT]
+            # 再次执行恢复 [AUTO]
             bar.value = "/plan"
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIn("[DEFAULT]", bar_widget.render().plain)
+            self.assertIn("[AUTO]", bar_widget.render().plain)
+
+    async def test_shift_tab_switches_preset(self) -> None:
+        """
+        auto-plan 扩展 F5：`Shift+Tab` 走**真实按键路径**切换预设。
+
+        ⚠ 这条必须用按键而不是直接调命令——它要验的是 `priority=True` 有没有
+        真的从 Textual 手里抢到这个键（`Screen` 自带 `shift+tab → focus_previous`）。
+        调命令会绕过整个按键分发，抢没抢到都会绿。
+
+        同时断言**焦点没被夺走**：抢占之后再自己动焦点，等于把被抢掉的行为
+        又还回去一半，用户会看到「模式变了、光标也跑了」。
+        """
+        app, manager = _make_app()
+        async with app.run_test() as pilot:
+            bar_widget = app.query_one(StatusBar)
+            focused_before = app.focused
+            self.assertIn("[AUTO]", bar_widget.render().plain)
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            self.assertTrue(manager.plan_mode, "shift+tab 必须真的切到 plan")
+            self.assertIn("[PLAN]", bar_widget.render().plain)
+            self.assertIs(app.focused, focused_before, "切换不得改变焦点")
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            self.assertFalse(manager.plan_mode)
+            self.assertIn("[AUTO]", bar_widget.render().plain)
 
     async def test_init_dual_content(self) -> None:
         app, manager = _make_app()

@@ -85,7 +85,23 @@ class HostFixture(unittest.TestCase):
 
         :param wait_ready: True 时额外等到 `status` 不再回 `starting`
             （装配失败的用例要传 False——它永远等不到 idle）
+
+        ## 为什么缺省补一个 `--permission-mode default`（auto-plan 扩展）
+
+        驱动设施的用例大量把「确认面板」当**夹具**使——它们验的是控制通道
+        （面板就绪的原子性、应答的两条路径、结算与退出），面板本身只是个
+        能稳定造出 `pending` 态的东西。
+
+        auto-plan 扩展之后，工作区内的普通写入在缺省档（放行）下**不再弹面板**，
+        于是那些用例会等到一个永远不来的 `pending`。而它们**不能**改用保护路径
+        那种面板：那个只有三个选项，`permanent` 那一支覆盖不到。
+
+        故在这里统一补一档。**只在调用方没自己指定时才补**——需要验证产品
+        缺省行为的用例（如 `test_e2e_protected` 那组）显式传自己的档位，
+        补的这一档不会盖掉它。
         """
+        if not any(a == "--permission-mode" for a in extra):
+            extra = (*extra, "--permission-mode", "default")
         before = {h.pid for h in discovery.list_hosts()}
         # 同一条用例可能起两次宿主（如「改代码 → 重启 → 比指纹」那条），
         # 开新句柄前先把上一个关掉——否则它既泄漏文件描述符，

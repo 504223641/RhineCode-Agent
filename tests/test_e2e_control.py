@@ -30,6 +30,7 @@ from unittest import mock
 
 from rhinecode.bootstrap import build_app
 from rhinecode.config import Config
+from rhinecode.permission.models import PermissionMode
 from rhinecode.tools import path_guard
 from rhinecode.tui.widgets import InputBar
 from rhinecode.trace.recorder import TraceRecorder
@@ -137,6 +138,17 @@ class DriverFixture(unittest.IsolatedAsyncioTestCase):
             exclude_tools=EXCLUDED,
         )
         self.result.manager.memory_manager.memories_enabled = False
+        # auto-plan 扩展：启动缺省档已是放行档（auto 预设），工作区内的普通写入
+        # 不再弹面板。本文件大量用例把**确认面板当夹具**——它们验的是控制通道
+        # （面板就绪的原子性、两条应答路径、结算与退出），面板只是个能稳定造出
+        # `pending` 态的东西。不设回默认档的话，它们会等一个永远不来的 pending。
+        #
+        # ⚠ 它们**不能**改用保护路径那种面板：那个只有三个选项，
+        # `permanent` 那一支覆盖不到。
+        #
+        # 产品缺省行为的验收在 `test_e2e_protected.py` 与 checklist 的 C 类场景，
+        # 不在本文件——本文件验的是驱动设施本身。
+        self.result.manager.permission_engine.set_mode(PermissionMode.DEFAULT)
         if plan_mode:
             self.result.manager.plan_mode = True
         self.turn_budget = turn_budget

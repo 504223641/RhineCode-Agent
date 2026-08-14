@@ -363,6 +363,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("scripted", "live"), default="scripted")
     parser.add_argument("--script", default=None, help="剧本位置，形如 MOD:ATTR（scripted 模式）")
     parser.add_argument("--seed", default=None, help="预置函数，形如 MOD:FUNC，签名 (workspace, user_dir)")
+    parser.add_argument(
+        "--permission-mode",
+        choices=("strict", "default", "permissive"),
+        default=None,
+        help=(
+            "覆盖启动权限档（缺省 None = 与产品一致，即 auto 预设的 permissive）。"
+            "给驱动设施用：auto-plan 扩展之后，工作区内的普通写入不再弹面板，"
+            "而一部分驱动用例需要一个**四选项**的确认面板作为夹具"
+            "（保护路径那种只有三个选项，`permanent` 一支覆盖不到）。"
+        ),
+    )
     parser.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument(
@@ -493,6 +504,20 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
             web_client_factory=web_client_factory,
             web_resolver=web_resolver,
         )
+        # 启动权限档的覆盖（auto-plan 扩展）。**缺省不动**——不传这个参数时
+        # 宿主与真实启动逐字一致（`CLAUDE.md` 记着「宿主是 build_app 的第二个
+        # 真实调用方，分叉处恰恰是验收依据」）。
+        #
+        # 只有显式传了才改，且改的是**协调层的引擎实例**而不是 `build_app` 的
+        # 参数：启动档是协调层构造时的一个决定，把它提升成装配参数会让产品多出
+        # 一个没人需要的配置面。
+        if args.permission_mode is not None:
+            from rhinecode.permission.models import PermissionMode
+
+            result.app._manager.permission_engine.set_mode(
+                PermissionMode(args.permission_mode)
+            )
+            log(f"启动权限档被覆盖为 {args.permission_mode}（仅驱动设施使用）")
     except BootstrapError as e:
         # 装配期致命错误：进 fatal 态并**继续服务一个有界的宽限窗口**，
         # 让客户端有机会读到那段成文文案（`e.args[0]` 已是完整 stderr 文案，

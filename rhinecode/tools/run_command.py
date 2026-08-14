@@ -123,13 +123,78 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+# 子进程环境变量的**黑名单**匹配片段（auto-plan 扩展 F17）。按变量名大写后做子串
+# 匹配，命中即不传给子进程。
+#
+# ## 为什么要有这一层
+#
+# 命令在 `auto` 预设下**一律自动批准**，于是「每一条被执行的命令都能看到
+# API Key」从隐患变成常态——一句打印环境的命令就够。而模型拿到密钥的**另一条**
+# 路已经堵死了：真正存密钥的 `config.yaml` 在用户主目录、不在工作区内，
+# 读它会被权限管线第②层路径沙箱直接拒绝。环境变量是剩下的那条。
+#
+# ## ⚠ 必须是黑名单，不能是白名单
+#
+# 白名单会让一大批正常命令突然坏掉（走代理的 `git`、认 `PATH` 的一切），
+# 而且坏得莫名其妙。宁可漏掉一个没见过的密钥变量名，也不要把正常环境拆掉。
+#
+# ## ⚠ 两个**不能**用的片段，都会误伤「名字像密钥、其实是路径」的变量
+#
+# - **不用裸 `AUTH`**：它会命中 **`SSH_AUTH_SOCK`**。那是 ssh-agent 的
+#   **socket 路径**、本身不是密钥，却是 ssh 方式 `git push` / `git clone` 能工作的
+#   唯一依靠。剔掉它之后命令会报 `Permission denied (publickey)`，而**根因完全
+#   看不出来**——用户会去查 `~/.ssh/`，那里一切正常。所以这里写的是
+#   `AUTHORIZATION`（`ANTHROPIC_AUTH_TOKEN` 那类由 `TOKEN` 兜住）。
+# - **不用裸 `KEY`**：它会命中 `SSH_KEY_PATH` 这类同样「是路径不是密钥」的变量。
+#
+# 调研过的一个**不需要**豁免的情形：`GITHUB_TOKEN` 会被 `TOKEN` 命中，但实测
+# `gh` 走系统 keyring（`gh auth status` 显示 `keyring`），过滤它代价为零；
+# 环境变量形式的 `GITHUB_TOKEN` 主要是 CI 注入的用法。**刻意不建豁免名单**——
+# 一份「例外的例外」会成为新的成对维护点，却挡不住任何东西。
+_SENSITIVE_ENV_MARKERS = (
+    "API_KEY",
+    "APIKEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTHORIZATION",
+)
+
+
+def filtered_environ() -> "tuple[dict[str, str], int]":
+    """
+    复制当前进程环境并剔除疑似密钥的条目（auto-plan 扩展 F17）。
+
+    :returns: `(过滤后的环境字典, 被剔除的条目数)`
+
+    判定**只看变量名**（大写后子串匹配 `_SENSITIVE_ENV_MARKERS`），
+    ⚠ **绝不看取值**——按取值猜「这看起来像密钥」会误伤正常配置，
+    且结果不可预测：同一个变量今天传得过去、明天换了个值就传不过去。
+
+    副作用：无（读 `os.environ`，返回新字典）。
+    """
+    env = {}
+    dropped = 0
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if any(marker in upper for marker in _SENSITIVE_ENV_MARKERS):
+            dropped += 1
+            continue
+        env[name] = value
+    return env, dropped
+
+
 def run_shell_captured(
     command: str,
     *,
     cwd,
     timeout: float,
     stdin_bytes: bytes = None,
-) -> subprocess.CompletedProcess:
+) -> "tuple[subprocess.CompletedProcess, int]":
     """
     以 shell 方式跑一条命令并捕获输出，**超时会真的把整棵进程树杀掉**。
 
@@ -138,8 +203,9 @@ def run_shell_captured(
     :param timeout: 超时秒数
     :param stdin_bytes: 要写进子进程标准输入的字节；`None` 表示把标准输入指到
                         空设备（见下面「为什么默认 DEVNULL」）
-    :returns: 与 `subprocess.run` 同形的 `CompletedProcess`，输出是**原始字节**
-              （由调用方用 `decode_subprocess_output` 自己解码）
+    :returns: `(CompletedProcess, 被剔除的环境变量条目数)`。前者与
+              `subprocess.run` 同形，输出是**原始字节**（由调用方用
+              `decode_subprocess_output` 自己解码）；后者见下面「环境变量过滤」。
     :raises subprocess.TimeoutExpired: 超时。**抛出前进程树已被清理**，
             因此调用方接住它时命令是真的停了，不是「文案上停了」
 
@@ -162,6 +228,21 @@ def run_shell_captured(
        退出的判定被整个跳过。指到 NUL 之后子进程的标准输入不再是控制台。
        （`tui/app.py` 的 `_install_sigint_guard` 是同一问题的另一半兜底。）
 
+    ## 环境变量过滤（auto-plan 扩展 F17）
+
+    子进程**不再原样继承**本进程的环境：疑似密钥的条目在这里被剔除
+    （判定见 `filtered_environ` 与 `_SENSITIVE_ENV_MARKERS`）。
+
+    **落点选在本函数里，是因为它是全项目唯一起 shell 子进程的地方**——两个
+    调用方（`run_command` 工具与 `hooks/actions.py` 的 Hook 命令动作）都经过它，
+    一处改即全覆盖。分别在两个调用方各做一遍的话，就是典型的「改一处漏一处」，
+    而漏掉的那一处不会报错，只是密钥照旧可见。
+
+    剔除条数**随返回值交给调用方**而不是在这里记录：本函数是纯工具函数、
+    不持有行为记录器。与 `request_cancel()` 返回子 Agent 条数是同一个先例。
+    ⚠ 调用方只应报告**数量**，绝不要报告被剔除的变量名——变量名本身就泄漏
+    「这台机器上配了什么服务」。
+
     ## 刻意不传 `text=True`
 
     由 `decode_subprocess_output` 自己按 UTF-8 优先解码，否则中文输出会在
@@ -181,10 +262,15 @@ def run_shell_captured(
         # 那不是「命令没停下来」，那是把整个应用连同测试进程一起干掉。
         popen_kwargs["start_new_session"] = True
 
+    # auto-plan F17：剔除疑似密钥的环境变量。**必须显式传 `env`**——不传的话
+    # `Popen` 让子进程原样继承本进程的环境，过滤等于没做。
+    env, dropped_env = filtered_environ()
+
     proc = subprocess.Popen(
         command,
         shell=True,
         cwd=cwd,
+        env=env,
         stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -206,7 +292,7 @@ def run_shell_captured(
         _terminate_process_tree(proc)
         raise
 
-    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr), dropped_env
 
 
 def _clip(text: str) -> str:
@@ -303,7 +389,7 @@ class RunCommandTool(Tool):
             # 三条约束全部收在 `run_shell_captured` 里（各自的理由见该函数
             # 的 docstring）——尤其最后一条：直接用 `subprocess.run` 的话，
             # 超时只改变返回的文案，实际仍要等到命令自己跑完。
-            proc = run_shell_captured(
+            proc, dropped_env = run_shell_captured(
                 command,
                 cwd=_require_cwd(cwd),
                 timeout=timeout,
@@ -314,8 +400,25 @@ class RunCommandTool(Tool):
             out_lines = len(stdout.splitlines())
             err_lines = len(stderr.splitlines())
 
+            # 环境变量过滤的可见性（auto-plan F17c）：**只在真的剔除了才出现**，
+            # 否则每条命令都多一行噪音。
+            #
+            # 为什么要让模型看见：被剔掉的可能正是某条命令的认证依据
+            # （`gh` / `docker login` / 私有源的 `pip`）。不告诉它的话，
+            # 模型看到的是一句无来由的「认证失败」，接下来多半会去改命令、
+            # 重试、或者干脆报告「这个工具坏了」——而真正的原因它无从得知。
+            #
+            # ⚠ **只报数量，绝不报变量名**：名字本身就泄漏「这台机器上配了什么服务」。
+            env_note = (
+                f"（已过滤 {dropped_env} 个疑似密钥的环境变量，未传给子进程）"
+                if dropped_env
+                else ""
+            )
+
             # 回显命令 + 退出码 + 截断保护后的两路输出，便于模型阅读且不爆 token
             parts = [f"$ {command}", f"退出码: {proc.returncode}"]
+            if env_note:
+                parts.append(env_note)
             if stdout:
                 parts.append(f"stdout（{out_lines} 行）:\n{_clip(stdout)}")
             if stderr:
@@ -329,6 +432,8 @@ class RunCommandTool(Tool):
             # 只在**真的裁剪了**的时候才构造：没超行数时两份完全相同，
             # 多存一份纯属让记录文件白白翻倍。
             full_parts = [f"$ {command}", f"退出码: {proc.returncode}"]
+            if env_note:
+                full_parts.append(env_note)
             if stdout:
                 full_parts.append(f"stdout（{out_lines} 行）:\n{stdout}")
             if stderr:

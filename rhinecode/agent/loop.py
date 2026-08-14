@@ -1169,7 +1169,9 @@ class Agent:
             # **DENY 现在拦得住了**——但那个 DENY 必须来自用户写下的规则（③）
             # 或安全底线（①②），不能来自权限档兜底（④）。
             # 想整个关掉它们，写 `deny: run_agent` / `deny: send_message`
-            # （⚠ 不带括号的整工具形式）；`/perm 严格` 不是、也从来不是这个用途。
+            # （⚠ 不带括号的整工具形式）；**收紧权限档不是、也从来不是这个用途**
+            # （auto-plan 扩展删掉 `/perm` 之后运行期已无处收紧，但结论不变：
+            #  哪怕经角色定义把档位声明成 strict，也关不掉这七个工具）。
             if tool.system_serial:
                 request = to_request(tool, tc.arguments, engine.mode, cwd)
                 raw = engine.decide(request)

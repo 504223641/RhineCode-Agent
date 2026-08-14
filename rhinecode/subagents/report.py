@@ -34,11 +34,16 @@ from rhinecode.subagents.models import (
 )
 from rhinecode.subagents.tasks import STATUS_LABELS, TaskRecord
 
-_MODE_LABELS = {
-    PermissionMode.STRICT: "严格",
-    PermissionMode.DEFAULT: "默认",
-    PermissionMode.PERMISSIVE: "放行",
-}
+# 档位显示名（auto-plan 扩展起收在 `presets.MODE_LABELS`，本文件不再自留一份）。
+#
+# 合一的理由：`permissive` 现在对用户显示成 `auto`（它就是 `auto` 预设内部的档位），
+# 各留一份的话同一个档位在两处叫两个名字，而用户没法确认那是不是同一个东西。
+#
+# ⚠ 这与 `CLAUDE.md` 里「`Layer` 的三份标签表刻意不合一」不是同一回事：
+# 那三份不合一是**架构约束**（合并会让只依赖标准库的 `trace` 叶子包反向依赖
+# `permission`）。这里没有那个约束——`subagents` 本来就依赖 `permission`，
+# 而 `presets` 是比两者都低的叶子模块。
+from rhinecode.presets import MODE_LABELS as _MODE_LABELS
 
 # 结论在列表里只显示首行的前若干字符，全文靠模型那边的交付。
 _CONCLUSION_PREVIEW = 60

@@ -5,7 +5,8 @@
 >
 > 建议分支：`c16`（从 `main` 起）
 >
-> ⚠ **盖在第 2 条（auto/plan 两 preset）之上**，必须等它做完。
+> ✅ **前置的 auto/plan 两 preset 已于 2026-08-14 实现**
+> （[`docs/extensions/auto-plan/`](../extensions/auto-plan/spec.md)），本条现在可以开工了。
 
 ## 这是章节不是扩展
 
@@ -17,7 +18,7 @@
 
 ## 目标
 
-`auto` 档下 `run_command` 与 `web_fetch` 一律放行（第 2 条做完之后的状态）。
+`auto` 档下 `run_command` 与 `web_fetch` 一律放行（auto-plan 扩展落地之后的现状）。
 本章在④层给这两类动作接上一个**独立的分类器模型**：执行前先问它一句
 「这个动作该不该跑」。
 
@@ -138,7 +139,7 @@ classifier:
 ```
 
 - **`enabled` 缺省开**（用户定的）。关掉之后 auto 档对这两类就是一律放行，
-  即第 2 条做完时的状态——**两种形态都保留，用户自己选**。
+  即 auto-plan 扩展落地时的状态——**两种形态都保留，用户自己选**。
 - **`model` 可配置，缺省用主模型**（用户定的）。留这个口子是因为
   `run_command` 是高频操作，每次多一次往返有感；将来可以换更便宜的。
 
@@ -198,17 +199,17 @@ classifier:
    （用户消息里的边界要真的起作用，这条是「只喂用户消息」这个口径的价值所在）
 4. 把 API base 指到一个不通的地址制造失败 → **弹面板**（不是拒绝、不是放行）
 5. 连续制造 3 次失败 → **熔断，界面明确提示**，之后这两类一律弹面板
-6. `classifier.enabled: false` → 回到第 2 条做完时的行为（一律放行）
+6. `classifier.enabled: false` → 回到 auto-plan 扩展落地时的行为（一律放行）
 
 ## 一键开工 Prompt
 
 ```
 先 git branch --show-current，在 main 上就 git checkout -b c16。
 
-⚠ 先确认 docs/todo/2-perm-auto-plan.md 已经做完——本章盖在它之上。
-（更前面的②″保护路径层已于 2026-08-14 实现。）
+⚠ 前置两条都已实现：②″保护路径层与 auto/plan 两 preset（均 2026-08-14，
+文档在 docs/extensions/protected-paths/ 与 docs/extensions/auto-plan/）。
 
-读 docs/todo/3-classifier.md，然后走完整 /spec，四份文档进 docs/c16/。
+读 docs/todo/2-classifier.md，然后走完整 /spec，四份文档进 docs/c16/。
 这是章节不是扩展（CLAUDE.md 能力表要多一行）。
 
 目标：auto 档下给 run_command 与 web_fetch 接一个独立的分类器模型，
@@ -232,6 +233,6 @@ classifier:
 不是断言结果）与"工具输出不进提示词"。真机验证六条，第 3 条（用户说过
 别提交就真的拦得住）与第 4 条（失败弹面板而不是放行）是分辨力所在。
 
-做完这条后把 docs/todo/3-classifier.md 删掉，
+做完这条后把 docs/todo/2-classifier.md 删掉，
 并重排 docs/todo/ 下其余文档的序号。
 ```

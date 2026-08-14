@@ -284,8 +284,14 @@ class ForegroundE2ETest(E2EBase):
         )
 
     def test_main_engine_mode_unchanged(self) -> None:
-        """AC14b 的端到端侧判据：角色声明 strict，主引擎仍是 default。"""
-        self.assertEqual(self.manager.permission_engine.mode.value, "default")
+        """
+        AC14b 的端到端侧判据：角色声明 strict，**主引擎的档位不受影响**。
+
+        auto-plan 扩展起启动缺省档是 `permissive`（auto 预设），此前是 `default`。
+        判据本身一个字没变——要看的是「子 Agent 的声明档没有反过来改主引擎」，
+        而不是主引擎具体是哪一档。
+        """
+        self.assertEqual(self.manager.permission_engine.mode.value, "permissive")
 
     def test_agents_report_renders(self) -> None:
         report = self.manager.agents_report()

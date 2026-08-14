@@ -46,16 +46,17 @@ class StatusBarSkillSegmentTests(unittest.TestCase):
             "deepseek",
             "m",
             "high",
-            plan_mode=True,
-            permission_mode="default",
+            preset="plan",
             mcp_status="MCP：已连接 1/1",
             context_status="上下文：19%",
             skill_status="Skill:2",
         )
         self.assertIn("Skill:2", text)
         # 其它字段一个不少。
+        # auto-plan 扩展：「权限模式」段已整段删除（档位恒为放行、与 [PLAN]/[AUTO]
+        # 标记重复），这里不再断言它。反证在
+        # `test_command_tui.py::test_permission_mode_segment_is_gone`。
         self.assertIn("PLAN", text)
-        self.assertIn("权限模式", text)
         self.assertIn("MCP", text)
         self.assertIn("上下文", text)
 

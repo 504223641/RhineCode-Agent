@@ -99,7 +99,10 @@ class PermissionEngine:
     :ivar session_rules: 会话级临时规则（「本会话放行」登记于此，关程序即失效）
     :ivar turn_rules: **本次执行**级临时规则（Skill 的 `allowed-tools` 预授权登记于此）。
         与 `session_rules` 同型、同求值逻辑，只是命更短——用户发出下一条消息即清空。
-    :ivar mode: 当前权限模式（默认 DEFAULT，可经 /perm 运行时切换）
+    :ivar mode: 当前权限模式。本类的默认值是 DEFAULT；**主对话的启动档由协调层
+        显式传入**（auto-plan 扩展起是 PERMISSIVE，即 `auto` 预设的档位）。
+        运行期用户切不到别的档——`/perm` 已删除，`strict` / `default` 只能经
+        `permissions.yaml` 与角色定义的 `permission_mode` 抵达。
     :ivar load_errors: 配置加载阶段收集的可读错误（供上层提示，不阻断启动）
     :ivar protected_exemptions: ②″保护路径的**会话级豁免**（protected-paths 扩展）。
         存的是**解析后的绝对路径**，精确到单个文件、不扩展到目录。
@@ -461,7 +464,13 @@ class PermissionEngine:
     # 可变状态操作
     # ------------------------------------------------------------------ #
     def set_mode(self, mode: PermissionMode) -> None:
-        """切换当前权限模式（/perm 命令调用）。"""
+        """
+        切换当前权限模式。
+
+        auto-plan 扩展起唯一的产品调用方是 `ConversationManager.cycle_preset`
+        （按预设写回两条轴之一）。原来的 `/perm` 命令已删除。
+        子 Agent **绝不**调它——它们一律走 `derive()` 派生自己的引擎视图。
+        """
         self.mode = mode
 
     def add_session_rule(self, rule: Rule) -> None:

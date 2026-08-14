@@ -474,7 +474,7 @@ class SystemSerialPermissionTest(unittest.TestCase):
         解释一遍。那与 C15 已经修过一次的「只读角色一个协作工具都拿不到」
         是同一个用户可见症状，只是卡在另一层。
 
-        **要整个关掉它们，用 `deny: send_message`（③层），不是 `/perm 严格`。**
+        **要整个关掉它们，用 `deny: send_message`（③层），不是收紧权限档。**
         下一条用例钉住那条路仍然通。
         """
         from rhinecode.permission.models import PermissionMode

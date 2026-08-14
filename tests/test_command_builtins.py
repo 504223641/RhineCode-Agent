@@ -22,8 +22,7 @@ from tests.test_command_dispatcher import FakeController
 EXPECTED_TABLE = {
     "/help": ({"/h"}, CommandType.LOCAL),
     "/think": (set(), CommandType.UI),
-    "/plan": (set(), CommandType.UI),
-    "/perm": ({"/permissions", "/allowed-tools"}, CommandType.UI),
+    "/mode": ({"/plan"}, CommandType.UI),
     "/mcp": (set(), CommandType.LOCAL),
     "/context": ({"/ctx"}, CommandType.LOCAL),
     "/compact": (set(), CommandType.LOCAL),
@@ -53,10 +52,11 @@ class BuiltinMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = build_builtin_registry()
 
-    def test_exactly_sixteen_canonical_commands(self) -> None:
+    def test_exactly_fifteen_canonical_commands(self) -> None:
         """
-        内置命令恰好十六条（C10 的十二条 + c11 的 /skills + c12 的 /hooks
-        + c13 的 /agents + c15 的 /tasks）。
+        内置命令恰好十五条（C10 的十二条 + c11 的 /skills + c12 的 /hooks
+        + c13 的 /agents + c15 的 /tasks，减去 auto-plan 扩展合并掉的一条
+        ——`/plan` 与 `/perm` 合并为 `/mode`，`/plan` 降为别名）。
 
         这条 len 断言是「批准表」的护栏——它保证任何人新增命令时必须
         显式更新 EXPECTED_TABLE 并同步这个数字，而不能悄悄加进去。
@@ -64,15 +64,14 @@ class BuiltinMetadataTests(unittest.TestCase):
         """
         names = [s.name for s in self.registry.visible_commands()]
         self.assertEqual(set(names), set(EXPECTED_TABLE))
-        self.assertEqual(len(names), 16)
+        self.assertEqual(len(names), 15)
 
     def test_alias_mapping(self) -> None:
         """全部首批别名映射正确（spec F10/AC5）。"""
         expected_alias_map = {
             "/quit": "/exit",
             "/continue": "/resume",
-            "/permissions": "/perm",
-            "/allowed-tools": "/perm",
+            "/plan": "/mode",
             "/ctx": "/context",
             "/h": "/help",
             "/reset": "/clear",
@@ -148,7 +147,13 @@ class BuiltinBehaviorTests(unittest.TestCase):
             self.assertIn(("show_report", f"report:{target.value}"), controller.calls)
 
     def test_mode_commands_show_result_and_refresh(self) -> None:
-        cases = {"/think": ModeTarget.THINKING, "/plan": ModeTarget.PLAN, "/perm": ModeTarget.PERMISSION}
+        # auto-plan 扩展：`/plan` 现在是 `/mode` 的别名，两者走同一个目标；
+        # 权限档已无运行期切换入口，`ModeTarget.PERMISSION` 随之删除。
+        cases = {
+            "/think": ModeTarget.THINKING,
+            "/mode": ModeTarget.PRESET,
+            "/plan": ModeTarget.PRESET,
+        }
         for text, target in cases.items():
             controller = FakeController()
             self.dispatcher.dispatch(text, controller)
