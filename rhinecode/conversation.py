@@ -81,6 +81,8 @@ from rhinecode.agent.events import (
     ConfirmDecision,
     StopReason,
 )
+from rhinecode.classifier import is_broad_command_allow, why_broad
+from rhinecode.classifier.render import render_dropped_rules
 from rhinecode.permission import (
     Decision,
     DecisionResult,
@@ -366,6 +368,9 @@ class ConversationManager:
         # 同形态）。为 `None` 时本章整体不启用，三类动作的行为与本章之前**逐字一致**
         # ——`RunOptions.classifier` 缺省 None，循环里那两处判断整个跳过。
         self.classifier = None
+        # c16 F21：待发的「预授权被丢弃」提示。由 `_grant_for_skill` 攒、
+        # `_wrap_events` 在事件流里取走——见那两处的说明。
+        self._grant_notices: list[str] = []
 
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
@@ -2005,10 +2010,59 @@ class ConversationManager:
         （经 `on_skill_activated` 回调）、以及 fork 子对话（`_wrap_events`）。
         撤销统一由 `_wrap_events` 的 `finally` 负责。
 
-        副作用：向权限引擎追加本次执行级规则。
+        副作用：向权限引擎追加本次执行级规则；丢弃过宽规则时向界面写一条提示。
+
+        ## ⚠ 分类器启用时，过宽的命令预授权同样要丢（c16 F20）
+
+        真机验收实测发现的缺口：`allowed-tools` 产生的是**③层规则**，
+        而③排在④之前——于是一个声明了 `Bash(python *)` 的 Skill 会让分类器
+        对**所有 python 命令零次调用**，整层被静默关掉。
+
+        F20 原先只过滤配置文件那一层，理由写的是「确认面板生成的规则用的是
+        完整命令串原文，天然是窄的」。**那条理由覆盖不到 Skill**：
+        `allowed-tools` 想写多宽写多宽，而项目级 Skill 随代码仓库分发
+        （`git clone` 一个仓库就可能多出几个）。
+
+        ⚠ **会话级规则仍然不动**：那些确实只来自确认面板，原理由成立。
         """
         rules, _ = self.skill_manager.grants_for_spec(spec)
+        if self.classifier is not None:
+            kept, dropped = [], []
+            for rule in rules:
+                if rule.effect == "allow" and is_broad_command_allow(
+                    rule.tool, rule.pattern
+                ):
+                    dropped.append((
+                        f"{rule.tool}({rule.pattern})" if rule.pattern else rule.tool,
+                        f"Skill「{spec.name}」",
+                        why_broad(rule.tool, rule.pattern),
+                    ))
+                else:
+                    kept.append(rule)
+            if dropped:
+                # 与启动时的告知同一条原则（F21）：静默丢弃会让
+                # 「我明明在 Skill 里声明了为什么还被审查」无从查起。
+                # 攒起来由 `_wrap_events` 在事件流里发出——见那里的说明。
+                self._grant_notices.append(render_dropped_rules(dropped))
+            rules = kept
         self._engine.grant_turn_rules(rules)
+
+    def _take_grant_notices(self) -> list[str]:
+        """
+        取走并清空「预授权被丢弃」的待发提示（c16 F21）。
+
+        :returns: 待发文本列表；没有时返回空列表
+
+        **取走即清**：同一条提示只该出现一次。攒而不清的话，一次触发的提示
+        会在本回合剩下的每个事件后面重复刷出来。
+
+        副作用：清空 `_grant_notices`。
+        """
+        if not self._grant_notices:
+            return []
+        out = list(self._grant_notices)
+        self._grant_notices.clear()
+        return out
 
     def on_skill_activated(self, name: str) -> None:
         """
@@ -2105,6 +2159,16 @@ class ConversationManager:
                     if event.stop_reason == StopReason.COMPLETED:
                         self.memory_manager.on_natural_stop(self.history)
                 yield event
+                # c16 F21：把「刚丢弃了哪条过宽的 Skill 预授权」透出去。
+                #
+                # ⚠ **必须在这里发**，不能在 `_grant_for_skill` 里直接写界面：
+                # 那个方法有三条触发路径，其中「模型自行调 `load_skill`」发生在
+                # **事件流中途**——协调层此刻没有任何直达界面的通道，
+                # 唯一的出口就是本方法正在产出的这条事件流。
+                for text in self._take_grant_notices():
+                    yield AgentEvent(
+                        type=AgentEventType.NOTICE, message=text, level="warning"
+                    )
         finally:
             # 回滚而非清空：模型在主对话里自行发起子对话时，这里是内层，
             # 清空会连外层那次执行的授权一并抹掉（见 grant_turn_rules 的说明）。

@@ -158,6 +158,59 @@ class WhyBroadTest(unittest.TestCase):
         self.assertEqual(why_broad("Bash", "npm test"), "")
 
 
+class SkillPreauthTest(unittest.TestCase):
+    """
+    ⚠ **Skill 的 `allowed-tools` 同样要过这道过滤（真机验收抓出来的缺口）。**
+
+    ## 缺口是什么
+
+    `allowed-tools` 产生的是**③层规则**（回合级），而③排在④之前——
+    于是一个声明了 `Bash(python *)` 的 Skill 会让分类器对**所有 python 命令
+    零次调用**，整层被静默关掉。
+
+    F20 原先只过滤配置文件那一层，理由写的是「确认面板生成的规则用的是
+    完整命令串原文，天然是窄的」。**那条理由覆盖不到 Skill**：
+    `allowed-tools` 想写多宽写多宽，而项目级 Skill 随代码仓库分发
+    （`git clone` 一个仓库就可能多出几个）。
+
+    ⚠ 会话级规则仍然不动——那些确实只来自确认面板，原理由成立。
+    """
+
+    def test_skill_grant_is_filtered_when_classifier_enabled(self) -> None:
+        """
+        结构护栏：`_grant_for_skill` 里对预授权跑了同一道过滤。
+
+        用源码断言而不是端到端跑一个 Skill，是因为后者要拖进
+        `SkillManager` + 真实 Skill 目录两条依赖链，而本条要钉的只有
+        「那道过滤在不在」。行为侧由下面那条 `is_broad_command_allow`
+        的取值断言配合。
+        """
+        import inspect
+
+        from rhinecode.conversation import ConversationManager
+
+        source = inspect.getsource(ConversationManager._grant_for_skill)
+        self.assertIn("is_broad_command_allow", source)
+        # 反证：不得无条件把 grants 直接交给引擎。
+        self.assertNotIn(
+            "rules, _ = self.skill_manager.grants_for_spec(spec)\n"
+            "        self._engine.grant_turn_rules(rules)",
+            source,
+            "分类器启用时，过宽的 Skill 预授权必须先被丢掉",
+        )
+
+    def test_the_exact_pattern_that_leaked(self) -> None:
+        """
+        真机上泄漏的那条形态：`Bash(python *)` 必须被判为宽泛。
+
+        同时钉住**不该误伤**的那条：实测里 Skill 声明的
+        `Bash(python -m unittest *)` 是正常的窄规则，丢掉它会让
+        「跑测试」这个最高频的操作每次都多花一次分类器调用。
+        """
+        self.assertTrue(is_broad_command_allow("Bash", "python *"))
+        self.assertFalse(is_broad_command_allow("Bash", "python -m unittest *"))
+
+
 class LeafPackageTest(unittest.TestCase):
     """
     结构护栏：本模块**不 import `permission`**。
