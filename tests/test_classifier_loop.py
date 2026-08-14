@@ -347,6 +347,92 @@ class NetworkAsymmetryTest(unittest.TestCase):
         self.assertEqual(clf.actions[0].port, 8443)
 
 
+class _TrippingClassifier:
+    """
+    第 N 次调用时**触发**熔断的假分类器。
+
+    与 `_FakeClassifier` 的差别只有一个：它的 `is_tripped()` 会在某一次
+    `review()` 之后从假变真——这正是真实熔断器的形态，也是下面那条护栏
+    唯一能用的构造方式（用一个恒为真的假分类器测不出「触发的那一刻」）。
+    """
+
+    def __init__(self, trip_on: int = 1) -> None:
+        self.calls = 0
+        self.trip_on = trip_on
+        self.tripped = False
+
+    def review(self, action, transcript):  # noqa: ARG002
+        self.calls += 1
+        if self.calls >= self.trip_on:
+            self.tripped = True
+        return Verdict(VerdictKind.FAILED, "Connection refused")
+
+    def is_tripped(self) -> bool:
+        return self.tripped
+
+    def note_manual_approval(self) -> None:
+        self.tripped = False
+
+    def breaker_state(self) -> BreakerState:
+        return BreakerState(
+            self.tripped, BreakerReason.FAILURES, "连续 3 次调用失败；最后一次：Connection refused"
+        )
+
+
+class BreakerVisibilityTest(unittest.TestCase):
+    """
+    ⚠ **F17：熔断必须可见。真机实测抓出来的缺陷，单测原先测不到。**
+
+    ## 缺陷是什么
+
+    「FAILED + 已熔断」那条早退分支会在**触发熔断的那一次**就把结论截走，
+    而那时提示还没来得及产生——净效果是**失败熔断永远不产生任何提示**。
+    用户只看到确认面板毫无征兆地弹出来，完全不知道分类器已经停用，
+    更不知道根因是它连不上。
+
+    ## 为什么原来的用例测不到
+
+    原有的熔断用例用的是一个 `tripped=True` **恒为真**的假分类器——
+    它模拟的是「早就熔断了」，永远走不到「触发的那一刻」。
+    因此下面用 `_TrippingClassifier`：它的熔断态在某一次 review 之后翻转。
+    """
+
+    def test_the_call_that_trips_emits_a_notice(self) -> None:
+        """触发熔断的那一次**必须**出提示，且提示里要有原因与恢复方式。"""
+        clf = _TrippingClassifier(trip_on=1)
+        _, asked, notices, _ = _run(_Cmd(), {"command": "ls"}, clf)
+        text = "\n".join(notices)
+        self.assertIn("安全审查已停用", text, "触发熔断的那一次必须出提示")
+        self.assertIn("Connection refused", text, "必须写明根因")
+        self.assertIn("恢复", text, "必须告诉用户怎么恢复")
+        self.assertEqual(asked, 1, "熔断后该退回弹面板")
+
+    def test_subsequent_calls_do_not_repeat_the_notice(self) -> None:
+        """
+        已经熔断之后的每一条命令**不再重复**刷提示。
+
+        重复刷会把那条真正有用的熔断提示淹在一堆同样的话里，
+        而用户此刻要看的是面板。
+        """
+        clf = _TrippingClassifier(trip_on=1)
+        clf.tripped = True   # 进来时就已经熔断
+        _, asked, notices, _ = _run(_Cmd(), {"command": "ls"}, clf)
+        self.assertEqual(notices, [], "已经熔断时不该再刷提示")
+        self.assertEqual(asked, 1)
+
+    def test_a_trip_emits_exactly_one_notice(self) -> None:
+        """
+        反证：熔断提示**恰好一条**。
+
+        修这个缺陷时容易在两处各加一次（早退分支一次、底部一次），
+        那样一次「拦截触发熔断」会连出两条同样的话。
+        """
+        clf = _FakeClassifier(Verdict(VerdictKind.BLOCK, "危险"), tripped=True)
+        _, _, notices, _ = _run(_Cmd(), {"command": "rm -rf x"}, clf)
+        breaker_lines = [n for n in notices if "安全审查已停用" in n]
+        self.assertLessEqual(len(breaker_lines), 1, "熔断提示不得重复")
+
+
 class BreakerFallbackTest(unittest.TestCase):
     """F16a：熔断后命令与网络退回弹面板。"""
 

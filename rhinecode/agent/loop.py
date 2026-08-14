@@ -683,6 +683,19 @@ class Agent:
             return decision, [], ""
 
         action = self._review_action(tool, tc, cwd)
+        # ⚠ **判定前后各取一次熔断态**，用来区分两件事：
+        #
+        # | | 该不该出熔断提示 |
+        # | --- | --- |
+        # | 本次调用**触发了**熔断 | **要**——这是它唯一一次可见的机会 |
+        # | 进来时**早就**熔断了 | 不要，否则之后每一条命令都刷一遍同样的提示 |
+        #
+        # 不做这个区分的话，「FAILED + 已熔断」那条早退分支会在**触发熔断的
+        # 那一次**就把结论截走，而那时提示还没来得及产生——净效果是
+        # **失败熔断永远不产生任何提示**。用户只看到面板毫无征兆地弹出来，
+        # 完全不知道分类器已经停用、更不知道根因是它连不上。
+        # 真机实测撞到过（`docs/c16/acceptance/` 场景 5）。
+        tripped_before = review.is_tripped()
         verdict = review.review(action)
         notices: list[AgentEvent] = []
 
@@ -699,8 +712,29 @@ class Agent:
             return decision, notices, "allow"
 
         tripped = review.is_tripped()
+        just_tripped = tripped and not tripped_before
+        if just_tripped:
+            # ⚠ **熔断必须可见**（spec F17）：静默熔断等于静默关掉一层安全机制，
+            # 比不做还糟——用户以为它还在保护自己，实际已经不在了。
+            #
+            # 这条**必须在下面那个早退分支之前**产生：触发熔断的那一次调用
+            # 恰好也是 FAILED，会被那条分支截走。
+            notices.append(
+                AgentEvent(
+                    type=AgentEventType.NOTICE,
+                    message=classifier_render.render_breaker_notice(
+                        review.breaker_state()
+                    ),
+                    level="warning",
+                )
+            )
+
         if verdict.kind is VerdictKind.FAILED and tripped:
             # 熔断中：不是一次判定，是整层停用。按类别分流退路。
+            #
+            # ⚠ 这里**不再**产出「本次判定失败」的提示：熔断之后每一条命令都会
+            # 走到这儿，逐条刷「安全审查没能给出结论」只会把上面那条真正有用的
+            # 熔断提示淹掉。`just_tripped` 那一条已经把该说的说完了。
             if tool.classifier_scope == SCOPE_MESSAGE:
                 return decision, notices, "failed"
             return (
@@ -740,19 +774,8 @@ class Agent:
                     level="warning",
                 )
             )
-        if tripped:
-            # 本次判定**触发了**熔断（上面那条 FAILED+tripped 分支管的是「已经
-            # 熔断」，走不到这里）。熔断必须可见——静默熔断等于静默关掉一层
-            # 安全机制，比不做还糟（spec F17）。
-            notices.append(
-                AgentEvent(
-                    type=AgentEventType.NOTICE,
-                    message=classifier_render.render_breaker_notice(
-                        review.breaker_state()
-                    ),
-                    level="warning",
-                )
-            )
+        # ⚠ 熔断提示**不在这里产出**，它已由上方的 `just_tripped` 统一处理。
+        # 两处各写一次的话，一次「拦截触发熔断」会连出两条同样的提示。
         return (
             DecisionResult(
                 Decision.DENY,
