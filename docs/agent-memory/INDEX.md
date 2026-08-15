@@ -34,6 +34,7 @@
 - [project-rhinecode-c11-skills](project_rhinecode_c11_skills.md) — C11 Skill 系统已完成；11 条端到端场景已用 P1a 真实模型验完 10 条，剩场景 9 结构上驱动不了
 - [project-rhinecode-c12-hooks](project_rhinecode_c12_hooks.md) — "C12 Hook 系统已完成开发与全部验收（含真实模型），PR #16 待合并；实跑撞出的复合命令缺陷已修，C6 同缺口已立项未修"
 - [project-rhinecode-c13-subagents](project_rhinecode_c13_subagents.md) — "C13 子 Agent 系统已由 PR #17 合并进 main（1793 测试全绿）；含两次设计修订与真实模型抓出的五处缺陷"
+- [project_cross_agent_sync](project_cross_agent_sync.md) — Claude Code 与 Codex 共用同一份项目理解的接线已完成；两边私有记忆不可合并是查证过的结论，别再试
 - [project_rhinecode_c14_worktree](project_rhinecode_c14_worktree.md) — C14 子 Agent 工作区隔离已完成并经真实模型验收；真跑抓出 7 个单元测试抓不到的缺陷，方法论教训值得复用
 - [project-rhinecode-c3-tools](project_rhinecode_c3_tools.md) — RhineCode c3 工具系统已实现（仅 DeepSeek），逻辑层验收通过，待 TUI 实时端到端验收
 - [project_rhinecode_c6_permissions](project_rhinecode_c6_permissions.md) — RhineCode c6 章节——五层防御权限系统的设计决策（决策管线、求值哲学）
