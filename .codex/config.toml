@@ -1,0 +1,52 @@
+# Codex 的项目级配置 —— 让 Codex 与 Claude Code 读到**完全相同**的项目指令。
+#
+# 这份文件为什么在仓库里而不是 ~/.codex/config.toml：
+#   Codex 的配置分层是 CLI 参数 > profile > **项目级 .codex/config.toml** >
+#   用户级 ~/.codex/config.toml > 系统级 > 内置默认值。项目级这一层在
+#   codex-rs/config/src/loader/mod.rs 里的原文是：
+#       - repo  `$(git rev-parse --show-toplevel)/.codex/config.toml`
+#               (loaded but disabled when untrusted)
+#   放在仓库里意味着**设置随项目走**：换机器、换人、重装 Codex 都不用重配，
+#   而写在用户级配置里的设置只对「当前这台机器的当前这个用户」生效。
+#
+# ⚠ 生效前提：该项目必须被标记为 trusted。Codex 第一次在这个目录下打开时会问，
+#   选信任即可；不信任的话这份文件会被加载但**整体禁用**，且不会显式报错。
+#   桌面版与 CLI 共用同一套配置栈，因此两边都吃这份文件。
+
+
+# ---------------------------------------------------------------------------
+# 指令文件的字节上限
+# ---------------------------------------------------------------------------
+# Codex 默认只读 32768 字节（32 KiB）的项目指令，**超出部分从文件中间按字节截断**，
+# 而且只在日志里 warn、TUI 上没有任何提示。源码见
+# codex-rs/core/src/agents_md.rs:
+#       if size > remaining {
+#           data.truncate(remaining as usize);
+#           tracing::warn!(..., "project doc exceeds remaining budget; truncating");
+#       }
+#
+# 本项目的 CLAUDE.md 约 160 KiB，用默认值的话切点会落在「成对维护点」开头
+# 约 6 KB 处——也就是说**安全边界、已知后续工程项、代码注释规范、学习与解释要求
+# 整节收不到**，而那些恰恰是「不请自来才有用」的部分。这正是本项目最忌讳的
+# 静默降级形态：配了却没生效，界面上完全看不出来。
+#
+# 设成 256 KiB 是留了增长余量（当前用量约 62%）。上限与 CLAUDE.md 实际大小的
+# 关系由 tests/test_cross_agent_sync.py 钉住——CLAUDE.md 涨过这个数会当场红，
+# 不会等到某天发现 Codex 又开始不知道注释规范了。
+#
+# ⚠ 这个上限**不是模型上下文窗口**，它是 Codex 自己定的产品级默认值，
+#   与用哪个模型、窗口多大无关。换 1M 窗口的模型也仍然是 32768。
+project_doc_max_bytes = 262144
+
+
+# ---------------------------------------------------------------------------
+# 指令文件的文件名回退
+# ---------------------------------------------------------------------------
+# Codex 原生找的是 AGENTS.md，Claude Code 原生找的是 CLAUDE.md。
+# 配置这一行之后，Codex 在找不到 AGENTS.md 时会回退读 CLAUDE.md
+# （schema 原文：Ordered list of fallback filenames to look for when AGENTS.md is missing）。
+#
+# 因此**本仓库刻意不建 AGENTS.md**：建了它就成了第二份事实来源，
+# 两份文档必然随时间分叉，而分叉的表现是「两个 Agent 对同一个项目理解不一致」
+# ——正是这套配置要解决的原问题。单一事实来源就是 CLAUDE.md。
+project_doc_fallback_filenames = ["CLAUDE.md"]

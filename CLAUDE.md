@@ -23,6 +23,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | [`docs/c11/README.md`](docs/c11/README.md) | C11 的四份文档与验收记录导航 |
 | [`docs/extensions/README.md`](docs/extensions/README.md) | **工具/能力扩展**（不占章节号）的文档在哪、以及「该开新章节还是算扩展」怎么判 |
 | [`docs/todo/README.md`](docs/todo/README.md) | **下一步做什么** —— 待选方向，按优先级编号，每份自带可一键复制的开工 Prompt |
+| [`docs/agent-memory/INDEX.md`](docs/agent-memory/INDEX.md) | **共享记忆索引** —— 之前学到的、写不进代码也写不进 spec 的东西（工作方式约定、真实模型验收踩过的坑）。**每个会话开始时先扫一遍这份索引**，正文按需读 |
 
 留在主文件里的都是**不请自来才有用**的东西：成对维护点、安全边界、代码注释规范、
 学习与解释要求、已知后续工程项。索引解决「我要查点东西」，解决不了
@@ -95,6 +96,44 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 ## 语言
 中文回答
 
+## 跨 Agent 协作（Claude Code / Codex）
+
+**这个项目由两个 Agent 交替开发，你可能是其中任意一个。** 你这次会话学到的东西，
+下一次很可能是另一个 Agent 接手——因此「记在自己脑子里」等于没记。
+
+**你的私有记忆不作数。** Claude Code 的 `~/.claude/projects/.../memory/` 与 Codex 的
+`~/.codex/memories/` **互相看不见，且都不可重定位**（Codex 的 `MemoriesToml` 里没有
+任何 path 键，Claude Code 的目录由 harness 固定）。它们只能当草稿。
+
+**唯一作数的记忆在 [`docs/agent-memory/`](docs/agent-memory/INDEX.md)**，它在版本库里，
+两个 Agent 都读得到、写得到，还能过 code review。
+
+### 什么时候该往里写
+
+**判据一条：这次学到的东西，如果不写下来，下一个 Agent 会不会重犯？** 会就写。
+典型的三类——用户给的纠正与偏好、真实模型/真机验收才暴露出来的坑（单测抓不到的那种）、
+以及「某个做法当时看着对、后来发现是错的」及其原因。
+
+**别写**代码结构、git 历史能查到的事、或本文件已经写了的东西。
+
+### 怎么写
+
+一条一个文件，`docs/agent-memory/<type>_<slug>.md`，frontmatter 三个字段
+（`name` / `description` / `metadata.type`，type 取 `feedback` | `project` | `user` | `reference`），
+正文说清**结论 + 为什么 + 下次怎么用**，关联条目用 `[[name]]` 互链。
+**写完必须在 `INDEX.md` 上加一行**，否则它是孤儿——两个 Agent 都只读索引判断相关性。
+跟着当次改动一起提交，不要攒着。
+
+### 两条不变量
+
+- **项目指令只有 `CLAUDE.md` 一份，刻意不建 `AGENTS.md`。** Codex 靠
+  `.codex/config.toml` 的 `project_doc_fallback_filenames` 回退来读它，而**那个回退
+  只在 `AGENTS.md` 不存在时生效**。建第二份文档 = 两个 Agent 的理解从此分叉。
+- **`CLAUDE.md` 的大小受 Codex 的 `project_doc_max_bytes` 约束**（现配 256 KiB）。
+  超了会被**从中间按字节截断且不报错**，丢的是文件尾部那几节。见成对维护点。
+
+护栏在 `tests/test_cross_agent_sync.py`（含索引双向对齐与「不得出现 AGENTS.md」的反证）。
+
 ## 技术栈
 
 - Python 3.11+
@@ -159,6 +198,9 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
 只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
+- **`CLAUDE.md` 的大小 ↔ `.codex/config.toml` 的 `project_doc_max_bytes`（跨 Agent）** → 往本文件加内容时，总字节数必须继续小于那个上限（现配 256 KiB，用量约 62%）。⚠ **超了不报错、界面上也没有任何提示**：Codex 会**从文件中间按字节截断**（源码 `codex-rs/core/src/agents_md.rs` 的 `data.truncate(remaining)`，只在日志里 warn），丢的正好是文件尾部——安全边界、已知后续工程项、代码注释规范、学习与解释要求这几节，也就是全文**最「不请自来才有用」**的部分。表现是 Codex 突然不写中文注释了、或者不知道五层管线，而你查不出原因。⚠ 另一条：**仓库根刻意不建 `AGENTS.md`**，Codex 的回退只在它不存在时生效，建了等于 CLAUDE.md 对 Codex 整个失联。护栏见 `tests/test_cross_agent_sync.py`（上限**从配置文件读出来比**，写死数字的话「误删配置退回 32 KiB 默认值」照样绿）
+- **共享记忆的正文 ↔ `docs/agent-memory/INDEX.md`（跨 Agent）** → 新增一条记忆必须同时在索引上加一行。**漏改不报错**，只是那条记忆成了孤儿——两个 Agent 都只读索引判断相关性，不在索引上等于不存在。⚠ 别写进自己 harness 的私有记忆目录（`~/.claude/projects/.../memory/`、`~/.codex/memories/`）：两者**互相看不见且都不可重定位**，写进去等于只有你自己知道。护栏见 `tests/test_cross_agent_sync.py::SharedMemoryTest`（含「目录里的文件必须都被索引」的反向断言）
+- **`/spec` 的两个入口（跨 Agent）** → `.claude/commands/spec.md`（正文）↔ `.codex/skills/spec/SKILL.md`（指针）。两处的 `name` 与 `description` 必须逐字相同——`description` 是 Codex 决定要不要触发这个技能的**唯一依据**。⚠ **Codex 那份必须继续是指针，别复制成正文**：复制不报错、两边一开始还完全一致，分叉是几个月后才发生的，那时已经没人记得它们本该同源。护栏用体积差异钉住这个形态
 - **新增一类要经分类器审查的动作（c16）** → 工具上声明 `classifier_scope`（`tools/base.py`）+ `agent/loop.py` 的**两条判定分支**（普通分支与 `system_serial` 分支）+ `classifier/prompt.py` 的待判动作段落。**漏改后两处不报错**，只表现为「声明了但从不被审查」——而配置和界面上都看不出异常。护栏见 `tests/test_classifier_loop.py`（触发与不触发各有正反例）
 - **`_review_action` 读的参数名 ↔ 三个工具声明的 `parameters`（c16）** → `agent/loop.py` 的 `_review_action` 里写的 `command` / `url` / `message` / `to` 必须与工具真实声明的一致。⚠ **实现期真踩过**：那里一度写成 `args.get("body")`，而 `send_message` 的参数叫 `message`。后果**完全无声**——分类器拿到一个空正文、判定形式上跑了实际毫无意义，没有任何东西报错。护栏见 `tests/test_classifier_message.py::ArgumentNameTest`（拿工具真实声明的 `parameters` 逐个比对）
 - **给模型的固定文案 ↔ 给用户的完整理由（c16）** → `classifier/render.py` 的 `DENIED_BY_CLASSIFIER` / `MESSAGE_NOT_DELIVERED` ↔ `render_denied_notice` / `render_failed_notice`。⚠ **两者刻意在同一个文件里相邻定义并互相指认**：分类器写的理由对模型而言是一份**绕过指南**（「原来是因为域名不对，那我换个域名」）。「顺手让模型也看到具体理由，反正它更有用」看起来永远像是个改进——它确实会让模型下一轮更「聪明」，直到你发现它聪明的方向是绕过。另：消息类的文案**必须写明投递没有发生**，C15 里消息是叫醒待命队员的唯一手段，发送方以为「对方已经在处理了」会坐等一个永远不会来的结果
