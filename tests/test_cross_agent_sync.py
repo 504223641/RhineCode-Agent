@@ -177,6 +177,74 @@ class SharedMemoryTest(unittest.TestCase):
         )
 
 
+class TruncationProbeTest(unittest.TestCase):
+    """验证「Codex 有没有读到完整 CLAUDE.md」用的探针必须真的落在切点之后。
+
+    ## 为什么需要这条
+
+    验证截断的唯一办法是问一个「答案只在文件尾部」的问题。**而这件事真的错过一次**：
+    2026-08-16 第一次验收时用的问题是「②″ 保护路径为什么是出口处的收紧器」，
+    看起来很深（安全边界那节在 64% 处），实际上同一块知识在**架构表的 Permission 行
+    里也有一份**（13% 处，而且更详细）。Codex 从前一处就答全了——**那道题在配置
+    完全没生效的情况下照样能过**，等于没验。
+
+    探针一旦退化成「切点前也能答」，验证就变成了一个恒真的仪式，而**没有任何东西
+    会报错**：你会看到一个漂亮的答案，然后放心地以为接线是好的。
+
+    ## 判据
+
+    每个探针必须同时满足两条：
+
+    - **全文只出现一次**。出现多次意味着前面某处可能也能作答，深度就不作数了
+      （上面那次翻车正是这个形态）。
+    - **首次出现的字节偏移大于 Codex 的内置默认上限**。用默认值而不是当前配置值
+      做基准是刻意的：探针要回答的问题是「**没配这套东西的话**会不会读不到」，
+      基准必须是那个未配置的状态。
+    """
+
+    # 验收梯子：(字节深度大致占比, 探针短语, 对应的问题在问什么)
+    # 深度递进是刻意的——万一失败，能据此判断截断发生在哪一段。
+    PROBES = (
+        ("SSH_AUTH_SOCK", "环境变量过滤为什么不能用裸 AUTH 做匹配片段"),
+        ("MSYS_NO_PATHCONV", "从 Git Bash 驱动 e2e 必须设什么环境变量"),
+        ("delegate-trigger-align", "「模型不会主动组队」那条已知项后来怎么反转的"),
+        ("getUserProfile", "代码注释规范里的函数注释示例叫什么、要写哪三件事"),
+    )
+
+    def test_probes_sit_past_the_default_cut(self) -> None:
+        raw = CLAUDE_MD.read_bytes()
+        for phrase, question in self.PROBES:
+            with self.subTest(phrase=phrase):
+                offset = raw.find(phrase.encode("utf-8"))
+                self.assertGreaterEqual(
+                    offset, 0, f"探针短语 {phrase!r} 已经不在 CLAUDE.md 里了（{question}）"
+                )
+                self.assertGreater(
+                    offset,
+                    CODEX_DEFAULT_MAX_BYTES,
+                    f"探针 {phrase!r} 现在在第 {offset} 字节，落在 Codex 默认上限 "
+                    f"{CODEX_DEFAULT_MAX_BYTES} 之内——拿它验截断是恒真的，"
+                    f"没配 project_doc_max_bytes 也照样答得出。换一个更靠后的探针。",
+                )
+
+    def test_probes_are_unique(self) -> None:
+        """反证：探针在全文只能出现一次。
+
+        重复出现意味着靠前的那处也能支撑作答，深度就不作数了——
+        这正是第一版验证题翻车的原因（②″ 的知识在 13% 和 64% 各有一份）。
+        """
+        raw = CLAUDE_MD.read_bytes()
+        for phrase, _ in self.PROBES:
+            with self.subTest(phrase=phrase):
+                count = raw.count(phrase.encode("utf-8"))
+                self.assertEqual(
+                    count,
+                    1,
+                    f"探针 {phrase!r} 在 CLAUDE.md 里出现了 {count} 次。"
+                    f"只要有一处在切点之前，这个探针就验不出截断了。",
+                )
+
+
 class SpecSkillParityTest(unittest.TestCase):
     """`/spec` 在两个 Agent 里必须是同一个东西。"""
 
