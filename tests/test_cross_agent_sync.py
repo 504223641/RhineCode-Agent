@@ -208,7 +208,11 @@ class TruncationProbeTest(unittest.TestCase):
         ("SSH_AUTH_SOCK", "环境变量过滤为什么不能用裸 AUTH 做匹配片段"),
         ("MSYS_NO_PATHCONV", "从 Git Bash 驱动 e2e 必须设什么环境变量"),
         ("delegate-trigger-align", "「模型不会主动组队」那条已知项后来怎么反转的"),
-        ("getUserProfile", "代码注释规范里的函数注释示例叫什么、要写哪三件事"),
+        # ⚠ 是「六件事」不是三件（函数用途 / 参数 / 返回值 / 主要执行步骤 /
+        # 异常与失败 / 副作用）。首次验收时这里问成了「三件事」——Codex 没有
+        # 顺着这个错误前提编三条，而是从原文把提问者纠正了。带错误前提的探针
+        # 因此比中性提问更有分辨力：被截断的一方最可能的行为是顺着前提编。
+        ("getUserProfile", "代码注释规范里的函数注释示例叫什么、复杂函数要说明哪六件事"),
     )
 
     def test_probes_sit_past_the_default_cut(self) -> None:
