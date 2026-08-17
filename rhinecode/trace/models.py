@@ -71,6 +71,7 @@ class TraceEventType(str, Enum):
     UI_TOOL_BATCH = "ui_tool_batch"              # tui-activity-fold：一批工具调用归并成一行
     UI_DETAIL_LEVEL = "ui_detail_level"          # tui-activity-fold：展开档位的切换
     CLASSIFIER_VERDICT = "classifier_verdict"    # c16：一次分类器审查的输入、结论与熔断状态
+    TODO_UPDATE = "todo_update"                  # todo-list：主对话待办清单的一次整表覆写
 
 
 # ---------------------------------------------------------------------------

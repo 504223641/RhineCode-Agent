@@ -448,6 +448,23 @@ def _s_classifier_verdict(r: dict) -> str:
     )
 
 
+def _s_todo_update(r: dict) -> str:
+    """
+    主对话待办清单的一次整表覆写（todo-list 扩展）。
+
+    ⚠ **被拒的那些同样要看得见**：整表覆写下一次拒绝意味着这一轮的进度
+    完全没被记下来，而屏幕上显示的还是上一份——排查「清单为什么不动」时
+    第一眼要看的就是这里有没有一串 `拒绝`。
+    """
+    if not r.get("ok"):
+        return f"拒绝 · {_text_of(r.get('reason'), 60)}"
+    return (
+        f"覆写 · {r.get('completed', 0)}/{r.get('total', 0)} 完成"
+        f" · 进行中 {r.get('in_progress', 0)}"
+        f" · v{r.get('version', 0)}"
+    )
+
+
 SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.SESSION_START.value: _s_session_start,
     TraceEventType.SESSION_END.value: _s_session_end,
@@ -479,6 +496,7 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.UI_TOOL_BATCH.value: _s_ui_tool_batch,
     TraceEventType.UI_DETAIL_LEVEL.value: _s_ui_detail_level,
     TraceEventType.CLASSIFIER_VERDICT.value: _s_classifier_verdict,
+    TraceEventType.TODO_UPDATE.value: _s_todo_update,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」
