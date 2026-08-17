@@ -37,6 +37,8 @@ from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
+from rhinecode.todo.models import TODO_STATE_LABELS, TodoState
+
 from rhinecode.agent.events import ClarifyOption
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
@@ -1735,6 +1737,14 @@ class HistoryView(ScrollableContainer):
     def compose(self) -> ComposeResult:
         # 内层 Vertical 作为消息列表容器，便于统一清空（remove_children）
         yield Vertical(id="history-messages")
+        # 待办清单块（todo-list 扩展 F10）。它是本容器的**第二个子节点**且
+        # `dock: bottom`，因此固定在历史区底部、不随消息内容滚动，
+        # 同时占掉可滚动区的相应高度（实测数据见该扩展 plan 的「T1 实测结论」）。
+        #
+        # ⚠ 放在 `HistoryView` **之内**是刻意的：历史区自带的那圈框线正好把它
+        # 一起围住，框线天生是连续的一整圈。放到外面就要自己重画左右与下边框
+        # （`#panel-dock` 就是那么做的），多一处得同步的东西。
+        yield TodoPane()
 
     def on_mount(self) -> None:
         """
@@ -2081,9 +2091,28 @@ class HistoryView(ScrollableContainer):
         ⚠ 必须一并把 `_current_batch` 置空：`remove_children` 已经把批次容器
         从 DOM 里删掉了，但这里还攥着一个指向已删除组件的引用——下一次
         可归并的调用会往那个「幽灵批次」里 `mount`，界面上什么都不出现。
+
+        ⚠ **它只清 `#history-messages` 的子节点，天生碰不到待办块**
+        （待办块是本容器的另一个子节点）。**别改成 `self.remove_children()`**
+        ——那会把待办块从 DOM 里一起删掉，而它是 `compose` 产出的、
+        不会被重建，于是 `/clear` 之后待办功能**永久失效**且没有任何报错。
+        待办的清空走协调层（`_clear_todo`）与 `_reset_display_state`，
+        见 todo-list 扩展 F17。
         """
         self.query_one("#history-messages", Vertical).remove_children()
         self._current_batch = None
+
+    def todo_pane(self) -> "TodoPane":
+        """
+        取待办块（todo-list 扩展）。
+
+        :returns: 本历史区内的 `TodoPane`
+
+        收敛成一个方法而不是让 `app.py` 到处 `query_one`——待办块的位置
+        是本类的内部结构，将来若挪位置（比如 plan 里登记的方案 B），
+        只有这一处要改。
+        """
+        return self.query_one(TodoPane)
 
     # ------------------------------------------------------------------ #
     # 会话历史回放（c9 /resume 交互化）
@@ -2318,6 +2347,111 @@ class ActivityView(Vertical):
 
         self.mount(Static("\n".join(lines), markup=True))
         self.display = True
+
+
+class TodoPane(SelectableStatic):
+    """
+    主对话的待办清单块（todo-list 扩展 F10–F14）。
+
+    挂在 `HistoryView` **内部**、`dock: bottom`——历史内容在它上面正常滚动，
+    它**不跟着滚**。形如：
+
+        ● 待办 (2/4)
+          ● 读现有实现        已完成
+          ● 改 login 接口     进行中
+          ● 改三处调用方      待办
+          ……还有 6 条，已完成 3 条
+
+    ## 它是观测区，不是交互区
+
+    区内没有任何操作入口。待办的增删改**只有一条写路径**（模型调 `todo_write`）
+    ——用户改不了。理由与 C15 共享清单同一条：两条并行的写路径里，
+    命令层那条绕开了「谁改的」这个记录；而在整表覆写语义下它还多一层麻烦，
+    模型下一次覆写会把用户的改动整个抹掉。
+
+    ## 三条实现约束
+
+    1. **本类不做任何显示判断。** 「该不该显示」「留哪 5 条」「省略行怎么写」
+       全在 `todo.render.build_view` 里算好了，这里只负责上色与转义。
+       两处各判一次必然分叉。
+    2. **一切文本经本模块的 `escape`**，绝不用 rich 那版——待办标题来自模型
+       给的参数，落单的 `[` 会在布局阶段抛 `MarkupError`，
+       **没有任何 try/except 兜得住，整个应用退出**。
+    3. **继承 `SelectableStatic` 而不是 `Static`**：内容要能被拖选、能被复制。
+       走 `set_markup` 的 Content 通路时选区功能原生成立，
+       但 `plain_text()` 这个唯一权威取文本入口来自它。
+
+    ## ⚠ 字段名预检过
+
+    `_render` / `_closed` / `_running` 是 Textual `MessagePump` 的实例字段，
+    撞上**一律不报错**、只表现为「界面上东西凭空少了」（本项目已撞三次）。
+    本类只新增 `_view`，已在 `Static("x")` 实例上 `hasattr` 验过为干净。
+    """
+
+    # 缺省隐藏（与四个面板、活动区同一做法）：不依赖外部 App CSS 也能初始隐藏，
+    # 于是不使用这个能力的用户界面表现与改造前逐字一致（spec N5）。
+    DEFAULT_CSS = "TodoPane { display: none; }"
+
+    # 状态 → 颜色。**取值与子 Agent 活动区同源**：进行中橘（与工具行「执行中」
+    # 同色系，语义都是「还在跑」）、已完成绿、待办用次级灰。
+    #
+    # ⚠ 颜色只是**第二重**区分。第一重是中文文字标签——单色终端、截图、
+    # 以及色觉障碍用户那里颜色全都会丢失，而文字不会（spec F14）。
+    _STATE_COLORS = {
+        TodoState.IN_PROGRESS: "#FFA500",
+        TodoState.COMPLETED: "#5FD75F",
+        TodoState.PENDING: SECONDARY_COLOR,
+    }
+
+    def __init__(self) -> None:
+        super().__init__("", markup=True)
+        # 当前画着的视图；`None` 表示这块没在显示。
+        self._view = None
+
+    def update_view(self, view) -> None:
+        """
+        整块重绘待办块。
+
+        :param view: `todo.render.TodoView`；**`None` 表示整块不该显示**
+
+        `None` 时 `display = False`，Textual 会连带收回它占的布局空间——
+        于是历史区的可用高度回到没有待办时的样子（spec F11/N5）。
+
+        **整块重绘而不是增量 diff**：行数以 5 为界，重绘一次比算差异便宜，
+        而且不会错——增量更新要维护「哪一行对应哪一条」的映射，
+        那是一类典型的、出错后表现为「状态串行」的 bug（与活动区同一判断）。
+
+        副作用：改自身内容与可见性。
+        """
+        self._view = view
+        if view is None:
+            self.display = False
+            self.set_markup("")
+            return
+
+        # 标题列按 `cell_len` 补齐，使右侧的状态标签对齐成一列。
+        # 用 `cell_len` 而不是 `len`：中文占两格，按字符数补齐会参差不齐
+        # （与确认面板四个选项的对齐同一做法）。
+        width = max((cell_len(row.title) for row in view.rows), default=0)
+
+        lines = [f"[{SECONDARY_COLOR}]●[/] {escape(view.header)}"]
+        for row in view.rows:
+            color = self._STATE_COLORS.get(row.state, SECONDARY_COLOR)
+            padding = " " * max(0, width - cell_len(row.title) + 2)
+            lines.append(
+                f"  [{color}]●[/] {escape(row.title)}{padding}"
+                f"[{color}]{escape(TODO_STATE_LABELS[row.state])}[/]"
+            )
+        if view.overflow:
+            lines.append(f"  [{SECONDARY_COLOR}]{escape(view.overflow)}[/]")
+
+        self.set_markup("\n".join(lines))
+        self.display = True
+
+    @property
+    def view(self):
+        """当前画着的视图（`None` = 未显示）。供测试与界面判断用。"""
+        return self._view
 
 
 class OverlayPanel:

@@ -302,6 +302,24 @@ class FakeManager:
     def drain_subagent_notifications(self) -> tuple:
         return ()
 
+    # todo-list 扩展：待办未启用时的取值。同上——真实 `ConversationManager`
+    # 在 `todo_store is None` 时返回的正是这些。
+    #
+    # ⚠ **刻意照抄真实取值，而不是给界面层加 `getattr` 兜底。**
+    # 兜底会让「协调层漏接了某个方法」这种真实接线错误被静默吞掉，
+    # 而那正是界面层最难排查的一类问题（界面看起来正常，只是某块永远不更新）。
+    def todo_version(self) -> int:
+        return 0
+
+    def todo_view(self):
+        return None
+
+    def todo_all_done(self) -> bool:
+        return False
+
+    def todo_all_done_text(self) -> str:
+        return ""
+
     # c15：协作能力未启用时的取值。真实 `ConversationManager` 在
     # `team_service is None` 时返回的正是这些，因此替身照抄即可——
     # 界面层不该为「有没有启用协作」写两套分支。

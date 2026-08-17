@@ -85,6 +85,7 @@ from rhinecode.tui.clipboard import copy_text
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
+    TodoPane,
     ClarifyPanel, SessionPanel, StatusLine, OverlayPanel, compose_status_text,
     # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
     DETAIL_CYCLE, DETAIL_FOLDED, DetailLevelClicked,
@@ -277,6 +278,40 @@ class RhineApp(App):
     HistoryView > Vertical {
         height: auto;
         min-height: 100%;
+    }
+    /*
+     * 待办清单块（todo-list 扩展 F10–F14）。
+     *
+     * 它是 `HistoryView` 的**第二个子节点**，`dock: bottom` 把它钉在历史区
+     * 底部：历史内容在它上面滚动，它自己不动，同时占掉可滚动区的相应高度。
+     *
+     * ## 实测数据（80×24，见该扩展 plan 的「T1 实测结论」）
+     *
+     * `dock` 在 `ScrollableContainer` 内部本项目此前无先例，故先量后写：
+     * 滚到顶与滚到底，本块 `region.y` **都是 17**（钉住）；块高由 3 变 5 时
+     * `max_scroll_y` 24 → 26、实际可见内容 16 → 14（**占位，精确 -2**）；
+     * 内容画在 `y 1..14`、本块在 `y 15..19`（**不重叠，不遮挡**）。
+     *
+     * ⚠ 断言「占位」时**不能用 `scrollable_content_region.height`**——
+     * 实测它恒为 19、**不扣 dock 子节点的高度**，用它会得出「没占地方」
+     * 的错误结论。正确的量是 `max_scroll_y`。
+     *
+     * ## 三条样式决定
+     *
+     * - **顶部分隔线用灰不用主题青**：它是**观测区**，而青色在本项目里
+     *   专属于「等着你决定」的四个交互面板。与活动区同一条理由、同一个取值。
+     * - **不加左右 padding**：`HistoryView` 自带 `padding: 0 1`，这里再加一层
+     *   会把框线内侧擦出空白——`background: transparent` 只让**颜色**透下来，
+     *   padding 那两列画的是**空格**，会把 `│` 逐个擦掉（验收第 19 条踩过）。
+     * - **`display: none` 是缺省态**，可见性由 `TodoPane.update_view` 按
+     *   「该不该显示」切换（判断在 `todo.render.build_view` 里，不在界面层）。
+     */
+    TodoPane {
+        dock: bottom;
+        height: auto;
+        display: none;
+        border: none;
+        border-top: tall #808080 60%;
     }
     /*
      * 子 Agent 活动区（tui-display 扩展 F1）。
@@ -481,6 +516,14 @@ class RhineApp(App):
         # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
         # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
         self._last_subagent_count = 0
+        # todo-list 扩展：待办块的刷新状态。
+        #
+        # `_todo_version` 是**上一次画过的版本号**——工作线程每轮读一次协调层的
+        # 当前版本号，不同才发起跨线程重绘。这样空闲时零成本，也不必新增定时器。
+        # `_todo_shown` 记「上一次画出来了没有」，用于判定「全部完成」那一次
+        # 由显示转隐藏的**跃迁**（只在那一刻留一行记录，见 `_refresh_todo`）。
+        self._todo_version = 0
+        self._todo_shown = False
         # 全局详细度档位（`Ctrl+O`）。**一个键同时管活动区与历史区**——
         # 对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套。
         #
@@ -1054,6 +1097,54 @@ class RhineApp(App):
             # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断定时器。
             pass
 
+    def _refresh_todo(self) -> None:
+        """
+        把待办块刷成清单当前的样子（todo-list 扩展 F10/F11/F15）。
+
+        **必须在主线程调用。** 唯一的调用来源是 `_do_stream` 里那次
+        `call_from_thread`，以及 `_reset_display_state`。
+
+        ## 版本号驱动，不是定时器驱动
+
+        清单每改一次内部版本号加一。这里先比对版本号，没变直接返回——
+        于是重绘天然幂等，反复调用零成本。
+
+        ⚠ **刻意不搭 `_poll_subagents` 那个 0.5 秒定时器**：它**只在子 Agent
+        服务启用时才注册**（见 `on_mount` 里那个 `if ... is not None`），
+        搭它会让待办块在关掉子 Agent 的配置下**整个不刷新**——
+        而配置和界面上都看不出异常。
+        ⚠ 也**不新增定时器**：空闲会话的开销必须与改造前一致（与活动区同一约束）。
+
+        ## 「全部完成」那一行只在**跃迁**的那一刻留（F15）
+
+        判据是「上一次显示过 **且** 这一次不该显示了 **且** 清单确实是全完成」。
+        三个条件缺一不可：
+        - 少了第一条，一个从来没显示过的会话也会冒出这行；
+        - 少了第三条，`/clear` 造成的「不该显示」会被误当成「全做完了」。
+
+        整段包 `try/except`：**观测与通知设施绝不能反过来打断界面**。
+
+        副作用：可能向聊天区追加一行事件级记录；改待办块的内容与可见性。
+        """
+        try:
+            version = self._manager.todo_version()
+            if version == self._todo_version:
+                return
+            self._todo_version = version
+            view = self._manager.todo_view()
+
+            if self._todo_shown and view is None and self._manager.todo_all_done():
+                # 事件级：真的完成了一件事，该看得见。提示级（dim）那档是留给
+                # 「记忆已更新」这类误读代价为零的消息的。
+                self.show_event(self._manager.todo_all_done_text())
+
+            self.query_one(HistoryView).todo_pane().update_view(view)
+            self._todo_shown = view is not None
+        except Exception:
+            # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断调用方
+            # （调用方是 Agent Loop 的事件消费循环）。
+            pass
+
     def _refresh_activity(self) -> None:
         """
         把子 Agent 活动区刷成任务表当前的样子（tui-display 扩展 F4/N7）。
@@ -1151,10 +1242,26 @@ class RhineApp(App):
 
         状态行本应已由 `_set_streaming(False)` 收掉，这里再兜一次——
         会话切换可能发生在一次运行的异常路径上。
+
+        todo-list 扩展 F17：待办块一并收起。**这是界面那一半**，
+        数据那一半由协调层的 `_clear_todo` 负责（两处配合才完整）。
         """
         self.query_one(StatusLine).stop()
         self._detail_level = DETAIL_FOLDED
         self.query_one(HistoryView).set_detail_level(DETAIL_FOLDED)
+        # 待办块收起 + 刷新状态复位（todo-list 扩展 F17）。
+        #
+        # ⚠ **版本号必须一起复位。** 新会话的清单从 0 重新计数，不复位的话
+        # 第一次覆写（版本号 1）在旧值恰好是 1 时会被判成「没变」，
+        # 于是**那一次刷新被整个跳过**——用户看到的是「换了会话之后
+        # 第一次列待办不显示」，看起来像功能坏了。
+        # 旧值不是 1 时它碰巧能工作，而「碰巧对」正是这类 bug 难查的原因。
+        #
+        # ⚠ `_todo_shown` 也要复位，否则下一段对话第一次收起待办时会误留
+        # 一行「全部完成」——那条记录的判据里有「上一次显示过」。
+        self.query_one(HistoryView).todo_pane().update_view(None)
+        self._todo_version = 0
+        self._todo_shown = False
 
     def compact_context(self) -> None:
         """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
@@ -2148,6 +2255,17 @@ class RhineApp(App):
                         getattr(res, "diff", None),
                         self._result_detail(res),
                     )
+                    # todo-list 扩展：待办清单变了就重绘那一块。
+                    #
+                    # ⚠ **先在工作线程读一个整数，不同才跨线程。** 版本号没变时
+                    # 一次 `call_from_thread` 都不发起——待办块的刷新因此不给
+                    # 每一次工具调用增加任何跨线程往返。
+                    #
+                    # ⚠ **刻意不按工具名判断**（不写 `if tc.name == "todo_write"`）：
+                    # 界面层不该认识任何具体工具的名字，而版本号这个判据对将来
+                    # 任何写路径都成立。
+                    if self._manager.todo_version() != self._todo_version:
+                        self.call_from_thread(self._refresh_todo)
 
                 elif etype == AgentEventType.USAGE:
                     # 本轮 token 用量送进状态行（tui-activity-fold F15/F17）。
