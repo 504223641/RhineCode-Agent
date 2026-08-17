@@ -2686,6 +2686,19 @@ class InputBar(Input):
             event.stop()
             return
 
+        # ⚠ **同一段内容再贴一次 = 就地展开成原文。**
+        #
+        # 占位块解决了「粘 50 行只剩 1 行」，但带来一个新问题：用户看不见
+        # 自己到底粘了什么，只能提交出去才知道。再贴一次就把它换成原文，
+        # 于是「想确认内容」不需要任何新的快捷键或界面——重复一次粘贴
+        # 是用户本来就会做的动作。
+        for token, stored in list(self._pastes.items()):
+            if stored == body and token in self.value:
+                self.value = self.value.replace(token, body, 1)
+                del self._pastes[token]
+                event.stop()
+                return
+
         self._paste_seq += 1
         token = f"[粘贴 #{self._paste_seq} · {len(lines)} 行]"
         self._pastes[token] = body

@@ -1460,3 +1460,10 @@ TODO_CLEAR_THEN_RELIST = [
      done()],
     [text("好了。"), done()],
 ]
+
+
+# 一轮里夹一个慢工具，用来验「请求跑着的时候界面还响不响应」。
+SLOW_RUN = [
+    [text("我先读个文件。"), tool("read_file", {"path": "seed.txt"}), done()],
+    [text("读完了。"), done()],
+]
