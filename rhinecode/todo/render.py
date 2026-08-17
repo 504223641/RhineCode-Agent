@@ -14,11 +14,13 @@
 界面层（`tui/widgets.py` 的 `TodoPane`）拿到 `TodoView` 之后只负责
 上色与转义——它**不做任何判断**。
 
-## ⚠ 排序只影响显示，不影响数据
+## ⚠ 顺序一律是「执行顺序」，本模块不重排
 
-`TodoStore.snapshot()` 永远返回模型给的原始顺序（那是它表达的执行次序，
-重排会让清单读起来不像一份计划）。本模块的优先级排序**只发生在这里**，
-每次现算，不写回。
+`TodoStore.snapshot()` 返回模型给的原始顺序，本模块**原样用它**。
+初版曾按状态重排（已完成的推到最后），真机反馈后撤销——
+清单要读起来像一份计划，而不是按状态分的堆。
+
+限高时**只挑一段**（窗口锚在第一条未完成的条目上），不改变相对次序。
 """
 
 from __future__ import annotations
@@ -36,15 +38,6 @@ from rhinecode.todo.models import TodoItem, TodoState
 # 之间的平衡点。
 DISPLAY_LIMIT = 5
 
-# 显示优先级：**用户要看的是「还剩什么」**，所以已完成的让位。
-#
-# ⚠ 数值越小越靠前。这张表同时是「已完成不占名额」的实现——它排在最后，
-# 于是只要还有进行中或待办，前 5 个名额就轮不到它。
-_DISPLAY_PRIORITY: dict[TodoState, int] = {
-    TodoState.IN_PROGRESS: 0,
-    TodoState.PENDING: 1,
-    TodoState.COMPLETED: 2,
-}
 
 
 @dataclass(frozen=True)
@@ -92,14 +85,27 @@ def build_view(
     ⚠ 后一条是「全部完成后待办块自动收起」的**唯一**实现点。
     界面层只是照着做，不重复判断。
 
+    ## 顺序：**一律按执行顺序，先做的在前**（真机反馈后改）
+
+    **不排序**，原样保持模型给的次序——那正是它安排的执行顺序。
+
+    ⚠ 初版按 `进行中 → 待办 → 已完成` 重排过，把已完成的推到最后。
+    那是错的：清单读起来不再像一份计划，而像一个按状态分的堆，
+    用户没法从上往下看出「这件事分几步、走到哪一步了」。
+    用户原话：「任务列表应该按照先后执行顺序排列，先执行的靠前」。
+
     ## 取哪几条（spec F13）
 
-    按 `进行中 → 待办 → 已完成` 排序，**同一档内保持模型给的原序**，
-    然后取前 `limit` 条。
+    顺序既然固定了，限高就只剩「取哪一段」这一个自由度。
+    **窗口锚在第一条未完成的条目上**：从它开始往后取 `limit` 条。
 
-    ⚠ 「同档保持原序」靠的是 **Python `sorted` 的稳定性**——它是语言保证，
-    不是巧合。改成别的排序方式（比如自己分桶再拼）时必须自己保证这一点，
-    否则同为「待办」的几条会莫名其妙地换位置，用户看到的是清单在自己抖。
+    ⚠ 不能简单地取前 `limit` 条：一份 15 条的清单做到第 8 条时，
+    前 5 条全是已完成的——屏幕上一条**还没做的**都看不见，
+    而这块界面存在的全部理由就是回答「还剩什么」。
+
+    ⚠ 也不能让窗口越过末尾：全部做完之前的最后几条时，
+    `start` 要往前收，保证窗口始终是满的（否则末尾只显示一两条，
+    上面白留一片）。
 
     ## 省略摘要说什么
 
@@ -118,10 +124,18 @@ def build_view(
     completed = sum(1 for item in items if item.state is TodoState.COMPLETED)
     header = f"待办 ({completed}/{total})"
 
-    # sorted 是稳定排序 → 同优先级内保持原序（见上面那段说明）
-    ordered = sorted(items, key=lambda item: _DISPLAY_PRIORITY[item.state])
-    shown = ordered[:limit]
-    hidden = ordered[limit:]
+    # **不排序**：原序就是执行顺序（见上面那段说明）。
+    ordered = list(items)
+
+    # 窗口锚在第一条未完成的条目上；全部完成时不会走到这里（上面已返回 None）。
+    first_unfinished = next(
+        (i for i, item in enumerate(ordered) if item.state is not TodoState.COMPLETED),
+        0,
+    )
+    # 往前收，保证窗口是满的（末尾不足 limit 条时不要露出空档）
+    start = max(0, min(first_unfinished, len(ordered) - limit))
+    shown = ordered[start:start + limit]
+    hidden = ordered[:start] + ordered[start + limit:]
 
     if hidden:
         hidden_done = sum(1 for item in hidden if item.state is TodoState.COMPLETED)

@@ -5,11 +5,12 @@
 什么时候不该显示、超过 5 条时留哪 5 条、省略摘要怎么说。
 
 ⚠ 本文件里分辨力最强的两条：
-- **已完成不占名额**（`test_completed_never_steals_a_slot`）——把优先级表
-  写反或干脆不排序时，它会红而别的用例照样绿；
-- **同档保持原序**（`StableOrderTest`）——它钉住的是 `sorted` 的稳定性。
-  改成「分桶再拼」的实现很容易丢掉这条，症状是同为待办的几条莫名换位置，
-  用户看到的是清单在自己抖。
+- **窗口锚在第一条未完成的条目上**（`WindowTest`）——简单地取前 5 条时它会红，
+  而别的用例照样绿。那种实现下，一份做到第 8 条的清单在屏幕上**一条还没做的
+  都看不见**，而这块界面存在的全部理由就是回答「还剩什么」；
+- **已完成的留在原位**（`ExecutionOrderTest`）——它钉住的是一次**口径反转**：
+  初版按状态重排（已完成推到最后），真机反馈后改成一律按执行顺序。
+  没有这条的话，后来的人看到「已完成排在待办前面」会以为是 bug 顺手改回去。
 """
 
 from __future__ import annotations
@@ -115,54 +116,44 @@ class DisplayLimitTest(unittest.TestCase):
         self.assertEqual(view.overflow, "")
 
 
-class PriorityTest(unittest.TestCase):
-    """AC12 后半：进行中 > 待办 > 已完成。"""
+class ExecutionOrderTest(unittest.TestCase):
+    """
+    ⚠ **顺序一律是执行顺序，先做的在前**（真机反馈后改，别改回按状态排）。
 
-    def test_in_progress_comes_first(self) -> None:
+    初版按 `进行中 → 待办 → 已完成` 重排，把已完成的推到最后。用户看过真机
+    之后否掉了：那样清单读起来不像一份计划，而像一个按状态分的堆——
+    没法从上往下看出「这件事分几步、走到哪一步了」。
+
+    顺序既然固定，限高就只剩「取哪一段」这一个自由度，见 `WindowTest`。
+    """
+
+    def test_order_is_exactly_as_given(self) -> None:
         view = build_view(
             [
-                item("已完成的", TodoState.COMPLETED),
-                item("待办的", TodoState.PENDING),
+                item("先做的", TodoState.COMPLETED),
                 item("在做的", TodoState.IN_PROGRESS),
+                item("待做的", TodoState.PENDING),
             ]
         )
         assert view is not None
-        self.assertEqual([r.title for r in view.rows], ["在做的", "待办的", "已完成的"])
+        self.assertEqual([r.title for r in view.rows], ["先做的", "在做的", "待做的"])
 
-    def test_completed_never_steals_a_slot(self) -> None:
+    def test_completed_stays_where_it_was(self) -> None:
         """
-        ⚠ **本文件分辨力最强的一条。**
+        **反证**：已完成的**不会**被挪到末尾。
 
-        5 条已完成 + 2 条待办：那 2 条待办**都必须在**显示出来的 5 条里。
-        不排序（或把优先级写反）的话，5 个名额会被已完成的占满，
-        屏幕上显示「待办 (5/7)」却一条没做完的都看不见——
-        而这正是这块界面存在的全部意义。
+        这条与初版的断言正好相反，是刻意的——它钉住的正是那次口径反转，
+        免得后来的人看到「已完成的排在待办前面」以为是 bug 顺手改回去。
         """
-        items = [item(f"完成{i}", TodoState.COMPLETED) for i in range(5)] + [
-            item("还没做A"),
-            item("还没做B"),
-        ]
-        view = build_view(items)
+        view = build_view(
+            [
+                item("第一步", TodoState.COMPLETED),
+                item("第二步", TodoState.PENDING),
+                item("第三步", TodoState.COMPLETED),
+            ]
+        )
         assert view is not None
-        shown = [r.title for r in view.rows]
-        self.assertIn("还没做A", shown)
-        self.assertIn("还没做B", shown)
-        self.assertEqual(shown[:2], ["还没做A", "还没做B"])
-
-    def test_completed_shows_up_when_there_is_room(self) -> None:
-        """反证：名额有富余时已完成的照常显示——优先级不是「隐藏已完成」。"""
-        view = build_view([item("完成", TodoState.COMPLETED), item("待办")])
-        assert view is not None
-        self.assertEqual([r.title for r in view.rows], ["待办", "完成"])
-
-
-class StableOrderTest(unittest.TestCase):
-    """
-    ⚠ 同一档内**保持模型给的原序**（靠 `sorted` 的稳定性）。
-
-    丢掉这条的症状是：同为「待办」的几条莫名其妙换位置，
-    用户看到的是清单在自己抖，而每一帧单独看都「没错」。
-    """
+        self.assertEqual([r.title for r in view.rows], ["第一步", "第二步", "第三步"])
 
     def test_same_state_keeps_input_order(self) -> None:
         view = build_view([item("先"), item("中"), item("后")])
@@ -170,25 +161,55 @@ class StableOrderTest(unittest.TestCase):
         self.assertEqual([r.title for r in view.rows], ["先", "中", "后"])
 
     def test_swapping_input_swaps_output(self) -> None:
-        """反证：换一下输入顺序，输出必须跟着换——否则「保持原序」只是碰巧。"""
+        """顺序完全跟着输入走。"""
         view = build_view([item("后"), item("先")])
         assert view is not None
         self.assertEqual([r.title for r in view.rows], ["后", "先"])
 
-    def test_stability_holds_across_states(self) -> None:
-        """两档混排时，各档内部同样保持原序。"""
-        view = build_view(
-            [
-                item("待办1"),
-                item("在做1", TodoState.IN_PROGRESS),
-                item("待办2"),
-                item("在做2", TodoState.IN_PROGRESS),
-            ]
-        )
+
+class WindowTest(unittest.TestCase):
+    """
+    限高时取哪一段：**窗口锚在第一条未完成的条目上**。
+
+    ⚠ 这一组是「保持执行顺序」之后唯一还需要判断的地方，两条边界各一个用例。
+    """
+
+    def test_window_starts_at_the_first_unfinished_item(self) -> None:
+        """
+        ⚠ **本文件分辨力最强的一条。**
+
+        15 条做到第 8 条时，简单地取前 5 条会全是已完成的——屏幕上一条
+        **还没做的**都看不见，而这块界面存在的全部理由就是回答「还剩什么」。
+        """
+        items = [
+            item(f"第{i}步", TodoState.COMPLETED if i < 8 else TodoState.PENDING)
+            for i in range(1, 16)
+        ]
+        view = build_view(items)
         assert view is not None
-        self.assertEqual(
-            [r.title for r in view.rows], ["在做1", "在做2", "待办1", "待办2"]
-        )
+        self.assertEqual(view.rows[0].title, "第8步")
+        self.assertEqual(len(view.rows), DISPLAY_LIMIT)
+
+    def test_window_is_pulled_back_at_the_tail(self) -> None:
+        """
+        做到倒数第二条时窗口要往前收，保证是满的——否则末尾只显示一两条、
+        上面白留一片。
+        """
+        items = [
+            item(f"第{i}步", TodoState.COMPLETED if i < 14 else TodoState.PENDING)
+            for i in range(1, 16)
+        ]
+        view = build_view(items)
+        assert view is not None
+        self.assertEqual(len(view.rows), DISPLAY_LIMIT)
+        self.assertEqual(view.rows[-1].title, "第15步")
+
+    def test_short_list_shows_everything_from_the_top(self) -> None:
+        """条数不超限时整份显示，窗口逻辑不该有任何可见影响。"""
+        view = build_view([item("甲", TodoState.COMPLETED), item("乙"), item("丙")])
+        assert view is not None
+        self.assertEqual([r.title for r in view.rows], ["甲", "乙", "丙"])
+        self.assertEqual(view.overflow, "")
 
 
 class AllDoneTextTest(unittest.TestCase):
