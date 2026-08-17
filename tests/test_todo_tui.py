@@ -241,24 +241,36 @@ class AllDoneTransitionTest(unittest.TestCase):
             self._todo_shown = False
             self.events: list[str] = []
             self.views: list = []
+            self.classes: list = []
 
         def show_event(self, text: str) -> None:
             self.events.append(text)
 
-        def query_one(self, _cls):  # noqa: ANN001
+        def query_one(self, cls):  # noqa: ANN001
+            """
+            按类型分发：`TodoPane` 收视图，`HistoryView` 收下边框开关。
+
+            ⚠ 两者都要接住——`_refresh_todo` 现在同时改这两处，
+            只接一个会让另一个抛 AttributeError 而被那层 try/except 吞掉，
+            表现为「这条用例莫名其妙什么都没发生」。
+            """
             app = self
+            from rhinecode.tui.widgets import HistoryView as _H
 
-            class _History:
+            if cls is _H:
+                class _History:
+                    @staticmethod
+                    def set_class(flag, name):
+                        app.classes.append((flag, name))
+
+                return _History()
+
+            class _Pane:
                 @staticmethod
-                def todo_pane():
-                    class _Pane:
-                        @staticmethod
-                        def update_view(view):
-                            app.views.append(view)
+                def update_view(view):
+                    app.views.append(view)
 
-                    return _Pane()
-
-            return _History()
+            return _Pane()
 
         # 直接借真实实现，保证测的就是产品代码那一份
         from rhinecode.tui.app import RhineApp as _R

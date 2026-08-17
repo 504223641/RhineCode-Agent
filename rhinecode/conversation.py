@@ -35,7 +35,11 @@ from rhinecode import presets
 from rhinecode.provider.base import BaseProvider, Message, ToolCall
 from rhinecode.provider.factory import create_provider
 from rhinecode.tools.base import Tool
-from rhinecode.tools.display import fold_group_map, primary_arg_map
+from rhinecode.tools.display import (
+    fold_group_map,
+    primary_arg_map,
+    silent_tool_names,
+)
 from rhinecode.tools.registry import ToolRegistry
 # c14：协调层定位存盘/存档/角色目录与环境信息，一律是主项目根——
 # 主对话的工作目录是不变量（spec F4），隔离只发生在子 Agent 那一侧。
@@ -968,6 +972,21 @@ class ConversationManager:
         副作用：无（只读快照）。
         """
         return primary_arg_map(self._registry)
+
+    def silent_tool_names(self) -> frozenset:
+        """
+        哪些工具的调用**不在历史区留工具行**（todo-list 扩展，真机反馈后加）。
+
+        :returns: 工具名集合；工具中心未启用时为空集合（历史区行为逐字不变）
+
+        判据见 `tools/display.py` 的 `SILENT_TOOLS`：**结果已经由界面上
+        另一块常驻区域完整呈现**。目前只有待办清单一个。
+
+        ⚠ 静默的只是**界面**——行为记录里那次调用照常在，权限管线照常过。
+
+        副作用：无。
+        """
+        return silent_tool_names(self._registry)
 
     def fold_group_map(self) -> dict:
         """

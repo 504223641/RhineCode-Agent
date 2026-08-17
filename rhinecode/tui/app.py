@@ -310,8 +310,23 @@ class RhineApp(App):
         dock: bottom;
         height: auto;
         display: none;
-        border: none;
+        /* 自己画左右与下边框，**接着历史区那圈框继续画**（手法与 `#panel-dock`
+           完全相同）。`border-top` 单独给灰色分隔线，见下方说明。 */
+        border: solid #7AEEFF 60%;
         border-top: tall #808080 60%;
+        padding: 0 1;
+        background: transparent;
+    }
+    /*
+     * 待办块可见时，历史区收起它自己的下边框（否则两者之间多一条横线，
+     * 看起来是**两个框**而不是一个）。类由 `_refresh_todo` 统一切。
+     *
+     * ⚠ 与 `#panel-dock` 的做法不同：那个是**浮层**，直接盖住历史区的下边框
+     * 那一行，所以历史区不必改。本块是**占位**的，两者上下相邻、谁也不盖谁，
+     * 因此必须有一方让出那条线。
+     */
+    HistoryView.-todo-open {
+        border-bottom: none;
     }
     /*
      * 子 Agent 活动区（tui-display 扩展 F1）。
@@ -524,6 +539,9 @@ class RhineApp(App):
         # 由显示转隐藏的**跃迁**（只在那一刻留一行记录，见 `_refresh_todo`）。
         self._todo_version = 0
         self._todo_shown = False
+        # 缺省空集合 = 「一个都不静默」，历史区行为与本扩展之前逐字一致。
+        # 真值在 `on_mount` 里从工具中心取（见那里）。
+        self._silent_tools = frozenset()
         # 全局详细度档位（`Ctrl+O`）。**一个键同时管活动区与历史区**——
         # 对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套。
         #
@@ -575,6 +593,13 @@ class RhineApp(App):
                 yield ConfirmPanel()
                 yield ClarifyPanel()
                 yield SessionPanel()
+            # 待办清单块（todo-list 扩展 F10）。**base 层 + dock: bottom**，
+            # 因此它真的占地方：`HistoryView` 的 `1fr` 少分到相应的行数。
+            #
+            # ⚠ 它必须排在 `#panel-dock` **之后**声明，但那与叠放无关——
+            # 叠放由图层决定（面板在 `panels` 层、本块在 `base` 层），
+            # 面板弹出时盖住它是预期行为。
+            yield TodoPane()
         # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
         #
         # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
@@ -636,6 +661,10 @@ class RhineApp(App):
         # `--continue` 恢复出来的历史里有工具行，晚一步的话首屏那批会用空表
         # 画成独立行，与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
         self.query_one(HistoryView).set_fold_groups(self._manager.fold_group_map())
+        # 历史区静默工具（todo-list 扩展，真机反馈后加）：这些工具的调用
+        # **不产生工具行**——它们的结果已由界面上另一块常驻区域完整呈现。
+        # 工具集在启动之后不再变化，故与折叠分组表同样只取一次。
+        self._silent_tools = self._manager.silent_tool_names()
         # 批次封闭的行为记录（tui-activity-fold N7/AC26）。走回调注入而不是让
         # 历史区直接持有记录器——它是纯展示层，认识 trace 会让依赖方向倒过来。
         self.query_one(HistoryView).set_batch_closed_hook(self._trace_tool_batch)
@@ -1138,7 +1167,10 @@ class RhineApp(App):
                 # 「记忆已更新」这类误读代价为零的消息的。
                 self.show_event(self._manager.todo_all_done_text())
 
-            self.query_one(HistoryView).todo_pane().update_view(view)
+            self.query_one(TodoPane).update_view(view)
+            # 待办块可见时历史区收起自己的下边框，由本块接着画——
+            # 不切的话两者之间会多一条横线，看起来是两个框（见那段 CSS 的说明）。
+            self.query_one(HistoryView).set_class(view is not None, "-todo-open")
             self._todo_shown = view is not None
         except Exception:
             # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断调用方
@@ -1259,7 +1291,8 @@ class RhineApp(App):
         #
         # ⚠ `_todo_shown` 也要复位，否则下一段对话第一次收起待办时会误留
         # 一行「全部完成」——那条记录的判据里有「上一次显示过」。
-        self.query_one(HistoryView).todo_pane().update_view(None)
+        self.query_one(TodoPane).update_view(None)
+        self.query_one(HistoryView).set_class(False, "-todo-open")
         self._todo_version = 0
         self._todo_shown = False
 
@@ -1622,6 +1655,18 @@ class RhineApp(App):
             # ——`gutter` 已经把 padding 与 border 一起算了，改用哪一种都不必动这行。
             spacing = dock.styles.gutter.height + dock.styles.margin.height
             reserved = (panel_h + spacing) if any_visible else 0
+            # todo-list 扩展：待办块**已经在历史区下面占着地方了**，而面板浮在
+            # 它上面。面板盖住的是待办块，不是历史内容——那部分不必再让一次。
+            #
+            # ⚠ 不减掉的话，每次弹面板历史内容都会**白抖一下**：往上跳了
+            # 待办块那么多行，而被盖住的压根不是它们。这正是 tui-activity-fold
+            # 花一整轮消掉的那类抖动，别让它从另一个入口回来。
+            #
+            # 夹到 0：面板比待办块高时，超出的部分仍要让。
+            if reserved:
+                todo = self.query_one(TodoPane)
+                if todo.display:
+                    reserved = max(0, reserved - todo.outer_size.height)
             # 只改下边距，左右沿用原样式（padding: 0 1）
             self.query_one(HistoryView).styles.padding = (0, 1, reserved, 1)
         except Exception:  # noqa: BLE001
@@ -2212,12 +2257,27 @@ class RhineApp(App):
                     # 模型刚开始吐这个调用，参数还在流里（可能要几十秒）。
                     # 先建一行「参数生成中… Ns」，让界面立刻有活体信号；这一行随后
                     # 由 TOOL_START 原地转成执行态，**不会**再多建一行。
+                    #
+                    # ⚠ 静默工具三个分支都要跳过（见 `_silent_tools`）。
+                    # 只跳过其中一两个会留下「建了行却永远收不了尾」的半成品，
+                    # 而 `finally` 的收尾会把它涂成「失败 · 未执行」。
+                    if event.tool_call.name in self._silent_tools:
+                        reset_text_widgets()
+                        continue
                     reset_text_widgets()
                     tc = event.tool_call
                     if tc.id not in tool_widgets:
                         tool_widgets[tc.id] = self.call_from_thread(
                             history_view.add_tool_widget, tc, True
                         )
+
+                elif (
+                    etype == AgentEventType.TOOL_START
+                    and event.tool_call.name in self._silent_tools
+                ):
+                    # 静默工具：不建行、不复用行。正文照常收尾（否则下一段
+                    # 正文会与上一段粘在一起）。
+                    reset_text_widgets()
 
                 elif etype == AgentEventType.TOOL_START:
                     # 工具开始：重置文本占位（工具后的文本另起块）。
@@ -2232,6 +2292,15 @@ class RhineApp(App):
                         )
                     else:
                         self.call_from_thread(widget.begin_running, tc)
+
+                elif (
+                    etype == AgentEventType.TOOL_RESULT
+                    and event.tool_call.name in self._silent_tools
+                ):
+                    # 静默工具：不定色、不留行。**但界面刷新照做**——
+                    # 待办块正是靠这里更新的，跳过它整块就永远不动了。
+                    if self._manager.todo_version() != self._todo_version:
+                        self.call_from_thread(self._refresh_todo)
 
                 elif etype == AgentEventType.TOOL_RESULT:
                     tc = event.tool_call

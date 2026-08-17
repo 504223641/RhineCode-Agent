@@ -229,6 +229,51 @@ def resolve_full_title(tool_call) -> "tuple[str, str]":
 #
 # ⚠ **写文件与编辑文件仍在表外**，那是这条判据的边界：它们改的是工作区内容、
 # 且带 diff 块，那正是用户要盯着看的**结果**，不是过程。
+# ---------------------------------------------------------------------------
+# 历史区静默工具（todo-list 扩展，真机反馈后加）
+# ---------------------------------------------------------------------------
+# **这些工具的调用不在历史区产生工具行。**
+#
+# ⚠ 与 `FOLD_GROUPS`（折叠成一行）是**两回事**：折叠是「压缩成一行还看得见」，
+# 静默是「一行都不出」。判据也不同——
+#
+#   折叠的判据是「无副作用，或已被用户过目」；
+#   **静默的判据是「这次调用的结果已经由界面上另一块常驻区域完整呈现」。**
+#
+# 目前唯一的成员是 `todo_write`：它每调一次就在历史区留下一行
+# `● todo_write(todos=[{'title': ..., 'state': ...}])`，而**同一份内容**
+# 此刻正完整地画在底部的待办块里。一次十几步的任务会因此多出十几行
+# 参数被截断的噪音，把真正的对话内容挤下去——这正是 tui-activity-fold
+# 花一整轮解决的那个问题（「20 次调用 = 净增 40 行且全部累积」）。
+# 对齐 Claude Code：它的 `TodoWrite` 同样不显示成工具调用。
+#
+# ⚠ **加进这张表之前先问一句：它的结果在界面上还有别的地方看得到吗？**
+# 看不到就不能静默——那等于让一次真实发生的动作在界面上**完全没有痕迹**，
+# 比噪音危险得多。行为记录（trace）不受影响，静默的只是界面。
+SILENT_TOOLS: frozenset = frozenset({"todo_write"})
+
+
+def silent_tool_names(registry) -> frozenset:
+    """
+    当前真正注册了的静默工具名。
+
+    :param registry: 工具注册中心；`None` 时返回空集合
+    :returns: `SILENT_TOOLS` 与已注册工具名的交集
+
+    与直接用 `SILENT_TOOLS` 的差别：**只保留真的注册了的**。
+    非 DeepSeek 工具模式下注册中心为空，返回空集合，历史区行为逐字不变。
+
+    副作用：无。
+    """
+    if registry is None:
+        return frozenset()
+    try:
+        names = set(registry.names())
+    except Exception:  # noqa: BLE001 —— 显示层的辅助，取不到就退回「都不静默」
+        return frozenset()
+    return frozenset(SILENT_TOOLS & names)
+
+
 FOLD_GROUPS: "dict[str, tuple[str, str]]" = {
     "glob_files": ("glob", "查找文件 {n} 次"),
     "grep_content": ("grep", "搜索内容 {n} 次"),

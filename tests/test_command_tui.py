@@ -308,6 +308,9 @@ class FakeManager:
     # ⚠ **刻意照抄真实取值，而不是给界面层加 `getattr` 兜底。**
     # 兜底会让「协调层漏接了某个方法」这种真实接线错误被静默吞掉，
     # 而那正是界面层最难排查的一类问题（界面看起来正常，只是某块永远不更新）。
+    def silent_tool_names(self) -> frozenset:
+        return frozenset()
+
     def todo_version(self) -> int:
         return 0
 
