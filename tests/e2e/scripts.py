@@ -1467,3 +1467,71 @@ SLOW_RUN = [
     [text("我先读个文件。"), tool("read_file", {"path": "seed.txt"}), done()],
     [text("读完了。"), done()],
 ]
+
+
+def seed_todo_bench(workspace, user_dir):  # noqa: ARG001
+    """
+    预置「待办清单触发口径」测试台（todo-list 扩展 B 组验收）。
+
+    造两种截然不同的活，用来双向测触发口径：
+
+    - **五步的活**：三个模块各有两处裸 `except:` + 一份测试要跑
+      → 期望模型**列待办**；
+    - **一步就完的活**：`utils.py` 里一个拼错的函数名
+      → 期望模型**不列**。
+
+    ⚠ 与 `G:\Rhine-test` 那份手工测试台**内容一致**，刻意不共用文件：
+    宿主的工作区是临时的、退出即删，而手工测试台要能被用户反复用。
+    """
+    from tests.e2e.seeding import seed_files
+
+    mod = '''"""{title}。"""
+
+import json
+
+
+def load_{name}(path):
+    """从 JSON 文件读一个{title}。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except:          # noqa: E722
+        return None
+
+
+def {check}({name}):
+    """{doc}"""
+    try:
+        return {expr}
+    except:          # noqa: E722
+        return {fallback}
+'''
+    seed_files(workspace, {
+        "src/auth.py": mod.format(
+            title="用户认证", name="user", check="verify_password",
+            doc="校验密码。", expr='user["password"] == "x"', fallback="False"),
+        "src/orders.py": mod.format(
+            title="订单", name="order", check="total_amount",
+            doc="算订单总额。",
+            expr='sum(i["price"] * i["count"] for i in order["items"])',
+            fallback="0"),
+        "src/payments.py": mod.format(
+            title="支付", name="payment", check="is_settled",
+            doc="这笔支付结清了没有。", expr='payment["status"] == "settled"',
+            fallback="False"),
+        "src/utils.py": (
+            '"""零碎工具。"""\n\n\n'
+            "def formate_money(cents):\n"
+            '    """把分转成「12.34 元」这种字符串。"""\n'
+            '    return f"{cents / 100:.2f} 元"\n'
+        ),
+        "tests/test_smoke.py": (
+            '"""最小冒烟测试。"""\n\n'
+            "import unittest\n\n\n"
+            "class SmokeTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n\n\n"
+            'if __name__ == "__main__":\n'
+            "    unittest.main()\n"
+        ),
+    })

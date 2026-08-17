@@ -251,7 +251,7 @@ class BriefTest(unittest.TestCase):
 
     def test_says_update_as_you_go(self) -> None:
         """每完成一步就更新，不要攒到最后——攒着等于用户全程看不到进度。"""
-        self.assertIn("每完成一步", self.brief)
+        self.assertIn("每做完一步", self.brief)
 
     def test_has_no_unbounded_push(self) -> None:
         """
@@ -267,7 +267,7 @@ class BriefTest(unittest.TestCase):
 
     def test_says_when_not_to_use_it(self) -> None:
         """必须写「什么时候不必用」——只写该用的一侧就是单向推力。"""
-        self.assertIn("不必用它", self.brief)
+        self.assertIn("不必列", self.brief)
 
 
 if __name__ == "__main__":

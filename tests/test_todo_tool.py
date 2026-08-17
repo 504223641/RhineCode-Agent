@@ -227,7 +227,7 @@ class SameVoiceTest(unittest.TestCase):
     # ⚠ **这张表本身是护栏的一部分**：下面 `test_the_guard_covers_four_layers`
     # 钉住它的长度。没有那一条的话，「把某一层从表里删掉」会让护栏静默变弱
     # ——测试照样全绿，而两处文本从此可以自由分叉。
-    _LAYERS = ("三步", "完整清单", "如实", "每完成一步")
+    _LAYERS = ("三步", "完整清单", "如实", "每做完一步")
 
     def setUp(self) -> None:
         tool, _ = make_tool()
@@ -274,7 +274,7 @@ class SameVoiceTest(unittest.TestCase):
     def test_both_say_update_as_you_go(self) -> None:
         """第四层：每完成一步就更新，不要攒到最后。"""
         for text in (self.description, self.brief):
-            self.assertIn("每完成一步", text)
+            self.assertIn("每做完一步", text)
 
     def test_both_say_when_not_to_use_it(self) -> None:
         """
@@ -285,7 +285,7 @@ class SameVoiceTest(unittest.TestCase):
         都要让子 Agent 去做」）。
         """
         self.assertIn("不用", self.description)
-        self.assertIn("不必用", self.brief)
+        self.assertIn("不必列", self.brief)
 
     def test_the_two_texts_are_not_the_same_string(self) -> None:
         """

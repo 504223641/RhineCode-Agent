@@ -60,7 +60,12 @@ from rhinecode.subagents.runner import ParentSnapshot
 from rhinecode.subagents.toolset import resolve_toolset
 from rhinecode.team.gate import TeamGate
 from rhinecode.team.render import render_team_brief
-from rhinecode.todo import build_view, render_all_done_text, render_todo_brief
+from rhinecode.todo import (
+    build_view,
+    render_all_done_text,
+    render_todo_brief,
+    render_todo_reminder,
+)
 from rhinecode.team.models import MAIN_NAME
 from rhinecode.trace import (
     SCOPE_MAIN,
@@ -1881,6 +1886,20 @@ class ConversationManager:
             injected = self._hooks.consume_injections()
             if injected:
                 parts.append(injected)
+            # todo-list 扩展：每轮提醒模型维护待办清单。
+            #
+            # ⚠ **这一条是真机验收逼出来的，不是设计时就有的。** 两个模型
+            # （flash / pro）在一个明确五步的任务上**各 0 次** `todo_write`，
+            # 而系统提示那段与工具 schema 都确认送到了——**静态提示词这条路
+            # 走到头了**。Claude Code 真正让它触发的机制就是这条每轮注入的提醒。
+            # 详见 `todo/render.py` 的 `render_todo_reminder`。
+            #
+            # ⚠ 必须在这个**每轮求值**的闭包里取（与 Skill 正文、Hook 注入同理）：
+            # 清单状态每一轮都可能变，闭包外取一次会让提醒停在第一轮的样子
+            # ——清单都列完了还在催「你的清单是空的」。
+            todo_hint = self._todo_reminder_text()
+            if todo_hint:
+                parts.append(todo_hint)
             return "\n\n".join(parts)
         # debug_log 开启时把缓存日志写到项目根下的固定文件，否则传 None 关闭日志。
         debug_log_path = (
@@ -2116,6 +2135,19 @@ class ConversationManager:
             return ""
         _, total = self.todo_store.counts()
         return render_all_done_text(total)
+
+    def _todo_reminder_text(self) -> str:
+        """
+        本轮 `<system-reminder>` 里的待办提醒（todo-list 扩展，真机验收后加）。
+
+        :returns: 一段提醒；未启用、或全部完成时为空串
+
+        副作用：无。
+        """
+        if self.todo_store is None:
+            return ""
+        _completed, total = self.todo_store.counts()
+        return render_todo_reminder(total, self.todo_store.all_completed())
 
     def _todo_brief_text(self) -> str:
         """

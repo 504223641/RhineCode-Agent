@@ -44,6 +44,7 @@ from rhinecode.todo.render import (
     build_view,
     render_all_done_text,
     render_todo_brief,
+    render_todo_reminder,
 )
 from rhinecode.todo.store import MAX_ITEMS, ReplaceResult, TodoStore
 
@@ -61,4 +62,5 @@ __all__ = [
     "parse_state",
     "render_all_done_text",
     "render_todo_brief",
+    "render_todo_reminder",
 ]
