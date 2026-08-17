@@ -224,7 +224,7 @@
 **依赖：** T2、T3、T5、T6
 
 **步骤：**
-1. 包 docstring：一句话说明它是叶子包、只依赖标准库。
+1. 包 docstring：一句话说明它是叶子包、只依赖标准库与 `trace`。
 2. re-export：`TodoState`、`TodoItem`、`TODO_STATE_LABELS`、`TodoStore`、
    `ReplaceResult`、`TodoView`、`TodoRow`、`build_view`、`render_todo_brief`、
    `render_all_done_text`、`DISPLAY_LIMIT`、`MAX_ITEMS`。
@@ -232,7 +232,8 @@
 
 **验证：** `python -c "import rhinecode.todo as t; print(sorted(t.__all__))"`
 列出全部导出名，且 `python -c "import rhinecode.todo"` 不触发任何本项目其他模块的导入
-（用 `python -X importtime -c "import rhinecode.todo" 2>&1 | grep -c "rhinecode\."` 确认只有 todo 自身几行）。
+（用 `python -X importtime -c "import rhinecode.todo" 2>&1 | grep -o "rhinecode\.[a-z_.]*" | sort -u`
+确认只出现 `todo` 自身与 `trace` 两族）。
 
 ---
 

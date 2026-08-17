@@ -84,9 +84,10 @@
 - [ ] **编译无错**（验证：`python -m compileall rhinecode tests`）
 - [ ] **全量测试全绿，skipped 仍是 4 项**
       （验证：`python -m unittest discover -s tests`）
-- [ ] **`todo` 包是叶子包**：单独 import 它**不触发**本项目任何其他模块
-      （验证：`python -X importtime -c "import rhinecode.todo"`，
-      输出里 `rhinecode.` 开头的行只有 `todo` 自身那几个 / spec N2）
+- [ ] **`todo` 包是叶子包**：单独 import 它只拉起 `todo` 自身与 `trace`
+      （验证：`python -X importtime -c "import rhinecode.todo" 2>&1 |
+      grep -o "rhinecode\.[a-z_.]*" | sort -u`，输出**只有** `rhinecode.todo*`
+      与 `rhinecode.trace*` 两族；出现 `team` / `tools` / `permission` 即违反 spec N2）
 - [ ] **符号白名单没被突破**（验证：`python -m unittest tests.test_tui_symbols`）
 - [ ] **既有会话切换路径没被碰坏**
       （验证：`python -m unittest tests.test_clear_stale_deliverables tests.test_tui_keybindings`）

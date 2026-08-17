@@ -8,7 +8,7 @@
 
 ```
   rhinecode/todo/            ← 叶子包：数据 + 校验 + 纯渲染逻辑
-        ↑                       只依赖标准库，不 import 任何本项目模块
+        ↑                       只依赖标准库与 trace（叶子→叶子）
   rhinecode/tools/todo_write.py   ← 工具：翻译模型参数 → 调 store
         ↑
   rhinecode/conversation.py  ← 协调层：持有 store，向界面暴露只读视图
@@ -21,7 +21,7 @@
 
 ### 为什么 `todo` 是叶子包
 
-与 `team` / `trace` / `skills` 同一条：只依赖标准库，谁都可以 import 它，
+与 `team` / `trace` / `skills` 同一条：谁都可以 import 它，
 它谁也不 import。这让它可以被纯逻辑单测完整覆盖——**限高取哪 5 条、
 什么时候该显示、覆写合法不合法**，这三件最容易出错的事全部在这一层，
 且验证它们**不需要起 Textual**。
@@ -107,7 +107,8 @@ clear() -> None
 ### 模块一：`rhinecode/todo/`（叶子包）
 
 **职责：** 清单的数据、校验、以及「该画成什么样」的纯逻辑。
-**依赖：** 仅标准库。
+**依赖：** 标准库 + `trace`（只为埋点取事件类型枚举；`trace` 本身也只依赖
+标准库，属叶子→叶子，与 `classifier` 依赖 `provider.base` + `trace` 同一先例）。
 
 #### `models.py`
 `TodoState` 枚举、`TodoItem`、中文标签表。
@@ -525,7 +526,7 @@ plan 里登记的**方案 B 不启用**，但保留在文档里——将来若�
 | F18 行为记录 | `TODO_UPDATE` + `SUMMARIZERS` |
 | F19 系统提示 | 133 槽 + `render_todo_brief` |
 | N1 不新增底部布局层 | 待办块在 `HistoryView` 之内，底部四层不变 |
-| N2 叶子包 | `todo/` 只依赖标准库 |
+| N2 叶子包 | `todo/` 只依赖标准库与 `trace`（实测确认，见下） |
 | N3 加锁不变量 | 锁内纯内存；埋点在锁外；不持有回调 |
 | N4 转义 | `TodoPane` 走本模块 `escape` |
 | N5 零回归 | 未注册工具时 store 为 `None` |
