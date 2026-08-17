@@ -56,6 +56,7 @@ from rhinecode.subagents.runner import ParentSnapshot
 from rhinecode.subagents.toolset import resolve_toolset
 from rhinecode.team.gate import TeamGate
 from rhinecode.team.render import render_team_brief
+from rhinecode.todo import build_view, render_all_done_text, render_todo_brief
 from rhinecode.team.models import MAIN_NAME
 from rhinecode.trace import (
     SCOPE_MAIN,
@@ -368,6 +369,11 @@ class ConversationManager:
         # 同形态）。为 `None` 时本章整体不启用，三类动作的行为与本章之前**逐字一致**
         # ——`RunOptions.classifier` 缺省 None，循环里那两处判断整个跳过。
         self.classifier = None
+        # todo-list 扩展：主对话的待办清单。由装配层在构造之后属性注入
+        # （与 `classifier` 同形态）。为 `None` 时本扩展整体不启用——
+        # `todo_view()` 恒返回 None，界面上那块永不显示，**这就是零回归的
+        # 实现方式**（spec N5），不需要额外的开关。
+        self.todo_store = None
         # c16 F21：待发的「预授权被丢弃」提示。由 `_grant_for_skill` 攒、
         # `_wrap_events` 在事件流里取走——见那两处的说明。
         self._grant_notices: list[str] = []
@@ -578,6 +584,8 @@ class ConversationManager:
         # ⚠ 漏掉的后果不报错：上一轮的队员消息会出现在新对话里，
         # 或者自动唤起在新会话里仍处于停用状态。
         self._clear_team()
+        # todo-list 扩展 F17：待办属于「上一段对话的状态」，一并清空。
+        self._clear_todo()
         self._hooks.bind_context(session_id=self.memory_manager.session_id)
         self._dispatch_session(HookEventType.SESSION_START, source="clear")
         if cancelled:
@@ -872,6 +880,8 @@ class ConversationManager:
             # 而取消要先给正在跑的那些发信号。反过来的话，一个刚被清空唤醒的
             # 队员会带着空花名册再跑一轮。
             self._clear_team()
+            # todo-list 扩展 F17：待办同理——它属于会话 A。
+            self._clear_todo()
             # 历史恢复埋点（trace F16）。`origin` 区分两条来源：
             # 这里是运行中的 `/resume`；另一条是启动时的 `--continue`
             # （它在 ConversationManager 构造期间原地改写 history、一条事件都不产，
@@ -1805,6 +1815,15 @@ class ConversationManager:
             # c15：组队说明进 134 稳定槽位（排在角色清单之前，见 builder 注释）。
             # 协作未启用时是空串，槽位整体跳过、输出与 c14 逐字一致。
             team_brief=self._team_brief_text(),
+            # todo-list 扩展：待办说明进 133 稳定槽位（排在组队说明之前）。
+            #
+            # ⚠ **三个 `build_default_prompt` 调用点里只有这一个传它。**
+            # `parent_snapshot`（分支式子 Agent）与 `_run_forked_skill`
+            # （fork 子对话）都不传——前者拿不到 `todo_write`
+            # （`GLOBAL_DENIED_TOOLS` 挡着），后者虽然工具集里有它，
+            # 但那条子对话与主对话**共用同一份清单**，鼓励它去覆写等于
+            # 让一段子任务把主线的进度笔记整个换掉。
+            todo_brief=self._todo_brief_text(),
             # web_fetch 扩展 F4 链路②的第一个调用点（另一个在 _run_forked_skill）。
             untrusted_enabled=self._config.web_fetch_enabled,
         )
@@ -1999,6 +2018,103 @@ class ConversationManager:
         """清空全部协作状态（`/clear` 与 `/resume` 共用，c15 F25）。"""
         if self.team_service is not None:
             self.team_service.clear()
+
+    def _clear_todo(self) -> None:
+        """
+        清空待办清单（`/clear` 与 `/resume` 共用，todo-list 扩展 F17）。
+
+        ⚠ **必须与 `_clear_team` / `clear_active` 挨着调用，不要另起一处。**
+        那几行已经是「会话切换要复位什么」的收口点；另写一处的结果必然是
+        「清空能复位、恢复不能」这种一半对的状态——而它在界面上表现为
+        「换了会话，上一段的待办还挂在那儿」，用户完全看不出根因。
+
+        界面那一半（收起待办块、复位版本号）由 `RhineApp._reset_display_state`
+        负责。**两处配合才完整**：这里只清数据，不碰任何 widget。
+
+        副作用：清空清单（进而让界面下次刷新时收起待办块）。
+        """
+        if self.todo_store is not None:
+            self.todo_store.clear()
+
+    # ------------------------------------------------------------------ #
+    # 待办清单的只读视图（todo-list 扩展，供 TUI 调用）
+    # ------------------------------------------------------------------ #
+
+    def todo_version(self) -> int:
+        """
+        待办清单的当前版本号。**界面靠它判断要不要重绘。**
+
+        :returns: 版本号；未启用时恒为 0
+
+        由 TUI 在**工作线程**调用一次（读一个整数，零跨线程成本），
+        变了才发起 `call_from_thread` 去重绘——这是「不新增定时器、
+        也不新增从工作线程到界面的推送」的落点（spec N6）。
+
+        副作用：无。
+        """
+        if self.todo_store is None:
+            return 0
+        return self.todo_store.version()
+
+    def todo_view(self):
+        """
+        待办块该画成什么样。
+
+        :returns: `TodoView`；**未启用、清单为空、或全部已完成时为 `None`**
+            ——界面据此把整块隐藏且不占布局空间（spec F11/N5）
+
+        ⚠ 「该不该显示」的判断**全在 `todo.render.build_view` 里**，
+        本方法只是转发。界面层不重复判断——两处各判一次必然分叉。
+
+        副作用：无。
+        """
+        if self.todo_store is None:
+            return None
+        return build_view(self.todo_store.snapshot())
+
+    def todo_all_done(self) -> bool:
+        """
+        清单是否**非空且全部完成**（界面据此决定要不要留那行记录）。
+
+        ⚠ 空清单返回 `False`——空不是「全做完了」。少了这条，
+        一个从来没列过待办的会话里会凭空冒出一行「全部完成」。
+
+        副作用：无。
+        """
+        if self.todo_store is None:
+            return False
+        return self.todo_store.all_completed()
+
+    def todo_all_done_text(self) -> str:
+        """
+        「全部完成」那行记录的文本（spec F15）。
+
+        :returns: 形如 `待办 4/4 全部完成`
+
+        副作用：无。
+        """
+        if self.todo_store is None:
+            return ""
+        _, total = self.todo_store.counts()
+        return render_all_done_text(total)
+
+    def _todo_brief_text(self) -> str:
+        """
+        系统提示里的「待办清单」段（槽位 133）。
+
+        :returns: 未启用时**空串**——槽位随之整体跳过，输出与本扩展之前
+            逐字一致（spec N5）
+
+        ⚠ **只由主对话那次 `build_default_prompt` 调用。** fork 子对话与
+        子 Agent 都拿不到 `todo_write`（前者共用主工具集但那条链另有考虑，
+        后者被 `GLOBAL_DENIED_TOOLS` 挡着），给它们注入等于让它们去用一个
+        看不见的工具。
+
+        副作用：无。
+        """
+        if self.todo_store is None:
+            return ""
+        return render_todo_brief()
 
     def _grant_for_skill(self, spec: "SkillSpec") -> None:
         """

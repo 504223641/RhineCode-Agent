@@ -48,6 +48,8 @@ from rhinecode.team import TeamService
 from rhinecode.tools.load_skill import LoadSkillTool
 from rhinecode.tools.send_message import SendMessageTool
 from rhinecode.tools.team_tasks import build_board_tools
+from rhinecode.todo import TodoStore
+from rhinecode.tools.todo_write import TodoWriteTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.web_fetch import WebFetchTool
 from rhinecode.web.manager import WebFetchManager
@@ -473,6 +475,20 @@ def build_app(
         for tool in build_board_tools(team_service):
             tool_registry.register(tool)
         tool_registry.register(SendMessageTool(team_service))
+
+        # todo-list 扩展：主对话的待办清单。
+        #
+        # 与协作服务同一条件、同一形态——它同样只在 DeepSeek 工具模式下
+        # 有意义（清单是给工具用的）。
+        #
+        # ⚠ **不注册时 `manager.todo_store` 保持 `None`**，于是
+        # `todo_view()` 恒返回 `None`、界面上那块永不显示、系统提示那个槽位
+        # 整体跳过——**这就是 spec N5「零回归」的全部实现**，
+        # 不需要任何配置开关。别为它加一个 `enabled` 字段：
+        # 那会多出一条「配置说开着、但工具模式没开」的自相矛盾状态。
+        todo_store = TodoStore(recorder=recorder)
+        manager.todo_store = todo_store
+        tool_registry.register(TodoWriteTool(todo_store))
 
         agent_catalog = discover_agents(
             main_project_root() / ".rhinecode" / "agents",
