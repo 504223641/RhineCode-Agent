@@ -927,6 +927,12 @@ class AllTypesTest(TraceHookBase):
                 "breaker_tripped": False, "breaker_reason": "none",
                 "breaker_detail": "",
             },
+            # todo-list 待办一类
+            T.TODO_UPDATE: {
+                "ok": True, "reason": "", "total": 4, "completed": 2,
+                "in_progress": 1, "version": 3,
+                "titles": ["读现有实现", "改 login 接口", "改三处调用方", "跑测试"],
+            },
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

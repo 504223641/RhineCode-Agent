@@ -95,6 +95,7 @@ def build_default_prompt(
     active_skills: str = "",
     agent_index: str = "",
     team_brief: str = "",
+    todo_brief: str = "",
     untrusted_enabled: bool = False,
 ) -> AssembledPrompt:
     """
@@ -126,6 +127,12 @@ def build_default_prompt(
     :param custom_instructions: 「自定义指令」槽位内容（c9：RHINE.md 拼接结果），空串跳过
     :param memory_index: 「长期记忆」槽位内容（c9：记忆索引），空串跳过
     :param skill_index: 「可用 Skill 清单」槽位内容（c11：第一阶段清单），空串跳过
+    :param todo_brief: 「待办清单」槽位内容（todo-list 扩展：一段恒定的待办说明），
+        空串跳过。**只由主对话传**——子 Agent 拿不到 `todo_write` 工具
+        （`subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`），传给它们等于
+        让它去用一个看不见的工具。
+        ⚠️ 它与 `team_brief` 的口径**刻意相反**（默认就列 vs 默认不委派），
+        理由见 `todo/render.py` 的 `render_todo_brief`。
     :param team_brief: 「组队协作」槽位内容（c15：一段恒定的组队说明），空串跳过。
         ⚠️ 它是本项目里模型决定「要不要组队」时读到的**主要文本**——
         工具描述只在它已经想到要用某个工具之后才起作用。
@@ -163,6 +170,12 @@ def build_default_prompt(
     )
     # c13 填充的角色清单槽。同样进 stable，且排在 Skill 清单**之前**（135 < 140）——
     # 它在会话内恒定不变，比会随热更新变化的清单更稳定。
+    # todo-list 扩展填充的待办说明槽。恒定文本，排在组队说明**之前**（133 < 134）
+    # ——两段缓存上等价，排序只按语义：先说「自己怎么管进度」，
+    # 再说「什么时候找别人」。
+    builder.add(
+        PromptModule(name="待办清单", priority=133, cacheable=True, content=todo_brief)
+    )
     # c15 填充的组队说明槽。恒定文本，排在角色清单**之前**（134 < 135）——
     # 它比角色清单还稳定，且语义上先总后分：先说「可以组队」，再说「有谁可派」。
     builder.add(
@@ -171,12 +184,18 @@ def build_default_prompt(
     builder.add(
         PromptModule(name="可用子 Agent 角色", priority=135, cacheable=True, content=agent_index)
     )
-    # 其余仍为空的预留槽：跳过上面已实际填充的五个，避免重复添加空槽。
+    # 其余仍为空的预留槽：跳过上面已实际填充的那些，避免重复添加空槽。
+    #
+    # ⚠ **新增填充槽位时必须同步这张表**（`CLAUDE.md` 的成对维护点）。
+    # 漏改不报错，只是那个槽位被添加两次——一次填了内容、一次是空槽，
+    # 而空槽在拼装时被整体跳过，于是**表面上一切正常**。
+    # 护栏：`test_todo_integration.py` 断言注入的文本恰好出现一次。
     _FILLED = (
         "自定义指令",
         "长期记忆",
         "可用 Skill 清单",
         "已激活 Skill",
+        "待办清单",
         "组队协作",
         "可用子 Agent 角色",
     )

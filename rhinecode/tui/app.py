@@ -85,6 +85,7 @@ from rhinecode.tui.clipboard import copy_text
 from rhinecode.tui.widgets import (
     ActivityView,
     HistoryView, InputBar, StatusBar, StatusHint, CommandPanel, ConfirmPanel,
+    TodoPane,
     ClarifyPanel, SessionPanel, StatusLine, OverlayPanel, compose_status_text,
     # 详细度档位（tui-activity-fold）：三档循环取代改造前的布尔开关
     DETAIL_CYCLE, DETAIL_FOLDED, DetailLevelClicked,
@@ -274,9 +275,115 @@ class RhineApp(App):
      * 取到的是**加新组件之前**的 `max_scroll_y`，每次都停在「差最后一条消息」
      * 的位置）。两个需求必须同时满足，而这一行 CSS 让它们不再互相冲突。
      */
+    /*
+     * 历史区各条内容之间留一行（真机反馈后加）。
+     *
+     * 改造前所有消息紧挨着排，一屏里「用户说的」「AI 说的」「工具跑了什么」
+     * 糊成一整块，要靠前缀符号去分辨每一段从哪开始。加一行行距之后，
+     * **段落边界由留白承担**，前缀符号退回它本来的角色（标明这一段是什么）。
+     * 与 Claude Code 的观感一致。
+     *
+     * ⚠ 选 `margin-bottom` 而不是 `margin-top`：后者会在历史区**最顶上**
+     * 留一行空白，而那一行紧挨着框线、看起来像排版错位。
+     * 落在末尾的那一行反而有用——它把最后一条内容与待办块/输入框分开。
+     *
+     * ⚠ 通配符 `*` 是刻意的：历史区里挂的东西有六七种
+     * （用户消息 / AI 正文 / 思考块 / 系统行 / 工具行 / 批次聚合行 / 命令报告），
+     * 逐个列类型必然漏，而漏掉的那种就会**只有它前后没有行距**——
+     * 那种不一致比完全没有行距更刺眼。它们全部经 `_mount_widget` 挂进来，
+     * 所以「直接子节点」这个范围是准确的。
+     *
+     * 代价：每条内容多占一行。长对话里可见内容大约减半——这是明码标价的
+     * 取舍，用户明确要的就是这个距离。
+     */
+    #history-messages > * {
+        margin-bottom: 1;
+    }
     HistoryView > Vertical {
         height: auto;
         min-height: 100%;
+    }
+    /*
+     * 待办清单块（todo-list 扩展 F10–F14）。
+     *
+     * 它是 `HistoryView` 的**第二个子节点**，`dock: bottom` 把它钉在历史区
+     * 底部：历史内容在它上面滚动，它自己不动，同时占掉可滚动区的相应高度。
+     *
+     * ## 实测数据（80×24，见该扩展 plan 的「T1 实测结论」）
+     *
+     * `dock` 在 `ScrollableContainer` 内部本项目此前无先例，故先量后写：
+     * 滚到顶与滚到底，本块 `region.y` **都是 17**（钉住）；块高由 3 变 5 时
+     * `max_scroll_y` 24 → 26、实际可见内容 16 → 14（**占位，精确 -2**）；
+     * 内容画在 `y 1..14`、本块在 `y 15..19`（**不重叠，不遮挡**）。
+     *
+     * ⚠ 断言「占位」时**不能用 `scrollable_content_region.height`**——
+     * 实测它恒为 19、**不扣 dock 子节点的高度**，用它会得出「没占地方」
+     * 的错误结论。正确的量是 `max_scroll_y`。
+     *
+     * ## 三条样式决定
+     *
+     * - **顶部分隔线用灰不用主题青**：它是**观测区**，而青色在本项目里
+     *   专属于「等着你决定」的四个交互面板。与活动区同一条理由、同一个取值。
+     * - **不加左右 padding**：`HistoryView` 自带 `padding: 0 1`，这里再加一层
+     *   会把框线内侧擦出空白——`background: transparent` 只让**颜色**透下来，
+     *   padding 那两列画的是**空格**，会把 `│` 逐个擦掉（验收第 19 条踩过）。
+     * - **`display: none` 是缺省态**，可见性由 `TodoPane.update_view` 按
+     *   「该不该显示」切换（判断在 `todo.render.build_view` 里，不在界面层）。
+     */
+    TodoPane {
+        dock: bottom;
+        height: auto;
+        display: none;
+        /* 自己画左右与下边框，**接着历史区那圈框继续画**（手法与 `#panel-dock`
+           完全相同）。
+         *
+         * ⚠ **顶边框必须是 `none`**（真机反馈后改，别改回来）。
+         *
+         * 初版用 `border-top: tall #808080` 想给一条灰色分隔线。问题出在
+         * **端帽**：`tall` 那一行的两端画的是方块 `▊` / `▎`，而它上下每一行
+         * 的两端都是 `│`——方块贴在格子一侧、竖线在格子中间，于是那一行
+         * 看起来跟上下**差一条线的距离**（用户原话）。
+         *
+         * 实测过四种（80×24，逐字符 dump 屏幕）：
+         *   tall  → `▊ ▔▔▔ ▎`   端帽是方块，错位（初版，就是这个 bug）
+         *   hkey  → `▔ ▔▔▔ ▔`   线齐了，但两端仍不是 `│`
+         *   solid → `┌ ─── ┐`   画成新开一个框，比错位更糟
+         *   none  → `│     │`   **整圈框线完全连续**
+         *
+         * Textual 的边框样式**给不出 `├───┤`**，所以「既要分隔线又要接上竖线」
+         * 做不到。取舍是保框线连续——待办块靠 `● 待办 (n/m)` 表头自己区分，
+         * Claude Code 的待办同样没有分隔线。
+         *
+         * ⚠ 四个交互面板也写着 `border-top: tall`，但**不是同一个坑**：
+         * 它们嵌在 `#panel-dock` 里、被那圈边框内缩一格，端帽落在框线
+         * **内侧**、不与 `│` 同列，因此不会错位。别顺手一起改。
+         */
+        border: solid #7AEEFF 60%;
+        border-top: none;
+        /* 上下各留一行（真机反馈后加）。
+         *
+         * 去掉顶边框之后框线是连续了，但历史区的最后一条消息与
+         * `● 待办 (n/m)` 直接贴在一起，读起来像同一段内容。留白是这里
+         * **唯一可用的分隔手段**——分隔线的路已经走不通（Textual 给不出
+         * 能接上 `│` 的端帽，见上方那段），色块又与「全项目只用框线划分
+         * 区域、不用色块」的既定口径冲突。
+         *
+         * ⚠ 代价是**待办块高 2 行**，历史区相应少 2 行。这是明码标价的
+         * 取舍：待办块是占位的（spec F12），它每高一行，历史内容就少一行。
+         */
+        padding: 1 1;
+        background: transparent;
+    }
+    /*
+     * 待办块可见时，历史区收起它自己的下边框（否则两者之间多一条横线，
+     * 看起来是**两个框**而不是一个）。类由 `_refresh_todo` 统一切。
+     *
+     * ⚠ 与 `#panel-dock` 的做法不同：那个是**浮层**，直接盖住历史区的下边框
+     * 那一行，所以历史区不必改。本块是**占位**的，两者上下相邻、谁也不盖谁，
+     * 因此必须有一方让出那条线。
+     */
+    HistoryView.-todo-open {
+        border-bottom: none;
     }
     /*
      * 子 Agent 活动区（tui-display 扩展 F1）。
@@ -481,6 +588,17 @@ class RhineApp(App):
         # 只在它**变化**时刷状态栏——每 0.5 秒无条件刷一次是白干活，
         # 而状态栏刷新还会产出一条 trace 埋点，空转会把时间线淹掉。
         self._last_subagent_count = 0
+        # todo-list 扩展：待办块的刷新状态。
+        #
+        # `_todo_version` 是**上一次画过的版本号**——工作线程每轮读一次协调层的
+        # 当前版本号，不同才发起跨线程重绘。这样空闲时零成本，也不必新增定时器。
+        # `_todo_shown` 记「上一次画出来了没有」，用于判定「全部完成」那一次
+        # 由显示转隐藏的**跃迁**（只在那一刻留一行记录，见 `_refresh_todo`）。
+        self._todo_version = 0
+        self._todo_shown = False
+        # 缺省空集合 = 「一个都不静默」，历史区行为与本扩展之前逐字一致。
+        # 真值在 `on_mount` 里从工具中心取（见那里）。
+        self._silent_tools = frozenset()
         # 全局详细度档位（`Ctrl+O`）。**一个键同时管活动区与历史区**——
         # 对齐 Claude Code 的全局 verbose 语义，两个键会让用户记两套。
         #
@@ -532,6 +650,13 @@ class RhineApp(App):
                 yield ConfirmPanel()
                 yield ClarifyPanel()
                 yield SessionPanel()
+            # 待办清单块（todo-list 扩展 F10）。**base 层 + dock: bottom**，
+            # 因此它真的占地方：`HistoryView` 的 `1fr` 少分到相应的行数。
+            #
+            # ⚠ 它必须排在 `#panel-dock` **之后**声明，但那与叠放无关——
+            # 叠放由图层决定（面板在 `panels` 层、本块在 `base` 层），
+            # 面板弹出时盖住它是预期行为。
+            yield TodoPane()
         # 活动区（tui-display 扩展 F1）：历史区**之下**、各面板与输入框**之上**。
         #
         # 位置是刻意的：它贴着输入框，也就是用户视线本来就在的地方；
@@ -593,6 +718,10 @@ class RhineApp(App):
         # `--continue` 恢复出来的历史里有工具行，晚一步的话首屏那批会用空表
         # 画成独立行，与其后新产生的形态不一致（界面上表现为「上下两截风格不同」）。
         self.query_one(HistoryView).set_fold_groups(self._manager.fold_group_map())
+        # 历史区静默工具（todo-list 扩展，真机反馈后加）：这些工具的调用
+        # **不产生工具行**——它们的结果已由界面上另一块常驻区域完整呈现。
+        # 工具集在启动之后不再变化，故与折叠分组表同样只取一次。
+        self._silent_tools = self._manager.silent_tool_names()
         # 批次封闭的行为记录（tui-activity-fold N7/AC26）。走回调注入而不是让
         # 历史区直接持有记录器——它是纯展示层，认识 trace 会让依赖方向倒过来。
         self.query_one(HistoryView).set_batch_closed_hook(self._trace_tool_batch)
@@ -1054,6 +1183,57 @@ class RhineApp(App):
             # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断定时器。
             pass
 
+    def _refresh_todo(self) -> None:
+        """
+        把待办块刷成清单当前的样子（todo-list 扩展 F10/F11/F15）。
+
+        **必须在主线程调用。** 唯一的调用来源是 `_do_stream` 里那次
+        `call_from_thread`，以及 `_reset_display_state`。
+
+        ## 版本号驱动，不是定时器驱动
+
+        清单每改一次内部版本号加一。这里先比对版本号，没变直接返回——
+        于是重绘天然幂等，反复调用零成本。
+
+        ⚠ **刻意不搭 `_poll_subagents` 那个 0.5 秒定时器**：它**只在子 Agent
+        服务启用时才注册**（见 `on_mount` 里那个 `if ... is not None`），
+        搭它会让待办块在关掉子 Agent 的配置下**整个不刷新**——
+        而配置和界面上都看不出异常。
+        ⚠ 也**不新增定时器**：空闲会话的开销必须与改造前一致（与活动区同一约束）。
+
+        ## 「全部完成」那一行只在**跃迁**的那一刻留（F15）
+
+        判据是「上一次显示过 **且** 这一次不该显示了 **且** 清单确实是全完成」。
+        三个条件缺一不可：
+        - 少了第一条，一个从来没显示过的会话也会冒出这行；
+        - 少了第三条，`/clear` 造成的「不该显示」会被误当成「全做完了」。
+
+        整段包 `try/except`：**观测与通知设施绝不能反过来打断界面**。
+
+        副作用：可能向聊天区追加一行事件级记录；改待办块的内容与可见性。
+        """
+        try:
+            version = self._manager.todo_version()
+            if version == self._todo_version:
+                return
+            self._todo_version = version
+            view = self._manager.todo_view()
+
+            if self._todo_shown and view is None and self._manager.todo_all_done():
+                # 事件级：真的完成了一件事，该看得见。提示级（dim）那档是留给
+                # 「记忆已更新」这类误读代价为零的消息的。
+                self.show_event(self._manager.todo_all_done_text())
+
+            self.query_one(TodoPane).update_view(view)
+            # 待办块可见时历史区收起自己的下边框，由本块接着画——
+            # 不切的话两者之间会多一条横线，看起来是两个框（见那段 CSS 的说明）。
+            self.query_one(HistoryView).set_class(view is not None, "-todo-open")
+            self._todo_shown = view is not None
+        except Exception:
+            # 应用退出竞态、渲染异常等：丢弃即可，绝不让它打断调用方
+            # （调用方是 Agent Loop 的事件消费循环）。
+            pass
+
     def _refresh_activity(self) -> None:
         """
         把子 Agent 活动区刷成任务表当前的样子（tui-display 扩展 F4/N7）。
@@ -1151,10 +1331,27 @@ class RhineApp(App):
 
         状态行本应已由 `_set_streaming(False)` 收掉，这里再兜一次——
         会话切换可能发生在一次运行的异常路径上。
+
+        todo-list 扩展 F17：待办块一并收起。**这是界面那一半**，
+        数据那一半由协调层的 `_clear_todo` 负责（两处配合才完整）。
         """
         self.query_one(StatusLine).stop()
         self._detail_level = DETAIL_FOLDED
         self.query_one(HistoryView).set_detail_level(DETAIL_FOLDED)
+        # 待办块收起 + 刷新状态复位（todo-list 扩展 F17）。
+        #
+        # ⚠ **版本号必须一起复位。** 新会话的清单从 0 重新计数，不复位的话
+        # 第一次覆写（版本号 1）在旧值恰好是 1 时会被判成「没变」，
+        # 于是**那一次刷新被整个跳过**——用户看到的是「换了会话之后
+        # 第一次列待办不显示」，看起来像功能坏了。
+        # 旧值不是 1 时它碰巧能工作，而「碰巧对」正是这类 bug 难查的原因。
+        #
+        # ⚠ `_todo_shown` 也要复位，否则下一段对话第一次收起待办时会误留
+        # 一行「全部完成」——那条记录的判据里有「上一次显示过」。
+        self.query_one(TodoPane).update_view(None)
+        self.query_one(HistoryView).set_class(False, "-todo-open")
+        self._todo_version = 0
+        self._todo_shown = False
 
     def compact_context(self) -> None:
         """手动压缩：Manager 返回事件流（阻塞的摘要 LLM 调用）走后台 Worker。"""
@@ -1302,11 +1499,24 @@ class RhineApp(App):
 
         仅当输入以 "/" 开头且仍处于命令字段（尚无空白分隔符，即尚未进入参数区）
         时显示候选面板；参数区输入、普通文本、零候选均隐藏（c10 plan 10.2）。
-        交互进行中、流式运行中或会话选择面板展示中不处理。
+
+        ## ⚠ 流式运行期间**照常显示**（真机反馈后改，别改回来）
+
+        这里原本还有一条 `or self._stream_active`。它造成的现象是
+        **「请求发出去之后敲 `/` 就没反应了」**——而输入框在忙碌期间
+        **是不禁用的**（见 `_set_streaming` 的说明：那样 Esc 才能可靠路由），
+        于是用户能打字、字也进去了，**唯独提示面板不出来**。
+        「能打字但没有任何反应」比「压根不让打」更让人困惑。
+
+        那条守卫对另外两个是必要的——确认面板与会话面板**占着同一个
+        浮层容器**，这时候抢过来会把交互链打断。而「正在跑模型」与这个
+        容器毫无关系：命令面板只是一张**只读的提示列表**，弹出来不改变
+        任何状态，也不会让用户多做成任何事（真正的闸门是
+        `on_input_bar_input_submitted` 里那条 `_stream_active` 守卫，
+        它拦的是**提交**，那一条原样保留）。
         """
         if (
             self._pending_interaction is not None
-            or self._stream_active
             or self._session_panel_active
         ):
             return
@@ -1327,10 +1537,14 @@ class RhineApp(App):
         - 多候选：显示稳定排序的候选菜单（焦点保持在 InputBar，方向键经 on_key
           转发给面板移动高亮，Enter 执行当前高亮项）；
         - 零候选：隐藏面板，不做任何改动。
+
+        ⚠ **流式运行期间照常补全**，理由与 `on_input_changed` 那条完全相同
+        （见那里的说明）：输入框忙碌时不禁用，只关补全会造成
+        「能打字、Tab 却没反应」。两处必须同口径——只改一处的话，
+        运行中 `/mo` 弹得出面板却按不了 Tab，比两处都关更莫名其妙。
         """
         if (
             self._pending_interaction is not None
-            or self._stream_active
             or self._session_panel_active
         ):
             return
@@ -1515,6 +1729,18 @@ class RhineApp(App):
             # ——`gutter` 已经把 padding 与 border 一起算了，改用哪一种都不必动这行。
             spacing = dock.styles.gutter.height + dock.styles.margin.height
             reserved = (panel_h + spacing) if any_visible else 0
+            # todo-list 扩展：待办块**已经在历史区下面占着地方了**，而面板浮在
+            # 它上面。面板盖住的是待办块，不是历史内容——那部分不必再让一次。
+            #
+            # ⚠ 不减掉的话，每次弹面板历史内容都会**白抖一下**：往上跳了
+            # 待办块那么多行，而被盖住的压根不是它们。这正是 tui-activity-fold
+            # 花一整轮消掉的那类抖动，别让它从另一个入口回来。
+            #
+            # 夹到 0：面板比待办块高时，超出的部分仍要让。
+            if reserved:
+                todo = self.query_one(TodoPane)
+                if todo.display:
+                    reserved = max(0, reserved - todo.outer_size.height)
             # 只改下边距，左右沿用原样式（padding: 0 1）
             self.query_one(HistoryView).styles.padding = (0, 1, reserved, 1)
         except Exception:  # noqa: BLE001
@@ -2105,12 +2331,27 @@ class RhineApp(App):
                     # 模型刚开始吐这个调用，参数还在流里（可能要几十秒）。
                     # 先建一行「参数生成中… Ns」，让界面立刻有活体信号；这一行随后
                     # 由 TOOL_START 原地转成执行态，**不会**再多建一行。
+                    #
+                    # ⚠ 静默工具三个分支都要跳过（见 `_silent_tools`）。
+                    # 只跳过其中一两个会留下「建了行却永远收不了尾」的半成品，
+                    # 而 `finally` 的收尾会把它涂成「失败 · 未执行」。
+                    if event.tool_call.name in self._silent_tools:
+                        reset_text_widgets()
+                        continue
                     reset_text_widgets()
                     tc = event.tool_call
                     if tc.id not in tool_widgets:
                         tool_widgets[tc.id] = self.call_from_thread(
                             history_view.add_tool_widget, tc, True
                         )
+
+                elif (
+                    etype == AgentEventType.TOOL_START
+                    and event.tool_call.name in self._silent_tools
+                ):
+                    # 静默工具：不建行、不复用行。正文照常收尾（否则下一段
+                    # 正文会与上一段粘在一起）。
+                    reset_text_widgets()
 
                 elif etype == AgentEventType.TOOL_START:
                     # 工具开始：重置文本占位（工具后的文本另起块）。
@@ -2125,6 +2366,15 @@ class RhineApp(App):
                         )
                     else:
                         self.call_from_thread(widget.begin_running, tc)
+
+                elif (
+                    etype == AgentEventType.TOOL_RESULT
+                    and event.tool_call.name in self._silent_tools
+                ):
+                    # 静默工具：不定色、不留行。**但界面刷新照做**——
+                    # 待办块正是靠这里更新的，跳过它整块就永远不动了。
+                    if self._manager.todo_version() != self._todo_version:
+                        self.call_from_thread(self._refresh_todo)
 
                 elif etype == AgentEventType.TOOL_RESULT:
                     tc = event.tool_call
@@ -2148,6 +2398,17 @@ class RhineApp(App):
                         getattr(res, "diff", None),
                         self._result_detail(res),
                     )
+                    # todo-list 扩展：待办清单变了就重绘那一块。
+                    #
+                    # ⚠ **先在工作线程读一个整数，不同才跨线程。** 版本号没变时
+                    # 一次 `call_from_thread` 都不发起——待办块的刷新因此不给
+                    # 每一次工具调用增加任何跨线程往返。
+                    #
+                    # ⚠ **刻意不按工具名判断**（不写 `if tc.name == "todo_write"`）：
+                    # 界面层不该认识任何具体工具的名字，而版本号这个判据对将来
+                    # 任何写路径都成立。
+                    if self._manager.todo_version() != self._todo_version:
+                        self.call_from_thread(self._refresh_todo)
 
                 elif etype == AgentEventType.USAGE:
                     # 本轮 token 用量送进状态行（tui-activity-fold F15/F17）。

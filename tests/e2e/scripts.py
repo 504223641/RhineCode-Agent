@@ -1333,3 +1333,205 @@ def seed_protected_isolated(workspace: Path, user_dir: Path) -> None:
         },
         "你在自己的隔离工作区里完成改动，最后给出一段自包含的结论。",
     )
+
+
+# ---------------------------------------------------------------------------
+# 待办清单（todo-list 扩展验收）
+# ---------------------------------------------------------------------------
+
+# 主场景：四步任务，逐条推进到全部完成。
+#
+# 覆盖 checklist 场景 1 的机器可判部分：清单出现 → 原地更新 → 全部完成后
+# 留一行记录并收起。**「历史内容有没有被遮挡」这一条机器判不了**，
+# 靠 plan 的 T19 几何实测（内容画在 y1..15、待办块 y16..21）与真机肉眼。
+TODO_FOUR_STEPS = [
+    [
+        text("这件事要分四步，我先列个清单。"),
+        tool("todo_write", {"todos": [
+            {"title": "读现有实现", "state": "in_progress"},
+            {"title": "改 login 接口"},
+            {"title": "改三处调用方"},
+            {"title": "跑测试"},
+        ]}),
+        done(),
+    ],
+    [
+        text("第一步做完了。"),
+        tool("todo_write", {"todos": [
+            {"title": "读现有实现", "state": "completed"},
+            {"title": "改 login 接口", "state": "in_progress"},
+            {"title": "改三处调用方"},
+            {"title": "跑测试"},
+        ]}),
+        done(),
+    ],
+    [
+        text("接口改好了。"),
+        tool("todo_write", {"todos": [
+            {"title": "读现有实现", "state": "completed"},
+            {"title": "改 login 接口", "state": "completed"},
+            {"title": "改三处调用方", "state": "in_progress"},
+            {"title": "跑测试", "state": "in_progress"},
+        ]}),
+        done(),
+    ],
+    [
+        text("全部做完。"),
+        tool("todo_write", {"todos": [
+            {"title": "读现有实现", "state": "completed"},
+            {"title": "改 login 接口", "state": "completed"},
+            {"title": "改三处调用方", "state": "completed"},
+            {"title": "跑测试", "state": "completed"},
+        ]}),
+        done(),
+    ],
+    [text("四步都完成了。"), done()],
+]
+
+# 拒绝路径（checklist 场景 3）：先列一份合法的，再提交 40 条被拒，
+# 然后模型据可读原因自我纠正。**屏幕上的待办块必须保持上一份内容不变。**
+TODO_REJECTED_THEN_FIXED = [
+    [
+        text("先列三条。"),
+        tool("todo_write", {"todos": [
+            {"title": "保留的第一条", "state": "in_progress"},
+            {"title": "保留的第二条"},
+            {"title": "保留的第三条"},
+        ]}),
+        done(),
+    ],
+    [
+        text("我把它拆得更细一些。"),
+        tool("todo_write", {"todos": [{"title": f"细分第 {i} 步"} for i in range(40)]}),
+        done(),
+    ],
+    [text("超上限了，我合并成两条。"),
+     tool("todo_write", {"todos": [
+         {"title": "合并后的第一条", "state": "in_progress"},
+         {"title": "合并后的第二条"},
+     ]}),
+     done()],
+    [text("好了。"), done()],
+]
+
+# 超过 5 条 → 限高 + 省略行；且标题里带**未闭合的方括号**。
+#
+# ⚠ 后者是本项目最致命的一类崩溃来源：落单的 `[` 会在**布局阶段的主线程**
+# 抛 MarkupError，没有任何 try/except 兜得住，Textual 直接拆掉整个 app。
+# 待办标题正是最典型的高危来源——它是模型给的自由文本。
+TODO_OVERFLOW_AND_BRACKETS = [
+    [
+        text("列一份长清单。"),
+        tool("todo_write", {"todos": [
+            {"title": "修 [WIP 的解析器", "state": "in_progress"},
+            {"title": "处理 allowed_tools: [read_file, glo"},
+            {"title": "第三条"},
+            {"title": "第四条"},
+            {"title": "第五条"},
+            {"title": "第六条"},
+            {"title": "第七条"},
+            {"title": "已经做完的甲", "state": "completed"},
+            {"title": "已经做完的乙", "state": "completed"},
+        ]}),
+        done(),
+    ],
+    [text("列好了。"), done()],
+]
+
+
+# `/clear` 之后重新列待办还显不显示（todo-list 扩展 F17 的界面半边）。
+#
+# ⚠ 这条专防「版本号没复位导致第一次刷新被跳过」：`/clear` 是本地命令、
+# **不消耗剧本轮次**，因此第二次 `send` 取到的是这里的第二轮。
+# 症状是「换了会话之后第一次列待办不显示」——看起来像功能整个坏了。
+TODO_CLEAR_THEN_RELIST = [
+    [text("先列两条。"),
+     tool("todo_write", {"todos": [
+         {"title": "清空前的甲", "state": "in_progress"},
+         {"title": "清空前的乙"},
+     ]}),
+     done()],
+    [text("列好了。"), done()],
+    [text("重新列。"),
+     tool("todo_write", {"todos": [
+         {"title": "清空后的丙", "state": "in_progress"},
+         {"title": "清空后的丁"},
+     ]}),
+     done()],
+    [text("好了。"), done()],
+]
+
+
+# 一轮里夹一个慢工具，用来验「请求跑着的时候界面还响不响应」。
+SLOW_RUN = [
+    [text("我先读个文件。"), tool("read_file", {"path": "seed.txt"}), done()],
+    [text("读完了。"), done()],
+]
+
+
+def seed_todo_bench(workspace, user_dir):  # noqa: ARG001
+    """
+    预置「待办清单触发口径」测试台（todo-list 扩展 B 组验收）。
+
+    造两种截然不同的活，用来双向测触发口径：
+
+    - **五步的活**：三个模块各有两处裸 `except:` + 一份测试要跑
+      → 期望模型**列待办**；
+    - **一步就完的活**：`utils.py` 里一个拼错的函数名
+      → 期望模型**不列**。
+
+    ⚠ 与 `G:\Rhine-test` 那份手工测试台**内容一致**，刻意不共用文件：
+    宿主的工作区是临时的、退出即删，而手工测试台要能被用户反复用。
+    """
+    from tests.e2e.seeding import seed_files
+
+    mod = '''"""{title}。"""
+
+import json
+
+
+def load_{name}(path):
+    """从 JSON 文件读一个{title}。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except:          # noqa: E722
+        return None
+
+
+def {check}({name}):
+    """{doc}"""
+    try:
+        return {expr}
+    except:          # noqa: E722
+        return {fallback}
+'''
+    seed_files(workspace, {
+        "src/auth.py": mod.format(
+            title="用户认证", name="user", check="verify_password",
+            doc="校验密码。", expr='user["password"] == "x"', fallback="False"),
+        "src/orders.py": mod.format(
+            title="订单", name="order", check="total_amount",
+            doc="算订单总额。",
+            expr='sum(i["price"] * i["count"] for i in order["items"])',
+            fallback="0"),
+        "src/payments.py": mod.format(
+            title="支付", name="payment", check="is_settled",
+            doc="这笔支付结清了没有。", expr='payment["status"] == "settled"',
+            fallback="False"),
+        "src/utils.py": (
+            '"""零碎工具。"""\n\n\n'
+            "def formate_money(cents):\n"
+            '    """把分转成「12.34 元」这种字符串。"""\n'
+            '    return f"{cents / 100:.2f} 元"\n'
+        ),
+        "tests/test_smoke.py": (
+            '"""最小冒烟测试。"""\n\n'
+            "import unittest\n\n\n"
+            "class SmokeTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n\n\n"
+            'if __name__ == "__main__":\n'
+            "    unittest.main()\n"
+        ),
+    })

@@ -104,9 +104,22 @@ def optional_slots() -> list[PromptModule]:
     - 110「自定义指令」（c9 填充：三层 RHINE.md）
     - 120「已激活 Skill」（c11 填充：已激活 Skill 的完整 SOP 正文）
     - 130「长期记忆」（c9 填充：两级记忆索引）
+    - 133「待办清单」（todo-list 扩展填充：一段恒定的待办说明）
     - 134「组队协作」（c15 填充：一段恒定的组队说明）
     - 135「可用子 Agent 角色」（c13 填充：角色清单）
     - 140「可用 Skill 清单」（c11 填充：第一阶段清单）
+
+    **为什么「待办清单」是 133、排在组队说明之前**（todo-list 扩展）：
+    两段都是**恒定不变**的文本，缓存上完全等价，因此排序只按语义——
+    **先说「自己怎么管进度」，再说「什么时候找别人」**。这与
+    134 →135 的既有次序（先说可以组队、再说有谁可派）是同一条先总后分的思路。
+
+    ⚠️ 它与组队说明的**口径刻意相反，别顺手统一**：委派要起一整条子对话并
+    冷启动，是贵的路径，故默认不委派；维护待办只是改一份内存清单，
+    成本近乎零，故多步任务默认就列。理由详见 `todo/render.py` 的
+    `render_todo_brief`——Claude Code 自己也是这么分的
+    （Skill 工具写 `call this tool first`，Agent 工具写
+    `do not spawn unless the user asks`）。
 
     **为什么「组队协作」是 134、排在角色清单之前**（c15）：
     它是一段**恒定不变**的文本（不随任何配置或运行状态变化），比角色清单
@@ -138,6 +151,7 @@ def optional_slots() -> list[PromptModule]:
         PromptModule(name="自定义指令", priority=110, cacheable=False, content=""),
         PromptModule(name="已激活 Skill", priority=120, cacheable=False, content=""),
         PromptModule(name="长期记忆", priority=130, cacheable=False, content=""),
+        PromptModule(name="待办清单", priority=133, cacheable=True, content=""),
         PromptModule(name="组队协作", priority=134, cacheable=True, content=""),
         PromptModule(name="可用子 Agent 角色", priority=135, cacheable=True, content=""),
         PromptModule(name="可用 Skill 清单", priority=140, cacheable=True, content=""),

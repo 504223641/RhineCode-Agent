@@ -37,6 +37,8 @@ from textual.widgets.option_list import Option
 from textual.containers import ScrollableContainer, Vertical
 from textual.message import Message as TextualMessage
 
+from rhinecode.todo.models import TODO_STATE_LABELS, TodoState
+
 from rhinecode.agent.events import ClarifyOption
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
@@ -2081,6 +2083,11 @@ class HistoryView(ScrollableContainer):
         ⚠ 必须一并把 `_current_batch` 置空：`remove_children` 已经把批次容器
         从 DOM 里删掉了，但这里还攥着一个指向已删除组件的引用——下一次
         可归并的调用会往那个「幽灵批次」里 `mount`，界面上什么都不出现。
+
+        待办块**不在本容器内**（它是 `#stage` 里 `HistoryView` 的兄弟节点，
+        见 `TodoPane` 的 docstring），因此这里天然碰不到它。
+        待办的清空走协调层（`_clear_todo`）与 `_reset_display_state`，
+        见 todo-list 扩展 F17。
         """
         self.query_one("#history-messages", Vertical).remove_children()
         self._current_batch = None
@@ -2320,6 +2327,132 @@ class ActivityView(Vertical):
         self.display = True
 
 
+class TodoPane(SelectableStatic):
+    """
+    主对话的待办清单块（todo-list 扩展 F10–F14）。
+
+    它是 `#stage` 里 `HistoryView` 的**兄弟节点**，base 层 `dock: bottom`——
+    历史内容在它上面正常滚动，它**不跟着滚**。形如：
+
+        ● 待办 (2/4)
+          ● 读现有实现        已完成
+          ● 改 login 接口     进行中
+          ● 改三处调用方      待办
+          ……还有 6 条，已完成 3 条
+
+    ## 它是观测区，不是交互区
+
+    区内没有任何操作入口。待办的增删改**只有一条写路径**（模型调 `todo_write`）
+    ——用户改不了。理由与 C15 共享清单同一条：两条并行的写路径里，
+    命令层那条绕开了「谁改的」这个记录；而在整表覆写语义下它还多一层麻烦，
+    模型下一次覆写会把用户的改动整个抹掉。
+
+    ## ⚠ 为什么在 `HistoryView` **外面**（验收期修订，原设计在里面）
+
+    初版把它做成 `HistoryView` 的子节点，理由是「历史区自带的框线正好把它围住，
+    框线天生连续」。真机反馈推翻了这个方案，**两条症状同一个根因**：
+
+    ① **历史区顶部凭空多出一段空白**（高度正好等于待办块）。
+       `HistoryView > Vertical` 那条 `min-height: 100%` 是 tui-display F39/F40
+       的全部实现，它解决的正是「内容短于视口时锚点产生负偏移、把消息推到底部」。
+       多一个 dock 子节点之后，`100%` 与「扣掉 dock 之后的真实视口」**对不上**，
+       负偏移原样回来——实测 `scroll_y = -6`，而 6 正是待办块的高度。
+    ② **框线左右不相接。** `HistoryView` 有 `padding: 0 1`，子节点被内缩到
+       `x=2..77`，而框线在 `x=0/79`，左右各空一列。
+
+    搬到外面之后两条同时消失，**且 `HistoryView` 的内部假设一个字没动**
+    ——它只是 `height: 1fr` 少分到几行，F39/F40 原样成立。这比在
+    `min-height` 上打补丁安全得多。
+
+    代价是要自己画左右与下边框（手法与 `#panel-dock` 完全相同），
+    并在可见时让 `HistoryView` 收起它自己的下边框（否则中间多一条横线，
+    看起来是两个框）——那个开关由 `app._refresh_todo` 统一切，见那里的说明。
+
+    ## 三条实现约束
+
+    1. **本类不做任何显示判断。** 「该不该显示」「留哪 5 条」「省略行怎么写」
+       全在 `todo.render.build_view` 里算好了，这里只负责上色与转义。
+       两处各判一次必然分叉。
+    2. **一切文本经本模块的 `escape`**，绝不用 rich 那版——待办标题来自模型
+       给的参数，落单的 `[` 会在布局阶段抛 `MarkupError`，
+       **没有任何 try/except 兜得住，整个应用退出**。
+    3. **继承 `SelectableStatic` 而不是 `Static`**：内容要能被拖选、能被复制。
+       走 `set_markup` 的 Content 通路时选区功能原生成立，
+       但 `plain_text()` 这个唯一权威取文本入口来自它。
+
+    ## ⚠ 字段名预检过
+
+    `_render` / `_closed` / `_running` 是 Textual `MessagePump` 的实例字段，
+    撞上**一律不报错**、只表现为「界面上东西凭空少了」（本项目已撞三次）。
+    本类只新增 `_view`，已在 `Static("x")` 实例上 `hasattr` 验过为干净。
+    """
+
+    # 缺省隐藏（与四个面板、活动区同一做法）：不依赖外部 App CSS 也能初始隐藏，
+    # 于是不使用这个能力的用户界面表现与改造前逐字一致（spec N5）。
+    DEFAULT_CSS = "TodoPane { display: none; }"
+
+    # 状态 → 颜色。**取值与子 Agent 活动区同源**：进行中橘（与工具行「执行中」
+    # 同色系，语义都是「还在跑」）、已完成绿、待办用次级灰。
+    #
+    # ⚠ 颜色只是**第二重**区分。第一重是中文文字标签——单色终端、截图、
+    # 以及色觉障碍用户那里颜色全都会丢失，而文字不会（spec F14）。
+    _STATE_COLORS = {
+        TodoState.IN_PROGRESS: "#FFA500",
+        TodoState.COMPLETED: "#5FD75F",
+        TodoState.PENDING: SECONDARY_COLOR,
+    }
+
+    def __init__(self) -> None:
+        super().__init__("", markup=True)
+        # 当前画着的视图；`None` 表示这块没在显示。
+        self._view = None
+
+    def update_view(self, view) -> None:
+        """
+        整块重绘待办块。
+
+        :param view: `todo.render.TodoView`；**`None` 表示整块不该显示**
+
+        `None` 时 `display = False`，Textual 会连带收回它占的布局空间——
+        于是历史区的可用高度回到没有待办时的样子（spec F11/N5）。
+
+        **整块重绘而不是增量 diff**：行数以 5 为界，重绘一次比算差异便宜，
+        而且不会错——增量更新要维护「哪一行对应哪一条」的映射，
+        那是一类典型的、出错后表现为「状态串行」的 bug（与活动区同一判断）。
+
+        副作用：改自身内容与可见性。
+        """
+        self._view = view
+        if view is None:
+            self.display = False
+            self.set_markup("")
+            return
+
+        # 标题列按 `cell_len` 补齐，使右侧的状态标签对齐成一列。
+        # 用 `cell_len` 而不是 `len`：中文占两格，按字符数补齐会参差不齐
+        # （与确认面板四个选项的对齐同一做法）。
+        width = max((cell_len(row.title) for row in view.rows), default=0)
+
+        lines = [f"[{SECONDARY_COLOR}]●[/] {escape(view.header)}"]
+        for row in view.rows:
+            color = self._STATE_COLORS.get(row.state, SECONDARY_COLOR)
+            padding = " " * max(0, width - cell_len(row.title) + 2)
+            lines.append(
+                f"  [{color}]●[/] {escape(row.title)}{padding}"
+                f"[{color}]{escape(TODO_STATE_LABELS[row.state])}[/]"
+            )
+        if view.overflow:
+            lines.append(f"  [{SECONDARY_COLOR}]{escape(view.overflow)}[/]")
+
+        self.set_markup("\n".join(lines))
+        self.display = True
+
+    @property
+    def view(self):
+        """当前画着的视图（`None` = 未显示）。供测试与界面判断用。"""
+        return self._view
+
+
 class OverlayPanel:
     """
     浮层面板的共用行为：**改变可见性时告诉外面一声**。
@@ -2494,6 +2627,108 @@ class InputBar(Input):
         if registry is not None:
             kwargs.setdefault("highlighter", CommandHighlighter(registry))
         super().__init__(**kwargs)
+        # 多行粘贴的暂存：`占位串 -> 原文`。见 `_on_paste`。
+        self._pastes: "dict[str, str]" = {}
+        self._paste_seq = 0
+
+    # ------------------------------------------------------------------ #
+    # 多行粘贴（真机反馈后加）
+    # ------------------------------------------------------------------ #
+
+    def _on_paste(self, event) -> None:
+        """
+        接住粘贴。**多行内容整段留住，界面上收成一个占位块。**
+
+        ## ⚠ 这是在修一个静默丢数据的缺陷
+
+        Textual 的 `Input._on_paste` 写死了 `event.text.splitlines()[0]`
+        ——**只取首行，其余直接丢掉，不给任何提示**。粘一段 50 行的报错进来，
+        49 行无声消失，而用户以为自己把整段发出去了。
+
+        单行输入框接不下多行是事实，但「接不下」不等于「悄悄扔掉」。
+
+        ## 为什么是占位块而不是把换行原样塞进去
+
+        换行塞进 `Input.value` 是可行的（值留得住，实测确认），但它在这个
+        单行组件里**渲染成空**——50 行会挤成一条首尾相连的长串，
+        既读不了也没法编辑。占位块对齐 Claude Code 的做法：
+        界面上显示 `[粘贴 #1 · 50 行]`，提交时原样展开。
+
+        ## 边界
+
+        用户把占位块删掉 = 明确表示不要这段内容，提交时那条自然不展开。
+        这不是静默丢失——**删除是他自己做的、看得见的动作**。
+
+        :param event: Textual 的 `Paste` 事件
+
+        副作用：改 `self.value`；往 `self._pastes` 里存一条原文。
+        """
+        # ⚠ **必须 `prevent_default()`，`stop()` 拦不住父类那个处理器。**
+        # Textual 的消息分发沿 `self.__class__.__mro__` 逐个类调同名处理器，
+        # `stop()` 只阻止**向上冒泡到别的组件**——父类 `Input._on_paste`
+        # 与本方法在同一个组件上，照样会被调到。不置位的后果是**两份内容
+        # 同时插进去**（占位块 + 首行），实测确认。
+        # `_get_dispatch_methods` 里那句 `if message._no_default_action: break`
+        # 就是它起作用的地方，而 MRO 从子类开始走，所以本方法先跑、能拦住。
+        event.prevent_default()
+        text = getattr(event, "text", "") or ""
+        if not text:
+            event.stop()
+            return
+
+        # 末尾的换行是复制时常见的附赠品，不算「多行」
+        body = text.rstrip("\r\n")
+        lines = body.splitlines()
+
+        if len(lines) <= 1:
+            # 单行：行为与 Textual 原本一致（除了不再吞掉尾部换行后的内容）
+            self._insert_or_replace(body)
+            event.stop()
+            return
+
+        # ⚠ **同一段内容再贴一次 = 就地展开成原文。**
+        #
+        # 占位块解决了「粘 50 行只剩 1 行」，但带来一个新问题：用户看不见
+        # 自己到底粘了什么，只能提交出去才知道。再贴一次就把它换成原文，
+        # 于是「想确认内容」不需要任何新的快捷键或界面——重复一次粘贴
+        # 是用户本来就会做的动作。
+        for token, stored in list(self._pastes.items()):
+            if stored == body and token in self.value:
+                self.value = self.value.replace(token, body, 1)
+                del self._pastes[token]
+                event.stop()
+                return
+
+        self._paste_seq += 1
+        token = f"[粘贴 #{self._paste_seq} · {len(lines)} 行]"
+        self._pastes[token] = body
+        self._insert_or_replace(token)
+        event.stop()
+
+    def _insert_or_replace(self, text: str) -> None:
+        """按当前选区插入或替换（与 Textual `Input._on_paste` 同一套语义）。"""
+        selection = self.selection
+        if selection.is_empty:
+            self.insert_text_at_cursor(text)
+        else:
+            self.replace(text, *selection)
+
+    def expand_pastes(self, text: str) -> str:
+        """
+        把占位块还原成原文。
+
+        :param text: 输入框里的字面内容
+        :returns: 展开后的文本；没有占位块时**原样返回**
+
+        ⚠ 只展开**当前还在文本里**的占位块。用户删掉的那些不还原
+        ——删除是他明确表达的意图。
+
+        副作用：无。
+        """
+        for token, body in self._pastes.items():
+            if token in text:
+                text = text.replace(token, body)
+        return text
 
     def _command_field_end(self) -> int:
         """返回命令字段的结束位置（开头到第一个空白之前；无空白即整段长度）。"""
@@ -2547,10 +2782,14 @@ class InputBar(Input):
 
         副作用：向消息总线 post InputSubmitted 消息；清空 self.value。
         """
-        text = self.value.strip()
+        # ⚠ 先展开多行粘贴的占位块，再 strip——发给模型的必须是原文。
+        text = self.expand_pastes(self.value).strip()
         if text:
             self.post_message(self.InputSubmitted(text))
             self.value = ""
+            # 暂存随提交一并清空：占位串的编号从下一条消息重新开始，
+            # 不清的话一次长会话会攒下所有历史粘贴的原文。
+            self._pastes.clear()
 
 
 # 模式标记样式（c10 F29/F30；auto-plan 扩展把 [DEFAULT] 改成 [AUTO]）：
