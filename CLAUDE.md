@@ -475,7 +475,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 3091 项，skipped 4，约 4 分钟
+python -m unittest discover -s tests      # 3096 项，skipped 4，约 4 分钟
 ```
 
 **跑满几分钟是正常的**，且几乎全是「为验真实行为付的真实代价」：实测
