@@ -164,41 +164,60 @@ class AskUserE2ETest(DriverFixture):
                     )
             self.assertGreaterEqual(len(provider.calls), 2)
 
-    async def test_free_text_carries_the_checked_ones_in_multi_select(self):
+    async def test_other_is_a_checkbox_and_typing_returns_to_the_list(self):
         """
-        ⚠ **多选题里选「其它…」，已勾的项要一起交上去**（F15 修订的相邻空白）。
+        ⚠ **多选题里「其它…」是第 N 个勾选项：打完字回到勾选界面，不当场交卷**
+        （F15 二次修订）。
 
-        原写法无条件只回传打的那句话：用户勾了「项目级」、又想补一条自己的，
-        那个勾选就凭空没了——而进自由输入态之后勾选**不在屏幕上**，
-        他不会发现。「其它…」在多选题里是「补一条」，不是「换一批」。
+        改之前打完字整道题就交了，于是「先补一条自己的、再回去把剩下几项勾上」
+        这个再自然不过的意图做不到，而且是交出去之后才发现。
 
-        步骤与真人一致：回车勾第一项（光标自动前进）→ 下移到「其它…」→
-        回车进自由输入 → 打字 → 回车。
+        步骤与真人一致：移到「其它…」→ 回车 → 打字 → 回车（**回到列表**）→
+        再勾一项 → 到「提交」行回车。
         """
-        app, provider = self.assemble(
-            self._script(_question("要哪几样？", "项目级", "用户级", multi=True))
+        app, _provider = self.assemble(
+            self._script(_question("要哪几样？", "单元测试", "README", multi=True))
         )
         async with self.driving(app) as (_pilot, core):
             await asyncio.to_thread(core.send, "问问我")
             await asyncio.to_thread(core.wait, 30.0)
+            panel = app.query_one(ClarifyPanel)
 
-            # 回车勾上第一项（光标自动前进到第二项），再下移一格到「其它…」
-            await asyncio.to_thread(core.keys, ["enter", "down", "enter"])
-            self.assertTrue(
-                app.query_one(ClarifyPanel).display, "自由输入态下面板不该收起"
+            # 下移两格到「其它…」（跳过两个候选项）并回车 → 自由输入态
+            await asyncio.to_thread(core.keys, ["down", "down", "enter"])
+            self.assertTrue(app._clarify_free_text, "该进自由输入态了")
+
+            await asyncio.to_thread(core.send, "还要 CI")
+            self.assertFalse(
+                app._clarify_free_text, "打完字必须回到勾选界面，不是当场交卷"
             )
-            await asyncio.to_thread(core.send, "还要一份 README")
+            self.assertEqual(
+                len(self._clarify_events()), 0, "打完字就结算了？那还怎么接着勾"
+            )
+            self.assertEqual(panel.custom_text(), "还要 CI")
+            self.assertTrue(
+                app.query_one(InputBar).disabled, "回到勾选界面后输入框要锁回去"
+            )
+
+            # 回到列表后再勾第一项（数字键直选），然后在「提交」行交卷。
+            # 四个可选项依次是：1 单元测试 / 2 README / 3 其它… / 4 提交
+            #
+            # ⚠ **这里刻意用数字键而不是方向键**：Textual 的
+            # `_widget_navigation.find_next_enabled` **会绕回另一头**
+            # （官方 docstring 原文 "wrap around the ends"），
+            # 于是「多按一格」不是停在末尾而是跳回第一项——按错一次不报错，
+            # 只表现为「最后那下回车没交卷」，排查方向会被完全带偏（真踩过）。
+            # 驱动设施的 `_answer_clarify_by_keys` 不受影响：它算的是精确步数。
+            await asyncio.to_thread(core.keys, ["1"])
+            self.assertEqual(panel.checked_labels(), ("单元测试",))
+            await asyncio.to_thread(core.keys, ["4"])
             await asyncio.to_thread(core.wait, 30.0)
 
             events = self._clarify_events()
-            self.assertEqual(len(events), 1)
+            self.assertEqual(len(events), 1, "最后那一下回车该交卷了")
             settled = str(events[0]["result"])
-            self.assertIn("还要一份 README", settled, "用户打的字没交上去")
-            self.assertIn(
-                "项目级", settled,
-                "已勾选的项被自由输入吞掉了——用户会以为它还在",
-            )
-        self.assertGreaterEqual(len(provider.calls), 2)
+            self.assertIn("还要 CI", settled, "自己打的那条没交上去")
+            self.assertIn("单元测试", settled, "回到列表后勾的那项没交上去")
 
     async def test_clarify_dispatches_the_notification_hook(self):
         """

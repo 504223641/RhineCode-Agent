@@ -177,15 +177,27 @@ class MultiSelectTest(unittest.TestCase):
         self.panel.activate_choice(index)
         self.assertEqual(self.panel.checked_labels(), ("丙",))
 
-    def test_other_row_never_gets_a_checkbox(self) -> None:
-        """「其它…」在多选下也不参与勾选——选它是要打字，不是要勾上。"""
-        other_index = self.panel._choices[-1][0]
-        row = _prompts(self.panel)[other_index]
+    def test_other_row_does_not_join_the_plain_toggle_set(self) -> None:
+        """
+        「其它…」的勾选状态**来自它那段文本**，不进 `_checked`（F15 二次修订）。
+
+        ⚠ 两份状态表达同一件事必然分叉（勾上了但文本是空的，或反过来），
+        而那种不一致在界面上看不出来，只表现为「提交行的条数不对」。
+
+        ⚠ 本条此前读的是 `_choices[-1]`——加了「提交」行之后那已经是**提交行**了，
+        于是它变成「断言提交行没有勾选框」，**照样全绿而验错了对象**。
+        这类静默漂移正是「加一行就要回头看谁在用下标取行」的理由。
+        """
+        other_position = len(self.panel._question.options)
+        self.panel.toggle_check(other_position)
+        self.assertEqual(self.panel.checked_labels(), (), "它不该进 `_checked`")
+        self.assertEqual(self.panel.checked_count(), 0, "也不该被算进条数")
+
+    def test_submit_row_never_gets_a_checkbox(self) -> None:
+        """反证：提交行是个动作不是候选项，不许长出勾选框。"""
+        row = _prompts(self.panel)[self.panel._choices[-1][0]]
         self.assertNotIn("\\[x]", row)
         self.assertNotIn("\\[ ]", row)
-        position = self.panel.choice_position(other_index)
-        self.panel.toggle_check(position)
-        self.assertEqual(self.panel.checked_labels(), ())
 
     def _submit_row(self) -> str:
         return _prompts(self.panel)[self.panel._choices[-1][0]]
@@ -355,42 +367,87 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class FreeTextKeepsChecksTest(unittest.TestCase):
+class OtherIsACheckboxInMultiSelectTest(unittest.TestCase):
     """
-    ⚠ **多选题里选「其它…」，已勾的项必须一起交上去**（F15 修订的相邻空白）。
+    ⚠ **多选题里「其它…」是第 N 个勾选项，勾上它的方式是打一段字**
+    （F15 二次修订）。
 
-    原写法无条件只回传打的那句话，于是：用户勾了两项、又想补一条自己的 →
-    移到「其它…」→ 打字 → **那两个勾选凭空没了**。而进自由输入态时面板
-    已经变成提示态、勾选根本不在屏幕上，他不会发现自己刚丢了两项。
-
-    判据：「其它…」在多选题里的语义是**补一条**，不是**换一批**。
+    改之前它是「进去打字 → 当场交卷」，于是用户想「先补一条自己的，
+    再回去把剩下几项勾上」这个再自然不过的意图**做不到**，
+    而且是交出去之后才发现。
     """
 
-    def test_checks_survive_entering_free_text(self) -> None:
-        panel = _panel(_question(multi=True, labels=("甲", "乙", "丙")))
-        panel.toggle_check(0)
-        panel.toggle_check(2)
-        panel.show_free_text()
+    def setUp(self) -> None:
+        self.panel = _panel(_question(multi=True, labels=("甲", "乙")))
+
+    def _other_row(self) -> str:
+        return _prompts(self.panel)[self.panel._choices[-2][0]]
+
+    def _submit_row(self) -> str:
+        return _prompts(self.panel)[self.panel._choices[-1][0]]
+
+    def test_other_row_shows_an_empty_checkbox(self) -> None:
+        self.assertIn("\[ ]", self._other_row())
+
+    def test_typing_checks_it_and_shows_what_you_typed(self) -> None:
+        """
+        回到列表后那一行要显示打的内容——只显示一个 `[x] 其它…` 的话，
+        用户想确认自己打了什么就只能再进去一次。
+        """
+        self.panel.set_custom_text("还要一份 README")
+        row = self._other_row()
+        self.assertIn("\[x]", row)
+        self.assertIn("还要一份 README", row)
+
+    def test_it_counts_toward_the_submit_row(self) -> None:
+        self.panel.toggle_check(0)
+        self.assertIn("已选 1 项", self._submit_row())
+        self.panel.set_custom_text("再加一条")
+        self.assertIn("已选 2 项", self._submit_row())
+
+    def test_enter_on_a_checked_other_clears_it(self) -> None:
+        """
+        ⚠ 它的回车语义必须与其余勾选项一致——**按一下切换**。
+
+        做成「已勾时再进去改」的话，用户就**没有任何办法把它取消掉**了。
+        """
+        self.panel.set_custom_text("写错了")
+        self.panel.highlighted = self.panel._choices[-2][0]
+        self.panel.action_select()
+        self.assertEqual(self.panel.custom_text(), "")
+        self.assertIn("\[ ]", self._other_row())
         self.assertEqual(
-            panel.checked_labels(), ("甲", "丙"),
-            "进了自由输入态就把勾选清了？那用户打完字会丢掉两项",
+            self.panel.get_option_at_index(self.panel.highlighted).id,
+            ClarifyPanel.SUBMIT_ID,
+            "取消之后光标照常推到提交行",
         )
 
-    def test_free_text_hint_says_the_checks_are_kept(self) -> None:
-        """
-        提示行必须说出来——本态下勾选不在屏幕上，不说的话用户会以为
-        打字把它们顶掉了，于是要么放弃打字、要么打完再回去重勾一遍。
-        """
-        panel = _panel(_question(multi=True, labels=("甲", "乙", "丙")))
-        panel.toggle_check(0)
-        panel.show_free_text()
-        self.assertIn("一起交上去", "".join(_prompts(panel)))
+    def test_checks_survive_entering_free_text(self) -> None:
+        """进自由输入态不许清掉已勾的项——回来还要接着挑。"""
+        self.panel.toggle_check(0)
+        self.panel.show_free_text()
+        self.assertEqual(self.panel.checked_labels(), ("甲",))
 
-    def test_single_select_hint_does_not_mention_checks(self) -> None:
-        """反证：单选题没有勾选可带，别凭空多一句话。"""
-        panel = _panel(_question(multi=False))
-        panel.show_free_text()
-        self.assertNotIn("一起交上去", "".join(_prompts(panel)))
+    def test_free_text_hint_differs_between_the_two_kinds(self) -> None:
+        """
+        ⚠ 两种题的回车含义不同，提示行是用户唯一的依据：
+        单选题打完就交卷，多选题打完只是记下来、回到勾选界面接着挑。
+        """
+        self.panel.show_free_text()
+        self.assertIn("回到勾选", "".join(_prompts(self.panel)))
+
+        single = _panel(_question(multi=False))
+        single.show_free_text()
+        text = "".join(_prompts(single))
+        self.assertIn("回车提交", text)
+        self.assertNotIn("回到勾选", text)
+
+    def test_single_select_other_row_has_no_checkbox(self) -> None:
+        """反证：单选题的「其它…」不该长出勾选框。"""
+        single = _panel(_question(multi=False))
+        row = _prompts(single)[single._choices[-1][0]]
+        self.assertNotIn("\[ ]", row)
+        self.assertNotIn("\[x]", row)
 
 
 class TextualClickRoutingTest(unittest.TestCase):

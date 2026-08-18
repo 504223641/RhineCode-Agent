@@ -2054,25 +2054,26 @@ class RhineApp(App):
                 # 结算成空串的话，模型会拿到一个「用户输入了空」的答案，
                 # 那比什么都不做更糟。
                 return
-            # ⚠ **多选题里已经勾上的项必须一起交上去**（F15 修订的相邻空白）。
+            # ⚠ **多选题里打完字不结算**（F15 二次修订）。
             #
-            # 原写法无条件只回传打的这句话，于是：用户勾了「单元测试」「CI」、
-            # 又想补一条自己的 → 移到「其它…」→ 打字 → **那两个勾选凭空没了**。
-            # 而进自由输入态时面板已变成提示态、勾选根本不在屏幕上，
-            # 他不会发现自己刚丢了两项——又一次「静默中间态」。
+            # 「其它…」在多选题里是**第 N 个勾选项**，勾上它的方式恰好是打一段字。
+            # 因此打完回车 = 那一项勾上了，回到勾选界面接着挑，最后仍在「提交」
+            # 行交卷——与其余勾选项走同一个出口。
             #
-            # 判据：用户勾都勾了，没有任何理由认为他想撤销；「其它…」在多选题里
-            # 的语义是**补一条**，不是**换一批**。单选题不受影响（没有勾选可带）。
-            labels: tuple = ()
+            # 原写法在这里直接结算，于是用户一打完字整道题就交了：他想「先补一条
+            # 自己的，再回去把剩下几项勾上」这个再自然不过的意图**做不到**，
+            # 而且交出去之后才发现。
+            #
+            # 单选题不受影响：那里没有「提交」行，打完就是答完。
             question = self._clarify_question
             if question is not None and question.multi_select:
-                try:
-                    labels = self.query_one(ClarifyPanel).checked_labels()
-                except Exception:  # noqa: BLE001 —— 取不到就退回只回传文本
-                    labels = ()
-            self._resolve_interaction(
-                ClarifyReply(kind="free_text", labels=labels, text=text)
-            )
+                panel = self.query_one(ClarifyPanel)
+                panel.set_custom_text(text)
+                self._leave_clarify_free_text()
+                panel.move_to_submit()
+                return
+
+            self._resolve_interaction(ClarifyReply(kind="free_text", text=text))
             return
 
         # 交互进行中 / 流式运行中 / 会话选择面板展示中：拦下提交。
@@ -3113,8 +3114,14 @@ class RhineApp(App):
 
         # ── 分支 2：多选的「提交」──
         if multi and option_id == ClarifyPanel.SUBMIT_ID:
+            custom = panel.custom_text()
+            # 勾了「其它…」的话，`kind` 是 `free_text`——它带着 `labels` 与
+            # `text` 两截，回灌会把两截分开说（见 `clarify._render_reply`）。
+            # 没勾就是纯多选，措辞与从前逐字一致。
             self._resolve_interaction(
-                ClarifyReply(kind="multi", labels=panel.checked_labels())
+                ClarifyReply(kind="free_text", labels=panel.checked_labels(), text=custom)
+                if custom
+                else ClarifyReply(kind="multi", labels=panel.checked_labels())
             )
             return
 

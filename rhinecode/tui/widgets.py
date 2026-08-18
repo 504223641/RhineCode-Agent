@@ -3699,6 +3699,11 @@ class ClarifyPanel(NumberedPanel):
         self._total: int = 1
         # 已勾选的**候选项下标**（不是 OptionList 下标）
         self._checked: set = set()
+        # 多选题里用户在「其它…」上自己打的那段文本；空串 = 那一项没勾上。
+        # ⚠ **它就是「其它…」的勾选状态**，不另设一个布尔——两份状态表达同一件事
+        # 必然会分叉（勾上了但文本是空的，或反过来），而那种不一致在界面上
+        # 看不出来，只表现为「提交行的条数不对」。
+        self._custom_text: str = ""
 
     # ------------------------------------------------------------------ #
     # 渲染
@@ -3746,8 +3751,9 @@ class ClarifyPanel(NumberedPanel):
         # 「提交」行：**把已选条数摆在用户正要按的那一行上**，他不必自己数，
         # 也不必把视线挪到别处去确认。
         if position == count + 1:
-            if self._checked:
-                return f"    提交（已选 {len(self._checked)} 项）"
+            total = self.checked_count()
+            if total:
+                return f"    提交（已选 {total} 项）"
             # 一项都没勾也允许提交——那是「这几个都不要」，与按 Esc 跳过
             # （「你自己定」）是两回事，见 `ClarifyReply` 的说明。
             return "    提交（一项都不选）"
@@ -3758,10 +3764,14 @@ class ClarifyPanel(NumberedPanel):
             label = escape(question.options[position].label)
         if not question.multi_select:
             return label
-        # 「其它…」在多选下同样不参与勾选（选它是要打字，不是要勾上）；
-        # 缩进四格与上方的 `[x] ` 勾选框对齐。
+
+        # 「其它…」在多选题里**也是一个勾选项**（F15 二次修订）：勾上它的方式是
+        # 打一段字，勾上之后那一行直接显示打的内容——不显示的话用户回到列表
+        # 只看得见一个 `[x] 其它…`，想确认自己打了什么就只能再进去一次。
         if position >= count:
-            return f"    {label}"
+            if self._custom_text:
+                return f"{self._CHECKED}其它：{escape(self._custom_text)}"
+            return f"{self._UNCHECKED}{label}"
         return f"{self._CHECKED if position in self._checked else self._UNCHECKED}{label}"
 
     def _hint_markup(self) -> str:
@@ -3832,6 +3842,7 @@ class ClarifyPanel(NumberedPanel):
         self._index = index
         self._total = total
         self._checked = set()
+        self._custom_text = ""
         self._render_options()
 
     def restore_options(self) -> None:
@@ -3861,14 +3872,16 @@ class ClarifyPanel(NumberedPanel):
             return
         self._reset_choices()
         self._add_static(self._header_markup())
-        # ⚠ 多选题里勾好的项会**一起交上去**，这一行必须说出来：进了本态之后
-        # 勾选就不在屏幕上了，不说的话用户以为打字会把它们顶掉，
-        # 于是要么放弃打字、要么打完再回去重勾一遍。
-        kept = ""
-        if self._question.multi_select and self._checked:
-            kept = f"（已勾的 {len(self._checked)} 项会一起交上去）"
+        # ⚠ **两种题的回车含义不同，这一行是用户唯一的依据**：
+        # 单选题打完就交卷；多选题打完只是记下来、回到勾选界面接着挑
+        # （F15 二次修订）。不说清楚的话，多选题里用户会以为一按回车就交了，
+        # 于是把剩下想勾的项全放弃掉。
+        if self._question.multi_select:
+            tail = "回车记下并回到勾选"
+        else:
+            tail = "回车提交"
         self._add_static(
-            f"[dim]{BRANCH_PREFIX}直接在下面打字，回车提交{kept} · Esc 退回选项[/dim]"
+            f"[dim]{BRANCH_PREFIX}直接在下面打字，{tail} · Esc 退回选项[/dim]"
         )
         self.set_visible(True)
 
@@ -3964,9 +3977,15 @@ class ClarifyPanel(NumberedPanel):
         """
         回车（以及数字键，它经基类的 `activate_choice` 也落到这里）。
 
-        **多选题里按在候选项上 = 勾选并前进，不结算**；其余一切
-        （单选的任何一项、多选的「其它…」与「提交」）沿用 `OptionList` 原生的
+        **多选题里按在候选项上 = 勾选并前进，不结算**；按在**已经勾上的
+        「其它…」**上 = 取消它（清掉打过的字）；其余一切（单选的任何一项、
+        多选里还没勾的「其它…」、「提交」）沿用 `OptionList` 原生的
         「发出 OptionSelected 交给 App 结算」。
+
+        ⚠ **「其它…」在多选题里就是个普通勾选项，只是勾上它要打字**
+        （F15 二次修订）。因此它的回车语义与其余勾选项一致——**按一下切换**：
+        没勾 → 进自由输入态去打字；已勾 → 直接取消。做成「已勾时再进去改」
+        的话，用户就没有任何办法把它取消掉了。
 
         ## 为什么这个差异落在 `action_select` 而不是 `activate_choice`
 
@@ -3977,15 +3996,48 @@ class ClarifyPanel(NumberedPanel):
         """
         question = self._question
         position = self.choice_position(self.highlighted)
-        if (
-            question is not None
-            and question.multi_select
-            and position is not None
-            and position < len(question.options)
-        ):
-            self.toggle_and_advance(position)
-            return
+        if question is not None and question.multi_select and position is not None:
+            if position < len(question.options):
+                self.toggle_and_advance(position)
+                return
+            # 已经勾上的「其它…」：取消它，光标照常推到「提交」
+            if position == len(question.options) and self._custom_text:
+                self.set_custom_text("")
+                self.move_to_submit()
+                return
         super().action_select()
+
+    def move_to_submit(self) -> None:
+        """把光标移到「提交」行（多选题才有；其余情形无副作用）。"""
+        submit = self._submit_position()
+        if submit is not None and 0 <= submit < len(self._choices):
+            self.highlighted = self._choices[submit][0]
+
+    def checked_count(self) -> int:
+        """已勾的总数——候选项 + 勾上了的「其它…」（后者算一项）。"""
+        return len(self._checked) + (1 if self._custom_text else 0)
+
+    def custom_text(self) -> str:
+        """多选题里用户自己打的那段；没打过是空串。"""
+        return self._custom_text
+
+    def set_custom_text(self, text: str) -> None:
+        """
+        记下用户在「其它…」上打的内容，并把那一行与提交行重画。
+
+        :param text: 用户打的原文（空串等于取消勾选）
+
+        副作用：改 `_custom_text`、重画两行。**不结算**——多选题里打完字
+        是回到勾选界面继续挑，不是交卷（F15 二次修订）。
+        """
+        self._custom_text = text.strip()
+        question = self._question
+        if question is None or not question.multi_select:
+            return
+        self._repaint_choice(len(question.options))       # 「其它…」那一行
+        submit = self._submit_position()
+        if submit is not None:
+            self._repaint_choice(submit)
 
     def checked_labels(self) -> tuple:
         """
