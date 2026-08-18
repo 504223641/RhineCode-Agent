@@ -270,6 +270,12 @@ def _render_reply(reply: Optional[ClarifyReply]) -> str:
     if reply is None:
         return "（用户没有选择，请按你的最佳判断继续）"
     if reply.kind == "free_text":
+        # 多选题里选「其它…」时，已经勾上的项**一起带过来**（F15 修订的相邻空白）
+        # ——「其它…」在多选题里是「补一条」不是「换一批」。措辞把两截分开，
+        # 免得模型把用户打的那句也当成一个候选项名。
+        if reply.labels:
+            picked = ", ".join(reply.labels)
+            return f"{picked}，另外还有：{reply.text}（后半句是用户自己输入的）"
         return f"{reply.text}（用户自己输入的）"
     if not reply.labels:
         # 只可能出现在多选：他看过全部选项，一个都不要。

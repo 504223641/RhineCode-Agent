@@ -15,12 +15,14 @@
 
 import unittest
 
+from rhinecode.agent import clarify
 from rhinecode.agent.clarify import (
     MAX_HEADER,
     MAX_OPTIONS,
     MAX_QUESTIONS,
     parse_questions,
 )
+from rhinecode.agent.events import ClarifyOption, ClarifyQuestion, ClarifyReply
 
 
 def _q(question="问题", options=None, **extra):
@@ -217,3 +219,46 @@ class OptionsAreImmutableTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderReplyTest(unittest.TestCase):
+    """
+    回灌清单里「→」右边那一截：四种答案类型的措辞刻意各不相同（F11/F12）。
+
+    ⚠ 尤其「多选一项都没勾」与「跳过」必须能分辨——前者是「都不要」，
+    后者是「随你」，那是两个相反的指令。
+    """
+
+    def _line(self, reply) -> str:
+        question = ClarifyQuestion(
+            question="要哪几样？",
+            options=(ClarifyOption(label="甲", description=""),),
+        )
+        return clarify.render_answers([(question, reply)])
+
+    def test_skip_and_empty_multi_read_differently(self) -> None:
+        skipped = self._line(None)
+        nothing = self._line(ClarifyReply(kind="multi", labels=()))
+        self.assertNotEqual(skipped, nothing)
+        self.assertIn("最佳判断", skipped)
+        self.assertIn("都不要", nothing)
+
+    def test_free_text_with_checks_shows_both_halves(self) -> None:
+        """
+        ⚠ 多选题里选「其它…」时，勾选与手打的内容**都要出现**，
+        且措辞要把两截分开——混成一串会让模型把用户打的那句
+        也当成一个候选项名。
+        """
+        line = self._line(
+            ClarifyReply(kind="free_text", labels=("单元测试", "CI"), text="还要 README")
+        )
+        self.assertIn("单元测试", line)
+        self.assertIn("CI", line)
+        self.assertIn("还要 README", line)
+        self.assertIn("用户自己输入", line)
+
+    def test_free_text_without_checks_is_unchanged(self) -> None:
+        """反证：单选题的自由输入不该凭空多出「另外还有」这种话。"""
+        line = self._line(ClarifyReply(kind="free_text", text="放到 docs 下面"))
+        self.assertIn("放到 docs 下面（用户自己输入的）", line)
+        self.assertNotIn("另外还有", line)

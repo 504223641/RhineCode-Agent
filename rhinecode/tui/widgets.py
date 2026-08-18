@@ -3861,7 +3861,15 @@ class ClarifyPanel(NumberedPanel):
             return
         self._reset_choices()
         self._add_static(self._header_markup())
-        self._add_static(f"[dim]{BRANCH_PREFIX}直接在下面打字，回车提交 · Esc 退回选项[/dim]")
+        # ⚠ 多选题里勾好的项会**一起交上去**，这一行必须说出来：进了本态之后
+        # 勾选就不在屏幕上了，不说的话用户以为打字会把它们顶掉，
+        # 于是要么放弃打字、要么打完再回去重勾一遍。
+        kept = ""
+        if self._question.multi_select and self._checked:
+            kept = f"（已勾的 {len(self._checked)} 项会一起交上去）"
+        self._add_static(
+            f"[dim]{BRANCH_PREFIX}直接在下面打字，回车提交{kept} · Esc 退回选项[/dim]"
+        )
         self.set_visible(True)
 
     # ------------------------------------------------------------------ #

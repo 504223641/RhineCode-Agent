@@ -2054,7 +2054,25 @@ class RhineApp(App):
                 # 结算成空串的话，模型会拿到一个「用户输入了空」的答案，
                 # 那比什么都不做更糟。
                 return
-            self._resolve_interaction(ClarifyReply(kind="free_text", text=text))
+            # ⚠ **多选题里已经勾上的项必须一起交上去**（F15 修订的相邻空白）。
+            #
+            # 原写法无条件只回传打的这句话，于是：用户勾了「单元测试」「CI」、
+            # 又想补一条自己的 → 移到「其它…」→ 打字 → **那两个勾选凭空没了**。
+            # 而进自由输入态时面板已变成提示态、勾选根本不在屏幕上，
+            # 他不会发现自己刚丢了两项——又一次「静默中间态」。
+            #
+            # 判据：用户勾都勾了，没有任何理由认为他想撤销；「其它…」在多选题里
+            # 的语义是**补一条**，不是**换一批**。单选题不受影响（没有勾选可带）。
+            labels: tuple = ()
+            question = self._clarify_question
+            if question is not None and question.multi_select:
+                try:
+                    labels = self.query_one(ClarifyPanel).checked_labels()
+                except Exception:  # noqa: BLE001 —— 取不到就退回只回传文本
+                    labels = ()
+            self._resolve_interaction(
+                ClarifyReply(kind="free_text", labels=labels, text=text)
+            )
             return
 
         # 交互进行中 / 流式运行中 / 会话选择面板展示中：拦下提交。
@@ -3070,11 +3088,18 @@ class RhineApp(App):
         ⚠ **顺序不能反**：多选态下高亮停在「其它…」上按回车，
         要进自由输入而不是提交勾选结果。
 
-        ⚠ **分支 3 看起来是死代码，但不是**（F15 修订）。回车与数字键都被
-        `ClarifyPanel.action_select` 接住了，走不到这里；**鼠标点击走得到**
-        ——`OptionList` 的点击直接发 `OptionSelected`，不经 `action_select`。
-        少了这一支，多选题里点一下候选项就会**当场提交**，而键盘上按同一项
-        只是勾选。同一个动作两种结果，且只有用鼠标的人撞得到。
+        ⚠ **分支 3 在 Textual 8.2.7 上正常不可达，留着是兜底**（F15 修订）。
+        实测确认过上游实现：`OptionList._on_click` 就是
+        `self.highlighted = clicked_option; self.action_select()`，因此
+        **鼠标点击与回车、数字键走的是同一条路**，三者都被
+        `ClarifyPanel.action_select` 接住，到不了这里。
+
+        那为什么不删：真到达时的**替代行为是错的**。删掉之后多选态下的数字 id
+        会落到分支 4（单选结算），把「用户勾了一项」当成「用户提交了一项」，
+        **静默提交一个他没打算交的答案**。留一支与键盘同语义的兜底，
+        代价是几行代码；删掉的代价是一次看不见的错答。
+        护栏见 `test_ask_user_panel.py::TextualClickRoutingTest`——它钉住的是
+        **上游那个事实**，换 Textual 大版本时会红，那正是需要重新判断的时刻。
 
         副作用：进入自由输入态、切换勾选，或结算一次交互。
         """

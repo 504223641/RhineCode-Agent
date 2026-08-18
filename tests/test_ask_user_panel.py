@@ -353,3 +353,72 @@ class MarkupSafetyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FreeTextKeepsChecksTest(unittest.TestCase):
+    """
+    ⚠ **多选题里选「其它…」，已勾的项必须一起交上去**（F15 修订的相邻空白）。
+
+    原写法无条件只回传打的那句话，于是：用户勾了两项、又想补一条自己的 →
+    移到「其它…」→ 打字 → **那两个勾选凭空没了**。而进自由输入态时面板
+    已经变成提示态、勾选根本不在屏幕上，他不会发现自己刚丢了两项。
+
+    判据：「其它…」在多选题里的语义是**补一条**，不是**换一批**。
+    """
+
+    def test_checks_survive_entering_free_text(self) -> None:
+        panel = _panel(_question(multi=True, labels=("甲", "乙", "丙")))
+        panel.toggle_check(0)
+        panel.toggle_check(2)
+        panel.show_free_text()
+        self.assertEqual(
+            panel.checked_labels(), ("甲", "丙"),
+            "进了自由输入态就把勾选清了？那用户打完字会丢掉两项",
+        )
+
+    def test_free_text_hint_says_the_checks_are_kept(self) -> None:
+        """
+        提示行必须说出来——本态下勾选不在屏幕上，不说的话用户会以为
+        打字把它们顶掉了，于是要么放弃打字、要么打完再回去重勾一遍。
+        """
+        panel = _panel(_question(multi=True, labels=("甲", "乙", "丙")))
+        panel.toggle_check(0)
+        panel.show_free_text()
+        self.assertIn("一起交上去", "".join(_prompts(panel)))
+
+    def test_single_select_hint_does_not_mention_checks(self) -> None:
+        """反证：单选题没有勾选可带，别凭空多一句话。"""
+        panel = _panel(_question(multi=False))
+        panel.show_free_text()
+        self.assertNotIn("一起交上去", "".join(_prompts(panel)))
+
+
+class TextualClickRoutingTest(unittest.TestCase):
+    """
+    ⚠ **钉住一条上游事实：`OptionList` 的鼠标点击经过 `action_select`。**
+
+    本扩展把多选的勾选逻辑放在 `action_select` 上，理由正是「它是回车、
+    数字键、鼠标点击三条路唯一的汇合点」。这个理由**整个依赖上游实现**
+    ——实测 Textual 8.2.7 的 `_on_click` 就是
+    `self.highlighted = clicked_option; self.action_select()`。
+
+    上游哪天改成直接 `post_message(OptionSelected(...))`，鼠标点击就会绕开
+    我们的覆写、在多选题里**当场提交**，而键盘按同一项只是勾选——
+    同一个动作两种结果，且只有用鼠标的人撞得到，测试全绿。
+
+    这条红了不代表有 bug，代表**那个判断要重新做一遍**（`app.py`
+    `_settle_clarify` 的分支 3 是为此留的兜底）。
+    """
+
+    def test_click_goes_through_action_select(self) -> None:
+        import inspect
+
+        from textual.widgets import OptionList
+
+        source = inspect.getsource(OptionList._on_click)
+        self.assertIn(
+            "action_select",
+            source,
+            "Textual 改了点击的路由：鼠标点击不再经过 action_select。"
+            "多选的勾选逻辑挂在那里，必须重新确认点击在多选题里的行为。",
+        )
