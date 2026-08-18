@@ -61,6 +61,7 @@ from rhinecode.subagents.toolset import resolve_toolset
 from rhinecode.team.gate import TeamGate
 from rhinecode.team.render import render_team_brief
 from rhinecode.todo import (
+    TodoState,
     build_view,
     render_all_done_text,
     render_todo_brief,
@@ -2163,12 +2164,25 @@ class ConversationManager:
 
         :returns: 一段提醒；未启用、或全部完成时为空串
 
+        ⚠ **序号取的是清单里的位置（从 1 起），不是「第几条没做完」。**
+        用户在界面上看到的编号就是位置，两处必须是同一个数——提醒里说
+        「第 3 条」而界面上第 3 条是别的东西，比不给序号更糟。
+
         副作用：无。
         """
         if self.todo_store is None:
             return ""
         _completed, total = self.todo_store.counts()
-        return render_todo_reminder(total, self.todo_store.all_completed())
+        # 一条 in_progress 都没有时传 None，那是「点火分支」的入口
+        # （详见 `todo/render.py` 的 `render_todo_reminder`），不是缺省值。
+        in_progress: Optional[tuple[int, str]] = None
+        for position, item in enumerate(self.todo_store.snapshot(), start=1):
+            if item.state is TodoState.IN_PROGRESS:
+                in_progress = (position, item.title)
+                break
+        return render_todo_reminder(
+            total, self.todo_store.all_completed(), in_progress
+        )
 
     def _todo_brief_text(self) -> str:
         """

@@ -1783,13 +1783,21 @@ class Agent:
         #
         # 文案要点：说清**现在是什么阶段**、**为什么被拒**、**下一步该做什么**。
         # 只说「不允许」会让模型换个工具名再试一次（同 out_of_scope 的教训）。
+        #
+        # ⚠ 工具可以用 `plan_blocked_hint` 追加一句自述，理由见
+        # `tools/base.py` 的同名字段说明：通用文案里那句「会产生副作用」
+        # 并非对每个被挡的工具都成立，而**一句不准确的拒绝理由会把模型
+        # 推去找绕过的办法**（`todo_write` 纯内存零副作用，它被挡的真实
+        # 理由是「待办是执行期的东西」）。
         for tc in plan_blocked:
             yield AgentEvent(type=AgentEventType.TOOL_START, tool_call=tc)
+            hint = getattr(self._registry.get(tc.name), "plan_blocked_hint", "")
             res = ToolResult(
                 ok=False,
                 output=(
-                    f"[计划模式] 现在处于**规划阶段**，{tc.name} 会产生副作用，因此没有执行。\n"
-                    f"规划阶段只允许只读调研（读文件、搜索、查看结构）与向用户提问。\n"
+                    f"[计划模式] 现在处于**规划阶段**，{tc.name} 在这一阶段不可用，因此没有执行。\n"
+                    + (f"{hint}\n" if hint else "")
+                    + f"规划阶段只允许只读调研（读文件、搜索、查看结构）与向用户提问。\n"
                     f"若这一步是方案的一部分，请把它写进计划、用 present_plan 提交给用户审批；"
                     f"获批后你才可以执行它。不要改用别的工具绕过这一限制。"
                 ),

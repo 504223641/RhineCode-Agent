@@ -188,6 +188,27 @@ class Tool(ABC):
                  之所以做成工具自己声明的标志、而不是在分类器里按名字硬编码：
                  与 `system_serial` 同一条理由——那会让分类器包认识具体工具的
                  名字，而它现在是个只依赖 provider 的叶子包。
+
+    - plan_blocked_hint：**规划阶段被挡下时，追加给模型的一句自述**。
+                 缺省空串 = 不追加，用通用文案。
+
+                 规划阶段守卫的通用文案说的是「这个工具会产生副作用」——
+                 那对绝大多数被挡的工具都成立（写文件、跑命令），
+                 但**不是所有工具都因为副作用而被挡**。
+
+                 ⚠ **一句不准确的拒绝理由比没有理由更糟**：模型会照着它去
+                 找绕过的办法。`todo_write` 就是这种情况——它纯内存、零副作用，
+                 被挡是因为「待办是执行期的东西，规划期不该有」。跟它说
+                 「你有副作用」，它下一步就会去想「那我换个没副作用的说法」。
+
+                 本字段让工具自己补一句「我到底是什么、为什么此刻不该用我」。
+                 手法对齐 Codex 的 `update_plan`——它在 Plan 模式下被硬拒时
+                 回的是「update_plan is a TODO/checklist tool and is not
+                 allowed in Plan mode」，那句话在**教模型区分两个概念**，
+                 而不只是宣布一条禁令。
+
+                 ⚠ 这是**收紧侧**的文案，只在工具已经被挡下之后才出现，
+                 不影响任何一层的判定。
     """
 
     name: str = ""
@@ -197,6 +218,9 @@ class Tool(ABC):
     system_serial: bool = False
     plan_safe: bool = False
     workspace_aware: bool = False
+    # 规划阶段被守卫挡下时，追加在通用文案后面的一句自述。空串 = 不追加。
+    # 语义与用法见类 docstring 的 `plan_blocked_hint` 一节。
+    plan_blocked_hint: str = ""
     # c16：空串 = 不进分类器。取值见上方类 docstring 的那张表。
     classifier_scope: str = ""
     primary_arg: str = ""

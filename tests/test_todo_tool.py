@@ -51,8 +51,25 @@ class DeclarationTest(unittest.TestCase):
         """
         self.assertTrue(self.tool.system_serial)
 
-    def test_plan_safe(self) -> None:
-        self.assertTrue(self.tool.plan_safe)
+    def test_not_plan_safe(self) -> None:
+        """
+        ⚠ **2026-08-18 由 True 翻成 False**（原 spec F8 被推翻）。
+
+        改的不是「它有没有副作用」——它确实零副作用，那半句仍然成立；
+        改的是「规划阶段该不该有待办」这个产品判断。
+        完整理由与两阶段的行为护栏在 `tests/test_todo_plan_stage.py`。
+        """
+        self.assertFalse(self.tool.plan_safe)
+
+    def test_declares_a_plan_blocked_hint(self) -> None:
+        """
+        被规划阶段守卫挡下时要有自己的话说。
+
+        通用文案说的是「这个工具会产生副作用」，而本工具没有——
+        **一句不准确的拒绝理由会把模型推去找绕过的办法**。
+        文案内容由 `tests/test_todo_plan_stage.py` 逐条钉住。
+        """
+        self.assertTrue(self.tool.plan_blocked_hint)
 
     def test_not_workspace_aware(self) -> None:
         """刻意不声明：本工具不碰任何路径。"""
@@ -238,7 +255,23 @@ class SameVoiceTest(unittest.TestCase):
     # 加的不是推力（那会把 flash 推成过触发），是一个**可匹配的时点**：
     # 「第一次调用 edit_file / write_file / run_command 之前」。
     # 「开始动手之前」是抽象判断，模型对它系统性偷懒；三个工具名是可匹配项。
-    _LAYERS = ("三步", "完整清单", "如实", "每做完一步", "第一次调用")
+    #
+    # ⚠ **第六、七层是 2026-08-18 为治「中途不更新、最后一次性全标完」加的，
+    # 它们互相咬合、不许单独删。** 原文写着「允许多条同时是 in_progress」，
+    # 那句话被模型当成免责条款用：开工时把几条全标 in_progress 之后，
+    # 清单**从此永远合法**，再没有任何东西迫使它开口。
+    # 「同一时刻只有一条」是台发动机（每做完一件事，清单就变得不合规，
+    # 而修好它的唯一办法就是再调一次工具）；「不许跳步」是它的锁
+    # （少了它，剩下的 pending 仍可被一次性直接标成 completed，绕开发动机）。
+    _LAYERS = (
+        "三步",
+        "完整清单",
+        "如实",
+        "每做完一步",
+        "第一次调用",
+        "同一时刻只能有一条 in_progress",
+        "不许从 pending 直接跳到 completed",
+    )
 
     def setUp(self) -> None:
         tool, _ = make_tool()
@@ -252,7 +285,7 @@ class SameVoiceTest(unittest.TestCase):
                 self.assertIn(layer, self.description, "工具描述缺了这一层")
                 self.assertIn(layer, self.brief, "系统提示那段缺了这一层")
 
-    def test_the_guard_covers_five_layers(self) -> None:
+    def test_the_guard_covers_seven_layers(self) -> None:
         """
         ⚠ **护栏自身的护栏。**
 
@@ -266,9 +299,12 @@ class SameVoiceTest(unittest.TestCase):
         ⚠ **从四层涨到五层是 2026-08-18 真机复测的结果**，理由写在
         `_LAYERS` 上方。涨表要在这里改是**刻意的**——它逼着加层的人
         顺手确认「新加的这层两处都写了」。
+
+        ⚠ **同日又从五层涨到七层**（进度纪律那两条），理由同样写在
+        `_LAYERS` 上方。那两条**互相咬合**，删掉任一条另一条即失效。
         """
-        self.assertEqual(len(self._LAYERS), 5)
-        self.assertEqual(len(set(self._LAYERS)), 5, "五层意思不能有重复")
+        self.assertEqual(len(self._LAYERS), 7)
+        self.assertEqual(len(set(self._LAYERS)), 7, "七层意思不能有重复")
 
     def test_both_say_three_steps_or_more(self) -> None:
         """第一层：**下限可数**。「三步」在两处都要出现。"""
@@ -281,7 +317,7 @@ class SameVoiceTest(unittest.TestCase):
         self.assertIn("完整清单", self.brief)
 
     def test_both_say_state_must_be_truthful(self) -> None:
-        """第三层：状态如实反映实际执行情况，允许多条同时进行中。"""
+        """第三层：状态如实反映实际执行情况。"""
         for text in (self.description, self.brief):
             self.assertIn("如实", text)
             self.assertIn("in_progress", text)
@@ -290,6 +326,69 @@ class SameVoiceTest(unittest.TestCase):
         """第四层：每完成一步就更新，不要攒到最后。"""
         for text in (self.description, self.brief):
             self.assertIn("每做完一步", text)
+
+    def test_both_say_exactly_one_in_progress(self) -> None:
+        """
+        第六层：同一时刻只能有一条 in_progress。
+
+        ⚠ **这条是「中途不更新」那个病的主药**，理由见 `_LAYERS` 上方。
+        """
+        for text in (self.description, self.brief):
+            self.assertIn("同一时刻只能有一条 in_progress", text)
+
+    def test_neither_permits_multiple_in_progress(self) -> None:
+        """
+        ⚠ **反证：旧口径不得残留。**
+
+        原文那句「允许多条同时是 in_progress」在**字面上仍然像句好话**
+        （它讲的是「别说假话」），因此最可能的退化方式不是删掉新规矩，
+        而是「顺手把旧那句加回来当补充说明」——两句并存时模型听哪句
+        没有定论，而界面上完全看不出来。
+
+        没有这一条的话，上面那条正向断言在两句并存时**照样通过**。
+        """
+        for text in (self.description, self.brief):
+            self.assertNotIn("允许多条", text)
+            self.assertNotIn("多条同时是 in_progress", text)
+
+    def test_both_forbid_jumping_from_pending_to_completed(self) -> None:
+        """
+        第七层：不许从 pending 直接跳到 completed。
+
+        ⚠ **它是第六层的锁。** 少了它，模型仍可把剩下的 pending 一次性
+        直接标成 completed——那正是要治的症状本身，而第六层管不到
+        （那一刻清单上确实只有零条 in_progress，形式上合规）。
+        """
+        for text in (self.description, self.brief):
+            self.assertIn("不许从 pending 直接跳到 completed", text)
+
+    def test_both_anchor_the_update_moment_to_concrete_tools(self) -> None:
+        """
+        更新的时点必须挂在**可匹配的动作**上，不是「做完一步」这种抽象判断。
+
+        ⚠ 判据取「三个工具名同时出现在更新那句话附近」不现实（措辞会变），
+        故退一步钉两件事：两处都点名了那三个工具，且都说了「之前」。
+        依据与第五层同源——模型对有具体可匹配项的指令遵循得好，
+        对抽象判断系统性偷懒。
+        """
+        for text in (self.description, self.brief):
+            for tool_name in ("edit_file", "write_file", "run_command"):
+                self.assertIn(tool_name, text)
+            self.assertIn("之前", text)
+
+    def test_both_tell_how_to_mark_parallel_work(self) -> None:
+        """
+        ⚠ **「只能一条」必须配一个出口，否则模型遇到并行会自己发明标法。**
+
+        两种真实情形各要有做法：多个子 Agent 同时跑（清单上算一条）、
+        某条卡住了要先做后面的（重排清单，不是多标一条 in_progress）。
+
+        没有出口的规矩会被绕过而不是被遵守——这与「负例是边界唯一的
+        形状来源」是同一条经验。
+        """
+        for text in (self.description, self.brief):
+            self.assertIn("子 Agent", text)
+            self.assertIn("重排清单", text)
 
     def test_both_say_when_not_to_use_it(self) -> None:
         """
@@ -335,21 +434,36 @@ class ManyShotExamplesTest(unittest.TestCase):
     子 Agent 去做」）。负例是「不该列」那条边界唯一的形状来源。
     """
 
-    # 正负两侧的小标题。⚠ 判定靠它们把描述切成两段，改标题要同步改这里。
+    # 三段的小标题。⚠ 判定靠它们切段，改标题要同步改这里。
     _POSITIVE_HEADING = "## 该用的例子"
     _NEGATIVE_HEADING = "## 不该用的例子"
+    # ⚠ 第三段（2026-08-18 加）：它的例子回答「已经决定要列了，遇到并行怎么标」，
+    # **与触发无关**。不单独切出来的话，它们会被算进负例段，
+    # 于是「负例恰好 4 个」那条钉子失效——而负例数量正是本类最要紧的一条。
+    _PROGRESS_HEADING = "## 进度怎么推"
 
     def setUp(self) -> None:
         tool, _ = make_tool()
         self.description = tool.description
 
     def _split(self) -> tuple[str, str]:
-        """把描述切成「正例段」与「负例段」两半。"""
+        """
+        把描述切成「正例段」与「负例段」两半。
+
+        ⚠ 负例段**到进度段为止**——进度段里的例子不是负例。
+        """
         self.assertIn(self._POSITIVE_HEADING, self.description)
         self.assertIn(self._NEGATIVE_HEADING, self.description)
+        self.assertIn(self._PROGRESS_HEADING, self.description)
         head, _, tail = self.description.partition(self._NEGATIVE_HEADING)
         _, _, positive = head.partition(self._POSITIVE_HEADING)
-        return positive, tail
+        negative, _, _ = tail.partition(self._PROGRESS_HEADING)
+        return positive, negative
+
+    def _progress_section(self) -> str:
+        """「进度怎么推」那一段的正文。"""
+        _, _, section = self.description.partition(self._PROGRESS_HEADING)
+        return section
 
     def test_four_positive_and_four_negative_examples(self) -> None:
         """
@@ -369,13 +483,21 @@ class ManyShotExamplesTest(unittest.TestCase):
         光给「用户说 X，你就调工具」是让模型背答案，只有说清判据
         （命中了哪一条、为什么这算三步）才迁移得到没见过的场景上。
         Claude Code 那八个例子**每一个**都有 `<reasoning>` 块。
+
+        ⚠ 总数 **10 = 触发 8 + 进度 2**。分开数是刻意的：只钉总数的话，
+        「删掉一个负例、补一个进度例」会静默通过，而那恰好是最坏的退化
+        （单向推力回来了，测试还是绿的）。
         """
-        self.assertEqual(self.description.count("<例子>"), 8)
-        self.assertEqual(self.description.count("</例子>"), 8, "有例子没闭合")
+        positive, negative = self._split()
+        self.assertEqual(positive.count("<例子>") + negative.count("<例子>"), 8)
+        self.assertEqual(self._progress_section().count("<例子>"), 2)
+
+        self.assertEqual(self.description.count("<例子>"), 10)
+        self.assertEqual(self.description.count("</例子>"), 10, "有例子没闭合")
         self.assertEqual(
-            self.description.count("<为什么>"), 8, "有例子没写判据"
+            self.description.count("<为什么>"), 10, "有例子没写判据"
         )
-        self.assertEqual(self.description.count("</为什么>"), 8)
+        self.assertEqual(self.description.count("</为什么>"), 10)
 
     def test_a_two_step_case_is_shown_as_not_listing(self) -> None:
         """

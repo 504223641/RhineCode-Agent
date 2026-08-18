@@ -254,12 +254,25 @@ class PromptSlotTest(unittest.TestCase):
 
 
 class PlanStageTest(unittest.TestCase):
-    """AC7：规划阶段可用。"""
+    """
+    ⚠ **原 AC7「规划阶段可用」已于 2026-08-18 推翻**，现为「规划阶段不可用」。
 
-    def test_plan_safe_is_declared(self) -> None:
-        self.assertTrue(_make_tool().plan_safe)
+    症状：任务还没聊定，待办清单就先冒出来了。理由与两阶段的行为护栏都在
+    `tests/test_todo_plan_stage.py`，本类只留接线层面的两条。
+    """
 
-    def test_plan_stage_call_succeeds(self) -> None:
+    def test_plan_safe_is_not_declared(self) -> None:
+        self.assertFalse(_make_tool().plan_safe)
+
+    def test_execute_still_accepts_the_plan_stage_keyword(self) -> None:
+        """
+        ⚠ **签名保留 `plan_stage` 是刻意的，不是漏删。**
+
+        循环现在不会再传它（只有 `plan_safe=True` 的工具才收得到），
+        但删掉它意味着将来若把标志改回 True，循环传进来时会直接抛
+        `TypeError`——那是个只在 Plan Mode 里才复现的运行期崩溃，
+        而改标志的人不会想到还要改签名。
+        """
         store = TodoStore()
         tool = TodoWriteTool(store)
         result = tool.execute({"todos": [{"title": "调研现状"}]}, plan_stage=True)
@@ -319,6 +332,98 @@ class DisabledIsZeroRegressionTest(unittest.TestCase):
         self.assertIsNone(m.todo_view())
         self.assertFalse(m.todo_all_done())
         self.assertEqual(m.todo_all_done_text(), "")
+
+
+class ReminderWiringTest(unittest.TestCase):
+    """
+    协调层怎么把清单状态喂给每轮提醒（`_todo_reminder_text`）。
+
+    ⚠ **序号必须是清单里的位置，不是「第几条没做完」。** 用户在界面上看到
+    的编号就是位置——提醒里说「第 3 条」而界面上第 3 条是别的东西，
+    比不给序号更糟：模型会去更新错的那条，而它自认为照做了。
+    这类错误在界面上完全看不出来（两个数字都「像是对的」，只是不相等）。
+    """
+
+    class _Manager:
+        """只带 `todo_store` 的最小协调层替身。"""
+
+        from rhinecode.conversation import ConversationManager as _CM
+
+        _todo_reminder_text = _CM._todo_reminder_text
+
+        def __init__(self, store) -> None:
+            self.todo_store = store
+
+    def _manager_with(self, rows):
+        """
+        建一个装了指定清单的协调层替身。
+
+        ⚠ **必须断言写入成功。** 状态的键名是 `state`；写成 `status` 会被
+        静默忽略并**默认成 pending**（`parse_state(None)` 的既有行为），
+        于是每一条用例都会「通过」在一份全是 pending 的清单上——
+        断言看起来在验位置，实际什么都没验到。写这几条时真踩过。
+        """
+        store = TodoStore()
+        outcome = store.replace(rows)
+        self.assertTrue(outcome.ok, f"预置清单没写进去：{outcome.reason}")
+        return self._Manager(store)
+
+    def test_disabled_says_nothing(self) -> None:
+        """未启用时空串——与其余读取口径一致。"""
+        m = self._Manager(None)
+        self.assertEqual(m._todo_reminder_text(), "")
+
+    def test_position_is_the_list_index_not_the_undone_index(self) -> None:
+        """
+        ⚠ **分辨力所在**：第 1 条已完成，in_progress 是清单里的**第 2 条**。
+
+        若实现改成「在未完成条目里数」，这里会得到「第 1 条」——
+        而界面上第 1 条写着「改 a.py」。构造上必须让两种算法给出不同答案，
+        否则这条护栏形同虚设。
+        """
+        m = self._manager_with(
+            [
+                {"title": "改 a.py", "state": "completed"},
+                {"title": "改 b.py", "state": "in_progress"},
+                {"title": "跑测试", "state": "pending"},
+            ]
+        )
+        text = m._todo_reminder_text()
+        self.assertIn("第 2 条", text)
+        self.assertIn("改 b.py", text)
+        self.assertNotIn("第 1 条", text)
+
+    def test_no_in_progress_reaches_the_ignition_branch(self) -> None:
+        """零条 in_progress 时要传 `None`，让提醒走点火分支。"""
+        m = self._manager_with(
+            [
+                {"title": "改 a.py", "state": "completed"},
+                {"title": "改 b.py", "state": "pending"},
+            ]
+        )
+        self.assertIn("一条 in_progress 都没有", m._todo_reminder_text())
+
+    def test_first_in_progress_wins_when_several_slip_through(self) -> None:
+        """
+        ⚠ 「只能一条」是**写给模型的约定，不是存储层校验**——数据层照单全收。
+
+        因此协调层必须对「真出现了多条」有确定行为：取**最靠前**那条。
+        不定行为会让提醒在同一份清单上时而念这条、时而念那条。
+        """
+        m = self._manager_with(
+            [
+                {"title": "改 a.py", "state": "in_progress"},
+                {"title": "改 b.py", "state": "in_progress"},
+            ]
+        )
+        text = m._todo_reminder_text()
+        self.assertIn("第 1 条", text)
+        self.assertIn("改 a.py", text)
+
+    def test_all_done_still_says_nothing(self) -> None:
+        """全部完成时不提醒，接线层不得绕过这个判断。"""
+        m = self._manager_with([{"title": "改 a.py", "state": "completed"}])
+        self.assertEqual(m._todo_reminder_text(), "")
 
 
 if __name__ == "__main__":
