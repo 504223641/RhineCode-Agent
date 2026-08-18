@@ -165,7 +165,7 @@ clear() -> None
 | `name` | `todo_write` | 对齐 Claude Code 的 `TodoWrite`，蛇形化 |
 | `read_only` | `False` | 它改状态 |
 | `system_serial` | `True` | spec F7：不弹面板，但仍过引擎、对④层免疫 |
-| `plan_safe` | `True` | spec F8：规划阶段可用（纯内存，无外部副作用） |
+| `plan_safe` | ~~`True`~~ → **`False`** | ⚠ 2026-08-18 推翻，见 spec F8 的勘误块。改的不是「有没有副作用」（那半句仍成立），是「规划阶段该不该有待办」 |
 | `workspace_aware` | `False` | 不碰路径 |
 | `classifier_scope` | **不声明** | 不跑命令 / 不联网 / 不发消息 |
 
@@ -538,7 +538,7 @@ T1 量的是**复刻品**，T19 用产品那一份真实的 `HistoryView` + `Tod
 | F5 非法拒绝、一字节不改 | 锁外全量校验，全通过才进锁替换 |
 | F6 硬上限 | `MAX_ITEMS = 30`，超出拒绝 |
 | F7 不弹面板但过管线 | `system_serial = True` |
-| F8 规划阶段可用 | `plan_safe = True` + `execute` 接 `plan_stage` |
+| ~~F8 规划阶段可用~~ → **规划阶段不可用** | `plan_safe = False` + `plan_blocked_hint`；`execute` 的 `plan_stage` 形参**刻意保留**（见 spec F8 勘误块） |
 | F9 子 Agent 拿不到 | `GLOBAL_DENIED_TOOLS` |
 | F10 钉在历史区内部底端 | `TodoPane` + `dock: bottom`（T1 实测确认） |
 | F11 空或全完成则整块隐藏 | `build_view` 返回 `None` → `display = False` |
