@@ -87,7 +87,8 @@ from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import (
     AgentEvent,
     AgentEventType,
-    ClarifyOption,
+    ClarifyQuestion,
+    ClarifyReply,
     ConfirmDecision,
     StopReason,
 )
@@ -108,8 +109,11 @@ from rhinecode.permission import (
 # 人在回路（HITL）确认回调类型：给定工具调用、工具实例与决策结果（含拒绝原因），
 # 返回四态决定（本次/本会话/永久/拒绝）。由 TUI 层实现（弹确认面板），协调层只调用。
 ConfirmCallback = Callable[[ToolCall, Tool, DecisionResult], ConfirmDecision]
-# 需求澄清回调：给定问题与候选项，返回用户所选概述；返回 None 表示用户取消。
-ClarifyCallback = Callable[[str, list[ClarifyOption]], Optional[str]]
+# 需求澄清回调：弹一次面板问**一个**问题，返回用户的作答；
+# 返回 None 表示用户跳过（按了 Esc）。
+# 入参是 (问题, 第几题从 0 起, 共几题)——后两个供面板显示进度、
+# 并让界面判断「答完这题要不要收面板」（ask-user 扩展 F13/F14）。
+ClarifyCallback = Callable[["ClarifyQuestion", int, int], Optional["ClarifyReply"]]
 # 计划审批回调：给定计划文本，返回用户是否批准开始执行。
 ApprovePlanCallback = Callable[[str], bool]
 
@@ -1911,6 +1915,23 @@ class ConversationManager:
         # 分支，这里也不会把确认面板弹到一条用户没在看的运行上。
         ask = None if unattended else self._build_ask()
 
+        # ask-user 扩展 F3：**澄清面板同理，无人轮里一个都不许弹。**
+        #
+        # ⚠ 这一行是本扩展里唯一会真的把产品搞坏的地方，写在这里是因为它与
+        # 上面那行是同一件事的两半。改造前 `clarify` 在无人轮里是**照传不误**的
+        # ——当时无害（`ask_user` 只在规划阶段可见，而无人轮不在 Plan Mode），
+        # 覆盖面一放开就变成：
+        #
+        #   半夜队友消息唤起主对话跑一轮 → 模型提问 → 面板弹出 → **没人在**
+        #   → Agent 线程停在 `Event.wait()` 上，**没有超时**
+        #   → 次日用户回来打字，输入框回一句「请先在面板上做出选择」，
+        #     而那个问题关于一件他从没提过的事。
+        #
+        # 传 None 之后模型在那一轮**看不到**这个工具（`_schema_for` 的判据），
+        # 硬造出调用也只会拿到一句「用户不在场，你自己定」（`_run_ask_user`
+        # 的纵深防御）。C15 安全边界第 ④ 条要求的「一个面板都不弹」由此成立。
+        clarify = None if unattended else self.clarify_callback
+
         events = self._agent.run(
             self.history,
             self.thinking_effort,
@@ -1921,7 +1942,7 @@ class ConversationManager:
             debug_log_path,
             self._engine,
             ask,
-            self.clarify_callback,
+            clarify,
             # auto-plan F12：同上，走包装方法（两处共用同一个实现）。
             self._approve_plan_then_exit,
             self._cancel_event,
