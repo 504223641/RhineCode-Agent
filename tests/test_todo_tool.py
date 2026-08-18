@@ -9,6 +9,10 @@
 - `SameVoiceTest` —— 工具描述与系统提示那段必须同口径。这是同一个坑的
   **第五次**（C11 Skill 清单、C13 角色清单、C14 交付信息、C15 消息标记块），
   前四次全都是真实模型实测才发现的。
+- `ManyShotExamplesTest` —— 描述里那八个正反示例**是本工具唯一有效的触发手段**，
+  不是可有可无的装饰。真机验收下静态规则三个杠杆全部失效（各 0 次调用），
+  对齐 Claude Code 补上示例才是第四个杠杆。护栏钉住正反两侧的数量，
+  因为「顺手删几个例子省 token」在测试上完全看不出来。
 """
 
 from __future__ import annotations
@@ -300,6 +304,112 @@ class SameVoiceTest(unittest.TestCase):
         self.assertNotEqual(self.description, self.brief)
         # 工具描述里不该出现系统提示那段的 Markdown 标题
         self.assertNotIn("## 待办清单", self.description)
+
+
+class ManyShotExamplesTest(unittest.TestCase):
+    """
+    ⚠ **描述里的八个示例是本工具唯一有效的触发手段，护栏钉住它们还在。**
+
+    背景（`docs/extensions/todo-list/acceptance-live.md`）：静态规则那条路
+    走到头了——能力描述 → 带可匹配条件的指令 → 每轮 `<system-reminder>`，
+    三个杠杆逐个加上，两个模型在一个明确五步的任务上仍然**各 0 次**调用；
+    而明确命令它用，一次就用对。差距查到是 Claude Code 那份描述有
+    **八个带 reasoning 的正反示例**，占了三分之二篇幅，我们此前**全是规则**。
+
+    因此「顺手删几个例子省 token」是这段文本最可能的退化方式，
+    而它在其它任何测试里都看不出来（功能全对、同口径全对）。
+
+    ⚠ **负例数量单独钉一条**：只留正例就是单向推力，而那正是 C13 委派触发
+    口径 2026-08-10 整个反转掉的形态（用户实测「一个非常简单的任务都要让
+    子 Agent 去做」）。负例是「不该列」那条边界唯一的形状来源。
+    """
+
+    # 正负两侧的小标题。⚠ 判定靠它们把描述切成两段，改标题要同步改这里。
+    _POSITIVE_HEADING = "## 该用的例子"
+    _NEGATIVE_HEADING = "## 不该用的例子"
+
+    def setUp(self) -> None:
+        tool, _ = make_tool()
+        self.description = tool.description
+
+    def _split(self) -> tuple[str, str]:
+        """把描述切成「正例段」与「负例段」两半。"""
+        self.assertIn(self._POSITIVE_HEADING, self.description)
+        self.assertIn(self._NEGATIVE_HEADING, self.description)
+        head, _, tail = self.description.partition(self._NEGATIVE_HEADING)
+        _, _, positive = head.partition(self._POSITIVE_HEADING)
+        return positive, tail
+
+    def test_four_positive_and_four_negative_examples(self) -> None:
+        """
+        四正四负，逐侧钉数量。
+
+        对齐 Claude Code 的 TodoWrite（4 个 `Examples of When to Use` +
+        4 个 `Examples of When NOT to Use`）。
+        """
+        positive, negative = self._split()
+        self.assertEqual(positive.count("<例子>"), 4, "正例不是 4 个")
+        self.assertEqual(negative.count("<例子>"), 4, "负例不是 4 个")
+
+    def test_every_example_carries_its_reasoning(self) -> None:
+        """
+        ⚠ **每个例子都必须带一段「为什么」**——这一条比数量更要紧。
+
+        光给「用户说 X，你就调工具」是让模型背答案，只有说清判据
+        （命中了哪一条、为什么这算三步）才迁移得到没见过的场景上。
+        Claude Code 那八个例子**每一个**都有 `<reasoning>` 块。
+        """
+        self.assertEqual(self.description.count("<例子>"), 8)
+        self.assertEqual(self.description.count("</例子>"), 8, "有例子没闭合")
+        self.assertEqual(
+            self.description.count("<为什么>"), 8, "有例子没写判据"
+        )
+        self.assertEqual(self.description.count("</为什么>"), 8)
+
+    def test_a_two_step_case_is_shown_as_not_listing(self) -> None:
+        """
+        ⚠ **临界负例不能少：恰好两步的活要示范成「不列」。**
+
+        「一步」和「纯问答」那两个负例太好判了，模型本来就不会误触发
+        （B2/B3/B4 三条真机全过正说明这一点）。真正需要示范的是**贴着
+        下限的那一档**——有两件事、听起来像多步、但只有两步。
+
+        没有它的话「三步」这个下限只是一句规则，模型仍会凭「有好几件事」
+        的感觉往上凑，而那是过触发的起点。
+        """
+        _positive, negative = self._split()
+        self.assertIn("两步", negative)
+        self.assertIn("三步", negative)
+
+    def test_has_no_unbounded_push(self) -> None:
+        """
+        ⚠ **反证，与 `test_todo_render.BriefTest` 那条成对。**
+
+        此前只有系统提示那一侧钉了这条，工具描述这一侧是空的——**成对维护点
+        少了一半护栏**，描述可以单方面滑向无下限推力而没人发现。
+        补示例这一轮顺手补齐（我自己就差点写下「拿不准就数步数」）。
+
+        禁的是这类**无下限**开头。委派那边 2026-08-10 整个反转掉的正是它：
+        为治欠触发写下四条单向推力，结果是「一个非常简单的任务都要让
+        子 Agent 去做」。待办成本远低于委派、口径可以更积极，
+        **但下限必须在**。
+        """
+        for banned in ("拿不准就", "一律先列", "总是先列", "任何任务都"):
+            with self.subTest(banned=banned):
+                self.assertNotIn(banned, self.description)
+
+    def test_the_examples_do_not_use_square_brackets(self) -> None:
+        """
+        ⚠ 示例里不许出现字面 `[`。
+
+        这段文本会随工具描述流到界面上的若干处（`/help` 类报告、
+        确认面板的参数摘要）。Textual 的 Content markup 比 Rich 严格，
+        **落单的 `[` 在布局阶段主线程抛 `MarkupError`，没有任何 try/except
+        兜得住、整个 app 直接退出**（见 CLAUDE.md 的 markup 转义那条）。
+
+        描述是我们自己写死的常量，最省事的办法就是压根不写它。
+        """
+        self.assertNotIn("[", self.description)
 
 
 class DescriptionMentionsTheLimitTest(unittest.TestCase):
