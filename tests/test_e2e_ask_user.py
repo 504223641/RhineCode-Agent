@@ -200,6 +200,88 @@ class AskUserE2ETest(DriverFixture):
             )
         self.assertGreaterEqual(len(provider.calls), 2)
 
+    async def test_clarify_dispatches_the_notification_hook(self):
+        """
+        ⚠ **AC6a 第三条：面板弹出时确实分发 `notification` 事件。**
+
+        这条必须有护栏，因为 `CLAUDE.md` 把 `notification` 列为
+        「`ask_user` 现在真实可用的三样手段」之一（另两样是可见性判据与跳过熔断）。
+        它要是没真的分发，那就是一条**错误的能力承诺**——已知项 #18 的教训
+        正是这个形态：文档说得通、实际不生效，而用户照着配了还以为是自己写错了。
+
+        ⚠ 真机验收里这条测不出来：那个工作区没有任何 hook 规则，
+        于是记录里一条 hook 事件都没有，**看起来像是没分发**。
+        这里直接盯分发动作本身。
+        """
+        app, _provider = self.assemble(
+            self._script(_question("放哪一层？", "项目级", "用户级"))
+        )
+        seen = []
+        original = app._dispatch_hook
+
+        def _spy(event_type, **kw):
+            seen.append((getattr(event_type, "value", event_type), kw.get("kind")))
+            return original(event_type, **kw)
+
+        app._dispatch_hook = _spy
+        async with self.driving(app) as (_pilot, core):
+            await asyncio.to_thread(core.send, "问问我")
+            await asyncio.to_thread(core.wait, 30.0)
+            await asyncio.to_thread(core.answer, "1")
+            await asyncio.to_thread(core.wait, 30.0)
+
+        kinds = [k for name, k in seen if name == "notification"]
+        self.assertIn(
+            "awaiting_clarify", kinds,
+            "澄清面板弹出时没有分发 notification——CLAUDE.md 把它列为"
+            "`ask_user` 唯三可用手段之一，不分发就是一条错误的能力承诺",
+        )
+
+    async def test_the_input_box_is_only_unlocked_in_the_free_text_state(self):
+        """
+        ⚠ **AC17：自由输入那条岔路必须是窄的，而挡住其余情形的是输入框本身。**
+
+        澄清面板一弹出就 `InputBar.disabled = True`（C4 起的既有行为），
+        因此选项列表态下用户**根本打不了字**——守卫那句「请先在面板上做出选择」
+        是第二道，不是第一道。本扩展做的是：进自由输入态时**解禁**它，
+        退回选项列表时**再锁上**。
+
+        这一条盯的就是那对开关。漏了「退回时锁上」的话，用户按 Esc 从
+        自由输入退回选项列表，输入框还开着，他打的字会被守卫的例外分支
+        当成一次结算送进回调——而他以为自己只是在聊天。
+
+        ⚠ **本条刻意不走 `core.send`**：驱动器自己在那一层就会拒绝非空闲态的提交，
+        于是判据变成「驱动器挡住了」而不是「产品挡住了」，产品侧改坏了也照样绿
+        （实测确认过——把产品的例外条件整个去掉，走 `send` 的写法仍然全绿）。
+        """
+        app, _provider = self.assemble(
+            self._script(_question("放哪一层？", "项目级", "用户级"))
+        )
+        async with self.driving(app) as (_pilot, core):
+            await asyncio.to_thread(core.send, "问问我")
+            await asyncio.to_thread(core.wait, 30.0)
+
+            bar = app.query_one(InputBar)
+            self.assertTrue(bar.disabled, "选项列表态下输入框必须是锁着的")
+
+            # 移到「其它…」并回车 → 解禁
+            await asyncio.to_thread(core.keys, ["down", "down", "enter"])
+            self.assertFalse(bar.disabled, "自由输入态下输入框必须解禁")
+
+            # Esc 退回选项列表 → **重新锁上**
+            await asyncio.to_thread(core.keys, ["escape"])
+            self.assertFalse(
+                getattr(app, "_clarify_free_text", True), "Esc 应当退回选项列表态"
+            )
+            self.assertTrue(
+                bar.disabled,
+                "从自由输入退回之后输入框还开着——用户打的字会被当成一次结算",
+            )
+
+            await asyncio.to_thread(core.answer, "1")
+            await asyncio.to_thread(core.wait, 30.0)
+            self.assertEqual(len(self._clarify_events()), 1)
+
     async def test_skip_closes_the_panel_and_frees_the_input(self):
         """
         AC27b：中途跳过时面板确实收起、输入框确实恢复。
