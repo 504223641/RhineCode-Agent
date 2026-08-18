@@ -231,7 +231,14 @@ class SameVoiceTest(unittest.TestCase):
     # ⚠ **这张表本身是护栏的一部分**：下面 `test_the_guard_covers_four_layers`
     # 钉住它的长度。没有那一条的话，「把某一层从表里删掉」会让护栏静默变弱
     # ——测试照样全绿，而两处文本从此可以自由分叉。
-    _LAYERS = ("三步", "完整清单", "如实", "每做完一步")
+    #
+    # ⚠ **第五层「时点锚点」是真机复测逼出来的（2026-08-18）。** 补齐八个示例
+    # 之后 flash 4/4 通过，而 pro 的 B1 仍然 0 次——它三条触发条件全中
+    # （改 3 个文件 / 4 步 / 6 处重复应用），正文里连规划都没提，直接开改。
+    # 加的不是推力（那会把 flash 推成过触发），是一个**可匹配的时点**：
+    # 「第一次调用 edit_file / write_file / run_command 之前」。
+    # 「开始动手之前」是抽象判断，模型对它系统性偷懒；三个工具名是可匹配项。
+    _LAYERS = ("三步", "完整清单", "如实", "每做完一步", "第一次调用")
 
     def setUp(self) -> None:
         tool, _ = make_tool()
@@ -245,7 +252,7 @@ class SameVoiceTest(unittest.TestCase):
                 self.assertIn(layer, self.description, "工具描述缺了这一层")
                 self.assertIn(layer, self.brief, "系统提示那段缺了这一层")
 
-    def test_the_guard_covers_four_layers(self) -> None:
+    def test_the_guard_covers_five_layers(self) -> None:
         """
         ⚠ **护栏自身的护栏。**
 
@@ -255,9 +262,13 @@ class SameVoiceTest(unittest.TestCase):
         （护栏在，但它管的东西被悄悄缩小了）。
 
         钉住数量之后，缩表就必须在这里改，改的时候人会读到这段说明。
+
+        ⚠ **从四层涨到五层是 2026-08-18 真机复测的结果**，理由写在
+        `_LAYERS` 上方。涨表要在这里改是**刻意的**——它逼着加层的人
+        顺手确认「新加的这层两处都写了」。
         """
-        self.assertEqual(len(self._LAYERS), 4)
-        self.assertEqual(len(set(self._LAYERS)), 4, "四层意思不能有重复")
+        self.assertEqual(len(self._LAYERS), 5)
+        self.assertEqual(len(set(self._LAYERS)), 5, "五层意思不能有重复")
 
     def test_both_say_three_steps_or_more(self) -> None:
         """第一层：**下限可数**。「三步」在两处都要出现。"""
