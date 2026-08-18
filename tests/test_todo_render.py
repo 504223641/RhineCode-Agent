@@ -20,9 +20,11 @@ import unittest
 from rhinecode.todo.models import TodoItem, TodoState
 from rhinecode.todo.render import (
     DISPLAY_LIMIT,
+    REMINDER_TITLE_LIMIT,
     build_view,
     render_all_done_text,
     render_todo_brief,
+    render_todo_reminder,
 )
 
 
@@ -245,7 +247,7 @@ class BriefTest(unittest.TestCase):
         self.assertIn("完整清单", self.brief)
 
     def test_says_state_must_be_truthful(self) -> None:
-        """状态如实反映实际执行情况，且允许多条同时进行中。"""
+        """状态如实反映实际执行情况。"""
         self.assertIn("如实", self.brief)
         self.assertIn("in_progress", self.brief)
 
@@ -268,6 +270,106 @@ class BriefTest(unittest.TestCase):
     def test_says_when_not_to_use_it(self) -> None:
         """必须写「什么时候不必用」——只写该用的一侧就是单向推力。"""
         self.assertIn("不必列", self.brief)
+
+
+class TodoReminderTest(unittest.TestCase):
+    """
+    每轮 `<system-reminder>` 待办提醒的四个分支。
+
+    ⚠ **这个函数此前一条测试都没有**（2026-08-18 补）。它是本扩展**唯一
+    被真机证明有效**的杠杆——两轮验收里静态提示词三个杠杆加满仍是各 0 次
+    调用，是加了这条提醒才有效果的。**唯一有效的东西没有护栏**，
+    意味着任何一次「顺手简化一下措辞」都可能把它改回无效形态而无人察觉。
+    """
+
+    def test_all_done_says_nothing(self) -> None:
+        """全部完成时不提醒——界面上那块已经收起，再催等于催已做完的事。"""
+        self.assertEqual(render_todo_reminder(4, True, None), "")
+        self.assertEqual(render_todo_reminder(4, True, (1, "改 a.py")), "")
+
+    def test_empty_list_asks_to_create_one(self) -> None:
+        """清单为空时提醒的是「记得创建」，并且要重复那条可数的下限。"""
+        text = render_todo_reminder(0, False)
+        self.assertIn("空的", text)
+        self.assertIn("三步", text)
+
+    def test_empty_list_keeps_the_lower_bound(self) -> None:
+        """
+        ⚠ **反证：提醒里不许放宽下限。**
+
+        提醒的作用是「让它想起来」，不是「让它无条件列」。放宽会把欠触发
+        直接推成过触发——委派那边 2026-08-10 就是这么翻的车。
+        """
+        text = render_todo_reminder(0, False)
+        for banned in ("拿不准就", "一律先列", "总是先列", "任何任务都"):
+            self.assertNotIn(banned, text)
+
+    def test_in_progress_item_is_named(self) -> None:
+        """
+        ⚠ **有 in_progress 时必须把序号与标题念出来。**
+
+        泛泛的「做完一步就更新」每轮都读得到，读多了等于没读；念出标题
+        之后它变成一个指名道姓的问句，而那种问题很难当没看见。
+        """
+        text = render_todo_reminder(4, False, (2, "改 b.py 里的裸 except"))
+        self.assertIn("第 2 条", text)
+        self.assertIn("改 b.py 里的裸 except", text)
+
+    def test_in_progress_reminder_anchors_to_concrete_tools(self) -> None:
+        """提醒也要挂在那三个可匹配的动作上，与两处静态文本同口径。"""
+        text = render_todo_reminder(4, False, (1, "改 a.py"))
+        for tool_name in ("edit_file", "write_file", "run_command"):
+            self.assertIn(tool_name, text)
+        self.assertIn("之前", text)
+
+    def test_long_title_is_clipped(self) -> None:
+        """
+        标题**没有长度校验**（`store.py` 只限条数），所以这里必须自己截。
+
+        不截的话，一条被写成几百字的「标题」会每轮随提醒重发一次。
+        """
+        text = render_todo_reminder(2, False, (1, "标" * 400))
+        self.assertIn("…", text)
+        self.assertNotIn("标" * (REMINDER_TITLE_LIMIT + 1), text)
+
+    def test_no_in_progress_is_its_own_branch(self) -> None:
+        """
+        ⚠ **点火分支：还有没做完的、却零条 in_progress。**
+
+        这是「同一时刻只能有一条 in_progress」那条规矩的发动机点火处——
+        模型刚做完一条还没汇报时，清单恰好是这个形状。
+        """
+        text = render_todo_reminder(4, False, None)
+        self.assertIn("一条 in_progress 都没有", text)
+        self.assertIn("todo_write", text)
+
+    def test_the_ignition_branch_is_not_the_empty_branch(self) -> None:
+        """
+        ⚠ **反证：点火分支不得与「清单为空」合并。**
+
+        合并看起来省一个分支，实际把两件不同的事说成了一句话：
+        「你漏了一次汇报」与「你还没列清单」要模型做的事完全不同。
+        合并之后模型在漏汇报时会被要求「先列清单」——它已经有清单了。
+        """
+        ignition = render_todo_reminder(4, False, None)
+        empty = render_todo_reminder(0, False, None)
+        self.assertNotEqual(ignition, empty)
+        self.assertNotIn("空的", ignition)
+        self.assertNotIn("一条 in_progress 都没有", empty)
+
+    def test_every_branch_tells_the_model_to_keep_quiet(self) -> None:
+        """
+        四个分支里凡是出声的，都必须写「别跟用户提这条提醒」。
+
+        少了它，模型会把提醒当成用户说的话，在正文里回一句
+        「好的，我会维护待办清单」——那是纯噪音。
+        """
+        for text in (
+            render_todo_reminder(0, False),
+            render_todo_reminder(4, False, None),
+            render_todo_reminder(4, False, (1, "改 a.py")),
+        ):
+            self.assertIn("不要在回复里向用户提起它", text)
 
 
 if __name__ == "__main__":
