@@ -402,6 +402,69 @@ class SkipCircuitTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# F6 / F6a：它确实不进权限管线，也确实拿不到 Hook 拦截
+# ---------------------------------------------------------------------------
+class NotInThePipelineTest(unittest.TestCase):
+    """
+    ⚠ **本组断言的是「有没有发生」，不是「结果对不对」。**
+
+    只断言「面板弹出来了」的话，「压根没进管线」与「进了管线且放行」
+    **看起来一模一样**——而两者的安全含义完全不同（后者意味着
+    `deny` 规则能拦住它，前者意味着拦不住）。
+
+    F6a 把「拦不住」登记成了已知边界，本组就是那条登记的物证。
+    """
+
+    def setUp(self) -> None:
+        self.agent = _agent()
+
+    def test_no_permission_decision_and_no_hook_for_ask_user(self) -> None:
+        """
+        `ask_user` 既不调权限引擎，也不触发 `pre_tool_use`。
+
+        ⚠ 后半句是 F6a 那条**已知边界**的实质：分流发生在 Hook 前置层的
+        上游，因此用户写拦截 Hook 也拦不住它。文档必须照实说——
+        「可被 deny 规则禁掉」那种错误的安全承诺比没有承诺更危险
+        （已知项 #18 的教训）。
+        """
+        decided: list = []
+        hooked: list = []
+
+        engine = PermissionEngine(RuleSet([]), mode=PermissionMode.PERMISSIVE)
+        real_decide = engine.decide
+        engine.decide = lambda req: (decided.append(req.tool_name), real_decide(req))[1]
+
+        real_hook = self.agent._dispatch_pre_tool
+        self.agent._dispatch_pre_tool = (
+            lambda tc, tool, cwd=None: (hooked.append(tc.name), real_hook(tc, tool, cwd))[1]
+        )
+        try:
+            results: dict[str, ToolResult] = {}
+            list(
+                self.agent._execute(
+                    [_ask_call([_q()]), ToolCall(id="2", name="peek", arguments={})],
+                    results,
+                    _RoundContext(),
+                    engine,
+                    lambda *a: True,
+                    _Clarify([ClarifyReply("option", ("甲",))]),
+                    None,
+                    threading.Event(),
+                    frozenset(),
+                )
+            )
+        finally:
+            self.agent._dispatch_pre_tool = real_hook
+
+        self.assertNotIn("ask_user", decided, "ask_user 不该进权限引擎")
+        self.assertNotIn("ask_user", hooked, "pre_tool_use 对 ask_user 不触发")
+        # **反证**：同一次运行里那个普通只读工具两样都经过了——
+        # 说明上面两条不是因为「这次压根没跑管线」。
+        self.assertIn("peek", decided)
+        self.assertIn("peek", hooked)
+
+
+# ---------------------------------------------------------------------------
 # F10：没有可用问题
 # ---------------------------------------------------------------------------
 class NoQuestionsTest(unittest.TestCase):
