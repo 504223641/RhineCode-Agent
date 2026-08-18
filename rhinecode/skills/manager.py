@@ -68,7 +68,10 @@ from rhinecode.trace import NullRecorder, TraceEventType, TraceRecorderProtocol
 
 # 豁免工具白名单收窄的工具名（spec F8/F15）。
 # `load_skill` 若被白名单挡住，模型就再也没法加载其它 Skill 了；
-# `ask_user` / `present_plan` 是 Plan Mode 的流程控制工具，与业务能力无关。
+# `present_plan` 是 Plan Mode 的流程控制工具，与业务能力无关；
+# `ask_user` 是「向用户提问」，它与 Skill 声明的业务能力同样无关——
+# 一个窄白名单不该顺带把「卡住了可以问人」这件事也关掉。
+# ⚠ ask-user 扩展起它不再限于 Plan Mode，但**留在本表里的理由没变**。
 _EXEMPT_TOOLS = frozenset({LOAD_SKILL_TOOL, "ask_user", "present_plan"})
 
 # 来源层级的中文标签，`/skills` 报告用。
@@ -793,7 +796,8 @@ class SkillManager:
         lines.append("、".join(sorted(registered)) if registered else "（无）")
         lines.append(
             "（Skill 不再收窄工具集；Plan Mode 的规划阶段会另外只保留只读工具"
-            "并附加 ask_user / present_plan）"
+            "并附加 present_plan。ask_user 不受阶段限制——只要当前有人可回答，"
+            "任何时候都在）"
         )
 
         # 预授权是现在真正影响行为的那样东西，必须在同一份报告里看得到——

@@ -174,6 +174,51 @@ class SymbolWhitelistTest(unittest.TestCase):
             "（`↓` 输出 token、`→` 从 A 到 B、`↔` 两态互换）",
         )
 
+    def test_ask_user_panel_adds_no_new_symbol(self) -> None:
+        """
+        ⚠ **澄清面板的勾选框刻意是 ASCII，这条钉住那个「刻意」。**
+
+        多选需要一个「勾上了没有」的行首标记，最自然的选法是图形勾选框
+        （U+2611 / U+2610 / U+2713 那一类）——三个都落在本文件的扫描区间内，
+        加任何一个都要同步改两处表（`CLAUDE.md` 那张 + 本文件的 `WHITELIST`）。
+        而那张表越短越有用：它的价值来自「不在表内的一律不用」，
+        每加一项都在稀释这句话。
+
+        转义后的 ASCII 方括号在任何终端里都不会退化成豆腐块，
+        也不占用任何符号语义。**别顺手换成图形符号。**
+
+        （提示行里同理刻意写「上下键选择」而不是箭头：那两个字形在本项目
+        已经分别指「输入 token」与「输出 token」，一符两义正是这张表要挡的。）
+
+        ⚠ 判据走 `_visible_strings`（与主扫描同一份实现），因此**只看真正会被
+        渲染的字符串字面量**——本类的注释里正好列着那几个「不许用」的符号
+        做说明，用裸文本扫会把说明本身判成违规。
+        """
+        path = Path(rhinecode.__file__).parent / "tui" / "widgets.py"
+        text = path.read_text(encoding="utf-8")
+        first = text.index("class ClarifyPanel")
+        lo = text[:first].count(chr(10)) + 1
+        hi = lo + text[first:].split(chr(10) + "class ")[0].count(chr(10))
+
+        found_ascii_box = False
+        offenders = []
+        for number, literal in _visible_strings(path):
+            if not lo <= number <= hi:
+                continue
+            if "[x]" in literal:
+                found_ascii_box = True
+            for match in _SUSPECT.finditer(literal):
+                if match.group() not in WHITELIST:
+                    offenders.append(f"{number}: {match.group()}  {literal[:60]}")
+
+        self.assertTrue(found_ascii_box, "勾选框不再是 ASCII 方括号了？")
+        self.assertEqual(
+            offenders,
+            [],
+            "澄清面板的界面文本里出现了白名单之外的符号——"
+            "新符号必须先进 CLAUDE.md 那张表：\n" + "\n".join(offenders),
+        )
+
     def test_the_whitelisted_symbols_are_actually_used(self) -> None:
         """
         **反证**：白名单不是许愿池。

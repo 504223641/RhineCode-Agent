@@ -39,7 +39,7 @@ from textual.message import Message as TextualMessage
 
 from rhinecode.todo.models import TODO_STATE_LABELS, TodoState
 
-from rhinecode.agent.events import ClarifyOption
+from rhinecode.agent.events import ClarifyQuestion
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
 from rhinecode.subagents.tasks import BRANCH_AGENT_NAME, STATUS_LABELS, TaskStatus
@@ -3236,6 +3236,46 @@ class NumberedPanel(OverlayPanel, OptionList):
             return self._choices[number - 1][0]
         return None
 
+    def choice_position(self, index: "Optional[int]") -> "Optional[int]":
+        """
+        反查：`OptionList` 下标 → 它是第几个**可选项**（从 0 起）。
+
+        :param index: `OptionList` 里的下标（通常是当前高亮）
+        :returns: 可选项序列里的位置；不是可选项（表头 / 详情行）时返回 None
+
+        与 `choice_index` 互为反向。需要它是因为「当前高亮的是第几个选项」
+        没法从 `highlighted` 直接读出来——中间夹着 disabled 的行。
+
+        副作用：无（纯函数）。
+        """
+        if index is None:
+            return None
+        for position, (list_index, _markup) in enumerate(self._choices):
+            if list_index == index:
+                return position
+        return None
+
+    def activate_choice(self, index: int) -> None:
+        """
+        数字键命中某一项时做什么。**缺省 = 移过去并选中**，与回车同一条结算路径。
+
+        :param index: 该项在 `OptionList` 里的下标
+
+        ## 为什么是一个可覆写点，而不是在 App 里判面板类型
+
+        澄清面板在**多选**下的数字键语义不同（切换勾选而不是提交，
+        ask-user 扩展 F15）。把这个差异写成 App 里的 `isinstance` 分支，
+        等于把面板的知识漏进 App，而且下一个面板有特殊语义时还要再加一支。
+
+        ⚠ **这不新增结算路径**（`_handle_digit_choice` 那条注释的约束仍然成立）：
+        缺省实现仍然走 `action_select()`，覆写方要么也走它、要么做的
+        压根不是结算（切换勾选就不是）。
+
+        副作用：移动高亮；缺省实现还会触发一次选择结算。
+        """
+        self.highlighted = index
+        self.action_select()
+
     def watch_highlighted(self, highlighted: "Optional[int]") -> None:
         """
         高亮变化时，把指示符从旧行挪到新行（F24）。
@@ -3546,78 +3586,478 @@ class ConfirmPanel(NumberedPanel):
 
 class ClarifyPanel(NumberedPanel):
     """
-    Plan Mode 需求澄清面板（spec F12）。
+    澄清提问面板（c4 spec F12 / ask-user 扩展 F13–F16）。
 
-    模型在规划阶段通过 ask_user 工具发起提问时，App 用本面板把问题与候选项呈现给用户：
-    出现在输入框上方，方向键上下选择，回车确认，Esc 取消，不遮挡历史区（与确认面板同款交互）。
+    模型通过 ask_user 工具提问时，App 用本面板把问题与候选项呈现给用户：
+    出现在输入框上方，上下键选择，回车确认，Esc 跳过，不遮挡历史区
+    （与确认面板同款交互）。
 
-    每个候选项展示「概述 + 详细描述」，但只有概述可被选中：
-    - 实现方式：每个候选项渲染为「可选的概述行」+ 紧随其后的「disabled 详情行」。
-      OptionList 的上下导航会自动跳过 disabled 项，从而做到「导航只在概述之间移动」，
-      同时详情仍然可见，帮助用户判断（对应需求：上下移动只在概述间移动、每个选择下有详细描述）。
-    - 最推荐的候选项排在第一位（由模型保证），概述文本自身已含推荐信息，不再额外加标记。
+    ## 两个状态
 
-    结果如何回传：用户选中某概述行时由 OptionList 原生发出 OptionList.OptionSelected
-    （option.id 为该候选项在 options 中的下标字符串，App 据此取回所选概述）；按 Esc 发出
-    本类的 Cancelled 消息（App 视为用户取消澄清）。App 再唤醒被阻塞的 Worker（见 RhineApp._clarify）。
+    ```
+                        选中「其它…」
+       ┌─────────────┐ ─────────────→ ┌─────────────┐
+       │ 选项列表态   │                │ 自由输入态   │
+       │             │ ←───────────── │             │
+       │ 面板可选     │      Esc       │ 面板=提示态  │
+       │ 输入框禁用   │                │ 输入框可用   │
+       └─────────────┘                └─────────────┘
+    ```
+
+    **自由输入态下面板不收起**（F16）——「现在到底在干什么」必须一直看得见。
+    收起来的话用户会以为提问已经结束，而回调其实还阻塞着，那正是本项目
+    反复吃亏的「静默中间态」。切换由 App 驱动（`show_free_text` /
+    `restore_options`），本类只负责画。
+
+    ## 渲染结构
+
+    ```
+    第 0 行  disabled  [徽章]  问题原文            （问题 2/3）
+    第 1 行  可选      1. 选项名（推荐）        —— 多选时前面多一个 [x] / [ ]
+    第 2 行  disabled       选项说明（dim）
+     …
+    第 n 行  可选      3. 其它…（自己打字）      —— 界面无条件追加（F8）
+    第 n+1   可选      4. 提交（已选 2 项）      —— **仅多选**（F15）
+    末行     disabled  提示行（dim）：随单选/多选变化
+    ```
+
+    ## 多选怎么走完一遍（F15 修订）
+
+    ```
+      [ ] 甲   ← 回车：勾上，光标自动落到下一项
+      [x] 乙   ← 回车：勾上，这是最后一个选项 …
+          其它…            ↓ 于是**跳过它**
+          提交（已选 2 项） ← 光标停在这里，再回车才真的交出去
+    ```
+
+    单选按一次回车就结束，多选要按 N+1 次——**最后那一次是「我选完了」**。
+    「其它…」在自动前进时被跳过是刻意的：落在它上面再按回车会进自由输入态，
+    那等于用户想提交却被拉去打字。要用它得自己按方向键过去。
+
+    - **徽章为空时整个方括号不出现**，进度在单问题时整段不出现（F13）——
+      两处都是「不出现」而不是「显示空的」，`[]` 与「问题 1/1」都是噪声。
+    - 说明行 disabled、导航跳过、**不占序号**（F23）：占了的话按 `2`
+      会落到一行说明文字上。
+
+    ## 结果如何回传
+
+    用户选中某一行时由 OptionList 原生发出 `OptionSelected`
+    （`option.id` 是候选项下标的字符串，或 `OTHER_ID`），App 据此结算；
+    按 Esc 发出本类的 `Cancelled`（App 视为跳过）。
+    App 再唤醒被阻塞的 Worker（见 `RhineApp._clarify`）。
     """
 
     # 默认隐藏自身，避免依赖外部 App CSS 才能初始隐藏
     DEFAULT_CSS = "ClarifyPanel { display: none; }"
 
+    # 「其它…」那一项的标识。它**不来自模型**，是界面无条件补的（F8）——
+    # 对齐 Claude Code 官方明写的客户端责任：
+    # 「Display an additional "Other" choice after Claude's options」。
+    OTHER_ID = "other"
+    _OTHER_LABEL = "其它…（自己打字）"
+
+    # 「提交」那一项的标识。**只在多选题里出现**（F15 修订）——单选按回车即结算，
+    # 凭空多一行「提交」只会让人多按一次键。
+    SUBMIT_ID = "submit"
+
+    # 多选的勾选框。
+    #
+    # ⚠ **必须是转义后的 ASCII**，两条理由：
+    # ① 不动界面符号白名单——`☑ ☐ ✓` 都落在 `test_tui_symbols.py` 的扫描区间内，
+    #    加一个就要同步 `CLAUDE.md` 那张表与那份 WHITELIST。白名单越短越有用。
+    # ② `[` 是 Textual markup 的标签开头，落单的 `[` 会在**布局阶段主线程**
+    #    抛 `MarkupError` 并拆掉整个应用，**没有任何 try/except 兜得住**。
+    #    这里是常量、不经用户输入，但仍然写成转义形态——给下一个人看的示范也算价值。
+    _CHECKED = "\\[x] "
+    _UNCHECKED = "\\[ ] "
+
     class Cancelled(TextualMessage):
-        """用户按 Esc 取消澄清时发出，由 App 视为用户取消。"""
+        """用户按 Esc 时发出。App 在选项列表态视为跳过、在自由输入态视为退回。"""
         pass
 
     BINDINGS = [
-        # Esc 取消：发出 Cancelled 消息交给 App 处理
+        # Esc：发出 Cancelled 消息交给 App 处理
         Binding("escape", "cancel", "取消", show=False),
+        # ⚠ **多选刻意不另绑一个键**（F15 修订）。勾选走的是 `OptionList` 自带的
+        # `enter`，由本类覆写 `action_select` 接管——理由见 `action_select`。
+        # 初版曾绑 `space` 做切换，改掉了：一个面板上「空格勾选、回车提交」
+        # 要用户同时记住两个键，而两个键的语义又只差一点点。
     ]
 
-    def show_for(self, question: str, options: list[ClarifyOption]) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         """
-        为一次澄清提问填充并显示面板。
+        :param args/kwargs: 原样透传给 `OptionList`
 
-        先清空旧选项再重建，避免残留上一次提问内容。结构为：
-        - 一个 disabled 表头（展示问题 question，不可选）
-        - 对每个候选项：一个可选概述行（id=下标字符串）+ 一个 disabled 详情行（若有 detail）
+        ⚠ 全部新实例字段（`_question` / `_index` / `_total` / `_checked`）在动手前
+        已按 `CLAUDE.md` 的要求在真实实例上 `hasattr` 查过，与 Textual 的
+        `MessagePump` 内部字段无冲突——撞上一律不报错，只表现为
+        「界面上东西凭空少了」。
+        """
+        super().__init__(*args, **kwargs)
+        self._question: "Optional[ClarifyQuestion]" = None
+        self._index: int = 0
+        self._total: int = 1
+        # 已勾选的**候选项下标**（不是 OptionList 下标）
+        self._checked: set = set()
+        # 多选题里用户在「其它…」上自己打的那段文本；空串 = 那一项没勾上。
+        # ⚠ **它就是「其它…」的勾选状态**，不另设一个布尔——两份状态表达同一件事
+        # 必然会分叉（勾上了但文本是空的，或反过来），而那种不一致在界面上
+        # 看不出来，只表现为「提交行的条数不对」。
+        self._custom_text: str = ""
 
-        :param question: 模型要澄清的问题
-        :param options: 候选项列表；第一个为最推荐项（概述文本自身已含推荐信息）
+    # ------------------------------------------------------------------ #
+    # 渲染
+    # ------------------------------------------------------------------ #
+    def _header_markup(self) -> str:
+        """
+        表头一行：徽章 + 问题原文 + 进度。
+
+        :returns: 已转义的 markup
+
+        副作用：无。
+        """
+        question = self._question
+        badge = ""
+        if question.header:
+            # `\[` 转义：让方括号作为字面量显示，而不是被当成标签开头
+            badge = f"\\[{escape(question.header)}]  "
+        # 进度只在不止一个问题时出现（F13）——「问题 1/1」是纯噪声
+        progress = f"　（问题 {self._index + 1}/{self._total}）" if self._total > 1 else ""
+        # `❓` 去掉（tui-display F28）——问句本身加上青色已经说清它是个提问
+        return f"[#7AEEFF]{badge}{escape(question.question)}{progress}[/#7AEEFF]"
+
+    def _submit_position(self) -> "Optional[int]":
+        """
+        「提交」在**可选项序列**里的位置；单选题没有这一行，返回 None。
+
+        排布固定为 `候选项 0..n-1` → `其它…`（n）→ `提交`（n+1），
+        因此它恒等于 `len(options) + 1`，不必去 `_choices` 里查。
+        """
+        question = self._question
+        if question is None or not question.multi_select:
+            return None
+        return len(question.options) + 1
+
+    def _choice_markup(self, position: int) -> str:
+        """
+        某个候选项那一行的正文（不含序号与高亮指示符，那两样由基类加）。
+
+        :param position: 候选项下标；`len(options)` 是「其它…」，
+            `len(options) + 1` 是多选题的「提交」
+        """
+        question = self._question
+        count = len(question.options)
+
+        # 「提交」行：**把已选条数摆在用户正要按的那一行上**，他不必自己数，
+        # 也不必把视线挪到别处去确认。
+        if position == count + 1:
+            total = self.checked_count()
+            if total:
+                return f"    提交（已选 {total} 项）"
+            # 一项都没勾也允许提交——那是「这几个都不要」，与按 Esc 跳过
+            # （「你自己定」）是两回事，见 `ClarifyReply` 的说明。
+            return "    提交（一项都不选）"
+
+        if position >= count:
+            label = self._OTHER_LABEL
+        else:
+            label = escape(question.options[position].label)
+        if not question.multi_select:
+            return label
+
+        # 「其它…」在多选题里**也是一个勾选项**（F15 二次修订）：勾上它的方式是
+        # 打一段字，勾上之后那一行直接显示打的内容——不显示的话用户回到列表
+        # 只看得见一个 `[x] 其它…`，想确认自己打了什么就只能再进去一次。
+        if position >= count:
+            if self._custom_text:
+                return f"{self._CHECKED}其它：{escape(self._custom_text)}"
+            return f"{self._UNCHECKED}{label}"
+        return f"{self._CHECKED if position in self._checked else self._UNCHECKED}{label}"
+
+    def _hint_markup(self) -> str:
+        """
+        底部提示行：**同一个面板在两种模式下按键含义不同，全靠这一行说清**。
+
+        ⚠ 单选时回车 = 选这一项，多选时回车 = 提交全部勾选——这是本扩展里
+        最容易做出交互不一致的地方，提示行不是装饰。
+
+        ⚠ 刻意不用 `↑↓` 表示方向键：那两个符号在本项目的符号表里已经
+        分别指「输入 token」与「输出 token」，同一个字形两种意思正是
+        那张表要挡的形态。写成「上下键」既清楚又不占用符号语义。
+        """
+        if self._question.multi_select:
+            return (
+                "[dim]回车勾选并跳到下一项 · 数字键直选 · "
+                "最后在「提交」行回车 · Esc 我不选[/dim]"
+            )
+        return "[dim]上下键选择 · 数字键直选 · 回车确认 · Esc 我不选，你自己定[/dim]"
+
+    def _render_options(self) -> None:
+        """
+        按当前状态重画选项列表态。
+
+        ⚠ **它刻意不碰 `self._checked`**：从自由输入态退回来时要靠它复原，
+        而勾选是用户已经做出的输入，退回一次就清空等于白勾。
+        重置勾选只发生在 `show_question`（换了一道题）。
 
         副作用：修改 OptionList 选项并使面板可见。
         """
         self._reset_choices()
-        # 青色表头：展示问题本身；disabled 使其不可被选中、导航跳过。
-        # `❓` 去掉（F28）——问句本身加上青色分隔线已经说清它是个提问。
-        self._add_static(f"[#7AEEFF]{escape(question)}[/#7AEEFF]")
+        self._add_static(self._header_markup())
 
-        first_selectable: "int | None" = None
-        for idx, opt in enumerate(options):
-            # 概述行：可选、带序号，id 为该候选项下标（字符串）。
-            # 注：推荐顺序由模型保证（第一位即最推荐），概述文本本身已带推荐信息，
-            #     故不再额外加「推荐」前缀，避免重复提示。
-            option_index = self._add_choice(str(idx), escape(opt.summary))
-            if first_selectable is None:
-                first_selectable = option_index
-            # 详情行：disabled，仅展示，导航会跳过，**不占序号**（F23）——
-            # 占了的话按 `2` 会落到一行说明文字上。
-            # 缩进与上方概述行的正文左缘对齐（序号前缀占四格）。
-            if opt.detail:
-                self._add_static(f"[dim]     {escape(opt.detail)}[/dim]")
+        first: "Optional[int]" = None
+        question = self._question
+        for position, option in enumerate(question.options):
+            index = self._add_choice(str(position), self._choice_markup(position))
+            if first is None:
+                first = index
+            if option.description:
+                # 缩进与上方选项行的正文左缘对齐（序号前缀占四格）
+                self._add_static(f"[dim]     {escape(option.description)}[/dim]")
 
-        self._add_static("[dim]                                              Esc 取消[/dim]")
+        # 「其它…」：界面无条件追加，模型给不了也管不着（F8）
+        other_index = self._add_choice(self.OTHER_ID, self._choice_markup(len(question.options)))
+        if first is None:
+            first = other_index
+
+        # 「提交」：只有多选题需要——单选按一次回车就结束了（F15 修订）
+        if question.multi_select:
+            self._add_choice(self.SUBMIT_ID, self._choice_markup(len(question.options) + 1))
+
+        self._add_static(self._hint_markup())
         self.set_visible(True)
-        # 默认高亮第一个可选概述行
-        if first_selectable is not None:
-            self.highlighted = first_selectable
+        self.highlighted = first
 
+    def show_question(self, question: "ClarifyQuestion", index: int = 0, total: int = 1) -> None:
+        """
+        呈现一个问题（进入选项列表态）。
+
+        :param question: 要问的问题
+        :param index: 这是第几题（从 0 起），用于进度指示
+        :param total: 本次一共几题；为 1 时不显示进度
+
+        副作用：重置勾选状态；修改 OptionList 选项并使面板可见。
+        """
+        self._question = question
+        self._index = index
+        self._total = total
+        self._checked = set()
+        self._custom_text = ""
+        self._render_options()
+
+    def restore_options(self) -> None:
+        """
+        从自由输入态退回选项列表态（F16 的 Esc 分支）。
+
+        与 `show_question` 的差别只有一处、但要紧：**它保留已勾选的项**。
+        多选题里用户勾了两项、又去看了看「其它…」、然后按 Esc 退回来——
+        勾选还在才是对的。
+
+        副作用：修改 OptionList 选项。
+        """
+        if self._question is not None:
+            self._render_options()
+
+    def show_free_text(self) -> None:
+        """
+        进入自由输入态：面板只留问题与一行提示，打字发生在主输入框里（F16）。
+
+        ⚠ **本态下不加任何可选项**，这带来一个免费的好处：数字键在这里
+        天然落进输入框（`choice_index` 找不到任何一项、返回 None，
+        App 的数字键处理就不会拦截），不必为此新增判断。
+
+        副作用：修改 OptionList 选项。
+        """
+        if self._question is None:
+            return
+        self._reset_choices()
+        self._add_static(self._header_markup())
+        # ⚠ **两种题的回车含义不同，这一行是用户唯一的依据**：
+        # 单选题打完就交卷；多选题打完只是记下来、回到勾选界面接着挑
+        # （F15 二次修订）。不说清楚的话，多选题里用户会以为一按回车就交了，
+        # 于是把剩下想勾的项全放弃掉。
+        if self._question.multi_select:
+            tail = "回车记下并回到勾选"
+        else:
+            tail = "回车提交"
+        self._add_static(
+            f"[dim]{BRANCH_PREFIX}直接在下面打字，{tail} · Esc 退回选项[/dim]"
+        )
+        self.set_visible(True)
+
+    # ------------------------------------------------------------------ #
+    # 多选（F15）
+    # ------------------------------------------------------------------ #
+    def toggle_check(self, position: int) -> None:
+        """
+        切换某个候选项的勾选状态。
+
+        :param position: 候选项下标（不是 OptionList 下标）
+
+        ## ⚠ 为什么必须同时更新 `_choices` 里存的那份 markup
+
+        基类的 `watch_highlighted` 会拿 `_choices` 里存的文本把**每一行**
+        重画一遍（它只换提示文本、不动 `highlighted`，因此不会自激）。
+        只改屏幕不改 `_choices` 的话——**用户按一下方向键，所有勾选凭空全没**。
+
+        而这个 bug 只在「勾选之后再移动光标」时出现，一次不移动光标的
+        手测完全看不到它。
+
+        副作用：修改勾选集合、就地改写该行与提示行的显示文本。
+        """
+        question = self._question
+        if question is None or not question.multi_select:
+            return
+        if not (0 <= position < len(question.options)):
+            return  # 「其它…」与越界一律不参与勾选
+
+        if position in self._checked:
+            self._checked.discard(position)
+        else:
+            self._checked.add(position)
+
+        self._repaint_choice(position)
+        # 「提交」行上的已选条数跟着变——它与勾选框是同一份状态的两种显示
+        submit = self._submit_position()
+        if submit is not None:
+            self._repaint_choice(submit)
+
+    def _repaint_choice(self, position: int) -> None:
+        """
+        就地重画某个可选项（勾选框变了、提交行的条数变了都走它）。
+
+        :param position: 可选项序列里的位置
+
+        ⚠ **两处必须一起改**：屏幕上那一行，以及 `_choices` 里存的那一份
+        （理由见 `toggle_check` 上方那段）。抽成一个函数正是为了防同一个坑的
+        下一次——两处各写一遍的话，将来加第三种会变的行必然只改一处。
+
+        副作用：改写 `_choices[position]` 与屏幕上对应的那一行。
+        """
+        if not (0 <= position < len(self._choices)):
+            return
+        list_index, _old = self._choices[position]
+        markup = self._choice_markup(position)
+        self._choices[position] = (list_index, markup)
+        try:
+            self.replace_option_prompt_at_index(
+                list_index,
+                numbered_prompt(position + 1, markup, list_index == self.highlighted),
+            )
+        except Exception:  # noqa: BLE001 —— 与基类 watch_highlighted 同理
+            # 这是装饰性更新，失败的最坏后果是勾选标记没跟上。
+            # 它跑在主线程的消息泵上，异常逃逸会打断整个界面。
+            pass
+
+    def toggle_and_advance(self, position: int) -> None:
+        """
+        勾选某一项，然后把光标推到**下一个该操作的地方**（F15 修订）。
+
+        :param position: 候选项下标
+
+        下一个地方是哪：还有候选项就是下一个候选项；这是最后一个候选项时
+        **跳过「其它…」直达「提交」**——落在「其它…」上再按回车会进自由输入态，
+        那等于用户想交卷却被拉去打字。
+
+        副作用：改勾选状态、重画两行、移动高亮。
+        """
+        question = self._question
+        if question is None or not question.multi_select:
+            return
+        self.toggle_check(position)
+
+        nxt = position + 1
+        if nxt >= len(question.options):
+            nxt = self._submit_position()
+        if nxt is None or not (0 <= nxt < len(self._choices)):
+            return
+        self.highlighted = self._choices[nxt][0]
+
+    def action_select(self) -> None:
+        """
+        回车（以及数字键，它经基类的 `activate_choice` 也落到这里）。
+
+        **多选题里按在候选项上 = 勾选并前进，不结算**；按在**已经勾上的
+        「其它…」**上 = 取消它（清掉打过的字）；其余一切（单选的任何一项、
+        多选里还没勾的「其它…」、「提交」）沿用 `OptionList` 原生的
+        「发出 OptionSelected 交给 App 结算」。
+
+        ⚠ **「其它…」在多选题里就是个普通勾选项，只是勾上它要打字**
+        （F15 二次修订）。因此它的回车语义与其余勾选项一致——**按一下切换**：
+        没勾 → 进自由输入态去打字；已勾 → 直接取消。做成「已勾时再进去改」
+        的话，用户就没有任何办法把它取消掉了。
+
+        ## 为什么这个差异落在 `action_select` 而不是 `activate_choice`
+
+        回车与数字键**必须同一个语义**。放在 `activate_choice` 里只覆盖数字键，
+        回车那条路会绕过它直接结算——两条路分叉，而且分叉在界面上看不出来
+        （用回车测一遍全对，用数字键测一遍也全对，只有混着用才露馅）。
+        `action_select` 是这两条路唯一的汇合点。
+        """
+        question = self._question
+        position = self.choice_position(self.highlighted)
+        if question is not None and question.multi_select and position is not None:
+            if position < len(question.options):
+                self.toggle_and_advance(position)
+                return
+            # 已经勾上的「其它…」：取消它，光标照常推到「提交」
+            if position == len(question.options) and self._custom_text:
+                self.set_custom_text("")
+                self.move_to_submit()
+                return
+        super().action_select()
+
+    def move_to_submit(self) -> None:
+        """把光标移到「提交」行（多选题才有；其余情形无副作用）。"""
+        submit = self._submit_position()
+        if submit is not None and 0 <= submit < len(self._choices):
+            self.highlighted = self._choices[submit][0]
+
+    def checked_count(self) -> int:
+        """已勾的总数——候选项 + 勾上了的「其它…」（后者算一项）。"""
+        return len(self._checked) + (1 if self._custom_text else 0)
+
+    def custom_text(self) -> str:
+        """多选题里用户自己打的那段；没打过是空串。"""
+        return self._custom_text
+
+    def set_custom_text(self, text: str) -> None:
+        """
+        记下用户在「其它…」上打的内容，并把那一行与提交行重画。
+
+        :param text: 用户打的原文（空串等于取消勾选）
+
+        副作用：改 `_custom_text`、重画两行。**不结算**——多选题里打完字
+        是回到勾选界面继续挑，不是交卷（F15 二次修订）。
+        """
+        self._custom_text = text.strip()
+        question = self._question
+        if question is None or not question.multi_select:
+            return
+        self._repaint_choice(len(question.options))       # 「其它…」那一行
+        submit = self._submit_position()
+        if submit is not None:
+            self._repaint_choice(submit)
+
+    def checked_labels(self) -> tuple:
+        """
+        当前勾选的选项名，按候选项顺序。
+
+        :returns: 元组；一项都没勾时是空元组（**那与「跳过」是两回事**，
+                  见 `ClarifyReply` 的说明）
+        """
+        question = self._question
+        if question is None:
+            return ()
+        return tuple(question.options[i].label for i in sorted(self._checked))
+
+    # ------------------------------------------------------------------ #
     def hide(self) -> None:
         """隐藏面板并收回布局空间。"""
         self.set_visible(False)
 
     def action_cancel(self) -> None:
-        """Esc 绑定：发出 Cancelled 消息，由 App 解释为用户取消澄清。"""
+        """Esc 绑定：发出 Cancelled 消息，由 App 解释为「用户跳过」。"""
         self.post_message(self.Cancelled())
 
 

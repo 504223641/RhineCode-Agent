@@ -165,7 +165,52 @@ def _s_permission_decision(r: dict) -> str:
 
 
 def _s_interaction(r: dict) -> str:
-    return f"{r.get('kind')} → {r.get('result')} · {_text_of(r.get('display'), 50)}"
+    """
+    一次人机交互（确认 / 澄清 / 计划审批）。
+
+    ⚠ **澄清那一类多两段**（ask-user 扩展 F22）：一次 `ask_user` 可以带 1–4 个
+    问题、逐个弹面板，因此摘要行要能回答「这是第几题」与「用户是怎么答的」。
+    没有这两段的话，一次三问的提问在时间线上是三条长得几乎一样的记录，
+    读的人分不出顺序，也看不出哪一题是被跳过的。
+
+    ⚠ `multi_select` **刻意不进摘要行**：答案形态本身已经说明了它
+    （多选的 result 是一串标签），而摘要行的宽度是稀缺资源。
+    它留在负载里，`--seq` 展开看得到。判据是「排查时第一眼要不要看到它」。
+    """
+    # 确认 / 计划审批两类的格式**逐字不变**（那两类没有「答案类型」可言，
+    # 硬塞一段空的只会多出一个孤零零的分隔点）。
+    answer_kind = _answer_kind_of(r)
+    prefix = f"{answer_kind} · " if answer_kind else ""
+    head = f"{r.get('kind')} → {prefix}{r.get('result')}"
+    total = r.get("question_total")
+    if isinstance(total, int) and total > 1:
+        head += f" · 第 {int(r.get('question_index') or 0) + 1}/{total} 题"
+    return f"{head} · {_text_of(r.get('display'), 50)}"
+
+
+def _answer_kind_of(r: dict) -> str:
+    """
+    澄清作答的类型：选了选项 / 多选 / 自己输入 / 跳过（ask-user 扩展 F22）。
+
+    :param r: `interaction` 事件负载
+    :returns: 一个短词；非澄清类交互返回空串（那时 `result` 自己就说清了）
+
+    ⚠ 判定只看负载里的既有字段，**刻意不 import `agent.events`**——
+    `trace` 是只依赖标准库的叶子包，这条不变量比少写几行判定重要
+    （与 `_LAYER_NAMES` 那三份表不合一是同一个理由）。
+    """
+    if r.get("kind") != "clarify":
+        return ""
+    result = r.get("result")
+    if result is None:
+        return "跳过"
+    # 结算值是 `ClarifyReply`，序列化之后是它的 repr 或 dict——两种形态下
+    # `kind=` / `'kind':` 都会出现在文本里，取字面判定即可。
+    text = str(result)
+    for name, label in (("free_text", "自己输入"), ("multi", "多选"), ("option", "选了选项")):
+        if name in text:
+            return label
+    return "已作答"
 
 
 def _s_tool_execute(r: dict) -> str:

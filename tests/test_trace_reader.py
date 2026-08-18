@@ -465,5 +465,58 @@ class WebExtractScopeTest(unittest.TestCase):
         self.assertEqual(len(scopes), 4, "作用域取值必须互不相同，否则 --scope 过滤会串")
 
 
+class ClarifyInteractionSummaryTest(unittest.TestCase):
+    """
+    澄清交互的摘要行（ask-user 扩展 F22，spec AC22）。
+
+    ⚠ **新增的负载字段不进摘要行就等于白记**——读时间线的人看不见它们，
+    要 `--seq` 展开才发现「原来早就记了」（`CLAUDE.md` 成对维护点）。
+
+    判据是「排查时第一眼要不要看到它」：一次三问的提问在时间线上是三条
+    长得几乎一样的记录，没有进度与答案类型就分不出顺序、也看不出
+    哪一题被跳过了。而 `multi_select` **刻意不进**摘要——答案形态本身
+    已经说明了它，摘要行的宽度是稀缺资源。
+    """
+
+    def _line(self, **payload) -> str:
+        from rhinecode.trace.reader import _s_interaction
+
+        base = {"kind": "clarify", "display": "放哪一层？", "result": None}
+        base.update(payload)
+        return _s_interaction(base)
+
+    def test_progress_shows_for_multiple_questions(self) -> None:
+        line = self._line(question_index=1, question_total=3)
+        self.assertIn("2/3", line)
+
+    def test_progress_hidden_for_a_single_question(self) -> None:
+        """单问题时不显示进度——「第 1/1 题」是纯噪声。"""
+        self.assertNotIn("1/1", self._line(question_index=0, question_total=1))
+
+    def test_answer_kind_is_visible(self) -> None:
+        cases = {
+            "跳过": None,
+            "自己输入": "ClarifyReply(kind='free_text', labels=(), text='x')",
+            "多选": "ClarifyReply(kind='multi', labels=('a', 'b'), text='')",
+            "选了选项": "ClarifyReply(kind='option', labels=('a',), text='')",
+        }
+        for label, result in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(label, self._line(result=result))
+
+    def test_other_interaction_kinds_are_untouched(self) -> None:
+        """
+        ⚠ **反证：确认与计划审批两类的格式逐字不变。**
+
+        它们没有「答案类型」可言，硬塞一段空的只会多出一个孤零零的分隔点。
+        """
+        from rhinecode.trace.reader import _s_interaction
+
+        line = _s_interaction(
+            {"kind": "confirm", "result": "allow", "display": "write_file"}
+        )
+        self.assertEqual(line, "confirm → allow · write_file")
+
+
 if __name__ == "__main__":
     unittest.main()

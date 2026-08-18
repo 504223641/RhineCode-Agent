@@ -56,6 +56,7 @@ from typing import Any, Iterable, Optional, Protocol
 
 from rhinecode.agent.events import ConfirmDecision
 from rhinecode.trace import reader
+from rhinecode.agent.events import ClarifyReply
 from rhinecode.tui.widgets import ClarifyPanel, ConfirmPanel, InputBar, SessionPanel
 from tests.e2e import protocol
 
@@ -289,7 +290,7 @@ async def extract_panel(app: Any, kind: str) -> Optional[PanelSnapshot]:
 #   | confirm | permanent   | yes_permanent   | ConfirmDecision.ALLOW_PERMANENT|
 #   | confirm | deny        | no              | ConfirmDecision.DENY           |
 #   | approve | yes / no    | yes / no        | True / False                   |
-#   | clarify | 数字串 idx  | （走 App 私有列表） | app._clarify_options[idx].summary |
+#   | clarify | 2 / 0,2 / other:… / skip | （走 App 私有属性） | ClarifyReply 或 None（=跳过） |
 #   | session | 会话标识/cancel | 会话标识    | 交给 app._settle_session(...)  |
 _CONFIRM_SETTLEMENT = {
     "once": ConfirmDecision.ALLOW,
@@ -311,11 +312,14 @@ def settlement_for(kind: str, choice: str, app: Any) -> Any:
 
     :raises ValueError: 未知 choice 或越界序号；由 `answer` 转成 `bad_request` 响应。
 
-    ⚠️ `clarify` 的结算值要读 App 的 `_clarify_options`——**这是刻意读私有属性**：
-    产品侧的结算路径本身就是这么算的（见 `on_option_list_option_selected` 的
-    clarify 分支：`self._clarify_options[idx].summary`）。走同一份计算是有意的，
-    照抄一份「等价实现」反而会在产品改了算法时静默分叉。
+    ⚠️ `clarify` 的结算值要读 App 的 `_clarify_question`——**这是刻意读私有属性**：
+    产品侧的结算路径本身就是从那个问题对象上取选项名的（见
+    `RhineApp._settle_clarify`）。走同一份数据源是有意的，照抄一份
+    「等价实现」反而会在产品改了算法时静默分叉。
     **代价是：产品若改了该属性名，本处会一起失效**——已登记为成对维护点。
+
+    ⚠️ 四种应答形态（ask-user 扩展 F21）见 `protocol._CLARIFY_INDEX` 上方的表。
+    其中 `skip` 结算成 `None`，与真人按 Esc 逐字等价。
     """
     if kind == "confirm":
         value = _CONFIRM_SETTLEMENT.get(choice)
@@ -329,16 +333,44 @@ def settlement_for(kind: str, choice: str, app: Any) -> Any:
         return choice == "yes"
 
     if kind == "clarify":
-        try:
-            idx = int(choice)
-        except ValueError:
-            raise ValueError(f"clarify 面板的 choice 必须是序号，收到 {choice!r}") from None
-        options = getattr(app, "_clarify_options", None) or []
-        if idx < 0 or idx >= len(options):
-            raise ValueError(f"clarify 序号 {idx} 越界：当前只有 {len(options)} 个选项")
-        return options[idx].summary
+        return _clarify_settlement(choice, app)
 
     raise ValueError(f"未知面板类型 {kind!r}")
+
+
+def _clarify_settlement(choice: str, app: Any) -> Any:
+    """
+    澄清面板的四种应答形态 → 产品侧结算值（ask-user 扩展 F21）。
+
+    :raises ValueError: 越界或形态不认识；由 `answer` 转成 `bad_request` 响应
+    """
+    # `skip` 与真人按 Esc 逐字等价：产品侧的「跳过」就是结算成 None
+    if choice == "skip":
+        return None
+
+    if choice.startswith("other:"):
+        text = choice[len("other:"):].strip()
+        if not text:
+            raise ValueError("clarify 的 other: 后面要跟非空文本")
+        return ClarifyReply(kind="free_text", text=text)
+
+    question = getattr(app, "_clarify_question", None)
+    options = list(getattr(question, "options", ()) or ())
+    indexes = []
+    for piece in choice.split(","):
+        try:
+            index = int(piece)
+        except ValueError:
+            raise ValueError(f"clarify 面板的 choice 必须是序号，收到 {choice!r}") from None
+        if index < 0 or index >= len(options):
+            raise ValueError(f"clarify 序号 {index} 越界：当前只有 {len(options)} 个选项")
+        indexes.append(index)
+
+    labels = tuple(options[i].label for i in indexes)
+    # 单选与多选走**同一条**取值路径，只有 kind 不同——两者的差别在产品侧是
+    # 「提交一项」与「提交全部勾选」，在这里只是标签个数。
+    multi = bool(getattr(question, "multi_select", False))
+    return ClarifyReply(kind="multi" if multi else "option", labels=labels)
 
 
 # ---------------------------------------------------------------------------
@@ -626,9 +658,21 @@ class DriverCore:
         state = self.snapshot()["state"]
         turns = self.build_result.recorder.turn_total()
 
+        # 自由输入态是**唯一**允许在 pending 时提交的情形（ask-user 扩展 F16/F18）。
+        #
+        # 用户选了澄清面板上的「其它…」之后，面板变成提示态、输入框解禁并取得焦点
+        # ——那时**打字就是正确的应答方式**，而三态模型只看得到「有面板待决」。
+        # 不开这条例外的话，`send` 会回一句 `busy`，于是产品新增的那条岔路
+        # （`on_input_bar_input_submitted` 顶部的自由输入分支）**根本没法无头验收**。
+        #
+        # ⚠ 判据取自 App 的 `_clarify_free_text`——与 `settlement_for` 读
+        # `_clarify_question` 同一个理由：**刻意读私有属性**，走产品自己那份状态，
+        # 照抄一份「等价判断」会在产品改了状态机时静默分叉。
+        free_text = bool(getattr(self.app, "_clarify_free_text", False))
+
         # ① 锁内：只做纯内存判断与记账（微秒级）
         with self._lock:
-            if state != SessionState.IDLE.value:
+            if state != SessionState.IDLE.value and not free_text:
                 return protocol.err(
                     "busy", f"会话当前处于 {state} 态，只有 idle 时才能提交", {"state": state}
                 )
@@ -740,7 +784,10 @@ class DriverCore:
             )
 
         # ② 参数校验（非法组合在协议层就被挡下，不进产品）
-        for message in (protocol.validate_choice(kind, choice), protocol.validate_via(kind, via)):
+        for message in (
+            protocol.validate_choice(kind, choice),
+            protocol.validate_via(kind, via, choice),
+        ):
             if message:
                 return protocol.err("bad_request", message, {"kind": kind})
 
@@ -812,9 +859,16 @@ class DriverCore:
         **正确做法**：在「可选项序列」（`extract_panel` 已过滤掉 disabled）里算出
         目标的下标，减去初始高亮在该序列中的下标，得到要移动几格；负数就按 `up`。
 
-        `clarify` + `keys` 在协议层已被拒（详情行使推导不稳），这里不必再处理。
+        ⚠️ **正因为算的是「过滤之后的序列」，`clarify` 走这条路没有任何问题**
+        ——它的详情行本来就不参与计数，初始高亮也停在第一个可选项上，
+        与 `ConfirmPanel` 完全同构。协议层原先禁掉这个组合的理由是不成立的，
+        ask-user 扩展重新量过之后放开了（F21）。
         """
         options = (snap.get("panel") or {}).get("options") or []
+        if kind == "clarify":
+            # 三种形态（`other:` 已在协议层拒绝走本路径）：
+            #   skip → 按 Esc；0,2 → 逐个移过去回车勾选，最后在提交行回车；2 → 移过去回车
+            return self._answer_clarify_by_keys(choice, options)
         if kind == "session":
             target_id = choice
         else:
@@ -852,6 +906,76 @@ class DriverCore:
 
         run_on_main(self.loop, _press())
         return protocol.ok({"kind": kind, "choice": choice, "via": "keys", "source": "human"})
+
+    def _answer_clarify_by_keys(self, choice: str, options: list) -> dict:
+        """
+        澄清面板的按键路径（ask-user 扩展 F21）。
+
+        :param choice: `skip` / 单个序号 / 逗号分隔的多个序号
+        :param options: `extract_panel` 给出的**可选项序列**（已过滤 disabled）
+        :returns: 控制通道响应
+
+        ## ⚠ 多选的移动必须是相对的
+
+        每按一次方向键，光标就停在新位置上。逐个目标都从 0 重新算步数的话，
+        第二个目标会跑偏——而它不会报错，只会**勾错项**，
+        然后判据在别处失败，看起来像产品的 bug。
+        """
+        pilot = self.pilot
+
+        if choice == "skip":
+            async def _skip() -> None:
+                await pilot.press("escape")
+
+            run_on_main(self.loop, _skip())
+            return protocol.ok(
+                {"kind": "clarify", "choice": choice, "via": "keys", "source": "human"}
+            )
+
+        ids = [o.get("id") for o in options]
+        targets = []
+        for piece in choice.split(","):
+            if piece not in ids:
+                return protocol.err(
+                    "bad_request",
+                    f"clarify 面板里没有 id={piece!r} 的可选项，当前可选项：{ids}",
+                    {"options": ids},
+                )
+            targets.append(ids.index(piece))
+
+        # ⚠ **判据是「面板上有没有提交行」，不是「勾了几项」**。
+        # 原写法用 `len(targets) > 1`，于是一道多选题只勾一项时会被当成单选
+        # ——按下回车只是勾上（产品侧不结算），驱动器却以为交完了，
+        # 随后 `wait` 一直等到超时。用面板自己报出来的结构判，才不会分叉。
+        submit_pos = ids.index(ClarifyPanel.SUBMIT_ID) if ClarifyPanel.SUBMIT_ID in ids else None
+        other_pos = ids.index(ClarifyPanel.OTHER_ID) if ClarifyPanel.OTHER_ID in ids else len(ids)
+
+        async def _press() -> None:
+            cursor = 0  # 初始高亮 = 可选项序列的第 0 项
+            for target in targets:
+                steps = target - cursor
+                key = "down" if steps >= 0 else "up"
+                for _ in range(abs(steps)):
+                    await pilot.press(key)
+                await pilot.press("enter")
+                if submit_pos is None:
+                    return          # 单选：这一下回车就结算完了
+                # 多选：回车勾上之后**光标自己动了**（F15 修订）——
+                # 下一个候选项，或最后一项之后直达提交行。跟着它记，
+                # 否则下一次的相对移动会整体偏一格。
+                cursor = target + 1 if target + 1 < other_pos else submit_pos
+
+            # 多选：最后落到提交行再回车，这一下才真的交出去
+            steps = submit_pos - cursor
+            key = "down" if steps >= 0 else "up"
+            for _ in range(abs(steps)):
+                await pilot.press(key)
+            await pilot.press("enter")
+
+        run_on_main(self.loop, _press())
+        return protocol.ok(
+            {"kind": "clarify", "choice": choice, "via": "keys", "source": "human"}
+        )
 
     def keys(self, sequence: list) -> dict:
         """

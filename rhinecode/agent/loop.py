@@ -41,10 +41,15 @@ from rhinecode.agent.collector import StreamCollector
 from rhinecode.agent.events import (
     AgentEvent,
     AgentEventType,
-    ClarifyOption,
+    ClarifyQuestion,
+    ClarifyReply,
     StopReason,
 )
-from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, plan_schemas
+# ⚠ 用模块别名而不是 `from ... import parse_questions`：本文件里 `clarify`
+# 这个名字已经被**澄清回调参数**占用了（贯穿 `run` / `_execute` / `_run_special`
+# 三层），裸导入同名函数会在阅读时造成持续的歧义。
+from rhinecode.agent import clarify as clarify_mod
+from rhinecode.agent.plan_tools import ASK_USER, PRESENT_PLAN, ask_schemas, plan_schemas
 from rhinecode.agent.prompt import build_system_reminder, plan_toggle_instruction
 from rhinecode.agent.cache_log import log_cache_usage
 from rhinecode.hooks import (
@@ -203,8 +208,16 @@ MAX_CONSECUTIVE_UNKNOWN = 3
 # ask：当决策管线判定为 ASK（交人工确认）时调用，弹 HITL 面板。上层闭包已封装四选项
 # （本次/本会话/永久/拒绝）与对应的会话规则登记 / 永久落盘，循环只看返回的 bool（是否执行）。
 AskFn = Callable[[ToolCall, Tool, DecisionResult], bool]
-# clarify：弹澄清面板，返回用户所选概述；返回 None 表示用户取消
-ClarifyFn = Callable[[str, list[ClarifyOption]], Optional[str]]
+# clarify：弹一次澄清面板，返回用户对**这一个问题**的作答；
+# 返回 None 表示用户跳过（按了 Esc）。
+#
+# 三个入参是 (问题, 第几题从 0 起, 共几题)。后两个同时喂三件事：
+# 面板上的进度指示、界面判断「答完这题要不要收面板」、以及记录里的定位。
+#
+# ⚠ **一题一次调用，不是一次传全部**（ask-user 扩展，plan.md D2）：
+# 界面那条阻塞回调链一次只能等一个信号，而主线程不能阻塞——
+# 把串行放到界面侧就得改跨线程机制，那是本扩展明令不动的东西。
+ClarifyFn = Callable[[ClarifyQuestion, int, int], Optional[ClarifyReply]]
 # approve_plan：弹「是否开始执行」审批，返回是否批准
 ApprovePlanFn = Callable[[str], bool]
 
@@ -289,6 +302,36 @@ def _invalid_args_result(tc: ToolCall) -> ToolResult:
     )
 
 
+def _ask_summary(
+    pairs: list[tuple[ClarifyQuestion, Optional[ClarifyReply]]]
+) -> str:
+    """
+    一次 `ask_user` 在**工具行上**显示的那句规模描述（ask-user 扩展）。
+
+    :param pairs: [(问题, 作答或 None)]，只含真的问过的那些
+    :returns: 单题时是所选内容本身，多题时是「问了 N 个」
+
+    ⚠ 与回灌给模型的文本**刻意不同**：那份要完整（模型据此决策），
+    这句只是历史区里一行工具行，长了会把那一行挤爆。单题时直接给答案，
+    是因为那正是用户回头翻记录时唯一想看的东西。
+
+    副作用：无（纯函数）。
+    """
+    if len(pairs) == 1:
+        _question, reply = pairs[0]
+        if reply is None:
+            return "用户未选择"
+        if reply.kind == "free_text":
+            return f"用户输入：{reply.text}"
+        if not reply.labels:
+            return "用户一项都没选"
+        return f"用户选择：{', '.join(reply.labels)}"
+    answered = sum(1 for _q, r in pairs if r is not None)
+    if answered == len(pairs):
+        return f"问了 {len(pairs)} 个问题，都已作答"
+    return f"问了 {len(pairs)} 个问题，答了 {answered} 个"
+
+
 class _RoundContext:
     """
     单轮工具执行的上下文，用于把 _execute 内部发生的「状态变化」回传给主循环。
@@ -301,6 +344,8 @@ class _RoundContext:
     :param user_denied: 本轮有工具在人在回路面板里被用户拒绝，**下一轮不发工具**
     :param known_count: 本轮命中的已知工具（含特殊工具）数量
     :param unknown_count: 本轮命中的未知工具数量
+    :param clarify_skipped: 本轮里用户跳过了几次提问（ask-user 扩展 F17 熔断）。
+        与 `unknown_count` 同一形态：本轮计数在这里，跨轮累计在 `run()` 的局部量里
     """
 
     def __init__(self) -> None:
@@ -310,6 +355,7 @@ class _RoundContext:
         self.user_denied: bool = False
         self.known_count: int = 0
         self.unknown_count: int = 0
+        self.clarify_skipped: int = 0
 
 
 class Agent:
@@ -872,23 +918,48 @@ class Agent:
         plan_mode: bool,
         execution_phase: bool,
         excluded: frozenset = frozenset(),
+        can_ask_user: bool = False,
     ) -> Optional[list[dict]]:
         """
         计算本轮要发给模型的工具 schema 列表。
 
         - 无注册中心 → None（纯对话，不带工具）
-        - Plan Mode 且未获批执行（规划阶段）→ 只读工具 + ask_user/present_plan 特殊工具
+        - Plan Mode 且未获批执行（规划阶段）→ 只读工具 + present_plan
         - 其余（普通模式，或 Plan Mode 已获批的执行阶段）→ 全部工具
+        - **有澄清回调时，任何阶段都再附加 ask_user**（ask-user 扩展 F1）
         - 无论哪种，都再排除 `excluded` 里的工具（防子对话嵌套）
 
         :param plan_mode: 是否处于 Plan Mode
         :param execution_phase: Plan Mode 下是否已获批进入执行阶段
         :param excluded: 本轮要排除的工具名集合；空集表示不排除
+        :param can_ask_user: 本次运行有没有可问的人（即拿到了澄清回调）
         :returns: 工具 schema 列表，或 None
 
-        **`plan_schemas()` 在过滤之后才拼接**，因此 `ask_user` / `present_plan`
-        天然不受白名单影响（spec F15）——它们是流程控制工具，与 Skill 声明的
-        业务能力无关。
+        ## ⚠ 两个特殊工具的判据从此不同（ask-user 扩展 F1）
+
+        改造前它们同进同出，共用「规划阶段」这一个判据；现在：
+
+        - `present_plan` —— 判据仍是**规划阶段**。没有计划要审批的时候，
+          「提交计划」这个动作不成立。
+        - `ask_user` —— 判据换成**有没有人可问**。向用户提问在任何阶段都成立，
+          此前只在规划阶段可见纯粹是它当初诞生在 C4 Plan Mode 里的历史遗留。
+
+        ## 这个判据顺带兑现了两条不变量，不必另立禁用清单
+
+        - **F2 子 Agent 拿不到它**——`subagents/runner.py` 那条运行链传的
+          澄清回调本来就是 `None`（注释写着「问不了人」），于是这里不发。
+          与官方登记的限制（*not currently available in subagents*）
+          **同一个理由**：全程非交互、用户不在场。
+        - **F3 无人值守轮拿不到它**——协调层在那种轮次把回调置空
+          （与 `ask=None` 同一手法），于是这里也不发。
+
+        换句话说「能不能问」= 「有没有人可问」，**这是结构，不是约定**。
+        另立一张「哪些场合禁用」的清单则要在每个新场合出现时记得去加一行，
+        而漏加不报错。
+
+        **两个 `*_schemas()` 都在过滤之后才拼接**，因此它们天然不受
+        Skill 白名单影响（c11 spec F15）——它们是流程控制工具，
+        与 Skill 声明的业务能力无关。
         """
         if self._registry is None:
             return None
@@ -910,6 +981,8 @@ class Agent:
 
         if planning:
             base = base + plan_schemas()
+        if can_ask_user:
+            base = base + ask_schemas()
         return base
 
     # ------------------------------------------------------------------ #
@@ -972,6 +1045,13 @@ class Agent:
         """
         execution_phase = False       # Plan Mode 下是否已获批执行
         consecutive_unknown = 0       # 连续「整轮仅未知工具」的次数
+        # ask-user 扩展 F17：本次运行里用户一共跳过了几次提问。达到上限后
+        # 不再弹面板——连按两次「我不选」已经把「别问我」说得很清楚了。
+        #
+        # ⚠ 它是**累计**而不是「连续」（与上面那个不同）：跳过之间夹着几次
+        # 正常作答，也不代表用户又想被问了；而「连续」口径会让模型学会
+        # 「穿插着问就能一直问」。
+        clarify_skips = 0
         # c13：子 Agent 闸门。缺省 NullGate → 两处调用退化为零成本空操作，
         # **不传等于零回归**。
         gate = options.subagent_gate if options.subagent_gate is not None else NullGate()
@@ -1070,7 +1150,11 @@ class Agent:
             # 工具集收窄策略**每轮现取**（c11 F14）：模型可能上一轮才激活 Skill，
             # 这一轮的工具集就该随之收窄；注册中心也可能因 MCP 重载增删了工具。
             excluded = options.excluded_tools
-            tools = self._schema_for(plan_mode, execution_phase, excluded)
+            # ask-user 扩展 F1：`ask_user` 的可见性判据是「有没有人可问」，
+            # 即本次运行拿没拿到澄清回调——不是「在哪个阶段」。
+            tools = self._schema_for(
+                plan_mode, execution_phase, excluded, can_ask_user=clarify is not None
+            )
 
             # 上一轮有工具被用户拒绝 → **本轮一件工具都不发**（硬约束）。
             # 理由见 DENIED_BY_USER_FEEDBACK 的注释：回灌文案是软约束、模型可以不听，
@@ -1209,7 +1293,15 @@ class Agent:
                 cwd=run_cwd,
                 # c16：本次运行的判定会话；None = 不做分类器审查。
                 review=review_session,
+                # ask-user 扩展 F17：本轮之前的累计跳过次数（熔断判据的一半，
+                # 另一半是本轮内的 `ctx.clarify_skipped`）。
+                clarify_skips=clarify_skips,
             )
+
+            # 跳过次数累加（放在 `_execute` 之后、各停止条件之前）。
+            # 位置与下面 `consecutive_unknown` 那段同理：本轮计数在 ctx 里，
+            # 跨轮累计只有这一处写入点。
+            clarify_skips += ctx.clarify_skipped
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
             for tc in tool_calls:
@@ -1282,6 +1374,7 @@ class Agent:
         cwd: Optional[Path] = None,
         unattended: bool = False,
         review: "Optional[ReviewSession]" = None,
+        clarify_skips: int = 0,
     ) -> Iterator[AgentEvent]:
         """
         执行本轮所有工具调用：先做权限「决策预扫」，再按类别分流执行（c6）。
@@ -1310,6 +1403,8 @@ class Agent:
         :param cancel_event: 取消信号，串行执行前检查
         :param interactive: 能否与人交互（c13）。缺省 True 即既有行为；为假时
             ASK 走非交互拒绝分支，见 `DENIED_NON_INTERACTIVE_FEEDBACK`
+        :param clarify_skips: **本轮之前**用户已累计跳过几次提问
+            （ask-user 扩展 F17 熔断）。只透传给 `_run_special`，本方法不解释它
 
         副作用：实际执行工具（可能读写文件、跑命令）；通过回调与用户交互。
         """
@@ -1734,7 +1829,15 @@ class Agent:
             if cancel_event.is_set():
                 ctx.cancelled = True
                 break
-            yield from self._run_special(tc, results, ctx, clarify, approve_plan)
+            yield from self._run_special(
+                tc, results, ctx, clarify, approve_plan,
+                # ask-user 扩展：Esc 的语义按阶段分岔（F17）、
+                # 「问不了人」的文案按原因分岔（F4）、熔断看累计跳过次数（F17）。
+                planning=planning,
+                interactive=interactive,
+                unattended=unattended,
+                clarify_skips=clarify_skips,
+            )
             if ctx.cancelled or ctx.plan_rejected:
                 break
 
@@ -1756,13 +1859,22 @@ class Agent:
         ctx: _RoundContext,
         clarify: Optional[ClarifyFn],
         approve_plan: Optional[ApprovePlanFn],
+        planning: bool = False,
+        interactive: bool = True,
+        unattended: bool = False,
+        clarify_skips: int = 0,
     ) -> Iterator[AgentEvent]:
         """
         执行一个特殊交互工具（ask_user / present_plan），路由到对应回调。
 
-        ask_user：解析 question/options → 调 clarify 弹澄清面板 → 所选概述作为结果；
-                  用户取消（返回 None）→ 置 ctx.cancelled，结果记为「用户取消」。
+        ask_user：解析 questions → 逐题调 clarify 弹面板 → 答案汇总回灌；
+                  详见下面 `_run_ask_user`。
         present_plan：解析 plan → 调 approve_plan 弹审批 → 批准则置 ctx.approved。
+
+        :param planning: 是否处于 Plan Mode 规划阶段（决定 Esc 的语义，F17）
+        :param interactive: 本次运行能否与人交互（子 Agent 为假；决定回灌哪条文案）
+        :param unattended: 本次运行是不是无人值守轮（同上）
+        :param clarify_skips: **本轮之前**已经累计跳过了几次提问（熔断，F17）
 
         回调缺失或参数非法时返回结构化错误，保证不崩溃（N1）。
         """
@@ -1775,20 +1887,13 @@ class Agent:
             return
 
         if tc.name == ASK_USER:
-            if clarify is None:
-                res = ToolResult(ok=False, output="当前不支持向用户澄清（缺少澄清回调）。")
-            else:
-                question = str(tc.arguments.get("question", "")).strip()
-                options = self._parse_options(tc.arguments.get("options"))
-                if not options:
-                    res = ToolResult(ok=False, output="ask_user 需要至少一个候选项 options。")
-                else:
-                    chosen = clarify(question, options)
-                    if chosen is None:
-                        ctx.cancelled = True
-                        res = ToolResult(ok=False, output="用户取消了澄清。", summary="用户取消")
-                    else:
-                        res = ToolResult(ok=True, output=f"用户选择：{chosen}", summary=f"用户选择：{chosen}")
+            res = self._run_ask_user(
+                tc, ctx, clarify,
+                planning=planning,
+                interactive=interactive,
+                unattended=unattended,
+                clarify_skips=clarify_skips,
+            )
         else:  # PRESENT_PLAN
             if approve_plan is None:
                 res = ToolResult(ok=False, output="当前不支持计划审批（缺少审批回调）。")
@@ -1812,24 +1917,115 @@ class Agent:
         yield AgentEvent(type=AgentEventType.TOOL_RESULT, tool_call=tc, tool_result=res)
 
     @staticmethod
-    def _parse_options(raw) -> list[ClarifyOption]:
+    def _run_ask_user(
+        tc: ToolCall,
+        ctx: _RoundContext,
+        clarify: Optional[ClarifyFn],
+        *,
+        planning: bool,
+        interactive: bool,
+        unattended: bool,
+        clarify_skips: int,
+    ) -> ToolResult:
         """
-        把模型给出的 options 原始数据（list[dict]）解析为 list[ClarifyOption]。
+        执行一次 `ask_user`：解析问题 → 逐题弹面板 → 汇总答案（ask-user 扩展）。
 
-        宽松解析：跳过非字典项、缺 summary 的项；detail 缺省为空串。保证不因模型输出瑕疵崩溃。
+        :param clarify: 澄清回调；`None` 表示现在没人可问
+        :param planning: 是否处于 Plan Mode 规划阶段
+        :param interactive: 本次运行能否与人交互
+        :param unattended: 本次运行是不是无人值守轮
+        :param clarify_skips: 本轮之前已累计跳过几次
+        :returns: 回灌给模型的结果
+
+        副作用：通过 `clarify` 回调与用户交互（阻塞等待）；可能修改 `ctx`。
+
+        ## 五条分支，顺序即优先级
+
+        1. **没人可问**（`clarify is None`）→ 按原因回灌三条文案之一（F4）。
+        2. **一个可用问题都没有** → 回灌怎么改（F10）。
+        3. **已经熔断**（跳过次数达上限）→ 一次面板都不弹（F17）。
+        4. **逐题提问**，中途跳过则不再问剩下的。
+        5. **跳过时按阶段分岔**：规划阶段停整轮（现状不变），其余继续（F17）。
+
+        ## ⚠ 三条「不置标志」的纪律
+
+        分支 1 / 2 / 3 与非规划阶段的跳过**都不置 `ctx.cancelled`、
+        不置 `ctx.user_denied`**：
+
+        - `cancelled` 会让主循环立刻以「用户取消」收尾——而这四种情形里
+          用户要么不在场、要么明说了「你自己定」，都不是「别干了」。
+        - `user_denied` 的含义是「人刚刚在面板上说了不」，它会让**下一轮
+          一件工具都不发**。借用它会让模型在一次普通的「你自己定」之后
+          突然失去全部工具，什么活也干不了。
         """
-        if not isinstance(raw, list):
-            return []
-        options: list[ClarifyOption] = []
-        for item in raw:
-            if not isinstance(item, dict):
+        # ── 分支 1：没人可问（F3 第二道 / F4）──
+        #
+        # 正常情况下模型压根看不到这个工具（`_schema_for` 的判据），
+        # 但它**会凭训练先验硬造出调用**——本项目在 C11 场景 10、C13 规划阶段
+        # 委派两处都实测到过这种形态。这里是纵深防御的第二道。
+        if clarify is None:
+            return ToolResult(
+                ok=False,
+                output=clarify_mod.render_unavailable(
+                    interactive=interactive, unattended=unattended
+                ),
+                summary="未提问：现在没人可问",
+            )
+
+        questions, notes = clarify_mod.parse_questions(tc.arguments.get("questions"))
+
+        # ── 分支 2：一个可用问题都没有（F10）──
+        if not questions:
+            detail = ("　" + "；".join(notes)) if notes else ""
+            return ToolResult(
+                ok=False,
+                output=clarify_mod.NO_QUESTIONS_FEEDBACK + detail,
+                summary="未提问：没有可用的问题",
+            )
+
+        # ── 分支 3：熔断（F17）──
+        #
+        # ⚠ 判据用「**本轮之前的累计 + 本轮已跳过**」而不是只看前者：
+        # 模型可能在**同一轮**里调两次 `ask_user`，只看跨轮累计会让熔断
+        # 晚一次生效——用户已经说了两次「别问我」，还要再被问第三次。
+        if clarify_skips + ctx.clarify_skipped >= clarify_mod.SKIP_LIMIT:
+            return ToolResult(
+                ok=True,
+                output=clarify_mod.SKIP_CIRCUIT_FEEDBACK,
+                summary="未提问：用户已连续跳过，不再打扰",
+            )
+
+        # ── 分支 4：逐题提问 ──
+        #
+        # 串行放在循环侧（而不是把整串问题丢给界面）是刻意的：界面那条
+        # 阻塞回调链一次只能等一个信号，放界面侧就得改跨线程机制，
+        # 而那是本扩展明令不动的东西（spec N2）。
+        pairs: list[tuple[ClarifyQuestion, Optional[ClarifyReply]]] = []
+        total = len(questions)
+        for index, question in enumerate(questions):
+            reply = clarify(question, index, total)
+            pairs.append((question, reply))
+            if reply is not None:
                 continue
-            summary = str(item.get("summary", "")).strip()
-            if not summary:
-                continue
-            detail = str(item.get("detail", "")).strip()
-            options.append(ClarifyOption(summary=summary, detail=detail))
-        return options
+
+            # ── 分支 5：用户跳过 → 按阶段分岔（F17）──
+            ctx.clarify_skipped += 1
+            if planning:
+                # **规划阶段维持 C4 以来的语义**：用户按 Esc = 不想规划了，
+                # 整轮结束。那在「批准前只调研」的语境里说得通。
+                ctx.cancelled = True
+                return ToolResult(
+                    ok=False, output="用户取消了澄清。", summary="用户取消"
+                )
+            # 其余任何时候：Esc 的意思是「我不选，你自己定」。剩下的问题
+            # 不再呈现（他已经表态不想挑了，再弹两次只会更烦）。
+            break
+
+        return ToolResult(
+            ok=True,
+            output=clarify_mod.render_answers(pairs, notes),
+            summary=_ask_summary(pairs),
+        )
 
     def _run_readonly_concurrent(
         self,

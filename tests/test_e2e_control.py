@@ -802,17 +802,31 @@ class PlanPanelTest(DriverFixture):
             self.assertGreaterEqual(len(provider.calls), 2, "批准后循环必须继续")
 
     async def test_clarify_panel(self):
+        """
+        ⚠️ **参数形状与两条判据都随 ask-user 扩展改了。**
+
+        - 工具参数从「单问题 + summary/detail」换成对齐官方的
+          `questions[]` + `label/description`（F7）；
+        - 可选项末尾**多一个「其它…」**，它由界面无条件追加（F8）；
+        - `clarify` + `keys` **不再被拒**（F21）——原禁令的理由
+          （详情行使按键次数推不稳）实测不成立，见 `protocol.py` 那段说明。
+        """
         script = [
             [
                 text("有几个方向不确定。"),
                 tool(
                     "ask_user",
                     {
-                        "question": "先改哪一块？",
-                        "options": [
-                            {"summary": "先改登录", "detail": "认证模块超时"},
-                            {"summary": "先改上传", "detail": "大文件失败"},
-                        ],
+                        "questions": [
+                            {
+                                "question": "先改哪一块？",
+                                "header": "优先级",
+                                "options": [
+                                    {"label": "先改登录", "description": "认证模块超时"},
+                                    {"label": "先改上传", "description": "大文件失败"},
+                                ],
+                            }
+                        ]
                     },
                 ),
                 done(),
@@ -827,12 +841,15 @@ class PlanPanelTest(DriverFixture):
 
             snap = await asyncio.to_thread(core.snapshot)
             self.assertEqual(snap["panel"]["kind"], "clarify")
-            # ⚠️ ClarifyPanel 在候选项之间夹着 disabled 详情行，
-            # options 必须只剩两个真候选（详情行被跳过）
-            self.assertEqual([o["id"] for o in snap["panel"]["options"]], ["0", "1"])
+            # ⚠️ ClarifyPanel 在候选项之间夹着 disabled 详情行（被跳过），
+            # 末尾那项「其它…」则是界面补的（F8）
+            self.assertEqual(
+                [o["id"] for o in snap["panel"]["options"]], ["0", "1", "other"]
+            )
+            self.assertIn("优先级", snap["panel"]["display"], "徽章要显示出来")
 
-            # clarify + keys 在协议层被拒（详情行使按键次数推不稳）
-            rejected = await asyncio.to_thread(core.answer, "1", "keys")
+            # 自由输入走 keys 仍然被拒，且错误消息要给出两条替代做法
+            rejected = await asyncio.to_thread(core.answer, "other:自己写", "keys")
             self.assertFalse(rejected["ok"])
             self.assertEqual(rejected["error"]["code"], "bad_request")
 
@@ -842,7 +859,10 @@ class PlanPanelTest(DriverFixture):
             events = [e for e in self.interactions() if e["kind"] == "clarify"]
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["source"], "driver")
-            self.assertEqual(events[0]["result"], "先改上传", "结算值取自 App 的澄清选项列表")
+            self.assertIn(
+                "先改上传", str(events[0]["result"]), "结算值取自 App 的当前问题对象"
+            )
+            self.assertEqual(events[0]["question_total"], 1)
             self.assertGreaterEqual(len(provider.calls), 2, "澄清后循环必须继续")
 
 
