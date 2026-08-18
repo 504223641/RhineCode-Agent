@@ -44,7 +44,12 @@ from rhinecode.conversation import (
     ConversationManager,
     SessionListRequest,
 )
-from rhinecode.agent.events import AgentEventType, StopReason, ConfirmDecision
+from rhinecode.agent.events import (
+    AgentEventType,
+    ClarifyReply,
+    ConfirmDecision,
+    StopReason,
+)
 from rhinecode.commands.parser import InputKind, parse_input
 from rhinecode.hooks import HookEventType
 
@@ -572,7 +577,13 @@ class RhineApp(App):
         # 由回调在 Worker 线程创建并阻塞、由主线程的选择/取消处理写入结果并唤醒。
         self._pending_interaction: dict | None = None
         # 当前澄清面板的候选项列表（用于把所选下标还原为概述文本）
-        self._clarify_options: list = []
+        # 当前正在问的那个问题（ask-user 扩展）。驱动设施也读它来算结算值
+        # ——**刻意读私有属性**，为的是与产品侧走同一份计算，
+        # 照抄一份「等价实现」反而会在产品改了算法时静默分叉。
+        self._clarify_question = None
+        # 是否处于自由输入态（用户选了「其它…」，正在主输入框里打字，F16）。
+        # 它是**输入框提交守卫**与 **Esc 分支**共同的判据，两处成对。
+        self._clarify_free_text: bool = False
         # 单轮运行锁：避免多个 Worker 同时修改同一份 conversation history。
         self._stream_active = False
         # c15 F20：「自动唤起已达上限」只提示一次的标志。
@@ -1904,8 +1915,11 @@ class RhineApp(App):
         if index is None:
             return False
         event.stop()
-        panel.highlighted = index
-        panel.action_select()
+        # 走面板自己的覆写点（ask-user 扩展 F15）：缺省实现就是
+        # 「移过去 + action_select()」，与改造前逐字相同；澄清面板在**多选**下
+        # 覆写成「切换勾选」——切换不是结算，因此上面那条
+        # 「不新增结算路径」的约束仍然成立。
+        panel.activate_choice(index)
         return True
 
     def _active_choice_panel(self):
@@ -1932,6 +1946,21 @@ class RhineApp(App):
         2. 流式运行中 → Esc 触发取消当前 Agent 循环（spec F9）。
         3. 命令面板可见 → Up/Down 移动高亮、Esc 隐藏（焦点始终保持在 InputBar）。
         """
+        # -1. 自由输入态的 Esc：**退回选项列表，而不是取消整次提问**
+        #     （ask-user 扩展 F16）。
+        #
+        # ⚠ **必须排在最前面**，两条理由都不能少：
+        # ① 排在数字键之后不行——那时用户正在打字，数字必须落进输入框；
+        #    （目前提示态里一个可选项都没有，数字键天然不会命中，但那是
+        #    「刚好如此」，把顺序钉死才是结构上的保证）
+        # ② 排在下面那条「有待决交互就 return」之后更不行——自由输入态下
+        #    焦点在**输入框**上，`ClarifyPanel` 自己的 Esc 绑定根本收不到，
+        #    于是 Esc 会变成一个什么都不做的键。
+        if self._clarify_free_text and event.key == "escape":
+            event.stop()
+            self._leave_clarify_free_text()
+            return
+
         # 0. 数字键直选（tui-display 扩展 F23）。
         #
         # ⚠ **必须排在下面那条「交互待决 → return」守卫之前**，否则永远走不到
@@ -2009,6 +2038,25 @@ class RhineApp(App):
            未知命令提示与错误边界全部由分发器统一负责，App 不再区分具体命令名，
            也不再维护状态刷新白名单。
         """
+        # ── 自由输入态：这一条提交**就是答案**（ask-user 扩展 F16/F18）──
+        #
+        # ⚠ **必须排在下面那条「有待决交互就拦下」之前**：自由输入态本来就
+        # 处在一次待决交互当中，走到那条守卫会被回一句「请先在面板上做出选择」
+        # ——而用户此刻正在做的恰恰就是那件事。
+        #
+        # ⚠ 这段文本**不是一条新消息**：不进对话历史、不触发消息类 Hook、
+        # 不开新回合、也不做斜杠命令解析（用户答案里的 `/` 是答案的一部分）。
+        # 因此这里直接结算并返回，压根不往下走到 `parse_input` / `dispatch`。
+        if self._clarify_free_text and self._pending_interaction is not None:
+            text = (event.text or "").strip()
+            if not text:
+                # 空回车不结算，停在自由输入态——与主输入框「空提交零副作用」同口径。
+                # 结算成空串的话，模型会拿到一个「用户输入了空」的答案，
+                # 那比什么都不做更糟。
+                return
+            self._resolve_interaction(ClarifyReply(kind="free_text", text=text))
+            return
+
         # 交互进行中 / 流式运行中 / 会话选择面板展示中：拦下提交。
         #
         # c11 起前两种情形给出**可见提示**而不是静默 return——静默会让用户
@@ -2660,7 +2708,15 @@ class RhineApp(App):
     # ------------------------------------------------------------------ #
     # 三类用户交互回调（均在 Worker 线程被调用，阻塞等待主线程选择）
     # ------------------------------------------------------------------ #
-    def _interact(self, kind: str, show_fn, default, display: str = ""):
+    def _interact(
+        self,
+        kind: str,
+        show_fn,
+        default,
+        display: str = "",
+        keep_panel: bool = False,
+        extra: "Optional[dict]" = None,
+    ):
         """
         统一的「阻塞式询问主线程」机制（确认/澄清/审批共用）。
 
@@ -2673,11 +2729,24 @@ class RhineApp(App):
         :param default: 未明确选择（如异常路径）时的默认结果
         :param display: 面板展示内容的摘要，仅用于 trace 埋点。**必须由调用方传入**——
                         展示内容全被闭进 `show_fn` 里，本方法拿不到（trace T45）
+        :param keep_panel: 结算后**不收面板、不还焦输入框**（ask-user 扩展 F14）。
+            一次 `ask_user` 可能带好几个问题，逐个弹的时候如果每答完一题都收一次面板，
+            用户会看到焦点在输入框与面板之间来回跳。⚠ 它只在**真的拿到了作答**时
+            才生效，见 `_resolve_interaction`
+        :param extra: 并进行为记录负载的附加字段（ask-user 扩展 F22）。
+            ⚠ **新增字段要同步 `trace/reader.py` 的摘要函数**（成对维护点）——
+            漏改不报错，只是那些字段读时间线时看不见，等于白记
         :returns: 用户选择的结果
         """
         # `source` 记录**这次结算走的是哪条路径**，缺省 human（面板按键路径）。
         # 结算方（`_resolve_interaction`）可以覆写它，见该方法的说明。
-        box = {"event": threading.Event(), "result": default, "kind": kind, "source": "human"}
+        box = {
+            "event": threading.Event(),
+            "result": default,
+            "kind": kind,
+            "source": "human",
+            "keep_panel": keep_panel,
+        }
 
         def _arm() -> None:
             """
@@ -2743,6 +2812,7 @@ class RhineApp(App):
                 "display": full_text(display),
                 "source": source,
                 "result": getattr(result, "value", result),
+                **(extra or {}),
             },
         )
         return result
@@ -2762,14 +2832,37 @@ class RhineApp(App):
             display=f"{tool_call.name} {tool_call.arguments}｜{decision.reason}",
         )
 
-    def _clarify(self, question, options):
-        """Plan Mode 需求澄清（spec F12），返回所选概述；用户取消返回 None。"""
-        self._clarify_options = options
+    def _clarify(self, question, index: int = 0, total: int = 1):
+        """
+        澄清提问（c4 spec F12 / ask-user 扩展）：弹一次面板问**一个**问题。
+
+        :param question: `ClarifyQuestion`
+        :param index: 这是第几题（从 0 起）
+        :param total: 本次一共几题
+        :returns: `ClarifyReply`；用户跳过（按 Esc）返回 None
+
+        ⚠ **一题一次调用**，串行由 Agent 循环侧驱动（plan.md D2）：
+        本方法底下那条阻塞回调链一次只能等一个信号，而主线程不能阻塞——
+        把串行搬到界面侧就得改跨线程机制，那是本扩展明令不动的东西。
+
+        副作用：阻塞当前 Worker 线程直到用户作答；写 `_clarify_question`
+        （驱动设施读它算结算值，见 `tests/e2e/control.py` 的 `settlement_for`）。
+        """
+        self._clarify_question = question
+        self._clarify_free_text = False
         return self._interact(
             "clarify",
-            lambda: self._show_clarify_panel(question, options),
+            lambda: self._show_clarify_panel(question, index, total),
             None,
-            display=f"{question}｜候选：{[o.summary for o in options]}",
+            display=f"{question.question}｜候选：{[o.label for o in question.options]}",
+            # 不是最后一题就别收面板（F14）——否则每答完一题焦点都要
+            # 在输入框与面板之间跳一次。
+            keep_panel=(index < total - 1),
+            extra={
+                "question_index": index,
+                "question_total": total,
+                "multi_select": question.multi_select,
+            },
         )
 
     def _approve_plan(self, plan: str) -> bool:
@@ -2788,18 +2881,53 @@ class RhineApp(App):
         panel.show_for(tool_call, tool, decision)
         panel.focus()
 
-    def _show_clarify_panel(self, question, options) -> None:
+    def _show_clarify_panel(self, question, index: int = 0, total: int = 1) -> None:
         """
-        在主线程展示需求澄清面板并移焦。
+        在主线程展示澄清面板并移焦（选项列表态）。
 
-        与确认/审批不同：Plan Mode 澄清要求用户「只能在候选项间选择，不能输入文本」，
+        与确认/审批不同：选项列表态要求用户「只能在候选项间选择，不能输入文本」，
         因此这里禁用输入框（disabled=True），阻止用户点击输入框继续打字；
-        结算交互时（_resolve_interaction）再恢复。其它交互（confirm/approve）不做此限制。
+        结算交互时（`_resolve_interaction`）再恢复。其它交互（confirm/approve）不做此限制。
+
+        ⚠ **自由输入态会把这个禁用解除**（`_enter_clarify_free_text`）——
+        那时打字正是我们要的行为。两处成对，见 ask-user 扩展 F16。
         """
         self.query_one(CommandPanel).hide()
         self.query_one(InputBar).disabled = True
         panel = self.query_one(ClarifyPanel)
-        panel.show_for(question, options)
+        panel.show_question(question, index, total)
+        panel.focus()
+
+    def _enter_clarify_free_text(self) -> None:
+        """
+        进入自由输入态：面板换成提示态，光标回到主输入框（ask-user 扩展 F16）。
+
+        ⚠ **面板不收起**——「现在到底在干什么」必须一直看得见。收起来的话
+        用户会以为提问已经结束，而澄清回调其实还阻塞在 Worker 线程上，
+        那正是本项目反复吃亏的「静默中间态」。
+
+        副作用：改面板内容、解禁并聚焦输入框、置 `_clarify_free_text`。
+        """
+        self._clarify_free_text = True
+        self.query_one(ClarifyPanel).show_free_text()
+        bar = self.query_one(InputBar)
+        bar.disabled = False
+        bar.focus()
+
+    def _leave_clarify_free_text(self) -> None:
+        """
+        从自由输入态退回选项列表态（F16 的 Esc 分支）。**不结算**。
+
+        用 `restore_options()` 而不是 `show_question()`：前者保留已勾选的项。
+        多选题里用户勾了两项、又去看了看「其它…」、然后按 Esc 退回来——
+        勾选还在才是对的。
+
+        副作用：改面板内容、禁用输入框、把焦点移回面板。
+        """
+        self._clarify_free_text = False
+        panel = self.query_one(ClarifyPanel)
+        panel.restore_options()
+        self.query_one(InputBar).disabled = True
         panel.focus()
 
     def _show_approve_panel(self, plan: str) -> None:
@@ -2861,11 +2989,26 @@ class RhineApp(App):
             return
         self._pending_interaction = None
         box["source"] = source
-        self.query_one(ConfirmPanel).hide()
-        self.query_one(ClarifyPanel).hide()
-        # 恢复输入框：澄清面板期间被禁用（见 _show_clarify_panel），结算后统一解禁并还焦
-        self.query_one(InputBar).disabled = False
-        self.query_one(InputBar).focus()
+        # 自由输入态一定随本次结算结束（ask-user 扩展 F16）
+        self._clarify_free_text = False
+
+        # ── 收尾是**有条件**的（ask-user 扩展 F14）──
+        #
+        # 一次 `ask_user` 可能带好几个问题，循环侧逐题调过来。不是最后一题时
+        # 保留面板与焦点，否则用户每答完一题都会看到焦点在输入框与面板之间跳一次。
+        #
+        # ⚠ **`and result is not None` 不可省。** 用户在第 2 题（共 3 题）
+        # 按 Esc 时 `keep_panel` 是真，但循环马上就要 break——不加这个条件，
+        # **面板会永远挂在屏幕上，而输入框还是禁用的**，也就是界面假死。
+        keep_panel = bool(box.get("keep_panel")) and result is not None
+        if not keep_panel:
+            self.query_one(ConfirmPanel).hide()
+            self.query_one(ClarifyPanel).hide()
+            # 恢复输入框：澄清面板期间被禁用（见 _show_clarify_panel），
+            # 结算后统一解禁并还焦
+            self.query_one(InputBar).disabled = False
+            self.query_one(InputBar).focus()
+
         box["result"] = result
         box["event"].set()
 
@@ -2908,12 +3051,48 @@ class RhineApp(App):
 
         elif isinstance(ol, ClarifyPanel) and kind == "clarify":
             event.stop()
-            try:
-                idx = int(event.option.id)
-                summary = self._clarify_options[idx].summary
-            except (ValueError, IndexError, TypeError):
-                summary = None
-            self._resolve_interaction(summary)
+            self._settle_clarify(ol, event.option.id)
+
+    def _settle_clarify(self, panel, option_id) -> None:
+        """
+        澄清面板上选中了一项：三条分支，**顺序即需求**（ask-user 扩展 F16/F11）。
+
+        :param panel: 发出选择消息的 `ClarifyPanel`
+        :param option_id: 被选中那一项的 id（候选项下标的字符串，或 `OTHER_ID`）
+
+        1. **「其它…」** → 进自由输入态，**不结算**（回调继续阻塞着）。
+        2. **多选态** → 结算为已勾选的那些（可能一项都没有——那是「都不要」，
+           与「跳过」是两回事，见 `ClarifyReply` 的说明）。
+        3. **单选** → 结算为该项。
+
+        ⚠ **顺序不能反**：多选态下高亮停在「其它…」上按回车，
+        要进自由输入而不是提交勾选结果。
+
+        副作用：进入自由输入态，或结算一次交互。
+        """
+        # ── 分支 1：其它…（不结算）──
+        if option_id == ClarifyPanel.OTHER_ID:
+            self._enter_clarify_free_text()
+            return
+
+        question = self._clarify_question
+
+        # ── 分支 2：多选（提交全部勾选）──
+        if question is not None and question.multi_select:
+            self._resolve_interaction(
+                ClarifyReply(kind="multi", labels=panel.checked_labels())
+            )
+            return
+
+        # ── 分支 3：单选 ──
+        try:
+            label = question.options[int(option_id)].label
+        except (AttributeError, IndexError, TypeError, ValueError):
+            # 取不出来就按「跳过」处理：宁可让模型自己拿主意，
+            # 也不要回灌一个我们自己都不确定的答案。
+            self._resolve_interaction(None)
+            return
+        self._resolve_interaction(ClarifyReply(kind="option", labels=(label,)))
 
     def on_confirm_panel_cancelled(self, event: ConfirmPanel.Cancelled) -> None:
         """确认/审批面板按 Esc 取消：确认视为 DENY、审批视为不批准。"""
@@ -2926,6 +3105,16 @@ class RhineApp(App):
             self._resolve_interaction(False)
 
     def on_clarify_panel_cancelled(self, event: ClarifyPanel.Cancelled) -> None:
-        """澄清面板按 Esc 取消：返回 None，循环据此以「用户取消」结束。"""
+        """
+        澄清面板按 Esc：结算为 None，即「用户跳过」（ask-user 扩展 F17）。
+
+        ⚠ **循环那边据此分两种行为，界面这边只有一种**：规划阶段是「不想规划了、
+        整轮停止」（C4 以来的语义），其余任何时候是「我不选，你自己定、循环继续」。
+        分岔在 `agent/loop.py` 的 `_run_ask_user` 里做——界面不知道也不该知道
+        当前是不是规划阶段。
+
+        ⚠ 自由输入态下的 Esc **走不到这里**：那时焦点在输入框上，面板的绑定
+        收不到按键，由 `on_key` 最前面那条分支接住并退回选项列表（F16）。
+        """
         if self._pending_interaction is not None:
             self._resolve_interaction(None)
