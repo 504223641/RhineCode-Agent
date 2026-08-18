@@ -28,7 +28,7 @@ from types import SimpleNamespace
 
 from textual.app import App, ComposeResult
 
-from rhinecode.agent.events import ClarifyOption
+from rhinecode.agent.events import ClarifyOption, ClarifyQuestion
 from rhinecode.memory.session import SessionInfo
 from rhinecode.provider.base import ToolCall
 from rhinecode.tui.widgets import ClarifyPanel, ConfirmPanel, SessionPanel
@@ -59,10 +59,16 @@ def _decision(reason: str = "默认模式下无规则命中", layer: str = "mode
     )
 
 
-CLARIFY_OPTIONS = [
-    ClarifyOption(summary="历史区下方按需出现", detail="不占空间，位置贴近输入框视线焦点"),
-    ClarifyOption(summary="历史区上方常驻", detail="位置稳定不跳动，但空转时白占两行"),
-]
+# ask-user 扩展：`ClarifyOption` 的字段已改名为 label / description（对齐官方），
+# 面板入口也从 `show_for(问题, 选项)` 换成 `show_question(问题对象, 第几题, 共几题)`。
+def _clarify_question(text="活动区应该放在界面的哪个位置？"):
+    return ClarifyQuestion(
+        question=text,
+        options=(
+            ClarifyOption(label="历史区下方按需出现", description="不占空间，位置贴近输入框视线焦点"),
+            ClarifyOption(label="历史区上方常驻", description="位置稳定不跳动，但空转时白占两行"),
+        ),
+    )
 
 
 def _sessions():
@@ -122,7 +128,7 @@ class NumberingTest(unittest.IsolatedAsyncioTestCase):
         app = _Harness()
         async with app.run_test() as pilot:
             panel = app.query_one(ClarifyPanel)
-            panel.show_for("活动区应该放在界面的哪个位置？", CLARIFY_OPTIONS)
+            panel.show_question(_clarify_question())
             await pilot.pause()
 
             lines = _prompts(panel)
@@ -224,7 +230,7 @@ class NoEmojiTest(unittest.IsolatedAsyncioTestCase):
                 _decision(),
             )
             clarify = app.query_one(ClarifyPanel)
-            clarify.show_for("放哪个位置？", CLARIFY_OPTIONS)
+            clarify.show_question(_clarify_question("放哪个位置？"))
             session = app.query_one(SessionPanel)
             session.show_for(_sessions(), current_id="20260811-a3f1c9")
             await pilot.pause()
@@ -389,11 +395,12 @@ class ContractUnchangedTest(unittest.IsolatedAsyncioTestCase):
         app = _Harness()
         async with app.run_test() as pilot:
             panel = app.query_one(ClarifyPanel)
-            panel.show_for("问题？", CLARIFY_OPTIONS)
+            panel.show_question(_clarify_question("问题？"))
             await pilot.pause()
 
             ids = [o.id for o in panel._options if o.id is not None]
-            self.assertEqual(ids, ["0", "1"])
+            # ask-user 扩展 F8：末尾那项「其它…」由界面无条件追加，不来自模型
+            self.assertEqual(ids, ["0", "1", ClarifyPanel.OTHER_ID])
 
     async def test_session_ids_are_full_session_ids(self) -> None:
         app = _Harness()
