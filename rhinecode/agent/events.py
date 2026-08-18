@@ -111,17 +111,78 @@ class Usage:
 @dataclass
 class ClarifyOption:
     """
-    Plan Mode 需求澄清面板中的单个选项（spec F12）。
+    澄清提问面板中的单个候选项（c4 spec F12 / ask-user 扩展 F7）。
 
-    模型通过 ask_user 工具给出若干选项，每个选项含「概述」与「详细描述」：
-    用户在面板里上下导航只在概述之间移动，详情用于帮助判断。
+    模型通过 ask_user 工具给出若干候选项，每项含「选项名」与「选了会怎样」：
+    用户在面板里上下导航只在选项名之间移动，说明用于帮助判断。
 
-    :param summary: 概述——一行短文本，作为可被上下导航选中的条目
-    :param detail: 详细描述——说明该选项的含义与取舍，仅展示、不可单独选中
+    :param label: 选项名——一行短文本，作为可被上下导航选中的条目
+    :param description: 说明——选了这项会怎样，仅展示、不可单独选中
+
+    ⚠ **字段名从 `summary` / `detail` 改成 `label` / `description`
+    是 ask-user 扩展 F7「对齐官方」的一部分，不是洁癖。** 模型对
+    Claude Code `AskUserQuestion` 那套字段名有很强的先验，用它见过的名字
+    能降低「参数名写错 → 解析不出 → 白问一轮」的概率。
+    改名影响四处调用点，改错会**当场 AttributeError**（不是静默失效），
+    因此不额外加护栏。
     """
 
-    summary: str
-    detail: str = ""
+    label: str
+    description: str = ""
+
+
+@dataclass
+class ClarifyQuestion:
+    """
+    一次澄清提问里的**一个**问题（ask-user 扩展 F7）。
+
+    一次 `ask_user` 调用可以带 1–4 个问题，循环侧逐个交给界面弹面板
+    （见 `agent/clarify.py` 与 `agent/loop.py` 的 `_run_special`）。
+
+    :param question: 问题原文。空则整题被解析阶段跳过
+    :param options: 候选项，1–4 项（超出部分已在解析阶段夹取）。
+        **界面另外无条件追加一项「其它…」**，那一项不来自这里
+    :param header: 短标签，渲染成面板表头前的一枚徽章；≤12 字符，
+        空则整个徽章不出现（不是显示一对空括号）
+    :param multi_select: 为真时用户可勾选任意多项（含零项）
+
+    ⚠ **`options` 用 tuple 而不是 list 是刻意的**：它由 Agent 线程构造、
+    主线程读来渲染，不可变能从结构上杜绝「界面渲染到一半被改」。
+    """
+
+    question: str
+    options: tuple[ClarifyOption, ...]
+    header: str = ""
+    multi_select: bool = False
+
+
+@dataclass
+class ClarifyReply:
+    """
+    用户对**一个**问题的作答（ask-user 扩展 F11/F12）。
+
+    ⚠ **「跳过」不用本类表达，而是整个回复为 `None`。** 它与「多选一项都没勾」
+    是两回事，回灌给模型的说法也必须不同：
+
+    | 情形 | kind | labels | text |
+    | --- | --- | --- | --- |
+    | 单选选了「摘要」 | `option` | `("摘要",)` | `""` |
+    | 多选勾了两项 | `multi` | `("概述", "结论建议")` | `""` |
+    | 多选一项都没勾 | `multi` | `()` | `""` |
+    | 自己打了字 | `free_text` | `()` | `"放到 docs/ 下面"` |
+    | **跳过（按了 Esc）** | —— 整个回复是 `None` —— | | |
+
+    把「一项都没选」和「我不选、你自己定」混成同一种，模型会把用户的
+    「都不要」理解成「随你」，那是两个相反的指令。
+
+    :param kind: `option` / `multi` / `free_text` 三者之一
+    :param labels: 选中的选项名
+    :param text: 自由输入的原文（`kind` 为 `free_text` 时才有意义）
+    """
+
+    kind: str
+    labels: tuple[str, ...] = ()
+    text: str = ""
 
 
 @dataclass
