@@ -254,12 +254,25 @@ class PromptSlotTest(unittest.TestCase):
 
 
 class PlanStageTest(unittest.TestCase):
-    """AC7：规划阶段可用。"""
+    """
+    ⚠ **原 AC7「规划阶段可用」已于 2026-08-18 推翻**，现为「规划阶段不可用」。
 
-    def test_plan_safe_is_declared(self) -> None:
-        self.assertTrue(_make_tool().plan_safe)
+    症状：任务还没聊定，待办清单就先冒出来了。理由与两阶段的行为护栏都在
+    `tests/test_todo_plan_stage.py`，本类只留接线层面的两条。
+    """
 
-    def test_plan_stage_call_succeeds(self) -> None:
+    def test_plan_safe_is_not_declared(self) -> None:
+        self.assertFalse(_make_tool().plan_safe)
+
+    def test_execute_still_accepts_the_plan_stage_keyword(self) -> None:
+        """
+        ⚠ **签名保留 `plan_stage` 是刻意的，不是漏删。**
+
+        循环现在不会再传它（只有 `plan_safe=True` 的工具才收得到），
+        但删掉它意味着将来若把标志改回 True，循环传进来时会直接抛
+        `TypeError`——那是个只在 Plan Mode 里才复现的运行期崩溃，
+        而改标志的人不会想到还要改签名。
+        """
         store = TodoStore()
         tool = TodoWriteTool(store)
         result = tool.execute({"todos": [{"title": "调研现状"}]}, plan_stage=True)

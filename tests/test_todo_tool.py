@@ -51,8 +51,25 @@ class DeclarationTest(unittest.TestCase):
         """
         self.assertTrue(self.tool.system_serial)
 
-    def test_plan_safe(self) -> None:
-        self.assertTrue(self.tool.plan_safe)
+    def test_not_plan_safe(self) -> None:
+        """
+        ⚠ **2026-08-18 由 True 翻成 False**（原 spec F8 被推翻）。
+
+        改的不是「它有没有副作用」——它确实零副作用，那半句仍然成立；
+        改的是「规划阶段该不该有待办」这个产品判断。
+        完整理由与两阶段的行为护栏在 `tests/test_todo_plan_stage.py`。
+        """
+        self.assertFalse(self.tool.plan_safe)
+
+    def test_declares_a_plan_blocked_hint(self) -> None:
+        """
+        被规划阶段守卫挡下时要有自己的话说。
+
+        通用文案说的是「这个工具会产生副作用」，而本工具没有——
+        **一句不准确的拒绝理由会把模型推去找绕过的办法**。
+        文案内容由 `tests/test_todo_plan_stage.py` 逐条钉住。
+        """
+        self.assertTrue(self.tool.plan_blocked_hint)
 
     def test_not_workspace_aware(self) -> None:
         """刻意不声明：本工具不碰任何路径。"""
