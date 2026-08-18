@@ -110,14 +110,38 @@ class ValidateViaTest(unittest.TestCase):
             self.assertIsNone(protocol.validate_via(kind, "channel"))
 
     def test_keys_ok_for_supported_kinds(self):
-        for kind in ("confirm", "approve", "session"):
+        # ⚠ **clarify 在 ask-user 扩展里被放开了。** 原先禁它的理由
+        # （「候选项之间夹着 disabled 详情行，按键次数推不稳」）实测不成立：
+        # `_answer_by_keys` 算步数用的是 `extract_panel` **过滤掉 disabled 之后**
+        # 的可选项序列，详情行本来就不参与计数。
+        #
+        # 放开它是必须的：多选的核心交互就是按空格勾选，不走按键路径验不到。
+        for kind in ("confirm", "approve", "session", "clarify"):
             self.assertIsNone(protocol.validate_via(kind, "keys"))
 
-    def test_keys_rejected_for_clarify(self):
-        # ClarifyPanel 的候选项之间夹着 disabled 详情行，按键次数推不稳。
-        msg = protocol.validate_via("clarify", "keys")
+    def test_keys_rejected_for_clarify_free_text(self):
+        """
+        唯一仍被拒绝的组合：clarify 的 `other:<文本>` 走 keys。
+
+        自由输入的键盘全链路有更贴近真实的验法（`keys` 选中「其它…」+
+        `send` 打字，后者走真人提交入口），让驱动器逐字模拟按键反而
+        绕开了要验的那条岔路。
+        """
+        msg = protocol.validate_via("clarify", "keys", "other:放到 docs 下面")
         self.assertIsNotNone(msg)
         self.assertIn("channel", msg, "错误消息要给出可行的替代做法")
+        self.assertIn("send", msg, "错误消息要指出更贴近真人的那条路")
+
+    def test_clarify_choice_forms(self):
+        """四种应答形态都要认（ask-user 扩展 F21）。"""
+        for choice in ("2", "0,2", "other:自己写的答案", "skip"):
+            with self.subTest(choice=choice):
+                self.assertIsNone(protocol.validate_choice("clarify", choice))
+
+    def test_clarify_rejects_garbage(self):
+        for choice in ("abc", "0,", "other:", "other:   ", "1;2"):
+            with self.subTest(choice=choice):
+                self.assertIsNotNone(protocol.validate_choice("clarify", choice))
 
     def test_unknown_via(self):
         self.assertIsNotNone(protocol.validate_via("confirm", "mouse"))

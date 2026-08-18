@@ -85,8 +85,19 @@ _OPEN_KINDS = frozenset({"clarify", "session"})
 
 PANEL_KINDS = frozenset(CHOICE_TABLE.keys())
 
-# clarify 的选项序号：纯数字字符串
-_CLARIFY_INDEX = re.compile(r"^\d+$")
+# clarify 的四种应答形态（ask-user 扩展 F21）：
+#
+#   2                    单选，选第 2 项（下标从 0 起）
+#   0,2                  多选，勾第 0 与第 2 项
+#   other:放到 docs 下面   自由输入，冒号之后整段原文即答案
+#   skip                 等价于在面板上按 Esc（我不选，你自己定）
+#
+# ⚠ 改造前只认「纯数字」。多选与自由输入之后那条式子不成立了——
+# 不改这里的结果是**新面板没法无头验收**，而本项目所有 TUI 行为的判据
+# 都建立在驱动设施上。
+_CLARIFY_INDEX = re.compile(r"^\d+(,\d+)*$")
+_CLARIFY_FREE_TEXT_PREFIX = "other:"
+_CLARIFY_SKIP = "skip"
 
 
 # `wait` 的 `until`：等到什么算数。
@@ -105,12 +116,17 @@ UNTIL_VALUES = frozenset({"terminal", "quiescent"})
 # AC15 要求同一次运行内出现两种不同来源，`via` 就是它的驱动手段。
 VIA_VALUES = frozenset({"channel", "keys"})
 
-# `keys` 只对 confirm / approve / session 有效。
-# **为什么排除 clarify**：`keys` 路径要把「目标选项」换算成「按多少次方向键」，
-# 而 `ClarifyPanel` 在候选项之间夹着 disabled 的详情行，`OptionList` 的上下导航
-# 会自动跳过它们——按键次数无法从选项下标稳定推出。与其写一个偶尔错位的推导，
-# 不如在协议层直接拒绝这个组合。
-KEYS_SUPPORTED_KINDS = frozenset({"confirm", "approve", "session"})
+# `keys` 支持哪几类面板。
+#
+# ⚠ **clarify 曾被排除，ask-user 扩展重新量过之后放开了。**
+# 原注释写的理由是「候选项之间夹着 disabled 详情行，按键次数推不出来」——
+# 而 `_answer_by_keys` 的实现**从来就不是按行数算的**：它在
+# `extract_panel` **已经过滤掉 disabled 之后**的可选项序列里算下标，
+# 详情行本来就不参与计数。`ClarifyPanel` 的初始高亮也正是第一个可选项，
+# 与 `ConfirmPanel` 完全同构。
+#
+# 放开它是必须的：多选的核心交互就是**按空格勾选**，不走按键路径根本验不到。
+KEYS_SUPPORTED_KINDS = frozenset({"confirm", "approve", "session", "clarify"})
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +201,19 @@ def validate_choice(kind: str, choice: Any) -> Optional[str]:
         return f"choice 必须是非空字符串，收到 {choice!r}"
 
     if kind == "clarify":
-        # 澄清面板的取值是选项序号（从 0 起）。越界与否要等拿到实际选项列表才知道，
-        # 这里只管格式。
+        # 四种形态见 `_CLARIFY_INDEX` 上方那段说明。越界与否要等拿到实际选项
+        # 列表才知道，这里只管格式。
+        if choice == _CLARIFY_SKIP:
+            return None
+        if choice.startswith(_CLARIFY_FREE_TEXT_PREFIX):
+            if not choice[len(_CLARIFY_FREE_TEXT_PREFIX):].strip():
+                return "clarify 的 other: 后面要跟非空文本（那段原文就是答案）"
+            return None
         if not _CLARIFY_INDEX.match(choice):
-            return f"clarify 的 choice 必须是选项序号（数字字符串），收到 {choice!r}"
+            return (
+                "clarify 的 choice 必须是选项序号（如 2）、逗号分隔的多个序号"
+                f"（如 0,2）、other:<文本> 或 skip，收到 {choice!r}"
+            )
         return None
 
     if kind == "session":
@@ -219,20 +244,33 @@ def validate_until(until: Any) -> Optional[str]:
     return None
 
 
-def validate_via(kind: str, via: Any) -> Optional[str]:
+def validate_via(kind: str, via: Any, choice: str = "") -> Optional[str]:
     """
-    校验 `via` 取值，以及它与面板类型的组合是否被支持。
+    校验 `via` 取值，以及它与面板类型（和取值）的组合是否被支持。
 
+    :param choice: 本次的应答取值。**只有 clarify 的自由输入用得上**
+        （ask-user 扩展 F21），缺省空串即「不看取值」，既有调用点零改动
     :returns: 不合法时返回给人看的错误消息；合法返回 None
 
-    唯一被拒绝的组合是 `clarify` + `keys`，理由见 `KEYS_SUPPORTED_KINDS` 处的注释。
+    唯一被拒绝的组合是 `clarify` + `other:`（自由输入）走 `keys`：
+    逐字模拟打字反而绕开了要验的东西，见下面那条错误消息给出的替代办法。
     """
     if via not in VIA_VALUES:
         return f"via 必须是 {sorted(VIA_VALUES)} 之一，收到 {via!r}"
     if via == "keys" and kind not in KEYS_SUPPORTED_KINDS:
+        return f"via=keys 不支持 {kind} 面板，请改用 via=channel。"
+    if (
+        via == "keys"
+        and kind == "clarify"
+        and isinstance(choice, str)
+        and choice.startswith(_CLARIFY_FREE_TEXT_PREFIX)
+    ):
+        # 自由输入的键盘全链路**有更贴近真实的验法**：用 `keys` 把光标移到
+        # 「其它…」按回车，再用 `send` 打字——后者走的是真人提交入口，
+        # 正好压在产品那条新岔路上。让驱动器逐字模拟按键反而绕开了它。
         return (
-            f"via=keys 不支持 {kind} 面板："
-            "该面板的候选项之间夹着 disabled 详情行，按键次数无法从选项下标稳定推出。"
-            "请改用 via=channel。"
+            "via=keys 不支持 clarify 的 other:<文本>。"
+            "改用 via=channel，或者走「keys 选中「其它…」+ send 打字」——"
+            "后者更接近真人路径。"
         )
     return None
