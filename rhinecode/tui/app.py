@@ -3058,17 +3058,25 @@ class RhineApp(App):
         澄清面板上选中了一项：三条分支，**顺序即需求**（ask-user 扩展 F16/F11）。
 
         :param panel: 发出选择消息的 `ClarifyPanel`
-        :param option_id: 被选中那一项的 id（候选项下标的字符串，或 `OTHER_ID`）
+        :param option_id: 被选中那一项的 id（候选项下标的字符串、`OTHER_ID`
+            或多选题的 `SUBMIT_ID`）
 
         1. **「其它…」** → 进自由输入态，**不结算**（回调继续阻塞着）。
-        2. **多选态** → 结算为已勾选的那些（可能一项都没有——那是「都不要」，
+        2. **多选的「提交」** → 结算为已勾选的那些（可能一项都没有——那是「都不要」，
            与「跳过」是两回事，见 `ClarifyReply` 的说明）。
-        3. **单选** → 结算为该项。
+        3. **多选的候选项** → 勾选并前进，**不结算**。
+        4. **单选** → 结算为该项。
 
         ⚠ **顺序不能反**：多选态下高亮停在「其它…」上按回车，
         要进自由输入而不是提交勾选结果。
 
-        副作用：进入自由输入态，或结算一次交互。
+        ⚠ **分支 3 看起来是死代码，但不是**（F15 修订）。回车与数字键都被
+        `ClarifyPanel.action_select` 接住了，走不到这里；**鼠标点击走得到**
+        ——`OptionList` 的点击直接发 `OptionSelected`，不经 `action_select`。
+        少了这一支，多选题里点一下候选项就会**当场提交**，而键盘上按同一项
+        只是勾选。同一个动作两种结果，且只有用鼠标的人撞得到。
+
+        副作用：进入自由输入态、切换勾选，或结算一次交互。
         """
         # ── 分支 1：其它…（不结算）──
         if option_id == ClarifyPanel.OTHER_ID:
@@ -3076,15 +3084,25 @@ class RhineApp(App):
             return
 
         question = self._clarify_question
+        multi = question is not None and question.multi_select
 
-        # ── 分支 2：多选（提交全部勾选）──
-        if question is not None and question.multi_select:
+        # ── 分支 2：多选的「提交」──
+        if multi and option_id == ClarifyPanel.SUBMIT_ID:
             self._resolve_interaction(
                 ClarifyReply(kind="multi", labels=panel.checked_labels())
             )
             return
 
-        # ── 分支 3：单选 ──
+        # ── 分支 3：多选的候选项（鼠标点击才到得了，见上面的 ⚠）──
+        if multi:
+            try:
+                position = int(option_id)
+            except (TypeError, ValueError):
+                return  # 认不出来就什么都不做，绝不拿一个猜的答案去结算
+            panel.toggle_and_advance(position)
+            return
+
+        # ── 分支 4：单选 ──
         try:
             label = question.options[int(option_id)].label
         except (AttributeError, IndexError, TypeError, ValueError):

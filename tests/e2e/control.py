@@ -867,7 +867,7 @@ class DriverCore:
         options = (snap.get("panel") or {}).get("options") or []
         if kind == "clarify":
             # 三种形态（`other:` 已在协议层拒绝走本路径）：
-            #   skip → 按 Esc；0,2 → 逐个移过去按空格，最后回车；2 → 移过去回车
+            #   skip → 按 Esc；0,2 → 逐个移过去回车勾选，最后在提交行回车；2 → 移过去回车
             return self._answer_clarify_by_keys(choice, options)
         if kind == "session":
             target_id = choice
@@ -943,7 +943,12 @@ class DriverCore:
                 )
             targets.append(ids.index(piece))
 
-        multi = len(targets) > 1
+        # ⚠ **判据是「面板上有没有提交行」，不是「勾了几项」**。
+        # 原写法用 `len(targets) > 1`，于是一道多选题只勾一项时会被当成单选
+        # ——按下回车只是勾上（产品侧不结算），驱动器却以为交完了，
+        # 随后 `wait` 一直等到超时。用面板自己报出来的结构判，才不会分叉。
+        submit_pos = ids.index(ClarifyPanel.SUBMIT_ID) if ClarifyPanel.SUBMIT_ID in ids else None
+        other_pos = ids.index(ClarifyPanel.OTHER_ID) if ClarifyPanel.OTHER_ID in ids else len(ids)
 
         async def _press() -> None:
             cursor = 0  # 初始高亮 = 可选项序列的第 0 项
@@ -952,10 +957,19 @@ class DriverCore:
                 key = "down" if steps >= 0 else "up"
                 for _ in range(abs(steps)):
                     await pilot.press(key)
-                cursor = target          # ⚠ 相对移动：记住停在哪了
-                if multi:
-                    # 多选：每个目标上按空格勾选，全部勾完再回车提交
-                    await pilot.press("space")
+                await pilot.press("enter")
+                if submit_pos is None:
+                    return          # 单选：这一下回车就结算完了
+                # 多选：回车勾上之后**光标自己动了**（F15 修订）——
+                # 下一个候选项，或最后一项之后直达提交行。跟着它记，
+                # 否则下一次的相对移动会整体偏一格。
+                cursor = target + 1 if target + 1 < other_pos else submit_pos
+
+            # 多选：最后落到提交行再回车，这一下才真的交出去
+            steps = submit_pos - cursor
+            key = "down" if steps >= 0 else "up"
+            for _ in range(abs(steps)):
+                await pilot.press(key)
             await pilot.press("enter")
 
         run_on_main(self.loop, _press())

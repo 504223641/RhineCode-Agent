@@ -115,7 +115,7 @@ class ValidateViaTest(unittest.TestCase):
         # `_answer_by_keys` 算步数用的是 `extract_panel` **过滤掉 disabled 之后**
         # 的可选项序列，详情行本来就不参与计数。
         #
-        # 放开它是必须的：多选的核心交互就是按空格勾选，不走按键路径验不到。
+        # 放开它是必须的：多选要依次回车勾选、最后在「提交」行回车，不走按键路径验不到。
         for kind in ("confirm", "approve", "session", "clarify"):
             self.assertIsNone(protocol.validate_via(kind, "keys"))
 

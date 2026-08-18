@@ -262,9 +262,10 @@ class ClarifyPanel(NumberedPanel):
 
     def show_question(self, q: ClarifyQuestion, index: int, total: int) -> None
     def show_free_text(self, q: ClarifyQuestion) -> None    # F16 提示态
-    def toggle_check(self, option_index: int) -> None       # F15 空格
+    def toggle_check(self, option_index: int) -> None       # F15 勾选
+    def toggle_and_advance(self, option_index: int) -> None # F15 勾选并前进
     def checked_labels(self) -> tuple[str, ...]
-    def action_toggle_check(self) -> None                   # Binding: space
+    def action_select(self) -> None                         # 覆写：回车/数字键的汇合点
     def action_cancel(self) -> None                         # Binding: escape（不变）
 ```
 
@@ -402,7 +403,7 @@ option.id == OTHER_ID   → 进自由输入态（换面板、解禁输入框、�
 **可选项序列**，详情行本来就不参与计数，而 `ClarifyPanel` 的初始高亮
 正是第一个可选项（序列下标 0）——与 `ConfirmPanel` 完全同构。
 
-按键路径支持三种取值：单选序号、多选（在每个目标上按 `space`、最后 `enter`）、
+按键路径支持三种取值：单选序号、多选（在每个目标上按 `enter` 勾选、末尾在「提交」行 `enter`）、
 `skip`（按 `escape`）。**`other:` 只支持 channel**，协议层给明确错误——
 自由输入的键盘全链路改用「`keys` 移到「其它…」按回车 + `send` 打字」验，
 那条路走的是真人提交入口，比让驱动器逐字模拟更接近真实。
@@ -469,7 +470,7 @@ option.id == OTHER_ID   → 进自由输入态（换面板、解禁输入框、�
 | --- | --- | --- |
 | ↑↓ | 面板导航 | 输入框光标 |
 | 数字 | 选中 / 切换勾选 | **落进输入框**（面板无可选项，天然如此） |
-| 空格 | 多选时切换勾选 | 输入一个空格 |
+| 回车 | 单选=选中；多选在候选项上=勾选并前进，在「提交」行=交卷 | —— |
 | 回车 | 结算本题 | 非空则结算；空则原地不动 |
 | `Esc` | 跳过（本题及剩余全部） | **退回选项列表** |
 | `Ctrl+C` ×2 | 退出程序（既有行为，不新增例外） | 同左 |
@@ -523,7 +524,7 @@ tests/
 | D10 | 回灌用什么格式 | **人读的清单**，不是 JSON | 省 token；且 JSON 容易被模型误当成「答案要照这个格式回」 |
 | D11 | 解析瑕疵怎么处理 | **能救就救 + 在回灌里说破** | 与 todo-list 那条「拒绝线不是截断线」方向相反，判据是「被截掉的事实模型下一轮能不能自己发现」——这里能（答案按问题原文列出，少了哪个看得见），那里不能 |
 | D12 | `ClarifyOption` 改不改字段名 | **改**（`label` / `description`） | F7 对齐官方的一部分。四处调用点改错会当场 `AttributeError`，不是静默失效，不需要额外护栏 |
-| D13 | 驱动设施要不要放开 `keys` | **放开** | 量过之后发现原禁令的理由不成立：按键步数本来就按「过滤掉 disabled 的可选项序列」算。多选的核心交互是按空格，不放开就没法验 |
+| D13 | 驱动设施要不要放开 `keys` | **放开** | 量过之后发现原禁令的理由不成立：按键步数本来就按「过滤掉 disabled 的可选项序列」算。多选要在好几行上依次按键，不放开就没法验 |
 | D14 | 自由输入的键盘全链路怎么验 | `keys` 移动 + `send` 打字 | `send` 走真人提交入口，正好压到 F18 那条新岔路上；让驱动器逐字模拟反而绕开了要验的东西 |
 
 ---

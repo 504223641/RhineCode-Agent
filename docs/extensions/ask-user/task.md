@@ -379,9 +379,10 @@ docstring 写明它存在的理由（让每个面板自己回答「数字键命�
    ⚠ 注释必须写明：只改屏幕不改 `_choices`，用户按一下方向键勾选就全没了
    （基类 `watch_highlighted` 会拿 `_choices` 重画所有行），
    而不移动光标的手测看不出来。
-4. `BINDINGS` 加 `space` → `action_toggle_check`（实测 Textual 8.2.7 的
-   `OptionList` **没有**占用 `space`，注释里记下这个事实与版本号）。
-5. 覆写 `activate_choice`：多选态且命中的不是「其它…」时改为切换勾选。
+4. **不另绑键**：勾选走 `OptionList` 自带的 `enter`，由覆写 `action_select` 接管。
+5. 覆写 `action_select`：多选态且命中的是候选项时 → `toggle_and_advance`；
+   其余（单选、「其它…」、「提交」）落回 `super()` 的结算路径。
+   ⚠ 差异必须落在这里而不是 `activate_choice`——回车与数字键的唯一汇合点。
 6. 提示行实时显示已选条数。
 
 **验证：** 见 T21
@@ -413,7 +414,8 @@ docstring 写明它存在的理由（让每个面板自己回答「数字键命�
 3. 多选：`toggle_check` 之后 `checked_labels` 正确；
    **反证**——`toggle_check` 之后再触发一次 `watch_highlighted`，勾选**仍在**
    （这条就是 T19 那个「只改屏幕」bug 的护栏）。
-4. `space` 在 `BINDINGS` 里；`activate_choice` 在多选下不结算、在单选下结算。
+4. `action_select` 在多选的候选项上不结算（只勾选并前进）、在「提交」行与单选下结算；
+   勾完末项跳过「其它…」直达「提交」；单选题没有「提交」行（反证）。
 5. 自由输入态下 `choice_index(1)` 返回 `None`。
 6. 含 `[` 的问题文本与选项名不会产生未转义的 markup。
 
@@ -562,7 +564,7 @@ present_plan」改成符合新判据的说法（`ask_user` 只要有人可问就
 **依赖：** T30
 
 **步骤：** `_answer_by_keys` 支持三种：单选序号（`target_id` 就是序号字符串）、
-多选（依次移动 + `space`，最后 `enter`）、`skip`（按 `escape`）。
+多选（依次移动 + `enter` 勾选，最后在「提交」行 `enter`）、`skip`（按 `escape`）。
 ⚠ 多选的移动是**相对**的，要记住当前位置逐步移动，不能每次都从 0 算。
 
 **验证：** 见 T32

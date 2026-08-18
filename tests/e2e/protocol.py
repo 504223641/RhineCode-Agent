@@ -125,7 +125,8 @@ VIA_VALUES = frozenset({"channel", "keys"})
 # 详情行本来就不参与计数。`ClarifyPanel` 的初始高亮也正是第一个可选项，
 # 与 `ConfirmPanel` 完全同构。
 #
-# 放开它是必须的：多选的核心交互就是**按空格勾选**，不走按键路径根本验不到。
+# 放开它是必须的：多选要在好几行上**依次回车勾选、最后在「提交」行回车**，
+# 不走按键路径根本验不到。
 KEYS_SUPPORTED_KINDS = frozenset({"confirm", "approve", "session", "clarify"})
 
 

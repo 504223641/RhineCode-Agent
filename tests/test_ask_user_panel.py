@@ -106,7 +106,7 @@ class DescriptionTest(unittest.TestCase):
 
 
 class MultiSelectTest(unittest.TestCase):
-    """F15：勾选框、空格、数字键、提示行。"""
+    """F15（含修订）：勾选框、回车勾选并前进、数字键、提交行。"""
 
     def setUp(self) -> None:
         self.panel = _panel(_question(multi=True, labels=("甲", "乙", "丙")))
@@ -123,11 +123,40 @@ class MultiSelectTest(unittest.TestCase):
         for glyph in ("☑", "☐", "✓", "✔", "○"):
             self.assertNotIn(glyph, prompts)
 
-    def test_space_toggles_the_highlighted_row(self) -> None:
-        self.panel.action_toggle_check()
+    def test_enter_toggles_the_highlighted_row(self) -> None:
+        """回车 = 勾选（F15 修订：初版是空格，两个键太多了）。"""
+        self.panel.action_select()
         self.assertEqual(self.panel.checked_labels(), ("甲",))
-        self.panel.action_toggle_check()
+        # 光标已经前进到「乙」，要再切「甲」得先移回去
+        self.panel.highlighted = self.panel._choices[0][0]
+        self.panel.action_select()
         self.assertEqual(self.panel.checked_labels(), ())
+
+    def test_enter_advances_to_the_next_option(self) -> None:
+        """勾完一项，光标自动落到下一项——用户不必手动按下箭头。"""
+        self.panel.action_select()
+        self.assertEqual(self.panel.choice_position(self.panel.highlighted), 1)
+        self.panel.action_select()
+        self.assertEqual(self.panel.choice_position(self.panel.highlighted), 2)
+
+    def test_last_option_jumps_over_other_straight_to_submit(self) -> None:
+        """
+        ⚠ 勾完**最后一个**候选项，光标要跳过「其它…」直达「提交」。
+
+        不跳的话用户想交卷、手却停在「其它…」上，再按一下回车就被拉进
+        自由输入态——那与他正在做的事完全相反，而且他多半已经在按了。
+        """
+        for _ in range(3):
+            self.panel.action_select()
+        landed = self.panel.get_option_at_index(self.panel.highlighted)
+        self.assertEqual(landed.id, ClarifyPanel.SUBMIT_ID)
+
+    def test_submit_row_only_exists_for_multi_select(self) -> None:
+        """反证：单选题不该多出一行「提交」——按一次回车就结束了。"""
+        self.assertIn(ClarifyPanel.SUBMIT_ID, _selectable_ids(self.panel))
+        self.assertNotIn(
+            ClarifyPanel.SUBMIT_ID, _selectable_ids(_panel(_question(multi=False)))
+        )
 
     def test_checked_marks_show_on_screen(self) -> None:
         self.panel.toggle_check(1)
@@ -139,7 +168,10 @@ class MultiSelectTest(unittest.TestCase):
         ⚠ 多选下数字键 = 切换勾选，**不是**提交（F15）。
 
         断言「勾上了」而不是「没提交」——后者没法直接观测，而前者一旦成立，
-        提交就不可能同时发生（`activate_choice` 的两条分支互斥）。
+        提交就不可能同时发生（`action_select` 的两条分支互斥）。
+
+        ⚠ 数字键与回车走的是**同一个** `action_select`（基类的
+        `activate_choice` 只负责先把光标移过去），因此两条路不可能分叉。
         """
         index = self.panel.choice_index(3)
         self.panel.activate_choice(index)
@@ -155,10 +187,28 @@ class MultiSelectTest(unittest.TestCase):
         self.panel.toggle_check(position)
         self.assertEqual(self.panel.checked_labels(), ())
 
-    def test_hint_counts_the_checked_ones(self) -> None:
+    def _submit_row(self) -> str:
+        return _prompts(self.panel)[self.panel._choices[-1][0]]
+
+    def test_submit_row_counts_the_checked_ones(self) -> None:
+        """已选条数摆在用户正要按的那一行上，他不必自己数、也不必挪视线。"""
+        self.assertIn("一项都不选", self._submit_row())
         self.panel.toggle_check(0)
         self.panel.toggle_check(2)
-        self.assertIn("已选 2 项", _prompts(self.panel)[-1])
+        self.assertIn("已选 2 项", self._submit_row())
+
+    def test_submit_row_count_survives_moving_the_cursor(self) -> None:
+        """
+        ⚠ **与勾选框同一个坑**：提交行的条数也存在 `_choices` 里，
+        只改屏幕不改它的话，用户按一下方向键条数就退回改之前那个数字。
+
+        它比勾选框那条更阴——勾选框全没了一眼就看得出来，
+        而一个「已选 1 项」旁边明明勾着两个，只有仔细数才发现。
+        """
+        self.panel.toggle_check(0)
+        self.panel.toggle_check(2)
+        self.panel.highlighted = self.panel._choices[1][0]
+        self.assertIn("已选 2 项", self._submit_row())
 
     def test_single_select_has_no_checkboxes(self) -> None:
         """反证：单选面板一个勾选框都不该出现。"""
