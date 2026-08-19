@@ -423,6 +423,14 @@ class PermissionEngine:
                 return verdict
             # 本层不下结论 → 直接进④。**刻意跳过③**：②′内部已经用同一个 merged
             # 求过一次值，再求一次必然还是 None，重复求值只会让读代码的人怀疑自己看漏了。
+            #
+            # ⚠ **搜索类（kind == "search"）不进本层**（web_search 扩展 F11）。
+            # 本层拦的是「模型自己指定的地址」；搜索端点由用户在配置里写死，
+            # 与 MCP Server 的地址同性质。让它过本层的后果是**用户配一个内网
+            # 搜索代理就用不了**（`check_hard` 会因为 10.x 不是全局可路由而拒绝），
+            # 而且 `check_hard` 拿查询词当地址解析必然判「地址畸形」——
+            # 表现是每次搜索都被硬拒。端点的协议校验另在装配层做
+            # （`web/search.check_endpoint`）。
         else:
             # ③ 规则：本次执行级 → 会话级 → 文件级，依次合并；deny 优先求值。
             #
@@ -456,6 +464,29 @@ class PermissionEngine:
                     Decision.ASK,
                     Layer.MODE,
                     "放行模式对网络访问不生效：未建立域名白名单时仍交由用户确认",
+                )
+            # ⚠️ **搜索类的例外**（web_search 扩展 spec F12）。
+            #
+            # 与上面 url 那一支**刻意分开写**，不合并成 `kind in ("url", "search")`：
+            # 两者的理由文案必须不一样。网络类那句说的是「未建立域名白名单时」，
+            # 而搜索类**根本没有白名单这回事**（F10：规则只有整工具形式，
+            # 没有 `WebSearch(domain:...)` 这种写法）——沿用那句话会把用户
+            # 引去写一条不存在的规则，然后困惑于为什么不生效。
+            #
+            # **基线为什么必须是 ASK 而不是 ALLOW**：这一格决定了 C16 分类器
+            # 熔断（连不上、或连续拦截被停用）之后退回到哪里。基线是 ASK 则
+            # 退回逐次弹面板；基线是 ALLOW 则退回**一律放行**——那意味着
+            # 「查询词外泄」这条防线在故障时完全消失，而用户只看到一条熔断提示。
+            # spec N1 的 fail-safe 要求偏严的那一侧。
+            #
+            # 正常情况下用户看不到这个面板：分类器判放行时会把它覆写成 ALLOW
+            # （`agent/loop.py::_apply_classifier`），日常搜索零打扰。
+            if request.kind == "search":
+                return _verdict(
+                    Decision.ASK,
+                    Layer.MODE,
+                    "放行模式对网络搜索不生效：查询词会原样发给第三方搜索服务商，"
+                    "交由安全审查或用户确认",
                 )
             return _verdict(Decision.ALLOW, Layer.MODE, "放行模式：无规则命中，默认允许")
         return _verdict(Decision.ASK, Layer.MODE, "默认模式：无规则命中，交由用户确认")

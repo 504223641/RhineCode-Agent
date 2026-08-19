@@ -66,6 +66,22 @@ _CONFIG_TEMPLATE = """\
 # deny:
 #   - "WebFetch(domain:*.evil.com)"
 #
+# 网络搜索（web_search）的规则**只支持不带括号的整工具形式**：
+#
+# deny:
+#   - "WebSearch"          # 彻底禁止模型上网搜索（任何情况下都生效）
+# allow:
+#   - "WebSearch"          # 放行搜索，不再逐次确认
+#
+# ⚠ 带括号的任何写法（WebSearch(*)、WebSearch(domain:x)、WebSearch(关键词)…）
+#   **一律不生效，而且不会有任何警告**——包括 deny。想禁止搜索请写上面那条
+#   不带括号的 deny，或在 config.yaml 里设 search.enabled: false。
+#
+# ⚠ 启用安全审查分类器（config.yaml 的 classifier.enabled，缺省开）时，
+#   上面那条 allow: WebSearch 会被**丢弃**并在启动时逐条告知你——
+#   因为 allow 会直接短路分类器，等于对搜索这一类关掉整层审查。
+#   deny 不受影响。
+#
 # ⚠ 在**本文件或用户级** permissions.yaml 里写下任何一条 allow 域名规则，
 #   就等于声明「只许访问这些」——此后未列出的域名一律被直接拒绝，
 #   且任何权限档都翻不过来（放行档也不行）。
