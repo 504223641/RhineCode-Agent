@@ -62,6 +62,7 @@ from rhinecode.hooks import (
 from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
 from rhinecode.classifier import (
     SCOPE_MESSAGE,
+    SCOPE_SEARCH,
     SCOPE_URL,
     ClassifierProtocol,
     ReviewAction,
@@ -615,7 +616,7 @@ class Agent:
         「两类走这条、一类走那条」少一个会漏改的地方**。
 
         ⚠ **参数名与工具的 `parameters` 是成对维护点**：这里写的
-        `command` / `url` / `message` / `to` 必须与三个工具声明的一致。
+        `command` / `url` / `message` / `to` / `query` 必须与四个工具声明的一致。
         改了工具的参数名而漏改这里不会报错，只表现为分类器收到一个空的
         待判内容——然后它会因为「看不出有什么问题」而放行。
 
@@ -641,6 +642,14 @@ class Agent:
         elif scope == SCOPE_MESSAGE:
             specifier = str(args.get("message") or "")
             recipient = str(args.get("to") or "")
+        elif scope == SCOPE_SEARCH:
+            # web_search 扩展 F9：待判内容是**完整查询词**，不是地址。
+            #
+            # ⚠ 这一支不能并进上面的 SCOPE_URL：那边取的是 `args["url"]`，
+            # 而搜索没有这个参数——照抄会让分类器拿到**空的待判内容**，
+            # 然后因为「看不出有什么问题」而放行，且**完全无声**。
+            specifier = str(args.get("query") or "")
+            recipient = ""
         else:
             specifier = str(args.get("command") or "")
             recipient = ""

@@ -65,6 +65,7 @@ from typing import TYPE_CHECKING
 
 from rhinecode.classifier.models import (
     SCOPE_MESSAGE,
+    SCOPE_SEARCH,
     SCOPE_URL,
     RecordedCall,
     ReviewAction,
@@ -319,8 +320,9 @@ def render_pending(action: ReviewAction) -> str:
     :param action: 待判动作
     :returns: 一段文本
 
-    三类各有自己的措辞——「要执行这条命令」「要访问这个地址」「要给某人发这条
-    消息」在自然语言里是三件不同的事，用同一句话描述会让分类器的判断变钝。
+    四类各有自己的措辞——「要执行这条命令」「要访问这个地址」「要给某人发这条
+    消息」「要拿这段文字去第三方搜索」在自然语言里是四件不同的事，
+    用同一句话描述会让分类器的判断变钝。
 
     副作用：无（纯函数）。
     """
@@ -329,6 +331,19 @@ def render_pending(action: ReviewAction) -> str:
         body = action.specifier
     elif action.scope == SCOPE_MESSAGE:
         head = f"助手准备给队友 “{neutralize(action.recipient)}” 发下面这条消息"
+        body = action.specifier
+    elif action.scope == SCOPE_SEARCH:
+        # web_search 扩展 F9。
+        #
+        # ⚠ 括号里那半句**不是修辞**。分类器要判的核心问题是「这段文字发出去
+        # 要不要紧」，而不是「搜这个有没有用」——不点破的话它会去评价后者，
+        # 那是另一个问题，而且不是它该管的。
+        head = (
+            "助手准备用下面这段文字去第三方搜索服务商检索"
+            "（注意：这段文字会**原样发给那家服务商**、留在他们的日志里，"
+            "等同于把它公开出去。请重点判断其中有没有不该外发的东西，"
+            "而不是判断这个检索有没有意义）"
+        )
         body = action.specifier
     else:
         head = "助手准备执行下面这条命令"

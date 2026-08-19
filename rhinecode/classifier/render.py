@@ -32,6 +32,7 @@ from typing import Iterable, Sequence
 from rhinecode.classifier.models import (
     SCOPE_COMMAND,
     SCOPE_MESSAGE,
+    SCOPE_SEARCH,
     SCOPE_URL,
     BreakerReason,
     BreakerState,
@@ -44,6 +45,7 @@ _SCOPE_LABELS = {
     SCOPE_COMMAND: "命令",
     SCOPE_URL: "网络访问",
     SCOPE_MESSAGE: "队友消息",
+    SCOPE_SEARCH: "网络搜索",
 }
 
 
@@ -183,14 +185,23 @@ def render_dropped_rules(dropped: Sequence[tuple[str, str, str]]) -> str:
     if not dropped:
         return ""
 
+    # ⚠ **措辞刻意不限定成「命令」**（web_search 扩展 T20）。
+    #
+    # 本函数原本写的是「过宽的**命令**放行规则」与「让分类器完全看不到对应的
+    # **命令**」——那在只有命令类会被丢弃时是准确的。web_search 加进来之后，
+    # 一条 `WebSearch` 被丢弃时那两句话会变成「过宽的命令放行规则：WebSearch」，
+    # 自相矛盾。
+    #
+    # 别把它改回去那个「更精确的说法」：这里是**一个面向多类别的通用出口**，
+    # 具体是哪一类由每条自己的 `why`（`broad.why_broad`）说清楚。
     lines = [
-        f"安全审查已启用，因此暂时不使用下面 {len(dropped)} 条过宽的命令放行规则："
+        f"安全审查已启用，因此暂时不使用下面 {len(dropped)} 条过宽的放行规则："
     ]
     for rule_text, source, why in dropped:
         lines.append(f"  · {rule_text}（来源：{source}）")
         lines.append(f"    {why}")
     lines.append(
-        "  这类规则会让分类器完全看不到对应的命令。"
+        "  这类规则会让分类器完全看不到对应的动作。"
         "想保留请把它改窄（例如写成一条具体的命令），"
         "或关掉分类器（classifier.enabled: false）。"
     )

@@ -54,6 +54,7 @@
 from rhinecode.classifier.models import (
     SCOPE_COMMAND,
     SCOPE_MESSAGE,
+    SCOPE_SEARCH,
     SCOPE_URL,
     BreakerReason,
     BreakerState,
@@ -65,13 +66,19 @@ from rhinecode.classifier.models import (
     Verdict,
     VerdictKind,
 )
-from rhinecode.classifier.broad import is_broad_command_allow, why_broad
+from rhinecode.classifier.broad import (
+    is_broad_allow,
+    is_broad_command_allow,
+    is_broad_search_allow,
+    why_broad,
+)
 from rhinecode.classifier.service import ClassifierService
 from rhinecode.classifier.session import ReviewSession
 
 __all__ = [
     "SCOPE_COMMAND",
     "SCOPE_MESSAGE",
+    "SCOPE_SEARCH",
     "SCOPE_URL",
     "BreakerReason",
     "BreakerState",
@@ -84,6 +91,8 @@ __all__ = [
     "Transcript",
     "Verdict",
     "VerdictKind",
+    "is_broad_allow",
     "is_broad_command_allow",
+    "is_broad_search_allow",
     "why_broad",
 ]

@@ -54,6 +54,9 @@ import shlex
 # （见 `permission/adapter.py` 的 `_TOOL_MAP`）。
 COMMAND_RULE_NAME = "Bash"
 
+# 搜索类规则的规则体系名（web_search 扩展 F16，见 `permission/adapter.py`）。
+SEARCH_RULE_NAME = "WebSearch"
+
 # ── 解释器 ───────────────────────────────────────────────────────────────
 #
 # 判据是「这个命令名后面跟任意参数就能执行任意代码」。清单对齐 Claude Code
@@ -218,6 +221,55 @@ def is_broad_command_allow(tool: str, pattern: str) -> bool:
     return False
 
 
+def is_broad_search_allow(tool: str, pattern: str) -> bool:
+    """
+    判断一条 allow 规则是否「宽到把搜索这一类的分类器整个关掉」。
+
+    :param tool: 规则体系工具名（取自 `Rule.tool`）
+    :param pattern: 规则括号里的模式；空串表示整工具规则
+    :returns: 宽泛返回 True（调用方据此丢弃该规则）
+
+    副作用：无（纯函数）。
+
+    判据只有一条：**`WebSearch` 且不带模式**。搜索的规则形状只有整工具形式
+    （web_search 扩展 F10），所以「整工具放行」= 「放行全部搜索」= 对这一类
+    关掉整层审查，与命令类的第①条判据同型。
+
+    ⚠ **带括号的写法一律返回 False。** 它本来就不命中任何调用（F10：
+    搜索类落规则匹配的「其它类」分支，那个分支只认空模式），
+    丢弃一条本来就无效的规则只会在启动时产生一条让人困惑的提示
+    ——用户会以为自己那条规则原本是生效的。
+    """
+    if str(tool or "").strip() != SEARCH_RULE_NAME:
+        return False
+    return not str(pattern or "").strip()
+
+
+def is_broad_allow(tool: str, pattern: str, *, include_search: bool = True) -> bool:
+    """
+    「这条 allow 规则宽到该被丢弃吗」的**唯一入口**。
+
+    :param tool: 规则体系工具名
+    :param pattern: 规则模式
+    :param include_search: 是否把搜索类算进来。装配层在
+        `search.enabled` 为假时传 False——**关掉的能力不该影响用户的规则文件**
+        （web_search 扩展 F4：关闭时 `allow: WebSearch` 不被丢弃）
+    :returns: 该丢弃返回 True
+
+    副作用：无（纯函数）。
+
+    ## 为什么要这个伞函数，而不是让装配层写 `A(...) or B(...)`
+
+    装配层那个丢弃循环是本模块**唯一的调用点**。写成两个调用的话，
+    将来加第三类时**漏加一个 `or` 不会报错**——只表现为某一类规则
+    悄悄不再被丢弃，而那等于对那一类静默关掉整层审查。
+    把「有哪些类」收在这一个函数里，新增一类只需要改这里。
+    """
+    if is_broad_command_allow(tool, pattern):
+        return True
+    return include_search and is_broad_search_allow(tool, pattern)
+
+
 def why_broad(tool: str, pattern: str) -> str:
     """
     给用户看的「为什么这条规则被丢弃」。
@@ -232,6 +284,13 @@ def why_broad(tool: str, pattern: str) -> str:
 
     副作用：无（纯函数）。
     """
+    # 搜索类先判：它的判据最简单，而且与命令类的三条判据完全不相干。
+    if is_broad_search_allow(tool, pattern):
+        return (
+            "它放行全部搜索，等于对搜索这一类关掉分类器——"
+            "而搜索把查询词原样发给第三方服务商，那正是最该被看一眼的东西"
+        )
+
     if not is_broad_command_allow(tool, pattern):
         return ""
 
