@@ -91,7 +91,7 @@ SearchProvider（frozen dataclass）
 ├── endpoint      : str                     默认端点
 ├── auth_header   : str                     密钥放哪个请求头
 ├── build_params  : (query, count) -> dict  构造查询参数
-└── parse         : (payload) -> list[SearchResult]   解析响应
+└── parse         : (payload) -> Optional[list[SearchResult]]  解析响应（三态，见下）
 ```
 
 模块里只有一个实例 `BRAVE`，与一张 `PROVIDERS = {"brave": BRAVE}` 表。
@@ -135,11 +135,17 @@ quota_state() -> tuple[int, int]                            # (已用, 上限)�
 | `normalize_count` | `(raw, default) -> int` | 夹取到 1–10；`None` / 非数字 / 越界一律**夹取或取缺省，不报错**（spec F1） |
 | `check_endpoint` | `(url) -> Optional[str]` | 端点校验：非 `http`/`https` 返回中文原因，合法返回 `None` |
 | `_brave_params` | `(query, count) -> dict` | `{"q": query, "count": count}` |
-| `_brave_parse` | `(payload) -> list[SearchResult]` | 从 `payload["web"]["results"]` 逐条取 `title` / `url` / `description` |
+| `_brave_parse` | `(payload) -> Optional[list[SearchResult]]` | 从 `payload["web"]["results"]` 逐条取 `title` / `url` / `description`。**三态**：`None` = 结构不认识、`[]` = 确实 0 条、列表 = 有结果 |
 
-⚠ **`_brave_parse` 必须是防御式的**：任一层键缺失、类型不对、单条结果缺字段——
-一律**跳过那一条**而不是抛异常。整个响应取不出任何一条时返回空列表，由 manager
-判成 `FAILURE_SERVICE`（spec F21 第三行「返回无法解析」）。理由是我们**连不上真实
+⚠ **`_brave_parse` 必须是防御式的，且返回值是三态**：单条结果缺字段或类型不对
+→ **跳过那一条**而不是抛异常；整个结构不认识（不是 dict、缺 `web`、`results` 不是列表）
+→ 返回 **`None`**，由 manager 判成 `FAILURE_SERVICE`（spec F21 第三行「返回无法解析」）；
+结构认得而 `results` 为空 → 返回 **`[]`**，那是**成功 0 条**（spec F21 第四行）。
+
+⚠ **三态不能压成「返回列表」。** 「解析不出来」与「真的没搜到」在 HTTP 层看不出区别，
+而 spec F21 对两者的判定完全相反（前者失败、不计配额；后者成功、计配额）。
+合并的净效果是一次解析故障伪装成「这个词搜不到」——模型去换关键词重试，
+而根因在字段名对不上。理由是我们**连不上真实
 服务去核对字段名**（本机 DNS 把公网域名重写成内网地址，见 web_fetch 验收记录遗留项 #3），
 因此实现期必须假设自己对字段名的记忆可能有偏差，让「解析不出来」走一条可读的失败路径，
 而不是让一个 `KeyError` 冒泡上去。
