@@ -259,7 +259,16 @@ def build_app(
     # 而协调层此刻还不存在。
     search_notices: list[str] = []
     if cfg.search_enabled:
-        provider_spec = PROVIDERS[cfg.search_provider]
+        # ⚠ **用 `.get` 而不是 `[]`**：`config.load()` 已经校验过服务商名，
+        # 但那不是唯一的构造路径——直接 `Config(search_provider="x")` 会绕过它
+        # （测试与嵌入式调用都这么干）。硬索引的后果是一个 `KeyError` 从装配层
+        # 冒出来，而 `BootstrapError` 才是本函数的「致命配置错误」通道。
+        provider_spec = PROVIDERS.get(str(cfg.search_provider or ""))
+        if provider_spec is None:
+            raise BootstrapError(
+                f"search.provider 不认识的搜索服务商：{cfg.search_provider}。"
+                f"目前支持：{', '.join(sorted(PROVIDERS))}"
+            )
         endpoint = cfg.search_endpoint or provider_spec.endpoint
 
         # 端点协议校验（spec F17）。**这里抛错而不是降级**：一个 `file://` 端点

@@ -163,6 +163,19 @@ class EndpointTests(Fixture):
             )
         self.assertIn("协议", str(ctx.exception))
 
+    def test_unknown_provider_gives_readable_error(self) -> None:
+        """
+        `config.load()` 已经校验过服务商名，但那**不是唯一的构造路径**——
+        直接 `Config(search_provider="x")` 会绕过它（测试与嵌入式调用都这么干）。
+
+        硬索引 `PROVIDERS[...]` 的后果是一个 `KeyError` 从装配层冒出来，
+        而 `BootstrapError` 才是这里的「致命配置错误」通道。
+        """
+        with self.assertRaises(BootstrapError) as ctx:
+            build_app(_cfg(search_provider="google"), user_dir=self.user_dir)
+        self.assertIn("google", str(ctx.exception))
+        self.assertIn("brave", str(ctx.exception))
+
     def test_http_endpoint_warns_but_starts(self) -> None:
         result = self.build(_cfg(search_endpoint="http://proxy.internal/search"))
         self.assertIn("不是 https", self._notices(result))
