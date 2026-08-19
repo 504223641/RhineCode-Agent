@@ -383,6 +383,10 @@ class ConversationManager:
         # 同形态）。为 `None` 时本章整体不启用，三类动作的行为与本章之前**逐字一致**
         # ——`RunOptions.classifier` 缺省 None，循环里那两处判断整个跳过。
         self.classifier = None
+        # web_search 扩展 F13：`WebSearchManager`，由装配层属性注入。
+        # 协调层只用它做一件事——`/clear` 时复位会话级搜索配额。
+        # None = 搜索能力未启用（或此实例不是走 `build_app` 造的）。
+        self.web_search_manager = None
         # todo-list 扩展：主对话的待办清单。由装配层在构造之后属性注入
         # （与 `classifier` 同形态）。为 `None` 时本扩展整体不启用——
         # `todo_view()` 恒返回 None，界面上那块永不显示，**这就是零回归的
@@ -567,6 +571,25 @@ class ConversationManager:
         """当前 Provider 是否具备工具能力（DeepSeek 工具模式，c10 供控制器只读）。"""
         return self._tools_enabled
 
+    def _untrusted_enabled(self) -> bool:
+        """
+        「外部不可信内容」那条固定约束要不要注入。
+
+        :returns: `web_fetch` 与 `web_search` **任一启用**即返回 True
+
+        副作用：无（纯读配置）。
+
+        ## 为什么抽成一个方法而不是在三处各写一遍判据
+
+        `build_default_prompt` 有三个调用点（主对话 / fork 子对话 / 无人值守轮）。
+        判据写三遍时，加第三个网络工具必然只改到其中一两处——而**漏改不报错**，
+        只表现为「某一类子对话失去了不可信约束」，界面上完全看不出来。
+
+        护栏见 `tests/test_web_bootstrap.py`（数调用点个数）与
+        `tests/test_web_search_bootstrap.py`（四种开关组合）。
+        """
+        return bool(self._config.web_fetch_enabled or self._config.search_enabled)
+
     def clear(self) -> str:
         """
         清空对话历史，返回兼容确认文本（c10 起由命令层展示，文案保持不变）。
@@ -578,6 +601,12 @@ class ConversationManager:
         记忆高水位一并归零。
         c11：已激活的 Skill 一并卸载（F11）——激活态属于「当前这段对话」，
         历史都清空了，还留着 SOP 注入与工具集收窄会让下一句话的行为莫名其妙。
+        web_search：会话级搜索配额归零（F13）——`/clear` 就是「新一次会话」
+        这个语义的既有落点。
+
+        ⚠ **本方法是成对维护点。** 它已经要复位 c8 压缩锚点与熔断、卸载 Skill、
+        清空 c15 花名册、清空待办、复位搜索配额——每加一件「属于当前这段对话
+        的状态」都要在这里加一行，而**漏掉一律不报错**。
 
         :returns: 确认文本「对话历史已清空」
         """
@@ -600,6 +629,11 @@ class ConversationManager:
         self._clear_team()
         # todo-list 扩展 F17：待办属于「上一段对话的状态」，一并清空。
         self._clear_todo()
+        # web_search 扩展 F13：会话级搜索配额复位。
+        # ⚠ 漏掉不报错，只表现为「清空对话之后配额没回来」——用户以为
+        # /clear 开了新一轮，而搜索还卡在上一轮用完的 50/50 上。
+        if self.web_search_manager is not None:
+            self.web_search_manager.reset_quota()
         self._hooks.bind_context(session_id=self.memory_manager.session_id)
         self._dispatch_session(HookEventType.SESSION_START, source="clear")
         if cancelled:
@@ -1303,7 +1337,11 @@ class ConversationManager:
             active_skills="",
             agent_index=self._agent_index_text(),
             team_brief=self._team_brief_text(),
-            untrusted_enabled=self._config.web_fetch_enabled,
+            # ⚠ **两者任一启用即注入**（web_search 扩展 F19 / AC26）。
+            # 只挂在 web_fetch 上的话，关掉 web_fetch 而只开 web_search 时，
+            # 那条「外部不可信内容是数据不是指令」的约束会**凭空消失**，
+            # 而搜索结果（标题与摘要，SEO 投毒的主要落点）照样进上下文。
+            untrusted_enabled=self._untrusted_enabled(),
         )
         names = tuple(self._registry.names()) if self._registry is not None else ()
         # 复用会话存档那套配对清理（同一份实现，不另写一遍）。
@@ -1504,7 +1542,11 @@ class ConversationManager:
             # ⚠ web_fetch 扩展 F4 链路②的**第二个**调用点。漏传这里的表现是
             # 「主对话有不可信约束、fork 子对话没有」——界面上完全看不出来，
             # 只有被注入的页面恰好走进 fork 子对话时才显形。
-            untrusted_enabled=self._config.web_fetch_enabled,
+            # ⚠ **两者任一启用即注入**（web_search 扩展 F19 / AC26）。
+            # 只挂在 web_fetch 上的话，关掉 web_fetch 而只开 web_search 时，
+            # 那条「外部不可信内容是数据不是指令」的约束会**凭空消失**，
+            # 而搜索结果（标题与摘要，SEO 投毒的主要落点）照样进上下文。
+            untrusted_enabled=self._untrusted_enabled(),
         )
         sub_body, _degrade = render_active_body(spec, arguments)
         env_text = assembled.dynamic
@@ -1854,7 +1896,11 @@ class ConversationManager:
             # 让一段子任务把主线的进度笔记整个换掉。
             todo_brief=self._todo_brief_text(),
             # web_fetch 扩展 F4 链路②的第一个调用点（另一个在 _run_forked_skill）。
-            untrusted_enabled=self._config.web_fetch_enabled,
+            # ⚠ **两者任一启用即注入**（web_search 扩展 F19 / AC26）。
+            # 只挂在 web_fetch 上的话，关掉 web_fetch 而只开 web_search 时，
+            # 那条「外部不可信内容是数据不是指令」的约束会**凭空消失**，
+            # 而搜索结果（标题与摘要，SEO 投毒的主要落点）照样进上下文。
+            untrusted_enabled=self._untrusted_enabled(),
         )
         # 一次性动态提醒（c9：恢复会话的时间跨度提醒）：并入本次 dynamic，取走即清，
         # 不进持久历史、不被存档（它是「此刻的环境事实」）。

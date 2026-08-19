@@ -3444,6 +3444,42 @@ class ConfirmPanel(NumberedPanel):
             lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
         return lines
 
+    def _search_detail_lines(self, tool_call, decision) -> list[str]:
+        """
+        为搜索类请求生成补充展示行：**完整查询词（不截断）**、命中层。
+
+        :param tool_call: 本次工具调用（从中取未经截断的原始查询词）
+        :param decision: DecisionResult（提供 layer）
+        :returns: 已转义、可直接进 markup 的行文本列表
+
+        ⚠ **「不截断」是安全要求**（web_search 扩展 F7），与 url 类同一条理由：
+        用户正是靠这一行决定放不放行的，而这次要放行的**就是把这段文字发给
+        第三方**。被截断意味着攻击者（或一个不小心的模型）只要把敏感部分放在
+        可见范围之后，人在回路这一层就形同虚设。
+
+        ⚠ **完整查询词进 markup 前一律用本模块的 `escape`，绝不要
+        `from rich.markup import escape`。** 查询词是自由文本，出现落单的 `[`
+        完全正常（搜个 `list[int] 怎么写` 就有），而 rich 那版只转义
+        「看起来像完整标签」的 `[...]`，落单的 `[` 会被整个放过，
+        然后在 Textual 的布局阶段抛 MarkupError——那是没有任何 try/except
+        兜得住、会直接拆掉整个 app 的那一类。
+        """
+        args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        raw_query = str(args.get("query") or "")
+        lines: list[str] = []
+        if raw_query:
+            # **不截断**：这一行的全部价值就在于让用户看到将被发出去的完整文字。
+            lines.append(f"   [dim]完整查询词：[/dim]{escape(raw_query)}")
+        lines.append(
+            "   [dim]去向：[/dim]第三方搜索服务商（查询词会留在他们的日志里）"
+        )
+        layer = getattr(decision, "layer", None)
+        layer_value = getattr(layer, "value", layer)
+        if layer_value:
+            label = self._LAYER_LABELS.get(str(layer_value), str(layer_value))
+            lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
+        return lines
+
     def show_for(self, tool_call, tool, decision=None) -> None:
         """
         为一次工具调用填充并显示确认面板（c6 四态放行）。
@@ -3509,6 +3545,9 @@ class ConfirmPanel(NumberedPanel):
         if decision is not None and getattr(decision, "kind", "") == "url":
             for line in self._url_detail_lines(tool_call, decision):
                 self._add_static(line)
+        elif decision is not None and getattr(decision, "kind", "") == "search":
+            for line in self._search_detail_lines(tool_call, decision):
+                self._add_static(line)
         # 四个可选项带序号（F23），用户可以直接按数字键选中。
         # 改造前这里是四个彩色 emoji（`✅ 🟢 💾 ❌`）——四种颜色反而盖过了
         # 「哪个是当前选中」这个唯一重要的信息。语义现在由序号 + 文字承担。
@@ -3531,7 +3570,28 @@ class ConfirmPanel(NumberedPanel):
         # 只改这里：面板不给「永久放行」了，但「本会话放行」仍写③层规则，
         #           用户点了之后下次还弹；
         # 只改那里：面板仍显示一个点了没用的「永久放行」。
+        #
+        # ⚠ **搜索类也不给「永久放行」，但理由与保护路径不同，
+        #    因此这里是两个布尔而不是一个**（web_search 扩展 F14）。
+        #
+        # 搜索的推导链：搜索类唯一可写的规则形状是整工具的 `allow: WebSearch`
+        # （F10 不支持带括号的写法）→「永久放行」把它写进**本地级配置文件**
+        # → 下次启动它属于文件规则集 → 而 F16 要求启用分类器时从文件规则集里
+        # **丢掉** `allow: WebSearch` → 于是用户点了「永久放行」，下次启动
+        # 面板照弹。与②″那条「骗人的按钮」完全同形。
+        #
+        # ⚠ **两者的「本会话放行」机制不同，所以不能合并成一个布尔**：
+        # - 保护路径那一支登记进引擎里②″层自己的**内存豁免集合**；
+        # - 搜索类走**正常的会话级规则**（`allow: WebSearch`，F16 只丢文件
+        #   规则集，会话级不受影响）。
+        #
+        # 合并的后果是搜索类的「本会话放行」跑去登记一个保护路径豁免——
+        # **不报错，但那次放行不生效**，用户点完下次还弹。
+        # 因此：`no_permanent` 管选项条数，`protected` 管说明文字与
+        # `conversation.py` 那侧的机制。
         protected = layer_value == "protected"
+        is_search = decision is not None and getattr(decision, "kind", "") == "search"
+        no_permanent = protected or is_search
         self._add_choices(
             [
                 ("yes", "本次放行", "仅执行本次"),
@@ -3544,7 +3604,7 @@ class ConfirmPanel(NumberedPanel):
                 ),
                 *(
                     []
-                    if protected
+                    if no_permanent
                     else [("yes_permanent", "永久放行", "写入本地配置，重启仍生效")]
                 ),
                 # ⚠ `Esc` 后面**不再手工塞空格**：说明列已由 `_add_choices` 按
