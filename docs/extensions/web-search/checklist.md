@@ -1,6 +1,6 @@
 # 网络搜索工具（web_search）Checklist
 
-> 状态：待批准（2026-08-19，第 1 轮）
+> 状态：**已批准**（2026-08-19，第 1 轮）
 >
 > 输入：已批准的 [`spec.md`](spec.md) + [`plan.md`](plan.md) + [`task.md`](task.md)。
 >
