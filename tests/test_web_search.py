@@ -53,6 +53,24 @@ class NormalizeCountTests(unittest.TestCase):
         """装配层会把配置里的 `search.max_results` 作为 default 传进来。"""
         self.assertEqual(normalize_count(None, default=8), 8)
 
+    def test_out_of_range_default_is_also_clamped(self) -> None:
+        """
+        ⚠ **回退值也要夹取。** 实现期实测撞到的一个真缺口：
+
+        `default` 来自配置里的 `search.max_results`，而那一项走「非法值回退默认」
+        的宽松口径——用户完全可以写 `max_results: 99`。不夹的话，模型**不指定
+        条数**时（最常见的情况）反而会把 99 原样发给服务商：一条越界值从
+        「用户指定」这条路被挡住，却从「缺省」这条路溜了出去。
+        """
+        self.assertEqual(normalize_count(None, default=99), MAX_COUNT)
+        self.assertEqual(normalize_count(None, default=0), MIN_COUNT)
+        self.assertEqual(normalize_count(None, default=-5), MIN_COUNT)
+        self.assertEqual(normalize_count("x", default=99), MAX_COUNT)
+        self.assertEqual(normalize_count(True, default=99), MAX_COUNT)
+
+    def test_garbage_default_falls_back_to_builtin(self) -> None:
+        self.assertEqual(normalize_count(None, default="x"), DEFAULT_COUNT)
+
 
 class CheckEndpointTests(unittest.TestCase):
     """端点校验：只判协议与主机名，**不判地址范围**（spec F11/F17）。"""

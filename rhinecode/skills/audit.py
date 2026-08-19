@@ -394,7 +394,8 @@ def _check_grants(spec: SkillSpec) -> list[SkillAdvice]:
                     f"但**一条都没能生效**"
                 ),
                 suggestion=(
-                    "检查工具名与写法。可用类别：Read / Write / Edit / Bash / WebFetch，"
+                    "检查工具名与写法。可用类别：Read / Write / Edit / Bash / "
+                    "WebFetch / WebSearch，"
                     "或 mcp__ 开头的远端工具。带模式的写法形如 `Bash(git status *)`；"
                     "域名规则**必须**带前缀，写成 `WebFetch(domain:github.com)`——"
                     "漏掉 `domain:` 的那条会被静默丢弃。"

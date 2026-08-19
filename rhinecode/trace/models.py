@@ -200,7 +200,7 @@ def redact_config(cfg: Any) -> dict:
     则新增字段默认不记录——「默认安全」。
 
     :param cfg: 配置对象（`rhinecode.config` 的配置数据类）；容忍字段增减
-    :returns: 字段名 → 值的字典，`api_key` 恒为 REDACTED
+    :returns: 字段名 → 值的字典，`api_key` 与 `search_api_key` 恒为 REDACTED
 
     副作用：无（纯函数）。
 
@@ -215,11 +215,23 @@ def redact_config(cfg: Any) -> dict:
         "api_key",
         "debug_log",
         "context_window",
+        # web_search 扩展 F25。前两项原样记录（排查时「搜索开没开、用的哪家」
+        # 是第一个要问的），密钥走掩码。
+        #
+        # ⚠ **`search_endpoint` 刻意不在这张表里。** 用户自定义端点可能把令牌
+        # 写在查询串里（部分搜索服务就是那样设计的），而本函数是白名单式取值
+        # ——不加进来就是默认安全，加进来就要再判一次内容。不加。
+        "search_enabled",
+        "search_provider",
+        "search_api_key",
     )
+    # 需要掩码的字段。**与 `fields` 是成对维护点**：新增一个含密字段时，
+    # 只加进 `fields` 而漏加这里，密钥就会原样落盘——而记录文件不会报错。
+    secrets = ("api_key", "search_api_key")
     snapshot: dict = {}
     for name in fields:
         value = getattr(cfg, name, None)
-        if name == "api_key":
+        if name in secrets:
             # 只要该字段存在（哪怕是空串）就记掩码，避免「没有这个键」被误读成「没配 key」
             snapshot[name] = REDACTED if value is not None else None
         else:

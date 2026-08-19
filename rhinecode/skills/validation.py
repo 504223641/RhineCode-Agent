@@ -52,6 +52,7 @@ _TOOL_ALIASES: dict[str, str] = {
     "glob": "Read",
     "grep": "Read",
     "webfetch": "WebFetch",
+    "websearch": "WebSearch",
     # 本系统的内部工具名
     "read_file": "Read",
     "write_file": "Write",
@@ -60,6 +61,7 @@ _TOOL_ALIASES: dict[str, str] = {
     "glob_files": "Read",
     "grep_content": "Read",
     "web_fetch": "WebFetch",
+    "web_search": "WebSearch",
 }
 
 
@@ -120,7 +122,8 @@ def grants_for(specs: Iterable[SkillSpec]) -> tuple[list[Rule], list[str]]:
                 warnings.append(
                     f"Skill `{spec.command_name}` 的 allowed-tools 声明了 `{item}`，"
                     f"本系统没有对应的工具类别，该项被忽略"
-                    f"（可用的类别：Read / Write / Edit / Bash / WebFetch，或 mcp__ 开头的远端工具）"
+                    f"（可用的类别：Read / Write / Edit / Bash / WebFetch / WebSearch，"
+                    f"或 mcp__ 开头的远端工具）"
                 )
                 continue
 

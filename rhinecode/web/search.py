@@ -64,19 +64,32 @@ def normalize_count(raw: Any, default: int = DEFAULT_COUNT) -> int:
     `True` 会被夹成 1——模型于是拿到一条结果，还以为自己要到的就是一条。
     传布尔进来是明显的类型错误，退回缺省比夹成 1 更诚实。
 
+    ⚠ **回退值也要夹取，这不是多余的。** `default` 来自配置里的
+    `search.max_results`，而那一项走的是「非法值回退默认」的宽松口径，
+    用户完全可以写 `max_results: 99`。不夹的话，模型**不指定条数**时
+    （最常见的情况）反而会把 99 原样发给服务商——一条越界值从「用户指定」
+    这条路被挡住，却从「缺省」这条路溜了出去。实现期实测撞到过。
+
     副作用：无（纯函数）。
     """
+
+    def _clamp(value: int) -> int:
+        if value < MIN_COUNT:
+            return MIN_COUNT
+        return MAX_COUNT if value > MAX_COUNT else value
+
+    try:
+        fallback = _clamp(int(default))
+    except (TypeError, ValueError):
+        fallback = DEFAULT_COUNT
+
     if isinstance(raw, bool):
-        return default
+        return fallback
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return default
-    if value < MIN_COUNT:
-        return MIN_COUNT
-    if value > MAX_COUNT:
-        return MAX_COUNT
-    return value
+        return fallback
+    return _clamp(value)
 
 
 def check_endpoint(url: str) -> Optional[str]:
