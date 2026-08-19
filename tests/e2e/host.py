@@ -58,7 +58,11 @@ from tests.e2e import discovery, fingerprint, protocol, sandbox
 from tests.e2e.control import DriverCore, ExternalResponder, SessionState
 from tests.e2e.discovery import HostInfo
 from tests.e2e.scripted import ScopedScriptedProvider, ScriptedProvider
-from tests.e2e.webstub import stub_client_factory, stub_resolver
+from tests.e2e.webstub import (
+    stub_client_factory,
+    stub_resolver,
+    stub_search_client_factory,
+)
 
 
 # 装配时一并摘掉的两个工具（spec F8 第二条 / F19）：
@@ -75,6 +79,14 @@ EXCLUDED_TOOLS = frozenset({"mcp_add_server", "mcp_resolve_server"})
 #
 # （不要把理由写成「注入替身后完全受控」：`--web-stub` 是可选的，
 #  不加时宿主拿的是真 httpx + 真域名解析，那个理由站不住。）
+
+# ⚠ **`web_search` 同样刻意不进 EXCLUDED_TOOLS**，理由与 `web_fetch` 一致：
+# 它不写真实用户主目录、不访问外部包索引，且第④层对它判 ASK（spec F12），
+# 驱动者必须显式应答才会真的发出去。
+#
+# 它另有一道 `web_fetch` 没有的兜底：**没配密钥就什么都发不出去**，
+# 而宿主造的配置里没有 `search.api_key`。但**别把这条当成主要理由**——
+# 它只在宿主不读用户真实配置时成立。
 
 # 装配失败后继续服务的宽限窗口（秒），让客户端有机会读到那段成文文案
 FATAL_GRACE_SECONDS = 60.0
@@ -379,7 +391,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--web-stub",
         action="store_true",
-        help="把 web_fetch 的 HTTP 客户端与域名解析换成离线替身（端到端场景用）",
+        help="把 web_fetch 与 web_search 的 HTTP 客户端、域名解析换成离线替身"
+             "（端到端场景用）",
     )
     parser.add_argument("--config", default=None,
                         help="配置文件路径。live 模式必须含有效凭据；scripted 模式也认它"
@@ -506,6 +519,11 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
         # 使端到端场景不发出任何真实请求（spec N5）。缺省 None = 用真实实现。
         web_client_factory = stub_client_factory() if args.web_stub else None
         web_resolver = stub_resolver if args.web_stub else None
+        # ⚠ **一个开关管两样**（web_search 扩展 T31）：搜索替身跟着 `--web-stub`
+        # 一起生效，不新开第二个开关。理由是少一个会漏改的地方——两个开关意味着
+        # 写场景的人可能只加一个，然后那次「离线」端到端跑起来**真的把查询词
+        # 发给了第三方**，而且不报错。
+        search_client_factory = stub_search_client_factory() if args.web_stub else None
         result = build_app(
             make_config(args),
             user_dir=user_dir,
@@ -514,6 +532,7 @@ async def serve(args: argparse.Namespace, host_state: HostState, workspace: Path
             exclude_tools=EXCLUDED_TOOLS,
             web_client_factory=web_client_factory,
             web_resolver=web_resolver,
+            search_client_factory=search_client_factory,
         )
         # 启动权限档的覆盖（auto-plan 扩展）。**缺省不动**——不传这个参数时
         # 宿主与真实启动逐字一致（`CLAUDE.md` 记着「宿主是 build_app 的第二个
