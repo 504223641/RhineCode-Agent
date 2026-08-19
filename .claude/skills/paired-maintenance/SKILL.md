@@ -1,6 +1,6 @@
 ---
 name: paired-maintenance
-description: RhineCode 的成对维护点速查——「改一处就必须同步另一处」的全部条目，每条对应一次真实踩过的坑，共同点是漏改一律不报错（编译过、测试绿、界面正常，只是某个行为悄悄不对了）。动 agent/loop.py、permission/、classifier/、subagents/、team/、todo/、worktree/、hooks/、skills/、tui/、trace/、tests/e2e/、bootstrap.py、tools/、commands/、context/、memory/、mcp/ 里任何一处代码之前先加载它，用它替代你自己直接开改的默认做法；用户不必点名，拿不准就加载。
+description: RhineCode 的成对维护点速查——「改一处就必须同步另一处」的全部条目，每条对应一次真实踩过的坑，共同点是漏改一律不报错（编译过、测试绿、界面正常，只是某个行为悄悄不对了）。动 agent/、permission/、classifier/、subagents/、team/、todo/、worktree/、hooks/、skills/、tui/、trace/、web/、tests/e2e/、bootstrap.py、conversation.py、presets.py、tools/、commands/、context/、memory/、mcp/ 里任何一处代码之前先加载它，用它替代你自己直接开改的默认做法；用户不必点名，拿不准就加载。
 ---
 
 # 成对维护点
@@ -12,10 +12,6 @@ description: RhineCode 的成对维护点速查——「改一处就必须同步
 > 这份清单原先常驻在 `CLAUDE.md` 主文件里（约 3.5 万字符）。搬到 Skill 是为了
 > 让它按需加载而不是每个会话都整份读一遍；**触发条件按目录锁定**，见 frontmatter
 > 的 description。主文件里留了一段指路块。
-
-**改一处就必须同步另一处的地方。** 这一节是全文对防 bug 最有用的部分——下面每一条
-都对应一次真实踩过的坑，共同点是**漏改不报错**：编译过、测试绿、界面正常，
-只是某个行为悄悄不对了。动到相关代码前先在这里搜一下关键词。
 
 - **新增一类要经分类器审查的动作（c16）** → 工具上声明 `classifier_scope`（`tools/base.py`）+ `agent/loop.py` 的**两条判定分支**（普通分支与 `system_serial` 分支）+ `classifier/prompt.py` 的待判动作段落。**漏改后两处不报错**，只表现为「声明了但从不被审查」——而配置和界面上都看不出异常。护栏见 `tests/test_classifier_loop.py`（触发与不触发各有正反例）
 - **`_review_action` 读的参数名 ↔ 三个工具声明的 `parameters`（c16）** → `agent/loop.py` 的 `_review_action` 里写的 `command` / `url` / `message` / `to` 必须与工具真实声明的一致。⚠ **实现期真踩过**：那里一度写成 `args.get("body")`，而 `send_message` 的参数叫 `message`。后果**完全无声**——分类器拿到一个空正文、判定形式上跑了实际毫无意义，没有任何东西报错。护栏见 `tests/test_classifier_message.py::ArgumentNameTest`（拿工具真实声明的 `parameters` 逐个比对）
