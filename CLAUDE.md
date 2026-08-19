@@ -165,10 +165,11 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 全部条目在 **`paired-maintenance` Skill**（约 3.5 万字符，按需加载）。
 
-⚠ **动下面任何一处代码之前，先加载它**——`agent/loop.py`、`permission/`、
+⚠ **动下面任何一处代码之前，先加载它**——`agent/`、`permission/`、
 `classifier/`、`subagents/`、`team/`、`todo/`、`worktree/`、`hooks/`、`skills/`、
-`tui/`、`trace/`、`tests/e2e/`、`bootstrap.py`、`tools/`、`commands/`、
-`context/`、`memory/`、`mcp/`。**拿不准就加载。**
+`tui/`、`trace/`、`web/`、`tests/e2e/`、`bootstrap.py`、`conversation.py`、
+`presets.py`、`tools/`、`commands/`、`context/`、`memory/`、`mcp/`。
+**拿不准就加载。**
 
 **这段指路块刻意留在主文件**：索引解决「我要查点东西」，解决不了「我不知道
 自己需要知道」。所以触发条件按**目录**锁定而不是按主题——你不可能碰到任何一个
@@ -179,10 +180,16 @@ Anthropic / OpenAI Provider 目前保持纯对话能力；工具调用、Plan Mo
 
 - **`subagents/toolset.py` 的 `BACKGROUND_DENIED_TOOLS` 恒为空集是刻意的**——
   本项目全程非交互、前后台约束相同，那一层没有独立内容。保留结构位是为将来留落点，
-  **但不为它造人为差异**。护栏 `test_subagent_toolset.py::BackgroundLayerTest`。
+  **但不为它造人为差异**（那会让同一个角色在两种场景下行为不同、而配置上看不出来）。
+  护栏 `test_subagent_toolset.py::BackgroundLayerTest`。
 - **`skills/render.py` 那一侧刻意保持 pushy，别跟 `subagents/render.py` 顺手统一**——
   两处措辞相近、文件就在隔壁，但成本结构相反：加载 Skill 只是往上下文加一段文本
   （便宜、可逆），委派要起一整条子对话并冷启动（贵）。两处反证测试钉住这个「刻意」。
+
+⚠ **这两条本身就是一对成对维护点**：上面是摘要，完整理由（含对齐依据与护栏全名）
+在 [`docs/internals/known-issues.md`](docs/internals/known-issues.md) 的 **#14** 与
+**#17** 里，两处**都不能单改**。摘要留在主文件是因为它们只有「不请自来」才起作用
+——一个正打算「顺手统一一下」的人，恰恰不会去查已知项清单。
 
 ## 常用命令
 
@@ -236,9 +243,15 @@ RHINE_E2E_LIVE=1 python -m unittest tests.test_e2e_live   # 真实模式（缺�
 ```
 
 运行时斜杠命令（c10 起大小写不敏感、支持别名与 Tab 补全；未知命令不进 AI、只提示 `/help`）。
-**完整清单与逐条描述见 `commands/builtins.py` 的 `CommandSpec` 注册表**——按 c10 的设计，
-那一份同时驱动执行 / `/help` / 补全 / 高亮，所以它与实际行为不会分叉。
-下面只留三条带约束、光看注册表看不出来的：
+**完整清单见 `commands/builtins.py` 的 `CommandSpec` 注册表**——按 c10 的设计，
+那一份同时驱动执行 / `/help` / 补全 / 高亮，所以「有哪些命令」与实际行为不会分叉。
+但**注册表里的 `description` 只有一句话，带约束的行为不在那里**：`/hooks` 与
+`/agents` 没有 `reload`（改了配置要重启）、`/clear` 还会复位 c8 的压缩锚点与熔断
+并卸载全部已激活 Skill、`/compact` **没有余量阈值**（主动触发即尝试摘要）、
+`/init` 遇到已存在的 RHINE.md 只提改进建议不覆盖，以及别名**刻意不进补全候选**
+这类规则——这些逐条写在
+[`docs/internals/capabilities.md`](docs/internals/capabilities.md) 的对应小节里。
+下面只留三条连那份文档也要翻半天、而搞错了会直接踩坑的：
 
 - `/mode`（别名 `/plan`）：在 **auto** 与 **plan** 两个模式间切换，等价于 `Shift+Tab`（DeepSeek 工具模式生效，auto-plan 扩展）。`auto` = 放行档 + 规划阶段关（放手干活）；`plan` = 同一档位 + 规划阶段开（先规划、澄清和审批，再执行）。**计划获批后自动回到 `auto`，被拒则留在 `plan`**。⚠ **`/perm` 已删除**——权限档不再有运行期切换入口，`strict` / `default` 只能经 `permissions.yaml` 与角色定义的 `permission_mode` 抵达（手法对齐 Claude Code 的 `dontAsk`）。**注意一处例外**：放行档对**网络访问**不生效——未建立域名白名单时仍然弹确认（web_fetch 扩展 F7；其余工具在放行档下的行为逐字不变）。
 - `/skills`：管理 Skill（c11）。五种形态——无参列出全部 Skill 及其来源层级、在哪执行（主对话 / 子对话）、激活状态、加载错误、字段提示，**以及体检建议段**（作者期扩展：七项检查，每条都给出具体改法；无建议时整段不出现；有建议时段尾指向 `/skill-creator`）；`/skills prompt` 查看当前**实际注入**了什么（第一阶段清单 / 已激活正文 / 当前可见工具集），排查「为什么模型没按我的 Skill 做」用；`/skills reload` 热更新定义（已激活的正文自动换新，定义消失的自动卸载，**斜杠短命令一并重新注册**——新增的立刻可补全可执行、删除的随之消失，`allowed-tools` 里认不出的项只丢弃并警告，既不终止进程也不影响下次启动——外部 Skill 里出现 `Task` / `TodoWrite` 这类名字是正常现象。**注意 `WebFetch` 现在是真工具**，写它不再产生「无对应工具类别」警告，但括号里必须写成 `WebFetch(domain:...)`，漏掉前缀会被丢弃并单独警告）；`/skills off [名字]` 卸载指定或全部激活项；`/skills run <名字> [参数]` 执行指定 Skill（通用入口，也是短命令被重名跳过时的替代入口）。
@@ -585,19 +598,23 @@ Textual app 上，2257 条（85%）纯逻辑用例加起来只有 10 秒。
 下面只列**尚未完成**的，标题为准；判断某条是否已被推翻、某个「刻意」为什么刻意，
 一律去那份文档查——那些理由都还在。
 
-1. API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
-3. `write_file` / `edit_file` 的文件系统级原子写入。
-4. OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
-   ⚠ **别指望照抄上游**：Claude Code 与 Codex 都不支持原生 Windows 沙箱，而 Windows 是本项目主力平台。
-   它**也不是 auto 预设的前提**——收窄手段是分类器（c16）而不是沙箱。
-5. 权限系统剩余项：资源配额、审计日志。（网络请求限制已由 web_fetch 扩展兑现，
-   模型改写自己的权限配置已由 protected-paths 扩展兑现；②″明确没覆盖的三个缺口见那份文档。）
-6. 开发环境依赖固定与 CI。
-7–11. 各章 spec 明确不做的范围清单：MCP（c7）/ 上下文管理（c8）/ Skill（c11）/ Trace / 记忆（c9）。
-13–15. 同上：Hook（c12）/ 子 Agent（c13）/ 工作区隔离（c14）。**c14 另有三条已知边界 + 一条只做了半截的**（`worktree.link` 一律降级为 copy）。
-16. `SkillReloadOutcome.dropped_fatal` 是死代码，已确认**暂不处理**；清理时要一起动四处。
-19. 子 Agent 协作（c15）spec 明确不做的清单，外加一条实现期定下的边界：**隔离委派与待命互斥**。
-20. 粘贴 `/skills` 报告会被命令解析器吞掉——牵动 c10 的解析契约，**本次不改**、单独立项。
+⚠ **编号是引用锚点，不是序号**：本文与 `docs/extensions/**` 多处按「已知项 #4 /
+#17 / #18」互指，所以这里刻意**不用有序列表**——Markdown 的有序列表会从起始号
+连续重编（`1. 3. 4.` 渲染成 `1. 2. 3.`），而缺号正是「那几条已修或已推翻」的信息。
+
+- **#1** API Key 与敏感配置的读取脱敏、环境变量化或工作区外管理。
+- **#3** `write_file` / `edit_file` 的文件系统级原子写入。
+- **#4** OS 级沙箱（Seatbelt / bubblewrap），约束 `run_command` 子进程自身发起的文件/网络访问。
+  ⚠ **别指望照抄上游**：Claude Code 与 Codex 都不支持原生 Windows 沙箱，而 Windows 是本项目主力平台。
+  它**也不是 auto 预设的前提**——收窄手段是分类器（c16）而不是沙箱。
+- **#5** 权限系统剩余项：资源配额、审计日志。（网络请求限制已由 web_fetch 扩展兑现，
+  模型改写自己的权限配置已由 protected-paths 扩展兑现；②″明确没覆盖的三个缺口见那份文档。）
+- **#6** 开发环境依赖固定与 CI。
+- **#7–#11** 各章 spec 明确不做的范围清单：MCP（c7）/ 上下文管理（c8）/ Skill（c11）/ Trace / 记忆（c9）。
+- **#13–#15** 同上：Hook（c12）/ 子 Agent（c13）/ 工作区隔离（c14）。**c14 另有三条已知边界 + 一条只做了半截的**（`worktree.link` 一律降级为 copy）。
+- **#16** `SkillReloadOutcome.dropped_fatal` 是死代码，已确认**暂不处理**；清理时要一起动四处。
+- **#19** 子 Agent 协作（c15）spec 明确不做的清单，外加一条实现期定下的边界：**隔离委派与待命互斥**。
+- **#20** 粘贴 `/skills` 报告会被命令解析器吞掉——牵动 c10 的解析契约，**本次不改**、单独立项。
 
 已修复/已推翻的四条（2、12、17、18）连同它们的理由与护栏位置，都留在那份文档里。
 
