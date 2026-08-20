@@ -78,6 +78,48 @@ class FourPlacesTests(unittest.TestCase):
         """界面提示里要出现中文名，而不是空白或英文 scope。"""
         self.assertEqual(_SCOPE_LABELS[SCOPE_SEARCH], "网络搜索")
 
+    def test_5_denied_notice_does_not_give_dead_end_advice(self) -> None:
+        """
+        ⚠ **这条是真实使用暴露的 bug 补的护栏**（2026-08-20 的一份 trace）。
+
+        `render_denied_notice` 原本只有两支：消息类一支、**其余全走 else**。
+        那个 else 说「写一条**具体的** allow 规则（写窄，别写通配）」——
+        对命令类是对的（`Bash(npm test)` 确实是窄规则），**对搜索是死路**：
+
+        ① 搜索没有窄规则（F10 只支持整工具 `WebSearch`，带括号一律不命中
+           **且不产生任何警告**）；
+        ② 而整工具的 `allow: WebSearch` 恰恰会被 F16 丢弃——正因为分类器启用着。
+
+        照那条建议做，两条路都走不通。**给出走不通的建议比不给更糟**：
+        用户会以为是自己配错了。而当时**编译过、测试全绿、界面正常**。
+        """
+        from rhinecode.classifier.models import Verdict, VerdictKind
+        from rhinecode.classifier.render import render_denied_notice
+
+        v = Verdict(kind=VerdictKind.BLOCK, reason="理由", staged=True)
+        text = render_denied_notice(_action(), v)
+
+        # 不许出现那条对搜索无效的建议。
+        self.assertNotIn("写窄，别写通配", text)
+        # 必须说清「没有更窄的规则可写」这件事本身。
+        self.assertIn("更窄", text)
+        self.assertIn("会被丢弃", text)
+        # 三条真的可行的出路都要在。
+        self.assertIn("重新搜", text)
+        self.assertIn("/clear", text)
+        self.assertIn("classifier.enabled: false", text)
+
+    def test_5b_command_notice_unchanged(self) -> None:
+        """对照组：命令类那一支一个字没动——它的「写窄规则」建议是对的。"""
+        from rhinecode.classifier.models import ReviewAction, Verdict, VerdictKind
+        from rhinecode.classifier.render import render_denied_notice
+
+        v = Verdict(kind=VerdictKind.BLOCK, reason="理由", staged=True)
+        text = render_denied_notice(
+            ReviewAction(scope=SCOPE_COMMAND, tool_name="run_command", specifier="rm -rf /"), v
+        )
+        self.assertIn("写窄，别写通配", text)
+
 
 # =============================================================================
 # 二、参数名反证（spec F9 / AC8）
