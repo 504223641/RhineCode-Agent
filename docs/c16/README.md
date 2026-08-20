@@ -13,6 +13,7 @@
 | [`checklist.md`](checklist.md) | 做对了没：13 节 80 余条可观测判据 + 7 个端到端场景 |
 | [`acceptance/live.md`](acceptance/live.md) | **真实模型实跑记录（第一轮）**：指令式输入、分类器与主对话同模型。7 个场景 + 一个真机才抓得到的缺陷 |
 | [`acceptance/live-realistic.md`](acceptance/live-realistic.md) | **真实模型实跑记录（第二轮）**：真实开发者说法、分类器换便宜模型、含提示词注入预置。又抓出一个缺陷 + 三条方法论发现 |
+| [`acceptance/transcript-scope.md`](acceptance/transcript-scope.md) | **误伤修复的两栏对照（2026-08-20）**：944 次直调判定。⚠ 取样把 `CLAUDE.md` ⑦b 原来的成因说法证伪了一半——「提过一次密钥就会污染」照它构造的六条加强样本 0/96 |
 
 ## 零基础版：这一章到底加了什么
 
