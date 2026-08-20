@@ -711,8 +711,11 @@ class ConversationManager:
 
         :returns: 供界面显示的结果文本；不支持的 Provider 返回原能力限制提示
         """
-        # Anthropic 和 DeepSeek 均支持思考模式，OpenAI 原生协议不支持
-        if self._protocol not in ("anthropic", "deepseek"):
+        # 本项目只保留 DeepSeek 一个 Provider（2026-08-20 删除 anthropic / openai）。
+        # 这一层判断刻意留着：配置里 protocol 写成别的值时，`create_provider` 会在
+        # 装配期就抛错，正常跑不到这里；但保留它可以让「将来再接一个不支持思考模式的
+        # Provider」时有个现成的落点，且不会因为漏判而把不支持的档位切上去。
+        if self._protocol != "deepseek":
             return "当前 Provider 不支持思考模式"
         self.thinking_effort = self._EFFORT_CYCLE[self.thinking_effort]
         label = self._EFFORT_LABEL[self.thinking_effort]

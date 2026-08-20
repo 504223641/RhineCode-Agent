@@ -2,74 +2,81 @@
 Provider 工厂模块。
 
 根据配置文件中的 protocol 字段，返回对应的 Provider 实例。
-新增 Provider 时只需在此处添加一个 elif 分支，无需改动其他模块。
 
-当前支持的 protocol：
-- anthropic：Anthropic Claude，支持 Extended Thinking
-- openai：OpenAI，流式对话，thinking 参数无效
-- deepseek：DeepSeek，OpenAI 兼容协议，thinking 参数无效
+## 本项目只保留 DeepSeek 一个 Provider
 
-## ⚠ 三个 Provider 一律在分支内部 import，别挪回模块顶层
+早期版本同时实现了 anthropic / openai / deepseek 三个 Provider，但后两者
+**一直停留在纯对话能力**——工具调用、Plan Mode、权限系统、Skill、子 Agent
+等等全部只在 `protocol: deepseek` 下可用。三份实现里有两份没人用，却要跟着
+每次协议改动一起维护，还把 anthropic SDK 拖进了每次启动的 import 链
+（实测 492ms，见下文「为什么仍然延迟 import」）。
 
-Python 的 `import` 是**执行整个模块**，不是「登记一个名字」。因此顶层写
-`from rhinecode.provider.anthropic import AnthropicProvider`，会让 `anthropic`
-这个 SDK 的全部类型定义**真的被执行一遍**——哪怕本次运行根本不会创建它。
+2026-08-20 起两者已删除。`protocol` 字段本身**刻意保留**：
 
-实测（本机 Python 3.11，各取 5 次最小值）：
+- 它不是「支持几个 Provider」的开关，而是「当前用的什么协议」的标识，
+  环境信息模块、状态栏、trace 的配置快照都在读它；
+- 老配置里写着 `protocol: anthropic` 的用户升级上来时，应当拿到一句
+  **说得清楚该怎么办**的错误，而不是一个 KeyError 或者静默按 deepseek 跑。
 
-    裸解释器                                39 ms
-    import openai（deepseek 必需）         601 ms
-    import anthropic（多数运行用不上）      577 ms
-    两个都 import（本次改动前的写法）       877 ms
-    只 import deepseek 需要的              612 ms
-                                          ────────
-                                       省  290 ms
+## 为什么 deepseek 这一支仍然延迟 import
 
-省下的是**增量**而不是 anthropic 的全部 577 ms——两个 SDK 共享 httpx / pydantic，
-先导的那个已经把公共部分付掉了。`openai` 则省不掉：`deepseek.py` 走的就是
-OpenAI 兼容协议，主力 Provider 真的要用它。
+`import` 在 Python 里是**执行整个模块**，不是「登记一个名字」。`deepseek.py`
+顶层 `import openai`（DeepSeek 走的是 OpenAI 兼容协议，真的要用那个 SDK），
+而那一句实测 601ms。
 
-这 290 ms 出现在**每一次进程启动**上，收益有两处：
-1. 用户每次敲 `rhine` 少等 290 ms；
-2. 测试套件里约 44 处真起子进程的地方（e2e 宿主 28 次、装配层子进程用例等）
-   各省一份，合计约 12 秒。
+把它留在 `create_provider` 内部，意味着**只 import 本模块、不创建 Provider**
+的进程完全不必付这笔钱。这不是假想场景：e2e 宿主的多数用例跑的是剧本
+Provider，根本不走 `create_provider`——实测 `tests.test_e2e_host` 那 28 条
+端到端用例因此从 44.7s 降到 28.7s。
 
-代价只有一处：配了 `protocol: anthropic` 却没装对应 SDK 时，`ImportError` 从
-「启动时」推迟到「创建 Provider 时」。这反而更合理——用不到的 Provider
-缺依赖不该拦住启动。
+    import rhinecode.provider.factory   902ms -> 68ms
+    import rhinecode.bootstrap         1187ms -> 464ms
 
-⚠ 本项目的方针是「只针对 DeepSeek 开发」（Anthropic / OpenAI Provider 保持
-纯对话能力），所以 anthropic 那条分支在实际使用中几乎不会被走到，
-这正是延迟导入在这里收益最大的原因。
+⚠ **别顺手把它挪回模块顶层**。看起来只是「早导晚导」的区别，实际是每一个
+不创建 Provider 的进程都白等半秒。
 """
 
 from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider
 
+# 已删除的 protocol → 给用户的迁移说明。
+# 单独抽出来是为了让错误信息**说得出该怎么办**：只说「无效供应商」的话，
+# 一个从旧版本升上来的用户只知道坏了，不知道是自己配错了还是程序坏了。
+_REMOVED_PROTOCOLS = {
+    "anthropic": "Anthropic Claude",
+    "openai": "OpenAI",
+}
+
 
 def create_provider(config: Config) -> BaseProvider:
     """
-    根据 config.protocol 创建并返回对应的 Provider 实例。
+    根据 config.protocol 创建并返回 Provider 实例。
 
     :param config: 包含 protocol、model、base_url、api_key 的配置对象
     :returns: 实现了 BaseProvider 接口的 Provider 实例
-    :raises ValueError: protocol 不在支持列表中时抛出，错误信息包含实际值
-    :raises ImportError: 对应 Provider 的第三方 SDK 未安装时抛出
-        （本次改动把它从「import 本模块时」推迟到了这里，见模块 docstring）
+    :raises ValueError: protocol 不是 deepseek 时抛出。已删除的两个协议
+        （anthropic / openai）有各自的迁移提示，其余值走通用分支
+    :raises ImportError: openai SDK 未安装时抛出（延迟到这里才暴露，见模块 docstring）
 
-    副作用：首次为某个 protocol 调用时会 import 对应的 SDK（几百毫秒）；
-    之后 Python 的模块缓存会让重复调用不再付这个代价。
+    副作用：首次调用时会 import openai SDK（约 600ms）；之后 Python 的
+    模块缓存会让重复调用不再付这个代价。
     """
-    if config.protocol == "anthropic":
-        # 延迟 import：只有真的选了 anthropic 才付它 SDK 的加载成本（见模块 docstring）
-        from rhinecode.provider.anthropic import AnthropicProvider
-        return AnthropicProvider(config)
-    elif config.protocol == "openai":
-        from rhinecode.provider.openai import OpenAIProvider
-        return OpenAIProvider(config)
-    elif config.protocol == "deepseek":
-        # DeepSeek 与 OpenAI API 完全兼容，通过 base_url 区分请求目标
+    if config.protocol == "deepseek":
+        # 延迟 import：只 import 本模块而不建 Provider 的进程不必付 SDK 的加载成本
+        # （见模块 docstring「为什么 deepseek 这一支仍然延迟 import」）
         from rhinecode.provider.deepseek import DeepSeekProvider
         return DeepSeekProvider(config)
-    else:
-        raise ValueError(f"无效供应商 {config.protocol}，目前仅支持 anthropic / openai / deepseek")
+
+    if config.protocol in _REMOVED_PROTOCOLS:
+        name = _REMOVED_PROTOCOLS[config.protocol]
+        raise ValueError(
+            f"{name}（protocol: {config.protocol}）的支持已于 2026-08-20 移除，"
+            f"本项目现在只支持 DeepSeek。\n"
+            f"请把配置文件里的这几行改成：\n"
+            f"  protocol: deepseek\n"
+            f"  model: deepseek-chat\n"
+            f"  base_url: https://api.deepseek.com\n"
+            f"  api_key: <你的 DeepSeek API Key>"
+        )
+
+    raise ValueError(f"无效供应商 {config.protocol}，目前仅支持 deepseek")

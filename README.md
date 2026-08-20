@@ -21,7 +21,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 Skill 系统已**对齐 [Agent Skills 开放标准](https://agentskills.io)**（Claude Code 与 Codex 共同遵循的那套），所以从 Claude Code 拿一个 Skill 目录复制进来就能直接用，不需要改任何东西。
 
-> 工具调用、Plan Mode、权限系统、Skill、子 Agent 与 Hook 的工具级事件仅在 `protocol: deepseek` 且启用默认工具注册中心时可用；记忆系统的 RHINE.md 注入与会话存档/恢复对所有 Provider 生效。Anthropic / OpenAI Provider 目前保持纯对话能力。
+> **本项目只支持 DeepSeek**（`protocol: deepseek`）。Anthropic / OpenAI 两个 Provider 已于 2026-08-20 删除——它们一直停留在纯对话能力，而工具调用、Plan Mode、权限系统、Skill、子 Agent 与 Hook 的工具级事件全都需要 `deepseek` 且启用默认工具注册中心。
 
 ## 功能
 
@@ -93,7 +93,7 @@ api_key: YOUR_API_KEY
 
 | 字段 | 说明 |
 |------|------|
-| `protocol` | `anthropic` / `openai` / `deepseek` |
+| `protocol` | 只支持 `deepseek` |
 | `model` | 模型名称 |
 | `base_url` | API 请求地址 |
 | `api_key` | 认证密钥 |
@@ -165,7 +165,7 @@ C10 起所有斜杠命令由**单一命令注册中心**统一管理：执行、
 | 命令 | 别名 | 类型 | 说明 |
 |------|------|------|------|
 | `/help` | `/h` | 本地 | 按稳定顺序列出全部命令的名称、别名、描述、用法与参数提示 |
-| `/think` | — | 界面 | 在 off / high / max 间循环切换思考模式（Anthropic / DeepSeek 生效） |
+| `/think` | — | 界面 | 在 off / high / max 间循环切换思考模式 |
 | `/mode` | `/plan` | 界面 | 在 **auto** 与 **plan** 两个模式间切换，等价于 `Shift+Tab`（DeepSeek 工具模式生效） |
 | `/mcp` | — | 本地 | 查看各 MCP Server 的连接状态、传输类型、注册工具数与失败原因 |
 | `/context` | `/ctx` | 本地 | 查看当前上下文近似用量（估算 token / 窗口上限 / 余量 / 已存盘结果数 / 是否熔断），只读（DeepSeek 工具模式生效） |
@@ -1116,10 +1116,8 @@ rhinecode/
 │   └── manager.py       # ContextManager：编排两层压缩、锚点、熔断、可观测
 ├── provider/
 │   ├── base.py          # BaseProvider / Message / StreamChunk / ToolCall 抽象
-│   ├── anthropic.py     # Anthropic 纯对话实现
-│   ├── openai.py        # OpenAI 纯对话实现
-│   ├── deepseek.py      # DeepSeek 流式对话、思考与工具调用解析
-│   └── factory.py       # Provider 工厂
+│   ├── deepseek.py      # DeepSeek 流式对话、思考与工具调用解析（走 OpenAI 兼容协议）
+│   └── factory.py       # Provider 工厂（只认 deepseek，旧协议值给迁移提示）
 ├── tools/
 │   ├── base.py          # Tool / ToolResult 抽象
 │   ├── diff.py          # 结构化 diff 构造

@@ -35,23 +35,13 @@ _CONFIG_TEMPLATE = """\
 # RhineCode 全局配置。填入真实 api_key 后即可在任意目录运行 `rhine`。
 # 也可用 `rhine --config <路径>` 指定其它配置文件覆盖本文件。
 
-# 使用 DeepSeek（默认，支持工具调用 / Plan Mode / 权限系统）
+# 后端协议。本项目只支持 DeepSeek——anthropic / openai 两个 Provider
+# 已于 2026-08-20 删除（它们一直停留在纯对话能力，工具调用 / Plan Mode /
+# 权限系统 / Skill / 子 Agent 全都只在 deepseek 下可用）。
 protocol: deepseek
 model: deepseek-chat
 base_url: https://api.deepseek.com
 api_key: YOUR_API_KEY
-
-# 使用 Anthropic Claude（纯对话）
-# protocol: anthropic
-# model: claude-sonnet-4-6
-# base_url: https://api.anthropic.com
-# api_key: sk-ant-...
-
-# 使用 OpenAI（纯对话）
-# protocol: openai
-# model: gpt-4o
-# base_url: https://api.openai.com/v1
-# api_key: sk-...
 
 # ---- 可选项（不写即用缺省值）----
 
@@ -172,8 +162,10 @@ class Config:
     LLM 供应商配置。
 
     字段说明：
-    - protocol：后端协议类型，决定使用哪个 Provider 实现（anthropic / openai / deepseek）
-    - model：模型名称，直接传给 API（例如 claude-sonnet-4-6、gpt-4o、deepseek-chat）
+    - protocol：后端协议类型，决定使用哪个 Provider 实现。目前只支持 deepseek
+                （anthropic / openai 已于 2026-08-20 删除，写这两个值会在装配期
+                 报错并给出迁移说明，见 provider/factory.py）
+    - model：模型名称，直接传给 API（例如 deepseek-chat）
     - base_url：API 请求基础地址，支持自定义代理或私有部署
     - api_key：身份认证密钥，仅在运行时内存中使用，不打印到界面或日志
     - debug_log：是否把每次请求的缓存命中/未命中 token 追加到 <项目根>/.rhinecode_debug.log，
