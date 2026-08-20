@@ -23,7 +23,7 @@ _CONFIG_FILE = "config.yaml"
 # 这里刻意**不 import** 那个模块：配置层依赖能力层是层级倒挂，而且
 # `web/search.py` 会连带把 `web/models.py` 拉起来，只为拿一个名字清单不划算。
 # 漏改的表现是「配置里写了新服务商，启动时说不认识」——会当场报错，不会静默。
-_KNOWN_PROVIDERS = ("brave",)
+_KNOWN_PROVIDERS = ("bocha", "brave")
 
 # 模板里的占位 api_key。它是「非空字符串」，能通过 load() 的非空校验，
 # 因此需要单独识别，用来区分「用户已填真实 key」和「刚生成模板还没填」。
@@ -108,12 +108,16 @@ api_key: YOUR_API_KEY
 # search:
 #   # 总开关，缺省开。关掉之后工具不注册、模型看不到它，行为与没有这个能力时一致。
 #   enabled: true
-#   # 搜索服务商。目前只支持 brave（Brave Search API，注册后拿一个密钥即可）。
-#   provider: brave
+#   # 搜索服务商，缺省 bocha。
+#   #   bocha —— 博查（https://open.bochaai.com/），国内可直连，POST + Bearer
+#   #   brave —— Brave Search API（境外，本机网络环境下多半连不通）
+#   provider: bocha
 #   # 服务商密钥。⚠ 与 api_key 同级敏感，勿提交进版本库。
 #   # 不填则工具照常注册，但每次调用返回一条「未配置密钥、不要重试」的说明。
+#   # 博查的密钥在 https://open.bochaai.com/ 控制台里拿。
 #   api_key: YOUR_SEARCH_API_KEY
-#   # 端点地址。留空 = 用服务商官方地址；填写可走内网搜索代理。
+#   # 端点地址。留空 = 用服务商官方地址（博查是 https://api.bocha.cn/v1/web-search）；
+#   # 填写可走内网搜索代理，或在服务商换域名时应急覆盖。
 #   # 只接受 http / https，其它协议启动时直接报错；非 https 会有一条启动警告。
 #   endpoint:
 #   # 每次搜索返回几条（1-10）。模型可以在调用时指定，越界只夹取。
@@ -216,7 +220,7 @@ class Config:
     # ⚠ `search_api_key` 与 `api_key` **同级敏感**：它进 trace 配置快照时必须掩码
     # （见 `trace/models.redact_config`），也不该被提交进版本库。
     search_enabled: bool = True
-    search_provider: str = "brave"
+    search_provider: str = "bocha"
     search_api_key: str = ""
     search_endpoint: str = ""
     search_max_results: int = 5
@@ -416,7 +420,7 @@ def load(path: str) -> Config:
     if not isinstance(search_raw, dict):
         search_raw = {}
     search_enabled = _parse_bool(search_raw.get("enabled", True), "search.enabled")
-    search_provider = str(search_raw.get("provider") or "brave").strip().lower()
+    search_provider = str(search_raw.get("provider") or "bocha").strip().lower()
     if search_provider not in _KNOWN_PROVIDERS:
         raise ValueError(
             f"search.provider 不认识的搜索服务商：{search_provider}。"

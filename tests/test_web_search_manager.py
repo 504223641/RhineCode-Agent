@@ -7,6 +7,7 @@ import threading
 import unittest
 
 from rhinecode.web.search import (
+    BOCHA,
     BRAVE,
     FAILURE_NO_KEY,
     FAILURE_QUOTA,
@@ -40,7 +41,17 @@ class _Client:
         self.closed = False
 
     def get(self, url, params=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+        self.calls.append(
+            {"method": "GET", "url": url, "params": params, "headers": headers, "timeout": timeout}
+        )
+        if self._raises is not None:
+            raise self._raises
+        return _Response(self._payload, self._status)
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append(
+            {"method": "POST", "url": url, "params": json, "headers": headers, "timeout": timeout}
+        )
         if self._raises is not None:
             raise self._raises
         return _Response(self._payload, self._status)
@@ -272,6 +283,70 @@ class OutcomeFieldTests(unittest.TestCase):
                 outcome = _manager(factory, api_key=api_key, quota=quota).search(query)
                 self.assertEqual(outcome.query, query.strip())
                 self.assertEqual(outcome.provider, "brave")
+
+
+class TransportTests(unittest.TestCase):
+    """
+    ⚠ 接第二家（博查）时补的那一格：**两种传输形态**。
+
+    Brave 是 GET + query 参数，博查是 POST + JSON body。`build_params` 返回的
+    字典两边通用，只是**放在请求的哪个位置**不同。当初的接缝假设了所有搜索 API
+    都是 GET——那正是「只有一个实现时看不出来」的东西。
+    """
+
+    _BOCHA_PAYLOAD = {
+        "code": 200,
+        "data": {"webPages": {"value": [{"name": "T", "url": "https://a.test/1", "summary": "S"}]}},
+    }
+
+    def _bocha(self, factory):
+        return WebSearchManager(BOCHA, "k", "", 5, 50, 10.0, client_factory=factory)
+
+    def test_bocha_uses_post_with_json_body(self) -> None:
+        factory = _Factory(payload=self._BOCHA_PAYLOAD)
+        outcome = self._bocha(factory).search("httpx 超时")
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.provider, "bocha")
+        call = factory.clients[0].calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["params"]["query"], "httpx 超时")
+
+    def test_brave_still_uses_get(self) -> None:
+        """对照组：接第二家没有改动第一家的行为。"""
+        factory = _Factory()
+        _manager(factory).search("q")
+        self.assertEqual(factory.clients[0].calls[0]["method"], "GET")
+
+    def test_bearer_prefix_applied(self) -> None:
+        factory = _Factory(payload=self._BOCHA_PAYLOAD)
+        self._bocha(factory).search("q")
+        self.assertEqual(factory.clients[0].calls[0]["headers"]["Authorization"], "Bearer k")
+
+    def test_brave_header_has_no_prefix(self) -> None:
+        """⚠ 反证：Brave 用的是裸 token，加上 `Bearer ` 前缀会当场认证失败。"""
+        factory = _Factory()
+        _manager(factory).search("q")
+        self.assertEqual(factory.clients[0].calls[0]["headers"]["X-Subscription-Token"], "k")
+
+    def test_only_two_headers_on_post(self) -> None:
+        """spec F2 的边界不因换成 POST 而变：没有 cookie、没有自定义头。"""
+        factory = _Factory(payload=self._BOCHA_PAYLOAD)
+        self._bocha(factory).search("q")
+        self.assertEqual(sorted(factory.clients[0].calls[0]["headers"]), ["Accept", "Authorization"])
+
+    def test_unparsable_payload_reports_top_level_keys(self) -> None:
+        """
+        解析失败时把**顶层键名**带进原因里——只有键名、没有内容。
+
+        本扩展的解析器是在**拿不到官方响应示例**的情况下写的（文档在飞书需登录），
+        这条诊断是那个不确定性的配套：它把「字段名对不上」从一次无从下手的失败
+        变成一分钟能定位的问题。
+        """
+        factory = _Factory(payload={"code": 401, "msg": "unauthorized"})
+        outcome = self._bocha(factory).search("q")
+        self.assertEqual(outcome.failure, FAILURE_SERVICE)
+        self.assertIn("code", outcome.error)
+        self.assertIn("msg", outcome.error)
 
 
 if __name__ == "__main__":

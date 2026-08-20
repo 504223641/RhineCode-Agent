@@ -11,7 +11,7 @@
     search(query, count)
       ├─ 密钥为空                → FAILURE_NO_KEY   （不发请求、不计数）
       ├─ _take_quota() 失败      → FAILURE_QUOTA    （不发请求、不计数）
-      └─ 发一次 HTTP GET
+      └─ 发一次 HTTP（GET 或 POST，按服务商声明）
            ├─ 异常 / 非 2xx / parse 返回 None → _release_quota() → FAILURE_SERVICE
            └─ parse 返回列表（含空列表）      → SearchOutcome(ok=True)
 
@@ -202,8 +202,19 @@ class WebSearchManager:
             # 合并两者的净效果是：一次解析故障伪装成「这个词搜不到」，
             # 模型于是去换关键词反复重试，而根因在别处，查半天查不到。
             self._release_quota()
+            # ⚠ 把**顶层键名**带进原因里。只有键名、没有内容——
+            # 结构信息不是用户数据，而它把「字段名对不上」从一次无从下手的
+            # 失败变成一分钟能定位的问题（本扩展的解析器正是在拿不到官方
+            # 响应示例的情况下写的，这条诊断是那个不确定性的配套）。
+            shape = ""
+            if isinstance(payload, dict):
+                shape = "、".join(list(payload)[:8]) or "（空对象）"
+            else:
+                shape = type(payload).__name__
             return self._outcome(
-                text, FAILURE_SERVICE, "搜索服务返回了无法识别的响应结构"
+                text,
+                FAILURE_SERVICE,
+                f"搜索服务返回了无法识别的响应结构（顶层字段：{shape}）",
             )
 
         used, limit = self.quota_state()
@@ -218,35 +229,49 @@ class WebSearchManager:
 
     def _request(self, query: str, count: int):
         """
-        发一次 GET 并返回解码后的 JSON 负载。
+        按服务商声明的方法发一次请求并返回解码后的 JSON 负载。
 
         :param query: 查询词原文
         :param count: 已规范化的条数
         :returns: 解码后的负载（通常是 dict）
         :raises Exception: 网络异常、超时、非 2xx、JSON 解码失败
 
-        ⚠ **只发 GET，只带两个请求头**（spec F2）：一个鉴权头、一个 `Accept`。
-        没有请求体、没有 cookie、没有自定义头——「除查询词之外还能往外发什么」
-        被压到零。（但请注意：**查询词本身就是发出去的数据**，
-        spec F2 明确禁止把这条写成「只取不发」。）
+        ⚠ **只带两个请求头**（spec F2）：一个鉴权头、一个 `Accept`。
+        没有 cookie、没有自定义头——「除查询词之外还能往外发什么」被压到零。
+
+        ⚠ **POST 的那一支同样受这条约束**：body 里只有 `build_params` 算出来的
+        那几个字段。换传输方式不改变边界——查询词本来就是要发出去的东西，
+        而 spec F2 明确禁止把这条写成「只取不发」。
 
         副作用：一次真实的 HTTP 请求（除非注入了替身）。
         """
-        # 工厂**不带参数**调用、超时逐次传给 `get`——与 `fetcher.fetch` 同一形态。
-        # 这样替身只需实现一个 `get`，不必模仿 httpx 的构造签名。
+        # 工厂**不带参数**调用、超时逐次传给请求方法——与 `fetcher.fetch` 同一形态。
+        # 这样替身只需实现 `get` / `post`，不必模仿 httpx 的构造签名。
         factory = self._client_factory or httpx.Client
         client = factory()
 
+        payload = self._provider.build_params(query, count)
+        headers = {
+            self._provider.auth_header: f"{self._provider.auth_prefix}{self._api_key}",
+            "Accept": "application/json",
+        }
+
         try:
-            response = client.get(
-                self._endpoint,
-                params=self._provider.build_params(query, count),
-                headers={
-                    self._provider.auth_header: self._api_key,
-                    "Accept": "application/json",
-                },
-                timeout=self._timeout,
-            )
+            # ⚠ **两种传输形态**（接第二家时补的）：Brave 是 GET + query 参数，
+            # 博查是 POST + JSON body。`build_params` 返回的字典两边通用，
+            # 只是放在请求的哪个位置不同。
+            #
+            # ⚠ POST 仍然**只发这一个 body**：没有 cookie、没有自定义头。
+            # spec F2 限制的是「除查询词之外还能往外发什么」——
+            # 换成 POST 不改变那条边界（查询词本来就是要发出去的东西）。
+            if self._provider.method.upper() == "POST":
+                response = client.post(
+                    self._endpoint, json=payload, headers=headers, timeout=self._timeout
+                )
+            else:
+                response = client.get(
+                    self._endpoint, params=payload, headers=headers, timeout=self._timeout
+                )
             status = int(getattr(response, "status_code", 0))
             if not 200 <= status < 300:
                 raise RuntimeError(f"搜索服务返回 HTTP {status}")

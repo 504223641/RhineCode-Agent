@@ -21,9 +21,12 @@ http/https」，标准库的 `urlsplit` 三行就够——**这不是重复实�
 
 ## 服务商适配的那道边界
 
-`SearchProvider` 是 spec「不做的事」里那句「留边界、只实现一家」的落点：
-本模块只有一个实例 `BRAVE`，与一张 `PROVIDERS` 表。加第二家的成本是
-**写两个函数 + 加一行表项**，不是重构。
+`SearchProvider` 是 spec「不做的事」里那句「留边界、只实现一家」的落点。
+
+⚠ **2026-08-20 接了第二家（博查）**，实测那句「加第二家 = 写两个函数 + 加一行
+表项」**基本成立，但漏了一格**：接缝当初假设所有搜索 API 都是「GET + query
+参数」，而博查是「POST + JSON body」。补一个 `method` 字段即可，结构没被推翻
+——这正是「只有一个实现时看不出来」的那类东西。
 """
 
 from dataclasses import dataclass
@@ -141,7 +144,12 @@ class SearchProvider:
     :ivar name: 服务商名，进结果元信息给模型与用户看
     :ivar endpoint: 官方端点，配置里没写 `search.endpoint` 时用它
     :ivar auth_header: 密钥放哪个请求头
-    :ivar build_params: `(查询词, 条数) -> 查询参数字典`
+    :ivar auth_prefix: 密钥前缀。Bearer 类的写 `"Bearer "`，裸 token 类的留空
+    :ivar method: `"GET"` 或 `"POST"`。**这一格是接第二家时补的**——
+                  Brave 是 GET + query 参数，博查是 POST + JSON body，
+                  而 `build_params` 返回的那个字典两边都能用，
+                  只是**放在请求的哪个位置**不同（见 `search_manager._request`）
+    :ivar build_params: `(查询词, 条数) -> 参数字典`（GET 时作 query、POST 时作 body）
     :ivar parse: `(响应负载) -> Optional[list[SearchResult]]`，**三态**，见下
 
     ## 为什么是「dataclass 装两个 callable」而不是抽象基类
@@ -150,8 +158,13 @@ class SearchProvider:
     再多一层继承。dataclass 里放两个 callable 是**同样的接缝、少一层间接**，
     而且加第二家的成本是「写两个函数 + 在 `PROVIDERS` 加一行」，不是重构。
 
-    spec 的「不做的事」里明确写了：**只实现一家**。没有第二个真实实现来检验的
-    抽象，很容易设计成只适配自己的想象。
+    spec 的「不做的事」里原本写着「只实现一家」，理由是**没有第二个真实实现来
+    检验的抽象，很容易设计成只适配自己的想象**。
+
+    ⚠ **2026-08-20 接第二家（博查）时这句话应验了一半**：接缝基本够用，
+    但**漏了一格**——它当初假设所有搜索 API 都是「GET + query 参数」，
+    而博查是「POST + JSON body」。补一个 `method` 字段就解决了，
+    没有推翻结构，但那正是「只有一个实现时看不出来」的东西。
     """
 
     name: str
@@ -159,6 +172,8 @@ class SearchProvider:
     auth_header: str
     build_params: Callable[[str, int], dict]
     parse: Callable[[Any], Optional[list]]
+    auth_prefix: str = ""
+    method: str = "GET"
 
 
 def _brave_params(query: str, count: int) -> dict:
@@ -231,8 +246,117 @@ def _brave_parse(payload: Any) -> Optional[list]:
     return items
 
 
+def _bocha_params(query: str, count: int) -> dict:
+    """
+    构造博查 Web Search API 的请求体。
+
+    :param query: 查询词原文（**不改写、不脱敏**，spec F8）
+    :param count: 已规范化的条数
+    :returns: JSON 请求体（博查是 POST，这个字典进 body 而不是 query）
+
+    ⚠ **`summary: true` 不可省。** 不带它时博查只返回一小段 `snippet`，
+    带上才给较完整的 `summary`——而搜索结果的价值就在于「这条值不值得再去抓」，
+    一句话的摘要判断不了。
+
+    `freshness: "noLimit"` 是显式写死的默认值：不限时间范围。
+    本扩展**不把时间范围开放给模型**（spec F2：参数只有查询词与条数），
+    但显式写出来比依赖服务端默认更清楚。
+
+    副作用：无（纯函数）。
+    """
+    return {"query": query, "count": count, "summary": True, "freshness": "noLimit"}
+
+
+def _bocha_parse(payload: Any) -> Optional[list]:
+    """
+    解析博查 Web Search API 的响应负载。
+
+    :param payload: 已解码的 JSON 负载
+    :returns: **三态**，与 `_brave_parse` 同口径（`None` / `[]` / 列表）
+
+    ## ⚠ 顶层包装两种形态都认
+
+    官方文档在飞书、需登录，公开渠道拿不到完整的响应示例。可确认的是它是
+    **Bing 兼容形态**（`webPages.value[]`），但**顶层有没有一层 `data` 包装
+    没能核实**——有的转述里写着 `{"code":200,"data":{...}}`，
+    有的写着直接就是 `{"_type":"SearchResponse",...}`。
+
+    **两种都认**是这里唯一诚实的做法：它不是「加料」，是把一个**已知的
+    不确定性**处理掉。代价只有三行，而猜错的代价是整个工具不可用。
+    真正的兜底仍然是三态——两种都不匹配时返回 `None`，走
+    「服务不可用，可以重试一次」那条**可读**的失败路径。
+
+    ## 字段映射
+
+    | 我们的字段 | 博查的字段 |
+    | --- | --- |
+    | `title` | `name` |
+    | `url` | `url` |
+    | `snippet` | `summary` 优先，取不到退 `snippet` |
+
+    最后一行是刻意的：`summary` 是请求里带 `summary: true` 才有的较完整摘要，
+    `snippet` 是那一小段。优先取长的，两个都没有就留空
+    （一条只有标题和地址的结果仍然是有用的路标）。
+
+    副作用：无（纯函数）。
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    # 顶层包装：`{"code":..,"data":{...}}` 与直接 `{"webPages":...}` 都认。
+    body = payload
+    inner = payload.get("data")
+    if isinstance(inner, dict):
+        body = inner
+
+    pages = body.get("webPages")
+    if not isinstance(pages, dict):
+        return None
+    raw_results = pages.get("value")
+    if not isinstance(raw_results, list):
+        return None
+
+    items: list = []
+    for entry in raw_results:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip()
+        if not url:
+            continue
+        snippet = str(entry.get("summary") or "").strip()
+        if not snippet:
+            snippet = str(entry.get("snippet") or "").strip()
+        items.append(
+            SearchResult(
+                title=str(entry.get("name") or "").strip(),
+                url=url,
+                snippet=snippet,
+            )
+        )
+    return items
+
+
+# 博查 Web Search API（2026-08-20 接入）。国内可直连，POST + Bearer 认证。
+#
+# ⚠ **端点是 `api.bocha.cn`**。`open.bochaai.com` 的示例代码里写的是
+# `api.bochaai.com`，与官方文档不一致——以文档为准，两个域名都在用的话
+# 可以经 `search.endpoint` 覆盖。
+BOCHA = SearchProvider(
+    name="bocha",
+    endpoint="https://api.bocha.cn/v1/web-search",
+    auth_header="Authorization",
+    auth_prefix="Bearer ",
+    method="POST",
+    build_params=_bocha_params,
+    parse=_bocha_parse,
+)
+
+
 # Brave Search API。选它的理由（plan 评审 2026-08-19）：注册后拿一个密钥就能用，
 # 配置里只多一个字段，出问题时排查面最窄。
+#
+# ⚠ **它在本项目的主力网络环境里连不通**（本机 DNS 把公网域名重写成 10.x，
+# 见 web_fetch 验收记录遗留项 #3），因此**缺省服务商是博查而不是它**。
 BRAVE = SearchProvider(
     name="brave",
     endpoint="https://api.search.brave.com/res/v1/web/search",
@@ -247,6 +371,8 @@ BRAVE = SearchProvider(
 # 那边要校验用户写的 `search.provider` 是否合法，但 `config.py` 刻意不 import
 # 本模块（那是层级倒挂——配置层不该依赖能力层）。加第二家时两处齐改，
 # 漏改的表现是「配置里写了新服务商，启动时说不认识」。
-PROVIDERS: dict = {BRAVE.name: BRAVE}
+PROVIDERS: dict = {BOCHA.name: BOCHA, BRAVE.name: BRAVE}
 
-DEFAULT_PROVIDER = BRAVE.name
+# ⚠ **缺省是博查，不是 Brave。** 本项目是中文、只针对 DeepSeek、
+# 主力网络环境连不通境外服务——把缺省定在一个连不上的服务商上是个坏缺省。
+DEFAULT_PROVIDER = BOCHA.name

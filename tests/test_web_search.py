@@ -6,8 +6,10 @@
 import unittest
 
 from rhinecode.web.search import (
+    BOCHA,
     BRAVE,
     DEFAULT_COUNT,
+    DEFAULT_PROVIDER,
     MAX_COUNT,
     MIN_COUNT,
     PROVIDERS,
@@ -199,20 +201,132 @@ class BraveParseTests(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class BochaParamsTests(unittest.TestCase):
+    def test_params_shape(self) -> None:
+        """
+        博查是 POST + JSON body，字段名与 Brave 完全不同。
+
+        `summary: True` 不可省——不带它只返回一小段 `snippet`，
+        而一句话的摘要判断不了「这条值不值得再去抓」。
+        """
+        body = BOCHA.build_params("httpx 超时", 3)
+        self.assertEqual(body["query"], "httpx 超时")
+        self.assertEqual(body["count"], 3)
+        self.assertIs(body["summary"], True)
+        self.assertEqual(body["freshness"], "noLimit")
+
+    def test_query_not_rewritten(self) -> None:
+        query = "RhineCode PermissionEngine decide AttributeError"
+        self.assertEqual(BOCHA.build_params(query, 5)["query"], query)
+
+
+class BochaParseTests(unittest.TestCase):
+    """
+    ⚠ **顶层包装两种形态都认**（`_bocha_parse` 的 docstring 有完整理由）。
+
+    官方文档在飞书需登录，公开渠道拿不到完整的响应示例——只能确认它是 Bing
+    兼容形态（`webPages.value[]`），而**有没有一层 `data` 包装没能核实**。
+    两种都认是把一个**已知的不确定性**处理掉，不是加料；真正的兜底仍是三态。
+    """
+
+    _ENTRY = {
+        "name": "HTTPX Timeouts",
+        "url": "https://www.python-httpx.org/advanced/timeouts/",
+        "summary": "较完整的摘要",
+        "snippet": "一小段",
+        "siteName": "python-httpx.org",
+        "datePublished": "2026-01-01",
+    }
+
+    def test_with_data_wrapper(self) -> None:
+        payload = {"code": 200, "log_id": "x", "data": {"webPages": {"value": [self._ENTRY]}}}
+        results = BOCHA.parse(payload)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].title, "HTTPX Timeouts")
+        self.assertEqual(results[0].url, self._ENTRY["url"])
+
+    def test_without_data_wrapper(self) -> None:
+        payload = {"_type": "SearchResponse", "webPages": {"value": [self._ENTRY]}}
+        self.assertEqual(len(BOCHA.parse(payload)), 1)
+
+    def test_summary_preferred_over_snippet(self) -> None:
+        """`summary` 是带 `summary: true` 才有的较完整摘要，优先取长的那个。"""
+        self.assertEqual(BOCHA.parse({"webPages": {"value": [self._ENTRY]}})[0].snippet, "较完整的摘要")
+
+    def test_falls_back_to_snippet(self) -> None:
+        entry = {k: v for k, v in self._ENTRY.items() if k != "summary"}
+        self.assertEqual(BOCHA.parse({"webPages": {"value": [entry]}})[0].snippet, "一小段")
+
+    def test_both_missing_leaves_empty(self) -> None:
+        """一条只有标题和地址的结果仍然是有用的路标。"""
+        entry = {"name": "T", "url": "https://a.test/1"}
+        self.assertEqual(BOCHA.parse({"webPages": {"value": [entry]}})[0].snippet, "")
+
+    def test_malformed_entries_skipped(self) -> None:
+        payload = {"webPages": {"value": [self._ENTRY, "不是对象", {"name": "没地址"}, {"url": "  "}]}}
+        self.assertEqual(len(BOCHA.parse(payload)), 1)
+
+    def test_unknown_structure_returns_none(self) -> None:
+        """三态上半：用 `assertIsNone` 而不是 `assertFalse`（两者都是假值）。"""
+        for payload in ("垃圾", None, 123, {}, {"data": "不是对象"},
+                        {"webPages": "不是对象"}, {"webPages": {"value": "不是列表"}},
+                        {"data": {"webPages": {}}}):
+            with self.subTest(payload=payload):
+                self.assertIsNone(BOCHA.parse(payload))
+
+    def test_真的没搜到_returns_empty_list(self) -> None:
+        """三态下半：结构认得、`value` 为空 → `[]`（成功 0 条、计配额）。"""
+        for payload in ({"webPages": {"value": []}}, {"data": {"webPages": {"value": []}}}):
+            with self.subTest(payload=payload):
+                result = BOCHA.parse(payload)
+                self.assertIsNotNone(result)
+                self.assertEqual(result, [])
+
+
 class ProviderTableTests(unittest.TestCase):
-    def test_only_one_provider_implemented(self) -> None:
+    def test_provider_table_matches_config_whitelist(self) -> None:
         """
-        spec「不做的事」：**只实现一家**。
+        ⚠ **成对维护点**：`config._KNOWN_PROVIDERS` ↔ 本模块的 `PROVIDERS`。
 
-        这条不是限制未来，而是钉住「没有第二个真实实现来检验的抽象容易设计成
-        只适配想象」这个判断——加第二家时改它，顺便被迫回头看一眼那个接缝。
+        `config.py` 刻意**不 import** 本模块（配置层依赖能力层是层级倒挂），
+        代价是那份名单要手工同步。漏改的表现是「配置里写了新服务商，
+        启动时说不认识」——会当场报错、不会静默，但这条断言让它在开发期就红。
         """
-        self.assertEqual(sorted(PROVIDERS), ["brave"])
+        from rhinecode.config import _KNOWN_PROVIDERS
 
-    def test_provider_fields_present(self) -> None:
-        self.assertTrue(BRAVE.endpoint.startswith("https://"))
-        self.assertTrue(BRAVE.auth_header)
-        self.assertIsNone(check_endpoint(BRAVE.endpoint))
+        self.assertEqual(sorted(_KNOWN_PROVIDERS), sorted(PROVIDERS))
+
+    def test_default_provider_is_reachable_domestically(self) -> None:
+        """
+        ⚠ **缺省是博查，不是 Brave**，这是刻意的。
+
+        本项目是中文、只针对 DeepSeek、主力网络环境连不通境外服务
+        （web_fetch 验收记录遗留项 #3：本机 DNS 把公网域名重写成 10.x）。
+        **把缺省定在一个连不上的服务商上是个坏缺省。**
+        """
+        self.assertEqual(DEFAULT_PROVIDER, "bocha")
+        self.assertIn(DEFAULT_PROVIDER, PROVIDERS)
+
+    def test_all_providers_well_formed(self) -> None:
+        for name, spec in PROVIDERS.items():
+            with self.subTest(provider=name):
+                self.assertEqual(spec.name, name)
+                self.assertTrue(spec.endpoint.startswith("https://"))
+                self.assertTrue(spec.auth_header)
+                self.assertIn(spec.method.upper(), ("GET", "POST"))
+                self.assertIsNone(check_endpoint(spec.endpoint))
+
+    def test_two_transports_both_present(self) -> None:
+        """
+        接第二家时补的那一格。**两种传输都要有真实实例**——
+        只剩一种时 `method` 那个字段又会退化成「看不出有没有用」的冗余。
+        """
+        methods = {spec.method.upper() for spec in PROVIDERS.values()}
+        self.assertEqual(methods, {"GET", "POST"})
+
+    def test_bearer_prefix_only_where_needed(self) -> None:
+        self.assertEqual(BOCHA.auth_prefix, "Bearer ")
+        self.assertEqual(BRAVE.auth_prefix, "")
 
 
 if __name__ == "__main__":

@@ -226,7 +226,14 @@
   （`file://` 之类启动时直接报错，与②′的协议限制同性质）；非 https 出一条启动警告
   但不阻断——内网搜索代理用 http 是合法场景。**端点刻意不过②′的地址范围校验**，
   否则内网代理用不了。
-- **服务商**：目前只有 `brave`。写错服务商名**抛错**（它决定数据发给谁）。
+- **服务商**：`bocha`（博查，**缺省**）与 `brave`（Brave Search）。
+  写错服务商名**抛错**（它决定数据发给谁）。
+  ⚠ **缺省是博查而不是 Brave**：本项目是中文、只针对 DeepSeek、主力网络环境
+  连不通境外服务（本机 DNS 把公网域名重写成 10.x），把缺省定在一个连不上的
+  服务商上是个坏缺省。
+  两家的传输形态**不同**——Brave 是 `GET` + query 参数 + 裸 token 头，
+  博查是 `POST` + JSON body + `Bearer` 头；`SearchProvider` 的 `method` /
+  `auth_prefix` 两格就是为此而加（接第二家时才发现原接缝假设了所有 API 都是 GET）。
 - **配置口径**：`enabled` / `provider` **非法值抛错**；
   `max_results` / `session_quota` / `timeout` **回退默认**。
 - **关掉之后**：工具不注册、系统提示里的不可信约束按「web_fetch 或 web_search
