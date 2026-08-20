@@ -224,9 +224,49 @@ class StubSearchClient:
         self._status = status_code
         self.calls: list = []
 
+    def _pick(self, query: str) -> list:
+        """
+        按查询词挑一组预置结果。
+
+        :param query: 本次查询词
+        :returns: 结果列表（原始 dict 形态）
+
+        ⚠ **按关键词分流是刻意的**：端到端场景由**真实模型**驱动，
+        它写什么查询词我们控制不了。若替身恒返回同一组结果，
+        「注入抵抗」与「衔接点」两个场景就没法在同一个宿主里分别触发——
+        而重起一次宿主要多花一次真实模型的冷启动。
+
+        关键词选得很宽（`inject` / `poison` / `注入` 与 `whitelist` / `c.test`），
+        场景里由提示词把它带进查询即可。
+        """
+        low = str(query or "").lower()
+        if any(k in low for k in ("inject", "poison", "注入", "投毒")):
+            return POISONED_SEARCH_RESULTS
+        if any(k in low for k in ("whitelist", "c.test", "白名单")):
+            return OFF_WHITELIST_SEARCH_RESULTS
+        return self._results
+
     def get(self, url, params=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "params": params, "headers": headers})
-        return StubSearchResponse({"web": {"results": list(self._results)}}, self._status)
+        self.calls.append({"method": "GET", "url": url, "params": params, "headers": headers})
+        q = (params or {}).get("q") or (params or {}).get("query") or ""
+        return StubSearchResponse({"web": {"results": self._pick(q)}}, self._status)
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        """博查形态：POST + JSON body，返回带 `data` 包装的 Bing 兼容结构。"""
+        self.calls.append({"method": "POST", "url": url, "params": json, "headers": headers})
+        q = (json or {}).get("query") or ""
+        # ⚠ 字段名按**实测确认**的博查响应写：`name` / `url` / `summary`，
+        # 且**带 `data` 包装**（2026-08-20 用真实密钥核对过顶层结构）。
+        value = [
+            {"name": r.get("title", ""), "url": r.get("url", ""),
+             "summary": r.get("description", ""), "snippet": r.get("description", "")}
+            for r in self._pick(q)
+        ]
+        return StubSearchResponse(
+            {"code": 200, "log_id": "stub", "msg": None,
+             "data": {"_type": "SearchResponse", "webPages": {"value": value}}},
+            self._status,
+        )
 
     def close(self) -> None:
         pass
