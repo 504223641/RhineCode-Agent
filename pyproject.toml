@@ -8,7 +8,9 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "textual>=0.80.0",
-    "anthropic>=0.40.0",
+    # ⚠ openai SDK 是 DeepSeek Provider 的依赖，不是「OpenAI Provider」的——
+    # 后者已于 2026-08-20 删除，而 DeepSeek 走的正是 OpenAI 兼容协议，
+    # 这一行**不能跟着一起删**。anthropic SDK 随那次删除一并移除。
     "openai>=1.50.0",
     "pyyaml>=6.0",
     # c7：MCP 客户端的 Streamable HTTP 传输需要流式读取 SSE（text/event-stream），

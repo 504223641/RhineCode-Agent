@@ -465,9 +465,12 @@ class DisplayContentPassthroughTests(unittest.TestCase):
 
 class ProviderDisplayContentIsolationTests(unittest.TestCase):
     """
-    c10 T34：display_content 不进入三个 Provider 的请求负载（spec C51）。
+    c10 T34：display_content 不进入 Provider 的请求负载（spec C51）。
 
     用 SDK 客户端替身捕获请求 kwargs——不发真实网络请求、不修改 Provider 生产实现。
+
+    ⚠ 本类原有三条用例（deepseek / openai / anthropic 各一条）。后两个 Provider
+    已于 2026-08-20 删除，对应用例随之移除，只剩 deepseek 这一条。
     """
 
     _MESSAGES = [
@@ -516,50 +519,3 @@ class ProviderDisplayContentIsolationTests(unittest.TestCase):
         list(provider.stream_chat(self._MESSAGES))
         self._assert_payload_clean(captured["messages"])
 
-    def test_openai_payload_excludes_display_content(self) -> None:
-        from rhinecode.provider.openai import OpenAIProvider
-
-        provider = OpenAIProvider(self._make_config("openai"))
-        captured: dict = {}
-
-        class FakeCompletions:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                return iter(())
-
-        class FakeChat:
-            completions = FakeCompletions()
-
-        class FakeClient:
-            chat = FakeChat()
-
-        provider._client = FakeClient()
-        list(provider.stream_chat(self._MESSAGES))
-        self._assert_payload_clean(captured["messages"])
-
-    def test_anthropic_payload_excludes_display_content(self) -> None:
-        from rhinecode.provider.anthropic import AnthropicProvider
-
-        provider = AnthropicProvider(self._make_config("anthropic"))
-        captured: dict = {}
-
-        class FakeStream:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            def __enter__(self):
-                return iter(())
-
-            def __exit__(self, *args):
-                return False
-
-        class FakeMessages:
-            def stream(self, **kwargs):
-                return FakeStream(**kwargs)
-
-        class FakeClient:
-            messages = FakeMessages()
-
-        provider._client = FakeClient()
-        list(provider.stream_chat(self._MESSAGES))
-        self._assert_payload_clean(captured["messages"])

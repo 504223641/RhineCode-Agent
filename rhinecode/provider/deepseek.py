@@ -11,10 +11,14 @@ DeepSeek 的 API 与 OpenAI 基本兼容，但新版（deepseek-v4-flash / deeps
 - 流式响应中工具调用以分片到达（delta.tool_calls，按 index 拼接 id/name/arguments 碎片），
   流结束后解析每个调用的 JSON arguments，产出 type="tool_call" 的 StreamChunk
 
-与 OpenAIProvider 的主要差异：
+它走的是 OpenAI 兼容协议（因此依赖 openai SDK），但在三处之上做了扩展：
 - thinking_effort != "off" 时通过 extra_body 开启思考模式
 - 流式循环中需额外读取 delta.reasoning_content → StreamChunk(type="thinking")
-- 实现工具调用（OpenAI 实现本章不支持）
+- 实现工具调用
+
+⚠ 本项目曾另有一个走原生 OpenAI 协议的 `OpenAIProvider`，已于 2026-08-20
+删除（它一直停留在纯对话能力）。**但 openai SDK 的依赖不能跟着删**——
+本 Provider 用的就是它。
 
 使用方式（config.yaml）：
     protocol: deepseek
@@ -35,7 +39,7 @@ class DeepSeekProvider(BaseProvider):
     """
     DeepSeek Provider，支持普通对话、Thinking Mode 与工具调用。
 
-    独立实现 stream_chat（不继承 OpenAIProvider），以便正确处理 extra_body、
+    直接实现 stream_chat（不复用任何基类的默认实现），以便正确处理 extra_body、
     reasoning_content 字段以及工具调用相关的消息转换与流式解析。
     """
 
