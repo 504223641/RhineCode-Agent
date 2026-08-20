@@ -193,7 +193,7 @@
    永久挂住——看到的是「跑十几分钟只有一串点和一个 F」。
    本轮几次误判成性能问题，最后靠临时写的 runner（在 `addFailure` 里当场
    flush traceback）才定位到，期间它掩盖了上面 A、C 两条。
-   已立项 [`docs/todo/6-driver-test-cleanup.md`](../../todo/6-driver-test-cleanup.md)。
+   已立项 `docs/todo/6-driver-test-cleanup.md`，并已由 `dc80a4a` 做完（收尾放进 `finally`）、该 todo 随之删除——**链接刻意去掉**，指向一个不存在的文件比不给链接更误导。
 
 6. **同一个坑会以不同面目出现第 N 次。**
    「两处文本必须同口径」在本项目已是第四次；这一轮的
