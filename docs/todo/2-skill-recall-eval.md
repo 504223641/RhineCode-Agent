@@ -118,7 +118,7 @@ should-not-trigger 两组提示词，批量跑，统计命中率，据此提改�
 别用自己写的 fixture 验自己的 spec。
 
 先读 docs/extensions/skill-authoring/spec.md 的「R 系列增补」一节，
-再读 docs/todo/1-skill-recall-eval.md 的完整背景与已知的坑。
+再读 docs/todo/2-skill-recall-eval.md 的完整背景与已知的坑。
 
-做完这条后把 docs/todo/1-skill-recall-eval.md 删掉，并重排 docs/todo/ 下其余文档的序号。
+做完这条后把 docs/todo/2-skill-recall-eval.md 删掉，并重排 docs/todo/ 下其余文档的序号。
 ```
