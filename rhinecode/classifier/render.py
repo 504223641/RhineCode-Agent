@@ -32,6 +32,7 @@ from typing import Iterable, Sequence
 from rhinecode.classifier.models import (
     SCOPE_COMMAND,
     SCOPE_MESSAGE,
+    SCOPE_SEARCH,
     SCOPE_URL,
     BreakerReason,
     BreakerState,
@@ -44,6 +45,7 @@ _SCOPE_LABELS = {
     SCOPE_COMMAND: "命令",
     SCOPE_URL: "网络访问",
     SCOPE_MESSAGE: "队友消息",
+    SCOPE_SEARCH: "网络搜索",
 }
 
 
@@ -98,9 +100,42 @@ def render_denied_notice(action: ReviewAction, verdict: Verdict) -> str:
     ]
     if action.scope == SCOPE_MESSAGE:
         # 消息类没有「写一条 allow 规则」这种细粒度手段（协作工具落 other 分支，
-        # 只认不带括号的整工具规则），所以提示的两条与另外两类不同。
+        # 只认不带括号的整工具规则），所以提示与命令 / 网络两类不同。
         lines.append("  这条消息没有送达。若确实需要，可在 permissions.yaml 里写 "
                      "`allow: send_message`，或关掉分类器（classifier.enabled: false）。")
+    elif action.scope == SCOPE_SEARCH:
+        # ⚠ **搜索类必须单独一支，不能落进下面那个 else。**
+        #
+        # 那句「写一条**具体的** allow 规则（写窄，别写通配）」对命令类是对的
+        # （`Bash(npm test)` 确实是一条窄规则），**对搜索是错的**——照做的话
+        # 两条路都走不通：
+        #
+        # ① 搜索**没有窄规则**（web_search 扩展 F10 只支持整工具 `WebSearch`，
+        #    带括号的写法一律不命中**且不产生任何警告**）；
+        # ② 而整工具的 `allow: WebSearch` 恰恰会被 F16 **丢弃**——正因为分类器
+        #    此刻是启用的。
+        #
+        # ⚠ **这个 bug 是真实使用中暴露的**（2026-08-20 的一份 trace）：加 scope
+        # 时让它落进了错误的分支，而**编译过、测试全绿、界面正常**，
+        # 只是那条建议是一条死路。**给出走不通的建议比不给更糟**——
+        # 用户会以为是自己配错了，然后在两条都不通的路上来回试。
+        #
+        # 下面三条是**真的可行**的：
+        # - 换个说法重搜：搜索类**不进判定缓存**（F9a），每次都重新判定；
+        # - `/clear`：判定会读对话里的**用户消息**，早先提到过的敏感内容会一直
+        #   影响后续判定（那正是那次误伤的成因——用户第一句里出现过一个
+        #   密钥样式的字符串，之后一条完全无关的搜索也被拦了）；
+        # - 关掉分类器。
+        lines.append(
+            "  这次搜索没有发出去。搜索**没有**「写一条更窄的 allow 规则」这种手段"
+            "（只支持整工具 `WebSearch`，而启用分类器时那条 allow 会被丢弃）。"
+        )
+        lines.append(
+            "  可行的是三条：换个说法重新搜一次（每次都重新判定）；"
+            "用 /clear 开一段新对话（判定会读对话里较早的用户消息，"
+            "先前提到过的敏感内容会一直影响它）；或关掉分类器"
+            "（classifier.enabled: false）。"
+        )
     else:
         lines.append(
             "  若这是你要的操作，可在 permissions.yaml 里为它写一条**具体的** "
@@ -183,14 +218,23 @@ def render_dropped_rules(dropped: Sequence[tuple[str, str, str]]) -> str:
     if not dropped:
         return ""
 
+    # ⚠ **措辞刻意不限定成「命令」**（web_search 扩展 T20）。
+    #
+    # 本函数原本写的是「过宽的**命令**放行规则」与「让分类器完全看不到对应的
+    # **命令**」——那在只有命令类会被丢弃时是准确的。web_search 加进来之后，
+    # 一条 `WebSearch` 被丢弃时那两句话会变成「过宽的命令放行规则：WebSearch」，
+    # 自相矛盾。
+    #
+    # 别把它改回去那个「更精确的说法」：这里是**一个面向多类别的通用出口**，
+    # 具体是哪一类由每条自己的 `why`（`broad.why_broad`）说清楚。
     lines = [
-        f"安全审查已启用，因此暂时不使用下面 {len(dropped)} 条过宽的命令放行规则："
+        f"安全审查已启用，因此暂时不使用下面 {len(dropped)} 条过宽的放行规则："
     ]
     for rule_text, source, why in dropped:
         lines.append(f"  · {rule_text}（来源：{source}）")
         lines.append(f"    {why}")
     lines.append(
-        "  这类规则会让分类器完全看不到对应的命令。"
+        "  这类规则会让分类器完全看不到对应的动作。"
         "想保留请把它改窄（例如写成一条具体的命令），"
         "或关掉分类器（classifier.enabled: false）。"
     )

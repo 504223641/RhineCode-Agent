@@ -62,6 +62,7 @@ TOOL_LABELS = {
     # 命令与网络
     "run_command": "Bash",
     "web_fetch": "WebFetch",
+    "web_search": "WebSearch",
     # Skill（c11）
     "load_skill": "Skill",
     # 协作（c15）

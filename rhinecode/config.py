@@ -17,6 +17,14 @@ import yaml
 _CONFIG_DIR_NAME = ".rhinecode"
 _CONFIG_FILE = "config.yaml"
 
+# 已知的搜索服务商（web_search 扩展 F17）。
+#
+# ⚠ **与 `rhinecode/web/search.py` 的 `PROVIDERS` 是成对维护点**，加第二家时两处齐改。
+# 这里刻意**不 import** 那个模块：配置层依赖能力层是层级倒挂，而且
+# `web/search.py` 会连带把 `web/models.py` 拉起来，只为拿一个名字清单不划算。
+# 漏改的表现是「配置里写了新服务商，启动时说不认识」——会当场报错，不会静默。
+_KNOWN_PROVIDERS = ("bocha", "brave")
+
 # 模板里的占位 api_key。它是「非空字符串」，能通过 load() 的非空校验，
 # 因此需要单独识别，用来区分「用户已填真实 key」和「刚生成模板还没填」。
 PLACEHOLDER_API_KEY = "YOUR_API_KEY"
@@ -86,6 +94,40 @@ api_key: YOUR_API_KEY
 #   # 单次判定超时（秒）。超时按调用失败处理：未熔断时拒绝该次动作，
 #   # 连续 3 次失败则停用分类器并改为逐次确认。
 #   timeout: 10
+
+# ---- 网络搜索（web_search）----
+# 让模型能「上网找」——给一句话，返回若干条「标题 + 地址 + 摘要」。
+# 要取正文仍然靠 web_fetch：搜索给路标，抓取才取货。
+#
+# ⚠ **你的查询词会原样发给下面这家服务商，并留在他们的日志里。**
+#   web_fetch 的「只取不发」在这里不成立——搜索的本质就是把问题发出去。
+#   模型在排查报错时很自然就会把项目内部的类名、模块名拼进查询词，
+#   那不是滥用而是正常使用。缺省启用安全审查分类器会在每次搜索前
+#   看一眼查询词，但它会误判；真正的硬边界只有两个：
+#   permissions.yaml 里写 `deny: WebSearch`（不带括号），或把下面的 enabled 设为 false。
+# search:
+#   # 总开关，缺省开。关掉之后工具不注册、模型看不到它，行为与没有这个能力时一致。
+#   enabled: true
+#   # 搜索服务商，缺省 bocha。
+#   #   bocha —— 博查（https://open.bochaai.com/），国内可直连，POST + Bearer
+#   #   brave —— Brave Search API（境外，本机网络环境下多半连不通）
+#   provider: bocha
+#   # 服务商密钥。⚠ 与 api_key 同级敏感，勿提交进版本库。
+#   # 不填则工具照常注册，但每次调用返回一条「未配置密钥、不要重试」的说明。
+#   # 博查的密钥在 https://open.bochaai.com/ 控制台里拿。
+#   api_key: YOUR_SEARCH_API_KEY
+#   # 端点地址。留空 = 用服务商官方地址（博查是 https://api.bocha.cn/v1/web-search）；
+#   # 填写可走内网搜索代理，或在服务商换域名时应急覆盖。
+#   # 只接受 http / https，其它协议启动时直接报错；非 https 会有一条启动警告。
+#   endpoint:
+#   # 每次搜索返回几条（1-10）。模型可以在调用时指定，越界只夹取。
+#   max_results: 5
+#   # 一次会话最多搜几次。搜索通常按次计费，一个跑飞的循环能几分钟烧光额度。
+#   # 达到上限后工具不报错，而是回一句「用已有信息继续」——回报错会让模型
+#   # 以为是临时故障而不停重试。0 或负数 = 不限制。/clear 会把它清零。
+#   session_quota: 50
+#   # 单次搜索超时（秒）。超时按「服务不可用」处理。
+#   timeout: 10
 """
 
 
@@ -143,6 +185,11 @@ class Config:
     - web_fetch_enabled：网络访问工具的总开关（web_fetch 扩展 F4）。可选字段，缺省 True。
     - worktree.cleanup_days / worktree.copy / worktree.link：子 Agent 隔离工作区的
       清理阈值与环境初始化清单（c14 F10/F19）。整段可缺省。
+    - search.*：网络搜索（web_search 扩展）。整段可缺省。**两种解析口径**：
+      `enabled` / `provider` **非法值抛错**（它们决定「要不要把查询词发出去、
+      发给谁」，静默回退会让用户以为关掉了而其实没关，或以为在用 A 而其实在用 B）；
+      `max_results` / `session_quota` / `timeout` **回退默认**（调优项，
+      写错了最坏是数值不对，不该阻断启动）。
                  设为 false 后：工具不注册、不出现在模型可见的工具清单里、系统提示不含
                  「外部不可信内容」那条约束、权限规则里的 `WebFetch(domain:...)` 不做语法
                  校验也不产生警告——**行为与本扩展之前逐字一致**。
@@ -168,6 +215,17 @@ class Config:
     classifier_enabled: bool = True
     classifier_model: str = ""
     classifier_timeout: float = 10.0
+    # web_search 扩展：网络搜索。整段可缺省 = 「开、brave、没密钥、5 条、50 次、10 秒」。
+    #
+    # ⚠ `search_api_key` 与 `api_key` **同级敏感**：它进 trace 配置快照时必须掩码
+    # （见 `trace/models.redact_config`），也不该被提交进版本库。
+    search_enabled: bool = True
+    search_provider: str = "bocha"
+    search_api_key: str = ""
+    search_endpoint: str = ""
+    search_max_results: int = 5
+    search_session_quota: int = 50
+    search_timeout: float = 10.0
     # c16：Provider 客户端的请求超时（秒）。**缺省 None = 不传给 SDK**，
     # 行为与本章之前逐字一致。
     #
@@ -350,6 +408,32 @@ def load(path: str) -> Config:
         classifier_raw.get("timeout", 10.0), 10.0
     )
 
+    # web_search 扩展：search 段整段可缺省。
+    #
+    # ⚠ **两种口径是刻意的，别顺手统一**（与 classifier 段同形）：
+    # - `enabled` / `provider` **抛错**——它们决定「要不要把查询词发出去、发给谁」。
+    #   一个开关被写成 "maybe" 是明确的配置错误，静默回退会让用户以为自己关掉了
+    #   搜索而实际上没关；服务商名写错则会让他以为数据发给了 A 而其实发给了 B
+    #   （或根本发不出去）。
+    # - 其余三项**回退默认**——调优项，写错了最坏是数值不对。
+    search_raw = data.get("search")
+    if not isinstance(search_raw, dict):
+        search_raw = {}
+    search_enabled = _parse_bool(search_raw.get("enabled", True), "search.enabled")
+    search_provider = str(search_raw.get("provider") or "bocha").strip().lower()
+    if search_provider not in _KNOWN_PROVIDERS:
+        raise ValueError(
+            f"search.provider 不认识的搜索服务商：{search_provider}。"
+            f"目前支持：{', '.join(_KNOWN_PROVIDERS)}"
+        )
+    search_api_key = str(search_raw.get("api_key") or "").strip()
+    search_endpoint = str(search_raw.get("endpoint") or "").strip()
+    search_max_results = _parse_int(search_raw.get("max_results", 5), "search.max_results", 5)
+    search_session_quota = _parse_int(
+        search_raw.get("session_quota", 50), "search.session_quota", 50, allow_zero=True
+    )
+    search_timeout = _parse_float(search_raw.get("timeout", 10.0), 10.0)
+
     return Config(
         protocol=data["protocol"],
         model=data["model"],
@@ -364,4 +448,11 @@ def load(path: str) -> Config:
         classifier_enabled=classifier_enabled,
         classifier_model=classifier_model,
         classifier_timeout=classifier_timeout,
+        search_enabled=search_enabled,
+        search_provider=search_provider,
+        search_api_key=search_api_key,
+        search_endpoint=search_endpoint,
+        search_max_results=search_max_results,
+        search_session_quota=search_session_quota,
+        search_timeout=search_timeout,
     )

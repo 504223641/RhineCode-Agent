@@ -424,6 +424,32 @@ def _helper(workspace: Path, name: str, source: str) -> str:
     return f'"{sys.executable}" "{path}"'
 
 
+def seed_search_whitelist(workspace: Path, user_dir: Path) -> None:
+    """
+    预置一条**项目级**域名白名单，只放行 `a.test`（web_search 扩展 AC28）。
+
+    :param workspace: 临时工作区（会在这里建 `.rhinecode/permissions.yaml`）
+    :param user_dir: 临时用户目录（本函数不用）
+
+    用于验证**搜索与抓取的衔接点**：搜索结果里会出现一条指向 `c.test` 的地址，
+    它**照常出现在搜索输出里**（搜索不做可访问性过滤），而模型拿它去
+    `web_fetch` 时**被②′层的域名策略拒绝**。
+
+    ⚠ **必须写进项目级**（`<工作区>/.rhinecode/permissions.yaml`）。
+    本地级 `permissions.local.yaml` **只放行、不建立白名单**（web_fetch 扩展 F6a）
+    ——写错层的话 `c.test` 会走到「弹确认面板」而不是「被硬拒」，
+    这条场景就什么也验不到。
+
+    副作用：在工作区里建目录与文件。
+    """
+    d = workspace / ".rhinecode"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "permissions.yaml").write_text(
+        "\n".join(['allow:', '  - "WebFetch(domain:a.test)"', ""]),
+        encoding="utf-8",
+    )
+
+
 def seed_hook_block_push(workspace: Path, user_dir: Path) -> None:
     """预置一条拦住 `git push` 的 pre_tool_use Hook（checklist 场景 1）。"""
     seed_basic(workspace, user_dir)

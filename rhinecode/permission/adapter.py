@@ -10,7 +10,12 @@
 
 ⚠ **成对维护点**：新增一种 `kind` 时，除了 `_TOOL_MAP`，**同文件的 `to_allow_rule`
 也要跟着加分支**。漏改后者不报错——本次调用照常放行，要到下次启动才发现那条
-「永久放行」写下的规则是废的。
+「永久放行」写下的规则是废的。目前有两种 kind 需要在两处同步：`url`（写
+`domain:` 模式）与 `search`（写空模式）。
+
+⚠ 新增 `kind` 时还要看第三处：`permission/engine.py` 第④层的模式兜底。
+`url` 与 `search` 在放行档下都判 ASK（各有各的理由文案），而其余种类判 ALLOW
+——漏改那里的表现是「配了放行档之后搜索就再也不问了」，也不报错。
 """
 
 from pathlib import Path
@@ -41,6 +46,13 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # specifier 刻意用**完整 URL 原文**而非主机名——确认面板与行为记录里要留下
     # 模型实际请求的那个地址；主机名另放在 PermissionRequest.host（见 to_request）。
     "web_fetch": lambda a: ("WebFetch", str(a.get("url") or ""), "url"),
+    # web_search：完整查询词进③整工具规则匹配 + ④模式兜底（web_search 扩展 F10）。
+    # specifier 用**完整查询词原文**——确认面板与行为记录里要留下模型实际搜了什么，
+    # 那是用户放不放行的唯一依据（spec F7）。
+    #
+    # ⚠ 种类是新的 "search" 而不是复用 "url"：复用会让②′网络边界层拿查询词
+    # 当地址去解析，`check_hard` 一律判「地址畸形」→ **每次搜索都被硬拒**。
+    "web_search": lambda a: ("WebSearch", str(a.get("query") or ""), "search"),
     # ⚠ **c15 的五个协作工具刻意不在这张表里**，与 `run_agent` / `load_skill`
     # 同先例：它们既不读文件也不执行命令，没有可映射的 Bash / Read / Edit /
     # Write 语义，副作用限于改本进程内存里的清单与信箱。
@@ -150,5 +162,22 @@ def to_allow_rule(request: PermissionRequest) -> tuple[str, str]:
         # 所以只在 host 确实非空时才生成 domain: 模式。
         if request.host:
             return request.rule_name, f"domain:{request.host}"
+        return request.rule_name, ""
+    if request.kind == "search":
+        # ⚠ **必须返回空模式（整工具形式）。**
+        #
+        # 搜索类落规则匹配的「其它类」分支，而那个分支只认 `rule.pattern == ""`
+        # （见 `rules._rule_matches` 最后一行）。返回
+        # `("WebSearch", "<查询词>")` 会写出一条**永远不会命中任何东西的废规则**
+        # ——与 `WebFetch(https://…?token=abc)` 完全同形，而那正是本函数
+        # 被造出来的原因。
+        #
+        # 顺带一条：查询词写进配置文件本身也是泄漏（它可能含用户的私密问题），
+        # 与 url 类不写查询参数是同一条理由。
+        #
+        # ⚠ 注意本函数只服务「本会话放行」——搜索类的确认面板**不提供
+        # 「永久放行」**（web_search 扩展 F14）：那个选项写的是文件级规则，
+        # 而启用分类器时 `allow: WebSearch` 会被 F16 丢弃，用户会看到
+        # 「点了永久放行，下次还是弹」。
         return request.rule_name, ""
     return request.rule_name, request.specifier

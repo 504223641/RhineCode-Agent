@@ -1,8 +1,19 @@
 """
-`web` 包的值对象：抓取结果与抽取结果。
+`web` 包的值对象：抓取结果、抽取结果，以及搜索结果（web_search 扩展）。
 
-两个都是 `frozen=True` 的 dataclass——它们在 fetcher → manager → render 之间
-单向传递，构造后不该被改写；不可变也让它们能安全地进日志、进断言。
+四个都是 `frozen=True` 的 dataclass——它们在 fetcher / search_manager →
+manager → render 之间单向传递，构造后不该被改写；不可变也让它们能安全地
+进日志、进断言。
+
+## 两组值对象刻意放在同一个文件里
+
+抓取侧（`FetchOutcome` / `ExtractOutcome`）与搜索侧（`SearchResult` /
+`SearchOutcome`）在**行为**上毫无关系——一个走 HTTP 抓取 + 逐跳硬校验，
+一个走 API 调用（spec F11 明确不过②′层）。但它们同属「`web` 包的纯数据」，
+拆成两个文件只会让调用方多记一个导入路径，而这里没有任何逻辑可以分开。
+
+真正需要分开的是**有行为的那部分**，那已经分了：`fetcher.py` 与
+`search_manager.py` 是两个模块，`render.py` 与 `search_render.py` 也是。
 """
 
 from dataclasses import dataclass
@@ -73,3 +84,79 @@ class ExtractOutcome:
     text: str = ""
     chars_truncated: bool = False
     degraded_reason: str = ""
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """
+    一条搜索结果（web_search 扩展 spec F18）。
+
+    :param title: 标题。**外部不可信内容**——SEO 投毒的主要落点，
+                  攻击者可以让一个精心构造的标题排到前面
+    :param url: 结果地址。**本工具不对它做任何可访问性判断**（spec F20）：
+                不过滤、不标注「能不能抓」。真正的访问控制发生在模型拿它去调
+                `web_fetch` 的那一刻，那时会完整走一遍域名策略与②′硬校验
+    :param snippet: 摘要。**外部不可信内容**，同 title
+
+    ## 为什么标题和摘要比网页正文更危险
+
+    网页正文的注入是「藏在文章里的一段指令」，而搜索结果的标题 / 摘要
+    **看起来像「系统给我的检索结果」**，不像「某个网页里的一段话」——
+    模型更容易直接采信。渲染时因此一律包进不可信标记（spec F19），
+    这一点不因为「结果只有几行」而放松。
+    """
+
+    title: str = ""
+    url: str = ""
+    snippet: str = ""
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    """
+    一次搜索的完整结果（web_search 扩展 spec F21/F23）。
+
+    它是 `WebSearchManager` → `WebSearchTool` → `search_render` 之间
+    **唯一的传递单位**：拿到它就能渲染出给模型的正文、给人看的单行摘要，
+    以及决定 `ToolResult.ok`。
+
+    :param ok: **「有没有真的问出去并拿到答复」**，不是「本函数有没有抛异常」
+    :param query: 原始查询词**原文**——不截断、不改写（spec F8 明确不做任何过滤）
+    :param provider: 服务商名（如 "brave"），进结果元信息
+    :param results: 结果列表；任何失败情形下为空
+    :param used: 本次会话已用搜索次数（含本次）
+    :param limit: 会话配额上限；**0 表示不限制**
+    :param failure: 失败类别，取 `rhinecode.web.search` 的三个常量之一；
+                    **成功时为空串**
+    :param error: `failure` 非空时的补充说明（异常原文、HTTP 状态码等）
+
+    ## `ok` 怎么取值（spec F21 那张表）
+
+    | 情形 | ok | 理由 |
+    | --- | --- | --- |
+    | 搜到结果 | `True` | 正常 |
+    | **搜到 0 条** | **`True`** | 如实回报了「这个词搜不到东西」，那是有效信息 |
+    | 未配置密钥 | `False` | 这次什么都没拿到 |
+    | 配额已用完 | `False` | 同上 |
+    | 服务不可用 / 超时 / 解析不出来 | `False` | 同上 |
+
+    ⚠ 这张表照抄 `web_fetch` 验收期修掉的那个真实缺陷：`ok` 若不反映
+    「有没有拿到内容」，**TUI 会把一次失败显示成绿色成功**、只是正文里写着失败
+    ——界面在撒谎，模型也拿不到「这次失败了」的信号。
+
+    ## `failure` 为什么必须是显式字段
+
+    **不能靠 `error` 的文本去判断类别。** spec F21 要求四类各有文案，
+    且「是否计入配额」「ok 取什么值」都按类别分岔——用字符串匹配去分类
+    是典型的「改一个字就静默失效」：文案润色一次，分类就悄悄错了，
+    而没有任何东西会报错。
+    """
+
+    ok: bool
+    query: str = ""
+    provider: str = ""
+    results: tuple = ()
+    used: int = 0
+    limit: int = 0
+    failure: str = ""
+    error: str = ""

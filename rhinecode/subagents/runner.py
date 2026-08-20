@@ -242,8 +242,11 @@ class SubAgentRuntime:
     # 不传等于本章不启用、行为逐字回到 C15。
     classifier: object = None
     principal_history: Optional[Callable[[], list]] = None
+    # ⚠ **web_search 扩展起有两个成员。** 漏掉 `web_search` 的后果是：
+    # 一个工具集里只有搜索、没有抓取的子 Agent **拿不到不可信约束**，
+    # 而搜索结果（标题与摘要）照样进它的上下文——不报错、界面上看不出。
     network_tool_names: frozenset = field(
-        default_factory=lambda: frozenset({"web_fetch"})
+        default_factory=lambda: frozenset({"web_fetch", "web_search"})
     )
 
 

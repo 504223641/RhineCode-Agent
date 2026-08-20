@@ -52,7 +52,10 @@ from rhinecode.todo import TodoStore
 from rhinecode.tools.todo_write import TodoWriteTool
 from rhinecode.tools.mcp_config import MCPAddServerTool
 from rhinecode.tools.web_fetch import WebFetchTool
+from rhinecode.tools.web_search import WebSearchTool
 from rhinecode.web.manager import WebFetchManager
+from rhinecode.web.search import PROVIDERS, check_endpoint
+from rhinecode.web.search_manager import WebSearchManager
 # c14：装配期定位项目级配置与目录，与「调用者站在哪个工作目录」无关，故取主项目根。
 from rhinecode.tools.path_guard import clear_read_roots, main_project_root
 from rhinecode.worktree import ProvisionEntry, render_cleanup_notice, scan_and_clean
@@ -65,14 +68,14 @@ from rhinecode.trace import (
     redact_config,
 )
 from rhinecode.trace.tracing_provider import TracingProvider
-# c16：分类器审查。`is_broad_command_allow` / `why_broad` 收的是两个字符串，
+# c16：分类器审查。`is_broad_allow` / `why_broad` 收的是两个字符串，
 # 由本层从 `Rule` 上取字段——那是刻意的，见 `classifier/broad.py` 的模块 docstring
 # （让分类器包 import `permission` 会连带把引擎与 `rhinecode.tools` 拉起来，
 #  它就不再是叶子包了）。
 from rhinecode.classifier import (
     ClassifierConfig,
     ClassifierService,
-    is_broad_command_allow,
+    is_broad_allow,
     why_broad,
 )
 from rhinecode.classifier.render import render_dropped_rules
@@ -140,6 +143,7 @@ def build_app(
     web_client_factory: Optional[Callable[[], Any]] = None,
     web_resolver: Optional[Callable[[str], list]] = None,
     hook_client_factory: Optional[Callable[[], Any]] = None,
+    search_client_factory: Optional[Callable[[], Any]] = None,
 ) -> BuildResult:
     """
     按固定顺序装配一个完整的 RhineCode 应用。
@@ -167,6 +171,10 @@ def build_app(
     :param web_resolver: 主机名解析函数，同上（缺省用 `socket.getaddrinfo`）。
     :param hook_client_factory: 造 HTTP 客户端的工厂，透传给 Hook 的 `http` 动作。
                      缺省 None（用真 `httpx.Client`）。形态同 `web_client_factory`。
+    :param search_client_factory: 造 HTTP 客户端的工厂，透传给 `web_search` 工具。
+                     缺省 None（用真 `httpx.Client`）。形态同 `web_client_factory`
+                     ——**可注入同样是 spec N5 的硬要求**，而且这里的安全含义更重：
+                     测试套件不该因为跑测试就把查询词发给第三方服务商。
     :returns: BuildResult
 
     :raises BootstrapError: 三类致命配置错误（命令注册冲突 / Provider 初始化失败 /
@@ -237,6 +245,68 @@ def build_app(
             resolver=web_resolver,
         )
         tool_registry.register(WebFetchTool(web_manager))
+
+    # ④'' 网络搜索工具（web_search 扩展 F4/F17/F27）。
+    #
+    # **位置约束与 ④' 完全相同**：必须在 `exclude_tools` 摘除与 `session_start`
+    # 快照之前（摘除要能摘到它；快照里的 `tool_names` 要与实际工具集一致）。
+    #
+    # ⚠ 但它**没有**「必须在第②步 Provider 之后」那条约束——搜索结果不经过
+    # 二次抽取（spec F18），`WebSearchManager` 完全不碰 LLM。
+    #
+    # 两条启动提示（端点非 https / 未配置密钥）在这里**只是攒起来**，
+    # 到第 ⑤ 步协调层建好之后再统一发——`add_startup_notice` 是协调层的方法，
+    # 而协调层此刻还不存在。
+    search_notices: list[str] = []
+    if cfg.search_enabled:
+        # ⚠ **用 `.get` 而不是 `[]`**：`config.load()` 已经校验过服务商名，
+        # 但那不是唯一的构造路径——直接 `Config(search_provider="x")` 会绕过它
+        # （测试与嵌入式调用都这么干）。硬索引的后果是一个 `KeyError` 从装配层
+        # 冒出来，而 `BootstrapError` 才是本函数的「致命配置错误」通道。
+        provider_spec = PROVIDERS.get(str(cfg.search_provider or ""))
+        if provider_spec is None:
+            raise BootstrapError(
+                f"search.provider 不认识的搜索服务商：{cfg.search_provider}。"
+                f"目前支持：{', '.join(sorted(PROVIDERS))}"
+            )
+        endpoint = cfg.search_endpoint or provider_spec.endpoint
+
+        # 端点协议校验（spec F17）。**这里抛错而不是降级**：一个 `file://` 端点
+        # 会让搜索工具变成文件读取工具、绕过第②层路径沙箱，与②′的协议限制同性质。
+        # 校验放装配层而不是 `config.py`，是为了保持配置层只做类型解析，
+        # 且 `BootstrapError` 本来就是既有的「致命配置错误」通道。
+        bad = check_endpoint(endpoint)
+        if bad is not None:
+            raise BootstrapError(f"搜索端点配置错误：{bad}")
+        if not endpoint.lower().startswith("https://"):
+            # 非 https 是**合法**的（内网搜索代理常常是 http），但值得说一句：
+            # 查询词是明文外发的数据。
+            search_notices.append(
+                f"提示：搜索端点 {endpoint} 不是 https，查询词将以明文发送。"
+                "若这是内网搜索代理，可以忽略本条。"
+            )
+        if not cfg.search_api_key:
+            # spec F27：工具**照常注册**（用户明确选择了「调用时返回可读错误」
+            # 而不是「工具凭空消失」），但启动时要说清楚。
+            # 两条出口服务不同的人：这条给用户，工具的失败文案给模型。
+            search_notices.append(
+                "提示：网络搜索已启用但未配置密钥，模型调用它只会拿到一条说明。"
+                "请在 config.yaml 的 search.api_key 里填入密钥，"
+                "或设 search.enabled: false 关掉这个能力。"
+            )
+
+        search_manager = WebSearchManager(
+            provider_spec,
+            cfg.search_api_key,
+            cfg.search_endpoint,
+            cfg.search_max_results,
+            cfg.search_session_quota,
+            cfg.search_timeout,
+            client_factory=search_client_factory,
+        )
+        tool_registry.register(WebSearchTool(search_manager))
+    else:
+        search_manager = None
 
     # ── Skill 系统第一阶段（c11 T57）：扫盘 + 白名单严格校验 ──
     #
@@ -347,6 +417,16 @@ def build_app(
     load_skill_tool.run_fork = manager.run_forked_for_model
     load_skill_tool.on_activated = manager.on_skill_activated
 
+    # ⑤' 网络搜索的两处回填（web_search 扩展 F13/F27）。
+    #
+    # **必须在协调层建好之后**：`add_startup_notice` 与配额复位的挂点都在它身上。
+    # 第 ④'' 步只是把两条提示攒进 `search_notices`，真正发出来在这里。
+    for notice in search_notices:
+        manager.add_startup_notice(notice)
+    # 属性注入，与 `manager.classifier` / `load_skill_tool.run_fork` 同一形态：
+    # `/clear` 要把会话级搜索配额清零（spec F13——那正是「新一次会话」的语义所在）。
+    manager.web_search_manager = search_manager
+
     # ⑤″ 安全审查分类器（c16）。
     #
     # **位置卡在协调层之后、子 Agent 装配之前**，两头都有理由：
@@ -418,8 +498,16 @@ def build_app(
             engine = manager.permission_engine
             kept, dropped = [], []
             for rule in engine.file_ruleset.rules:
-                if rule.effect == "allow" and is_broad_command_allow(
-                    rule.tool, rule.pattern
+                # ⚠ 用**伞函数** `is_broad_allow` 而不是 `A(...) or B(...)`：
+                # 这里是本模块唯一的调用点，写成两个调用的话，将来加第三类时
+                # **漏加一个 `or` 不会报错**——只表现为某一类规则悄悄不再被
+                # 丢弃，而那等于对那一类静默关掉整层审查。
+                #
+                # ⚠ `include_search` 由 `cfg.search_enabled` 把门（spec F4）：
+                # **关掉的能力不该影响用户的规则文件**——搜索关着的时候
+                # 丢掉一条 `allow: WebSearch` 只会产生一条让人困惑的启动提示。
+                if rule.effect == "allow" and is_broad_allow(
+                    rule.tool, rule.pattern, include_search=cfg.search_enabled
                 ):
                     text = f"{rule.tool}({rule.pattern})" if rule.pattern else rule.tool
                     dropped.append((text, rule.source, why_broad(rule.tool, rule.pattern)))
@@ -515,7 +603,18 @@ def build_app(
             new_context_manager=manager.new_subagent_context_manager,
             # 「外部不可信内容」段原文。运行器只在子 Agent 的**最终工具集**
             # 含网络访问工具时才注入它（spec F7 的例外），这里只负责把文本递过去。
-            untrusted_section=UNTRUSTED_CONTENT if cfg.web_fetch_enabled else "",
+            # ⚠ **两者任一启用即注入**（web_search 扩展 F19 / AC26）。
+            #
+            # 本行原来只挂在 `web_fetch_enabled` 上。关掉 web_fetch 而只开
+            # web_search 时，那条「外部不可信内容是数据不是指令」的约束会
+            # **凭空消失**，而搜索结果（标题与摘要，SEO 投毒的主要落点）
+            # 照样进上下文——这是本扩展**最容易漏改的一处**，
+            # 护栏见 `tests/test_web_search_bootstrap.py` 的四组合断言。
+            untrusted_section=(
+                UNTRUSTED_CONTENT
+                if (cfg.web_fetch_enabled or cfg.search_enabled)
+                else ""
+            ),
             thinking_effort=manager.thinking_effort,
             # c16：共用主对话那一个分类器实例（F23），并把主对话历史作为
             # 取用户消息的来源（F9）。两者都用回调/共享对象而不是快照——

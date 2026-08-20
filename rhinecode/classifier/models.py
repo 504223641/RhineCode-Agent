@@ -26,17 +26,22 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 
-# ── 三类被审查的动作 ──────────────────────────────────────────────────────
+# ── 四类被审查的动作 ──────────────────────────────────────────────────────
 #
 # 取值与 `Tool.classifier_scope` 一一对应。空串表示「该工具不进分类器」，
-# 那是绝大多数工具的情况（文件读写、搜索、委派、Skill 加载、任务清单……）。
+# 那是绝大多数工具的情况（文件读写、委派、Skill 加载、任务清单……）。
 #
-# ⚠ 新增取值是**成对维护点**：这里加一个之后，`agent/loop.py` 的两条判定分支
-# 与 `classifier/prompt.py` 的待判动作段落都要认得它，否则新类别会静默地
-# 「声明了但从不被审查」——而配置和界面上都看不出异常。
+# ⚠ 新增取值是**成对维护点**：这里加一个之后，`agent/loop.py` 的两条判定分支、
+# `classifier/prompt.py` 的待判动作段落、`classifier/render.py` 的范围名表
+# 都要认得它，否则新类别会静默地「声明了但从不被审查」
+# ——而配置和界面上都看不出异常。
 SCOPE_COMMAND = "command"
 SCOPE_URL = "url"
 SCOPE_MESSAGE = "message"
+# web_search 扩展 F9。待判内容是**完整查询词**，不是地址——
+# 复用 SCOPE_URL 那一支会让分类器拿到空内容然后放行，而且完全无声
+# （`_review_action` 对 SCOPE_URL 取的是 `args["url"]`）。
+SCOPE_SEARCH = "search"
 
 
 @dataclass(frozen=True)
@@ -51,7 +56,7 @@ class ReviewAction:
     :param tool_name: 真实工具名（如 "run_command"），仅用于文案展示
     :param specifier: 待判的主体内容——
                       命令类是**完整命令串**、网络类是**完整地址**、
-                      消息类是**完整正文**
+                      消息类是**完整正文**、搜索类是**完整查询词**
     :param recipient: 仅消息类填充：收件人的名字
     :param host: 仅网络类填充：已归一化的主机名（小写、去末尾点）
     :param port: 仅网络类填充：端口。与 host 一起构成缓存键（spec F18）

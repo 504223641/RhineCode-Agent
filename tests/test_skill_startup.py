@@ -39,6 +39,17 @@ def _fake_config() -> MagicMock:
     cfg.api_key = "real-key"
     cfg.protocol = "deepseek"
     cfg.model = "test-model"
+    # ⚠ **搜索那三项必须显式给值**（web_search 扩展）。
+    #
+    # `MagicMock` 的任意属性都是**真值**，于是 `cfg.search_enabled` 恒为真、
+    # 装配层会去建搜索工具，然后拿一个 Mock 当服务商名去查表——
+    # 表现是启动期直接炸掉，而错误信息（`KeyError: <MagicMock ...>`）
+    # 跟这几个用例要测的东西毫无关系。
+    #
+    # 关掉它最省事：这批用例测的是 Skill / 命令的接线，与搜索无关。
+    cfg.search_enabled = False
+    cfg.search_provider = "brave"
+    cfg.search_api_key = ""
     return cfg
 
 

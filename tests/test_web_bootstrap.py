@@ -298,12 +298,21 @@ class SwitchChainTests(BootstrapFixture):
         import rhinecode.conversation as conv
 
         source = inspect.getsource(conv)
-        occurrences = source.count("untrusted_enabled=self._config.web_fetch_enabled")
+        occurrences = source.count("untrusted_enabled=self._untrusted_enabled()")
         self.assertEqual(
             occurrences, 3,
             "build_default_prompt 的三个调用点都要传开关；"
             "漏一处会让对应的子对话失去不可信约束，且界面上看不出来",
         )
+        # ⚠ **判据本身也搬了一次家**（web_search 扩展）：原来三处各写
+        # `self._config.web_fetch_enabled`，现在统一走 `_untrusted_enabled()`
+        # ——因为开关从一个变成了两个（web_fetch 或 web_search 任一启用）。
+        #
+        # **这条护栏当场抓到过一次真实漏改**：web_search 那轮只改了
+        # `bootstrap.py` 里给子 Agent 用的 `untrusted_section`，而主对话的
+        # 三个调用点一个没动。没有它的话，「关掉 web_fetch、只开 web_search」
+        # 这个完全合理的配置会让不可信约束凭空消失，而界面上看不出来。
+        self.assertNotIn("untrusted_enabled=self._config.", source)
 
     def test_disabled_skips_domain_validation(self) -> None:
         """
