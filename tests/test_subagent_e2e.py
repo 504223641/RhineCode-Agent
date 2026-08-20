@@ -29,6 +29,7 @@ import time
 import unittest
 from pathlib import Path
 
+from rhinecode.agent.prompt.modules import IDENTITY
 from rhinecode.bootstrap import build_app
 from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, StreamChunk, ToolCall
@@ -45,6 +46,14 @@ permission_mode: strict
 
 # 子 Agent 的 stable 就是角色正文，用它的开头判断「这一轮是谁发的」。
 _ROLE_BODY_HEAD = "你是查找员"
+
+# 主对话的 stable 一定以身份模块（八模块的第一个）开头，用它**正向**认出主对话。
+#
+# ⚠ **刻意取自产品里的那份常量，不是抄一句字面量。** 抄字面量的话，
+# 身份模块哪天改了措辞，这里会静默退化成「谁都不算主对话」——
+# `main_bodies` 变成空列表，下游断言全部报 IndexError，
+# 而报错位置离真正的原因隔着整个文件。
+_MAIN_STABLE_HEAD = IDENTITY[:24]
 
 # 子 Agent 闸门的兜底上限（秒）。**不是判据，是防死锁的保险**。
 #
@@ -69,13 +78,39 @@ class _ScriptedProvider(BaseProvider):
         self.bodies: list[str] = []
         # 主对话那些轮次的请求体，**与 `bodies` 分开收**。
         #
-        # ⚠ `bodies` 由主线程与子 Agent 线程**共同追加**，因此 `bodies[-1]`
-        # 不一定是主对话最后那一轮——子 Agent 可能刚好在它之后发了请求。
-        # 用 `bodies[-1]` 断言会得到一个**间歇性失败**的测试（实测约 1/8 概率），
+        # ⚠ `bodies` 由**三个**线程共同追加，因此 `bodies[-1]` 不一定是主对话
+        # 最后那一轮。用 `bodies[-1]` 断言会得到一个**间歇性失败**的测试，
         # 而失败信息看起来像产品出了问题（「结论怎么不在请求里」），极易误判。
+        #
+        # 三个生产者分别是：
+        #   ① 主对话线程    —— stable 是八模块，以 `_MAIN_STABLE_HEAD` 开头
+        #   ② 子 Agent 线程 —— stable 是角色正文，以 `_ROLE_BODY_HEAD` 开头
+        #   ③ `rhine-memory` 线程（c9 自动记忆）—— stable 是记忆管理器提示词
+        #
+        # ⚠ **③ 是 `test_conclusion_delivered_exactly_once` 那次偶发红的根因。**
+        # 原判据是「**不是**子 Agent 就算主对话」这种反向写法，于是记忆线程的
+        # 请求被当成了主对话那一轮。记忆线程由 `on_natural_stop` 在每轮自然结束后
+        # 异步起（daemon 线程，见 `memory/manager.py`），落点时刻**完全随机**：
+        # 它落在最后一次主对话请求之后时，`main_bodies[-1]` 就变成那份记忆请求体
+        # ——里面当然没有 `<subagent-result`，于是报 `AssertionError: 0 != 1`，
+        # 看起来像交付逻辑坏了，而交付其实一次不多一次不少地发生过。
+        # 单跑时机器空闲，记忆线程往往赶在下一轮主请求之前跑完（故 18 次全绿）；
+        # 全量跑几十个线程抢 CPU，它就经常落到后面（故 3 次里红 2 次）。
+        #
+        # 判据因此改成**正向**：只有以八模块身份段开头的才算主对话。
+        # 反向判据的毛病是「将来多一个生产者就又错一次」，正向的不会。
+        # 反证见 `ProviderStubClassificationTest`。
         self.main_bodies: list[str] = []
         self.tool_names: list[list[str]] = []
         self._background = background
+        # 记录用的锁。**不是为了性能，是为了让四个平行列表的下标对得上。**
+        #
+        # `systems[i]` 与 `tool_names[i]` 必须指同一次请求——`sub_turn_index()`
+        # 拿前者算下标、断言拿后者取值，全靠这个对应关系。三个线程各自
+        # 「append 完 systems 再 append tool_names」时可以交错，一旦交错，
+        # 下标就错位到别人的请求上，而**列表长度仍然相等**、断言仍然跑得通，
+        # 只是验的对象悄悄换了人——正是本文件反复踩过的那类无声失败。
+        self._record_lock = threading.Lock()
         # 子 Agent 的**闸门**：它在这里阻塞，直到测试显式放行。
         #
         # ⚠ 这里刻意**不用 `time.sleep`**。原写法是让子 Agent 睡 0.15 秒，
@@ -93,24 +128,33 @@ class _ScriptedProvider(BaseProvider):
             self._sub_gate.set()
 
     def stream_chat(self, messages, thinking_effort="off", tools=None, system=None):
-        self.turns += 1
-        self.systems.append(system or "")
+        stable = system or ""
         body = "\n".join(str(getattr(m, "content", "") or "") for m in messages)
-        self.bodies.append(body)
-        if not (system or "").startswith(_ROLE_BODY_HEAD):
-            self.main_bodies.append(body)
-        self.tool_names.append(
-            sorted(t["function"]["name"] for t in (tools or []))
-        )
+        is_sub = stable.startswith(_ROLE_BODY_HEAD)
+        is_main = stable.startswith(_MAIN_STABLE_HEAD)
 
-        if (system or "").startswith(_ROLE_BODY_HEAD):
+        # 四个列表在同一个临界区里一起追加，保证下标一一对应（见 `_record_lock`）。
+        with self._record_lock:
+            # `turns` 只数**主对话**的轮次——「第 1 轮委派、之后说话」这条脚本
+            # 说的就是主对话。子 Agent 与记忆线程的请求不该把它往前推。
+            if is_main:
+                self.turns += 1
+                self.main_bodies.append(body)
+            self.systems.append(stable)
+            self.bodies.append(body)
+            self.tool_names.append(
+                sorted(t["function"]["name"] for t in (tools or []))
+            )
+            turns = self.turns
+
+        if is_sub:
             # 卡在闸门上，直到测试放行；`_SUB_GATE_TIMEOUT` 只是防死锁的兜底。
             self._sub_gate.wait(timeout=_SUB_GATE_TIMEOUT)
             yield StreamChunk(type="text", content="结论：在 a.py 与 b.py 各有一处。")
             yield StreamChunk(type="done")
             return
 
-        if self.turns == 1:
+        if turns == 1:
             yield StreamChunk(
                 type="tool_call",
                 tool_call=ToolCall(
@@ -399,6 +443,62 @@ class BackgroundE2ETest(E2EBase):
             self.provider.main_bodies[-1].count("<subagent-result"),
             1,
             "结论只该被交付一次，重复会让同一段内容在历史里出现多遍",
+        )
+
+
+class ProviderStubClassificationTest(unittest.TestCase):
+    """
+    替身的「这一轮是谁发的」判据本身的反证。
+
+    ## 为什么要给一个测试替身写测试
+
+    因为本文件几乎所有断言都写成 `main_bodies[-1]`，而那个下标的**含义**
+    完全由 `_ScriptedProvider` 的分类判据决定。判据一旦错，断言不会报错，
+    只会**换一个对象去验**——`test_conclusion_delivered_exactly_once` 那次
+    偶发红就是这么来的：记忆线程的请求被算成了主对话，
+    `main_bodies[-1]` 于是指向一份记忆请求体，报出 `0 != 1`。
+
+    下面三条各钉一个生产者，**都不起线程、不看时序**：直接把三份真实的
+    system 提示喂给替身，看它分到哪个桶里。
+    """
+
+    def _stub(self):
+        return _ScriptedProvider()
+
+    def _feed(self, provider, system: str) -> None:
+        """喂一次请求并把流消费干净（替身是生成器，不消费就什么都不会发生）。"""
+        list(provider.stream_chat([], system=system))
+
+    def test_main_prompt_counts_as_main(self) -> None:
+        """正向：八模块提示词算主对话。"""
+        provider = self._stub()
+        self._feed(provider, IDENTITY + "\n（后面还有别的模块）")
+        self.assertEqual(len(provider.main_bodies), 1)
+
+    def test_role_body_does_not_count_as_main(self) -> None:
+        """反向①：子 Agent 的角色正文不算主对话（C13 起就有的判据）。"""
+        provider = self._stub()
+        self._feed(provider, "你是查找员。最后一段必须是自包含的结论。")
+        self.assertEqual(provider.main_bodies, [])
+
+    def test_memory_prompt_does_not_count_as_main(self) -> None:
+        """
+        反向②——**本次修的就是这一条**。
+
+        ⚠ 喂的是 `build_memory_request` **真实产出**的 system，不是一句手写的
+        近似文本。手写的话，记忆提示词哪天改了开头，这条护栏会继续通过，
+        而产品里的分类会重新错掉——护栏必须钉在真正的生产者上。
+        """
+        from rhinecode.memory.memory_updater import build_memory_request
+        from rhinecode.provider.base import Message
+
+        system, _req = build_memory_request([Message(role="user", content="x")], "", "")
+        provider = self._stub()
+        self._feed(provider, system)
+        self.assertEqual(
+            provider.main_bodies,
+            [],
+            "记忆线程的请求不是主对话那一轮，算进去会让 main_bodies[-1] 随机漂移",
         )
 
 

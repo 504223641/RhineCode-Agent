@@ -168,7 +168,7 @@ B 栏必须包含**边界声明**那一类（用户说「这次先别提交」�
 修一个 C16 分类器的误伤：对话里提过一次密钥样式的字符串之后，
 后续**完全无关**的动作也会被以「用户曾提到过那个密钥」为由拦下。
 
-背景、真实 trace、四条候选走法都在 docs/todo/2-classifier-transcript-contamination.md，
+背景、真实 trace、四条候选走法都在 docs/todo/1-classifier-transcript-contamination.md，
 先读它，再读 docs/extensions/web-search/acceptance.md 第七节（那次误伤的完整记录）。
 
 ⚠ 三件事先想清楚再动手：
@@ -189,7 +189,7 @@ A 栏「不该拦」测误伤率，B 栏「该拦」测漏拦率，B 栏必须�
 若最后结论是「改不动，接受现状」，那也是合格的产出——把结论与数据写回
 CLAUDE.md 的 ⑦b，把它从「待修」改成「已评估、明确不修」。
 
-做完这条后把 docs/todo/2-classifier-transcript-contamination.md 删掉，并重排
+做完这条后把 docs/todo/1-classifier-transcript-contamination.md 删掉，并重排
 docs/todo/ 下其余文档的序号，同步 docs/todo/README.md 与全仓的编号引用
 （跑一遍 `grep -rn "docs/todo/[0-9]\|第 [0-9] 条 todo" docs/todo/`）。
 ```
