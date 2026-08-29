@@ -239,7 +239,6 @@ class BlockingAndClaimTest(unittest.TestCase):
         """
         board = TaskBoard()
         board.create("孤儿")
-        task = board.get("1")
         # 直接构造一个悬空依赖（绕过 add_dependency 的校验，模拟异常状态）
         with board._lock:  # noqa: SLF001 —— 刻意构造异常状态
             board._tasks["1"].blocked_by = ("404",)

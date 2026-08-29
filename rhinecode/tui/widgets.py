@@ -43,7 +43,7 @@ from rhinecode.agent.events import ClarifyQuestion
 from rhinecode.commands.registry import CommandRegistry
 from rhinecode.memory.session import SessionInfo
 from rhinecode.subagents.tasks import BRANCH_AGENT_NAME, STATUS_LABELS, TaskStatus
-from rhinecode.tools.diff import MARK_ADD, MARK_CONTEXT, MARK_GAP, MARK_REMOVE
+from rhinecode.tools.diff import MARK_ADD, MARK_GAP, MARK_REMOVE
 from rhinecode.tools.display import (
     SEGMENT_SEP,
     TOOL_LABELS,

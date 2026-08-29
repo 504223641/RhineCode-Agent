@@ -14,7 +14,7 @@ from rhinecode.commands.models import (
     CommandType,
     ReportTarget,
 )
-from rhinecode.commands.registry import CommandRegistrationError, CommandRegistry
+from rhinecode.commands.registry import CommandRegistry
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.skills.models import SkillCommandInfo
 from tests.test_command_dispatcher import FakeController

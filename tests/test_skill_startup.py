@@ -18,7 +18,6 @@ from unittest.mock import MagicMock, patch
 
 import rhinecode.__main__ as entry
 import rhinecode.bootstrap as bootstrap
-from rhinecode.commands import build_builtin_registry
 from rhinecode.tools.registry import ToolRegistry
 
 

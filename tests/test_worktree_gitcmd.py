@@ -7,7 +7,6 @@ c14 T5：git 子进程封装（spec F8 / F11 / F16 / F20②）。
 """
 
 import unittest
-from pathlib import Path
 
 from rhinecode.worktree import gitcmd
 from rhinecode.worktree.models import GitCommandFailed, NotARepository

@@ -17,7 +17,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from rhinecode.agent.loop import Agent, RunOptions
+from rhinecode.agent.loop import Agent
 from rhinecode.agent.prompt import build_default_prompt
 from rhinecode.agent.prompt.environment import EnvironmentInfo
 from rhinecode.config import Config

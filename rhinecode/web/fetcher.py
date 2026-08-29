@@ -45,7 +45,7 @@ rebinding 已在 spec 的「安全边界」里列为已知边界。
 
 import socket
 from typing import Callable, Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import httpx
 

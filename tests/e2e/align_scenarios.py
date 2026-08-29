@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from tests.e2e import seeding

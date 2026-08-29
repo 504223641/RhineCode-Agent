@@ -26,7 +26,7 @@ from rhinecode.permission.adapter import to_request
 from rhinecode.permission.engine import PermissionEngine
 from rhinecode.permission.models import Decision, PermissionMode, Rule
 from rhinecode.permission.rules import RuleSet
-from rhinecode.subagents.toolset import ALWAYS_GRANTED_TOOLS, GLOBAL_DENIED_TOOLS
+from rhinecode.subagents.toolset import GLOBAL_DENIED_TOOLS
 from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.path_guard import main_project_root
 

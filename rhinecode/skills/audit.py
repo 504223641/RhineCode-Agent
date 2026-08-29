@@ -524,8 +524,8 @@ def _check_overrides_builtin(
             kind=AdviceKind.OVERRIDES_BUILTIN,
             skill=spec.command_name,
             finding=(
-                f"这个 Skill 盖掉了同名的**内置样板**——内置那份的每个字段都不再生效"
-                f"（覆盖是整份替换，不做字段合并）"
+                "这个 Skill 盖掉了同名的**内置样板**——内置那份的每个字段都不再生效"
+                "（覆盖是整份替换，不做字段合并）"
             ),
             suggestion=(
                 "若这是有意定制，忽略本条。"

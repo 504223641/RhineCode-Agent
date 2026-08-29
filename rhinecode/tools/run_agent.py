@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
 
 from rhinecode.subagents.service import SubAgentService
 from rhinecode.subagents.tasks import KIND_BRANCH, KIND_ROLE

@@ -11,7 +11,7 @@
     engine.decide(request) 跑四层 → 返回 DecisionResult（含 Decision 与命中 Layer）。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 

@@ -19,12 +19,9 @@
 from __future__ import annotations
 
 import os
-import threading
-import time
 import unittest
 from pathlib import Path
 
-from tests.e2e.assertions import TraceView
 from tests.test_e2e_host import HostFixture
 
 

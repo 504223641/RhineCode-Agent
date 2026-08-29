@@ -29,7 +29,7 @@ from pathlib import Path
 
 from rhinecode.bootstrap import build_app
 from rhinecode.config import Config
-from rhinecode.provider.base import Message, StreamChunk
+from rhinecode.provider.base import StreamChunk
 from rhinecode.trace import TraceRecorder
 from rhinecode.trace.recorder import current_scope
 from rhinecode.tui.widgets import ActivityView, HistoryView, InputBar

@@ -19,7 +19,6 @@ plan 里点名的三处「漏了不报错、界面上看不出来」的坑，各
 
 from __future__ import annotations
 
-import threading
 import unittest
 from pathlib import Path
 

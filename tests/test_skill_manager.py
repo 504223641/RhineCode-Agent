@@ -16,7 +16,6 @@ from rhinecode.skills import discovery as discovery_module
 from rhinecode.skills.manager import SkillManager
 from rhinecode.skills.models import (
     ActivationStatus,
-    DegradeKind,
     LOAD_SKILL_TOOL,
     SkillSource,
     builtin_skills_dir,

@@ -12,7 +12,6 @@ import unittest
 from rhinecode.commands import build_builtin_registry
 from rhinecode.commands.skill_commands import build_skill_command_specs
 from rhinecode.skills.models import SkillCommandInfo
-from rhinecode.tui.app import RhineApp
 from rhinecode.tui.widgets import CommandPanel, InputBar, compose_status_text
 from tests.test_command_tui import _history_text, _make_app
 

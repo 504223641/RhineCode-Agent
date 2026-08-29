@@ -49,9 +49,8 @@ initialized module`）。
 
 from __future__ import annotations
 
-import threading
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover —— 仅类型检查期
     from rhinecode.provider.base import Message

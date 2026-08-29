@@ -140,7 +140,7 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
     async def test_idle_row_is_blank(self) -> None:
         """占位归占位，空闲时那一行不该有任何内容。"""
         app = _Harness()
-        async with app.run_test(size=(120, 40)) as pilot:
+        async with app.run_test(size=(120, 40)):
             line = app.query_one(StatusLine)
             self.assertEqual(str(line.content).strip(), "")
 

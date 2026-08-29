@@ -31,7 +31,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 
 from rich.markup import escape as rich_escape

@@ -26,7 +26,7 @@ import unittest
 from pathlib import Path
 
 from rhinecode.provider.base import Message
-from rhinecode.trace.recorder import bind_scope, current_scope
+from rhinecode.trace.recorder import bind_scope
 from tests.e2e.scripted import FALLBACK_MARKER, ScopedScriptedProvider, done, text
 
 

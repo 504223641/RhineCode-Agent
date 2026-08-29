@@ -25,7 +25,7 @@ from rhinecode.permission.models import (
     PermissionRequest,
 )
 from rhinecode.permission.rules import RuleSet
-from rhinecode.provider.base import Message, StreamChunk
+from rhinecode.provider.base import StreamChunk
 from rhinecode.skills.manager import SkillManager
 from rhinecode.tools.glob_files import GlobTool
 from rhinecode.tools.path_guard import (

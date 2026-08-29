@@ -28,7 +28,6 @@ import re
 from typing import Any, Optional
 
 from rhinecode.hooks.models import (
-    COMBINE_ALL,
     COMBINE_ANY,
     FIELD_MATCH_KIND,
     MATCH_KIND_PLAIN,

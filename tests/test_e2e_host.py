@@ -724,7 +724,6 @@ class InjectionAndIsolationTest(HostFixture):
 
     def test_user_dir_isolated_from_real_home(self):
         """AC25：用户级目录位于临时目录之下，不是真实主目录。"""
-        data = self.status() if self.info else None
         info = self.start_host(
             "--mode", "scripted", "--script", "tests.e2e.scripts:SAY_HELLO",
             "--idle-timeout", "120",
