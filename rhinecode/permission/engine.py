@@ -558,21 +558,48 @@ class PermissionEngine:
         """
         self.turn_rules.clear()
 
-    def persist_local_rule(self, rule_string: str) -> bool:
+    def persist_local_rule(self, rule_string: str) -> Optional[str]:
         """
         永久放行：把一条 allow 规则写入本地级配置，并同步登记为会话规则使其本次立即生效。
 
         :param rule_string: 形如 "Bash(git *)" 的规则字符串
-        :returns: 是否成功写入本地级配置
+        :returns: **成功返回 None；失败返回一句可读的失败原因**
 
         副作用：写入本地级 permissions.local.yaml；向 session_rules 追加一条等价规则。
+
+        ## ⚠ 返回值的语义是「错误原因」，不是「成功与否」
+
+        本方法原先返回 `bool`，失败时把原因 append 进 `self.load_errors` 就算完事。
+        那个字段的语义是「**加载阶段**收集的错误」，只有一个消费者
+        （`conversation._compose_startup_notice`），而它在**挂载时读一次**——
+        运行期往里 append 等于扔进垃圾桶。净效果是：用户点了确认面板上的
+        「永久放行（写入本地配置，重启仍生效）」，写盘失败了也**一个字都看不到**，
+        重启后那条授权凭空失效。
+
+        因此改成把原因交还给调用方，由它送上界面（见
+        `conversation._build_ask` 与 `permission/render.render_permanent_allow_fallback`）。
+
+        ⚠ **改回 `bool` 或新增第二个调用方时当心返回值反转**：
+        成功是 `None`（假值），失败是非空串（真值），与 `bool` 的方向**正好相反**。
+        写成 `if not engine.persist_local_rule(...)` 会把每一次成功都当成失败处理，
+        而那**不报错**——只是每次「永久放行」都额外多登记一条会话规则、
+        并多弹一条「没写进去」的提示。护栏见
+        `tests/test_review_fixes.py::PermanentAllowFallbackTests`
+        （成功与失败两个方向都断言了返回值本身）。
+
+        ## 三种失败形态里有两种不需要任何 IO 故障
+
+        `config.append_local_allow` 的三个抛出点：坏 YAML、顶层不是映射、
+        以及最后那次 `write_text`。前两种只要用户手改过一次
+        `permissions.local.yaml` 就会命中——尤其是**顶层写成列表**：
+        `permissions.yaml`（用户级/项目级）与本地级是同一套规则体系的三层，
+        而只有本地级这份要求顶层是映射，照着上面两层的样子手写几条就会踩到。
         """
         try:
             config.append_local_allow(rule_string)
         except Exception as exc:  # noqa: BLE001 - UI should not crash if local permission write fails.
-            self.load_errors.append(f"写入本地权限配置失败：{exc}")
-            return False
+            return f"写入本地权限配置失败：{exc}"
         rule = config.parse_rule_string(rule_string, "allow", "local")
         if rule is not None:
             self.session_rules.append(rule)
-        return True
+        return None

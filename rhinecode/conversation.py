@@ -95,6 +95,7 @@ from rhinecode.agent.events import (
 )
 from rhinecode.classifier import is_broad_command_allow, why_broad
 from rhinecode.classifier.render import render_dropped_rules
+from rhinecode.permission.render import render_permanent_allow_fallback
 from rhinecode.permission import (
     Decision,
     DecisionResult,
@@ -391,9 +392,19 @@ class ConversationManager:
         # `todo_view()` 恒返回 None，界面上那块永不显示，**这就是零回归的
         # 实现方式**（spec N5），不需要额外的开关。
         self.todo_store = None
-        # c16 F21：待发的「预授权被丢弃」提示。由 `_grant_for_skill` 攒、
-        # `_wrap_events` 在事件流里取走——见那两处的说明。
-        self._grant_notices: list[str] = []
+        # 待发的运行期提示：攒在这里，由 `_wrap_events` 在事件流里取走——
+        # 见那里的说明（协调层在事件流中途没有任何直达界面的通道）。
+        #
+        # **目前有两个生产者**，它们的共同点是「发生在一次运行的中途，
+        # 而用户必须当场知道」：
+        # - c16 F21：`_grant_for_skill` 丢弃了过宽的 Skill 预授权；
+        # - B1 修复：`_build_ask` 里「永久放行」写盘失败、降级成了本会话放行。
+        #
+        # ⚠ 这个列表**不是** `PermissionEngine.load_errors` 的替代品，
+        # 两者的适用时机正相反：那个字段只在**挂载时**被读一次
+        # （`_compose_startup_notice`），运行期往里 append 等于扔进垃圾桶——
+        # B1 那条缺陷的根因就是它。
+        self._pending_notices: list[str] = []
 
         # 启动编排：加载 RHINE.md、清理过期会话、开新档或 --continue 恢复。
         # 返回的提示由 TUI 挂载时展示（无提示为 None）。
@@ -1745,6 +1756,7 @@ class ConversationManager:
               本会话（ALLOW_SESSION）→ 为「该工具 + 本次目标」登记一条会话级 allow 规则后放行，
                   本会话内后续相同调用经引擎直接 ALLOW，不再弹面板；
               永久（ALLOW_PERMANENT）→ 把同样的 allow 规则写入本地级配置（重启仍生效）后放行；
+                  **写盘失败时**退回一条会话级规则并当场向用户说明已降级（B1，见该分支）；
               拒绝（DENY）→ 不执行。
 
             规则的工具名与匹配模式来自 adapter 的规范化结果（与引擎判断口径一致），
@@ -1812,9 +1824,32 @@ class ConversationManager:
                 )
                 return True
             if choice == ConfirmDecision.ALLOW_PERMANENT:
-                if not self._engine.persist_local_rule(rule_string):
+                # ⚠ **返回值是「失败原因」不是「成功与否」**：成功给 None、
+                # 失败给一句可读的原因（见 `PermissionEngine.persist_local_rule`）。
+                # 写成 `if not ...` 会把每次成功都当成失败，而那不报错。
+                failure = self._engine.persist_local_rule(rule_string)
+                if failure is not None:
+                    # 写盘失败 → 退回会话级规则，本次照常放行（既有行为，不变）。
                     self._engine.add_session_rule(
                         Rule(effect="allow", tool=grant_tool, pattern=grant_pattern, source="session")
+                    )
+                    # …**但必须当场告诉用户**（B1）。
+                    #
+                    # 他刚在面板上读到的是「写入本地配置，重启仍生效」，
+                    # 而这一次并没有写进去。此前这条原因被 append 进
+                    # `engine.load_errors`，那个字段只在挂载时被读一次，
+                    # 于是「静默降级」——用户以为授权持久化了，重启后凭空失效，
+                    # 当场没有任何信号。
+                    #
+                    # ⚠ **必须走这个攒—取列表，不能在这里直接写界面**：
+                    # 本闭包由 Agent Loop 在 Worker 线程上、事件流中途调用，
+                    # 协调层此刻没有任何直达界面的通道，唯一的出口就是
+                    # `_wrap_events` 正在产出的那条事件流（与 c16 F21 同一条理由）。
+                    # 时机也够用：`ask` 返回之后必然会 yield 一个事件
+                    # （TOOL_START+TOOL_RESULT，或拒绝分支的 TOOL_RESULT），
+                    # 提示在下一个事件边界就会被取走送上界面。
+                    self._pending_notices.append(
+                        render_permanent_allow_fallback(rule_string, failure)
                     )
                 return True
             return False
@@ -2292,25 +2327,25 @@ class ConversationManager:
                 # 与启动时的告知同一条原则（F21）：静默丢弃会让
                 # 「我明明在 Skill 里声明了为什么还被审查」无从查起。
                 # 攒起来由 `_wrap_events` 在事件流里发出——见那里的说明。
-                self._grant_notices.append(render_dropped_rules(dropped))
+                self._pending_notices.append(render_dropped_rules(dropped))
             rules = kept
         self._engine.grant_turn_rules(rules)
 
-    def _take_grant_notices(self) -> list[str]:
+    def _take_pending_notices(self) -> list[str]:
         """
-        取走并清空「预授权被丢弃」的待发提示（c16 F21）。
+        取走并清空运行期待发提示（c16 F21 的预授权丢弃 + B1 的永久放行降级）。
 
         :returns: 待发文本列表；没有时返回空列表
 
         **取走即清**：同一条提示只该出现一次。攒而不清的话，一次触发的提示
         会在本回合剩下的每个事件后面重复刷出来。
 
-        副作用：清空 `_grant_notices`。
+        副作用：清空 `_pending_notices`。
         """
-        if not self._grant_notices:
+        if not self._pending_notices:
             return []
-        out = list(self._grant_notices)
-        self._grant_notices.clear()
+        out = list(self._pending_notices)
+        self._pending_notices.clear()
         return out
 
     def on_skill_activated(self, name: str) -> None:
@@ -2414,7 +2449,7 @@ class ConversationManager:
                 # 那个方法有三条触发路径，其中「模型自行调 `load_skill`」发生在
                 # **事件流中途**——协调层此刻没有任何直达界面的通道，
                 # 唯一的出口就是本方法正在产出的这条事件流。
-                for text in self._take_grant_notices():
+                for text in self._take_pending_notices():
                     yield AgentEvent(
                         type=AgentEventType.NOTICE, message=text, level="warning"
                     )

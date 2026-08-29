@@ -5,7 +5,7 @@ from pathlib import Path
 
 from rhinecode.conversation import ConversationManager
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
-from rhinecode.agent.events import ConfirmDecision, StopReason
+from rhinecode.agent.events import AgentEventType, ConfirmDecision, StopReason
 from rhinecode.permission.models import PermissionMode
 from rhinecode.tools.base import Tool, ToolResult
 from rhinecode.tools.edit_file import EditFileTool
@@ -271,21 +271,114 @@ class PermissionFilterTests(TempWorkspaceTest):
 
 
 class PermanentAllowFallbackTests(TempWorkspaceTest):
+    """
+    B1：「永久放行」写盘失败时**必须让用户当场看见**已经降级成「本会话放行」。
+
+    面板选项 3 的说明文字逐字是「写入本地配置，重启仍生效」
+    （`tui/widgets.py` 的 `ConfirmPanel.show_for`）。写盘失败时代码改加一条
+    会话级规则并照常放行——本次一切正常，重启后那条授权凭空失效。
+    此前失败原因被 append 进 `engine.load_errors`，而它唯一的消费者
+    `_compose_startup_notice` **只在挂载时读一次**，运行期追加的条目
+    永远不会显示。净效果就是静默降级。
+
+    ⚠ 三条用例缺一不可：
+    - 失败 → **界面上真的出现一条提示**（正例，钉住本次修复）；
+    - 成功 → **一条提示都不出现**（反证；少了它，一个「无条件提示」的实现
+      会全绿通过，而那会让每一次正常的永久放行都多出一条与事实不符的警告，
+      几次之后用户就不看提示了，那比不做还糟）；
+    - `persist_local_rule` 的返回值两个方向都断言（它从 `bool` 改成了
+      「失败原因 / None」，方向**正好相反**，写成 `if not ...` 不报错）。
+    """
+
+    BROKEN = "allow: [unclosed\n"
+
+    def _notice_texts(self, events) -> list[str]:
+        """取事件流里所有 NOTICE 的正文——那是运行期唯一能到达界面的通道。"""
+        return [
+            e.message for e in events
+            if e.type == AgentEventType.NOTICE and e.message
+        ]
+
+    def _manager(self) -> ConversationManager:
+        manager = manager_with_tool(ToolCallingProvider(), self.tool)
+        manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW_PERMANENT
+        return manager
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.tool = RecordingTool()
+
     def test_broken_local_permissions_file_falls_back_to_session_rule(self) -> None:
         Path(".rhinecode").mkdir(exist_ok=True)
         local_path = Path(".rhinecode/permissions.local.yaml")
-        broken = "allow: [unclosed\n"
-        local_path.write_text(broken, encoding="utf-8")
-        tool = RecordingTool()
-        manager = manager_with_tool(ToolCallingProvider(), tool)
-        manager.confirm_callback = lambda _tc, _tool, _dec: ConfirmDecision.ALLOW_PERMANENT
+        local_path.write_text(self.BROKEN, encoding="utf-8")
+        manager = self._manager()
 
-        list(manager.submit_user_message("run it"))
+        events = list(manager.submit_user_message("run it"))
 
-        self.assertTrue(tool.executed)
-        self.assertEqual(local_path.read_text(encoding="utf-8"), broken)
+        # 既有行为不变：本次照常执行、坏文件没被覆盖、退回一条会话级规则。
+        self.assertTrue(self.tool.executed)
+        self.assertEqual(local_path.read_text(encoding="utf-8"), self.BROKEN)
         self.assertEqual(len(manager._engine.session_rules), 1)
-        self.assertTrue(any("写入本地权限配置失败" in err for err in manager._engine.load_errors))
+
+        # B1 的判据：用户**在界面上**看得到这件事。
+        notices = self._notice_texts(events)
+        matched = [t for t in notices if "写入本地权限配置失败" in t]
+        self.assertEqual(
+            len(matched), 1, f"写盘失败必须产出且只产出一条运行期提示，实际：{notices}"
+        )
+        text = matched[0]
+        # 四件事一件都不能少（见 `permission/render.render_permanent_allow_fallback`）。
+        self.assertIn("本会话", text, "要说清降级成了什么")
+        self.assertIn("重启", text, "要说清重启后会失效")
+        self.assertIn("danger", text, "要说清是哪一条规则")
+        # 攒—取列表必须被清空：同一条提示只该出现一次。
+        self.assertEqual(manager._pending_notices, [])
+        # ⚠ 反证：不许再退回那口没有出口的井。
+        #
+        # 注意 `load_errors` 本身**不为空**——引擎在构造时加载过这份坏文件，
+        # 那条「配置文件解析失败」是**加载期**错误，属于该字段的本职、
+        # 且启动提示会显示它。这里要钉的是**运行期**那条别再混进来：
+        # 它在挂载之后才产生，进去就永远没人读。
+        self.assertEqual(
+            [e for e in manager._engine.load_errors if "写入本地权限配置失败" in e],
+            [],
+            "运行期错误不该再进 load_errors——那个字段只在挂载时被读一次",
+        )
+
+    def test_successful_permanent_allow_says_nothing(self) -> None:
+        """**反证**：写盘成功时一条提示都不该出现（理由见类 docstring）。"""
+        manager = self._manager()
+
+        events = list(manager.submit_user_message("run it"))
+
+        self.assertTrue(self.tool.executed)
+        local_path = Path(".rhinecode/permissions.local.yaml")
+        self.assertTrue(local_path.exists(), "对照组：这一次确实写盘了")
+        self.assertIn("danger", local_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [t for t in self._notice_texts(events) if "写入本地权限配置失败" in t],
+            [],
+        )
+
+    def test_persist_local_rule_returns_the_reason_not_a_bool(self) -> None:
+        """
+        返回值语义的两个方向都钉住：成功 `None`、失败非空串。
+
+        ⚠ 它从 `bool` 改过来，方向**正好相反**——
+        `if not engine.persist_local_rule(...)` 会把每一次成功都当成失败，
+        而那不报错，只表现为每次永久放行都多一条会话规则和一条假提示。
+        """
+        engine = self._manager()._engine
+
+        self.assertIsNone(engine.persist_local_rule("Bash(git status)"))
+
+        Path(".rhinecode/permissions.local.yaml").write_text(
+            self.BROKEN, encoding="utf-8"
+        )
+        failure = engine.persist_local_rule("Bash(git diff)")
+        self.assertIsInstance(failure, str)
+        self.assertIn("写入本地权限配置失败", failure)
 
 
 class ConversationManagerTests(unittest.TestCase):

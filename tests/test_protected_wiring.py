@@ -152,9 +152,13 @@ class AskClosureTest(unittest.TestCase):
     def test_session_allow_registers_an_exemption_and_writes_nothing(self) -> None:
         manager = self._manager()
         writes = {"n": 0}
+        # ⚠ 桩的返回值是「失败原因」不是「成功与否」：真方法成功时返回 None
+        # （B1 修复后的语义，见 `PermissionEngine.persist_local_rule`）。
+        # 这两条用例断言的是**调用次数为 0**，返回值走不到，但桩仍要与真方法同口径
+        # ——一个语义相反的桩迟早会被别处照抄。
         manager._engine.persist_local_rule = lambda _s: writes.__setitem__(
             "n", writes["n"] + 1
-        ) or True
+        )
 
         self.assertTrue(self._ask(manager, ConfirmDecision.ALLOW_SESSION, Layer.PROTECTED))
 
@@ -174,9 +178,13 @@ class AskClosureTest(unittest.TestCase):
         """
         manager = self._manager()
         writes = {"n": 0}
+        # ⚠ 桩的返回值是「失败原因」不是「成功与否」：真方法成功时返回 None
+        # （B1 修复后的语义，见 `PermissionEngine.persist_local_rule`）。
+        # 这两条用例断言的是**调用次数为 0**，返回值走不到，但桩仍要与真方法同口径
+        # ——一个语义相反的桩迟早会被别处照抄。
         manager._engine.persist_local_rule = lambda _s: writes.__setitem__(
             "n", writes["n"] + 1
-        ) or True
+        )
 
         self.assertTrue(
             self._ask(manager, ConfirmDecision.ALLOW_PERMANENT, Layer.PROTECTED)
