@@ -100,7 +100,6 @@ from rhinecode.permission import (
     DecisionResult,
     Layer,
     PermissionEngine,
-    PermissionMode,
     PermissionRequest,
     Rule,
     to_allow_rule,
@@ -1598,7 +1597,6 @@ class ConversationManager:
             # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
             self._cancel_event = threading.Event()
 
-            registry = self._registry
             stop_reason = StopReason.COMPLETED
             events = sub_agent.run(
                 sub_history,

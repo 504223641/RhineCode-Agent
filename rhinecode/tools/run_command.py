@@ -13,7 +13,7 @@ import os
 import subprocess
 
 from rhinecode.tools.base import Tool, ToolResult
-from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_cwd
+from rhinecode.tools.path_guard import require_cwd as _require_cwd
 
 # 命令执行的默认超时（秒）。超过则终止子进程并返回超时错误。
 # 定义为模块常量，便于后续统一调整；本章不暴露为 YAML 配置项。

@@ -25,7 +25,7 @@ from rhinecode.trace.models import SCOPE_WEB_EXTRACT
 from rhinecode.web import extract as extract_mod
 from rhinecode.web import fetcher, render
 from rhinecode.web.convert import truncate
-from rhinecode.web.models import ExtractOutcome, FetchOutcome
+from rhinecode.web.models import ExtractOutcome
 
 
 class WebFetchManager:

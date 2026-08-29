@@ -38,7 +38,7 @@ from tests.e2e.assertions import (
     check_tools_offered,
     check_ui_contains,
 )
-from tests.e2e.scripted import ScriptedProvider, done, text
+from tests.e2e.scripted import ScriptedProvider, done
 from rhinecode.provider.base import Message
 
 

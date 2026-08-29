@@ -54,7 +54,6 @@ from rhinecode.hooks.conditions import parse_matcher
 from rhinecode.hooks.models import (
     ACTION_AGENT,
     ACTION_COMMAND,
-    ACTION_HTTP,
     ACTION_PROMPT,
     ACTION_TYPES,
     COMBINE_ALL,

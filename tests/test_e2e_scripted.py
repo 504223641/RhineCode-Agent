@@ -11,7 +11,6 @@ import threading
 import unittest
 
 from rhinecode.provider.base import Message
-from tests.e2e import scripted
 from tests.e2e.scripted import (
     FALLBACK_MARKER,
     CountingProviderFactory,

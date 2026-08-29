@@ -13,7 +13,6 @@ c14 T17：权限管线第②层按调用者的工作目录判定（spec F2 / F5 
 """
 
 import unittest
-from pathlib import Path
 
 from rhinecode.permission import Decision, PermissionEngine, PermissionMode
 from rhinecode.permission.models import Layer, PermissionRequest, Rule

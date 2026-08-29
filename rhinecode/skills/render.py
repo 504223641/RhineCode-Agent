@@ -276,7 +276,7 @@ def render_resources(spec: SkillSpec) -> str:
 
     lines = [
         "",
-        f"### 本 Skill 的随附资源",
+        "### 本 Skill 的随附资源",
         "",
         f"资源目录：`{spec.resource_dir}`",
     ]

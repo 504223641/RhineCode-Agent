@@ -13,14 +13,10 @@ import unittest
 
 from rhinecode.team import TeamService
 from rhinecode.team.identity import bind_identity, current_identity, identity
-from rhinecode.team.models import MAIN_NAME, TaskState
+from rhinecode.team.models import MAIN_NAME
 from rhinecode.team.render import render_incoming
 from rhinecode.tools.send_message import SendMessageTool
 from rhinecode.tools.team_tasks import (
-    TaskCreateTool,
-    TaskGetTool,
-    TaskListTool,
-    TaskUpdateTool,
     build_board_tools,
 )
 

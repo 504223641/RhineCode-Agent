@@ -53,7 +53,6 @@ from rhinecode.subagents.tasks import (
     KIND_BRANCH,
     KIND_ROLE,
     TaskManager,
-    TaskStatus,
 )
 from rhinecode.subagents.toolset import ALWAYS_GRANTED_TOOLS, resolve_toolset
 from rhinecode.tools.path_guard import main_project_root

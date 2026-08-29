@@ -18,7 +18,7 @@ from pathlib import Path
 from rhinecode.subagents.models import AgentCatalog, AgentSource, AgentSpec
 from rhinecode.subagents.runner import SubAgentRuntime, run_subagent
 from rhinecode.subagents.service import SubAgentService, resolve_isolation
-from rhinecode.subagents.tasks import KIND_ROLE, TaskStatus
+from rhinecode.subagents.tasks import KIND_ROLE
 from rhinecode.subagents.toolset import resolve_toolset
 from rhinecode.permission.engine import PermissionEngine
 from rhinecode.permission.models import PermissionMode

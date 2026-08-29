@@ -457,7 +457,7 @@ class ActivityRowsTest(unittest.TestCase):
         可变的话，界面拿到手之后有人会顺手改它，而它是**共享**对象——
         改动会静默流回领域层，或者反过来被后台线程改到一半读出去。
         """
-        r = self.tm.create(KIND_ROLE, "explorer", "t")
+        self.tm.create(KIND_ROLE, "explorer", "t")
         row = self.tm.activity_rows()[0]
         with self.assertRaises(Exception):
             row.tokens = 999  # type: ignore[misc]

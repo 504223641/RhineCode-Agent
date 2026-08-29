@@ -13,13 +13,11 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from rhinecode.agent.events import AgentEventType, StopReason
 from rhinecode.agent.loop import Agent, RunOptions
 from rhinecode.commands import CommandDispatcher, CommandType, build_builtin_registry
 from rhinecode.commands.models import CommandSpec
-from rhinecode.commands.registry import CommandRegistry
 from rhinecode.context.manager import ContextManager
 from rhinecode.permission.engine import PermissionEngine
 from rhinecode.permission.models import PermissionMode

@@ -14,7 +14,6 @@ Python 会按 `locale.getpreferredencoding()` 解码子进程输出——中文 
 因此这里断言的是行为而非实现：**非 ASCII 输出必须能被拿到**。
 """
 
-import subprocess
 import sys
 import unittest
 
