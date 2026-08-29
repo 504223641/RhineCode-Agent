@@ -22,6 +22,14 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     "textual>=0.80.0",
+    # C2：rich 必须**显式声明**，不能靠 textual 的传递依赖。
+    # rhinecode/tui/widgets.py:23-29 直接 import 了 7 个 rich 模块
+    # （cell_len / Group / Highlighter / Markdown / Segment / Style / Text）——
+    # 「直接 import 就要直接声明」是打包的基本纪律。现在不会崩（textual 8.2.8 的
+    # Requires 里有 rich），但 textual 一直在减少对 rich 的依赖（Content / Span
+    # 这些自有类型已经在替代它），哪天它不再依赖 rich，我们这边就是一个
+    # 装得上、一启动界面就 ImportError 的包。
+    "rich>=13",
     # ⚠ openai SDK 是 DeepSeek Provider 的依赖，不是「OpenAI Provider」的——
     # 后者已于 2026-08-20 删除，而 DeepSeek 走的正是 OpenAI 兼容协议，
     # 这一行**不能跟着一起删**。anthropic SDK 随那次删除一并移除。
