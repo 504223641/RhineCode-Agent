@@ -1,11 +1,25 @@
 [build-system]
-requires = ["setuptools>=42"]
+# ⚠ 下限 77 是 PEP 639 的要求，不是随手写的：[project] 里的 `license = "MIT"`
+# （SPDX 表达式）与 `license-files` 两个字段从 setuptools 77 才被支持——
+# 更老的版本会把 license 当成「许可证正文」（已废弃写法），并对 license-files
+# 报「未知字段」而直接构建失败。
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "rhinecode"
 version = "0.1.0"
 requires-python = ">=3.11"
+
+# 许可证（A1）。选型结论见 docs/review/01-release-blockers.md 的 R5-10：
+# 依赖全是宽松许可证、不构成任何约束，MIT 在「被读、被用、被记住」三件事上
+# 摩擦最小，且先选 MIT 是可逆的那一步（将来换 Apache-2.0 成本很低，反过来难）。
+#
+# ⚠ 两行缺一不可：`license` 只是元数据里的一个字符串，**不会把 LICENSE 全文
+# 打进分发包**。没有 license-files 时 sdist / wheel 里一个 LICENSE 都没有
+# （已实测），也就是说装到用户机器上的那份包在法律上是「无许可证」的。
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "textual>=0.80.0",
     # ⚠ openai SDK 是 DeepSeek Provider 的依赖，不是「OpenAI Provider」的——
