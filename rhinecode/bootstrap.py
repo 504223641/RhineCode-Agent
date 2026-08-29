@@ -76,9 +76,13 @@ from rhinecode.classifier import (
     ClassifierConfig,
     ClassifierService,
     is_broad_allow,
+    is_broad_domain_allow,
     why_broad,
 )
-from rhinecode.classifier.render import render_dropped_rules
+from rhinecode.classifier.render import (
+    render_broad_domain_warning,
+    render_dropped_rules,
+)
 from rhinecode.permission.rules import RuleSet
 from rhinecode.tui.app import RhineApp
 
@@ -497,6 +501,8 @@ def build_app(
             # 白名单，spec F22 明确不动它（丢弃会连带改变②′层的行为）。
             engine = manager.permission_engine
             kept, dropped = [], []
+            # F22：全域名放行规则**只提醒、不丢弃**（见下方 `broad_domains` 的说明）。
+            broad_domains: list[str] = []
             for rule in engine.file_ruleset.rules:
                 # ⚠ 用**伞函数** `is_broad_allow` 而不是 `A(...) or B(...)`：
                 # 这里是本模块唯一的调用点，写成两个调用的话，将来加第三类时
@@ -513,9 +519,37 @@ def build_app(
                     dropped.append((text, rule.source, why_broad(rule.tool, rule.pattern)))
                 else:
                     kept.append(rule)
+                    # F22：全域名放行规则（`WebFetch(domain:*)` 与整工具
+                    # `WebFetch`）同样会让结论停在③层，于是**分类器对网络访问
+                    # 零次调用**——那一整类审查被静默关掉。
+                    #
+                    # ⚠ **只提醒，不丢弃**，与命令类刻意不同：域名规则同时承担
+                    # 「建立域名白名单」的语义（②′层用 `policy_ruleset
+                    # .has_allow_for` 判断用户有没有声明过白名单），丢掉它会让
+                    # 「白名单未建立」重新成立，未列出的域名从 DENY 退回 ASK
+                    # ——**那是放宽**。所以它走 `is_broad_domain_allow` 而**不进**
+                    # `is_broad_allow` 伞函数，且这一支排在 `kept.append` 旁边、
+                    # 不碰 kept/dropped 的分流。
+                    #
+                    # ⚠ 由 `cfg.web_fetch_enabled` 把门，与上面 `include_search`
+                    # 同一条理由（F4）：**关掉的能力不该影响用户的规则文件**
+                    # ——网络访问关着的时候，为一条 `WebFetch(domain:*)` 提醒
+                    # 「分类器对网络访问不生效」只会让人困惑。
+                    if (
+                        cfg.web_fetch_enabled
+                        and rule.effect == "allow"
+                        and is_broad_domain_allow(rule.tool, rule.pattern)
+                    ):
+                        broad_domains.append(
+                            f"{rule.tool}({rule.pattern})" if rule.pattern else rule.tool
+                        )
             if dropped:
                 engine.file_ruleset = RuleSet(kept)
                 manager.add_startup_notice(render_dropped_rules(dropped))
+            if broad_domains:
+                # 与丢弃说明同一个出口（B2 的要求）：两者都是「你写的规则和你
+                # 以为的不一样」，分两个通道说会让其中一条显得不那么要紧。
+                manager.add_startup_notice(render_broad_domain_warning(broad_domains))
 
     # ⑤' 子 Agent 系统（c13）。
     #

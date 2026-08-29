@@ -57,6 +57,15 @@ COMMAND_RULE_NAME = "Bash"
 # 搜索类规则的规则体系名（web_search 扩展 F16，见 `permission/adapter.py`）。
 SEARCH_RULE_NAME = "WebSearch"
 
+# 网络访问（url 类）规则的规则体系名与域名前缀（web_fetch 扩展，
+# 见 `permission/adapter.py` 的 `_TOOL_MAP` 与 `permission/rules.py` 的 url 分支）。
+#
+# ⚠ 前缀**大小写敏感**，与 `permission/rules.py` 的 `rule.pattern.startswith(...)`
+# 同口径：`WebFetch(DOMAIN:*)` 在那边不命中任何调用，这边也就不该提醒
+# ——提醒一条本来就无效的规则，只会让用户以为它原本是生效的。
+URL_RULE_NAME = "WebFetch"
+DOMAIN_PREFIX = "domain:"
+
 # ── 解释器 ───────────────────────────────────────────────────────────────
 #
 # 判据是「这个命令名后面跟任意参数就能执行任意代码」。清单对齐 Claude Code
@@ -243,6 +252,64 @@ def is_broad_search_allow(tool: str, pattern: str) -> bool:
     if str(tool or "").strip() != SEARCH_RULE_NAME:
         return False
     return not str(pattern or "").strip()
+
+
+def is_broad_domain_allow(tool: str, pattern: str) -> bool:
+    """
+    判断一条 allow 规则是否「宽到把网络访问这一类的分类器整个关掉」（spec F22）。
+
+    :param tool: 规则体系工具名（取自 `Rule.tool`）
+    :param pattern: 规则括号里的模式；空串表示整工具规则
+    :returns: 放行**一切主机名**时返回 True
+
+    副作用：无（纯函数）。
+
+    ## ⚠ 它刻意**不进** `is_broad_allow` 伞函数
+
+    伞函数的语义是「这条规则宽到**该被丢弃**」——装配层那个丢弃循环直接拿它的
+    返回值决定丢不丢。而 F22 明说域名规则**不丢，只提醒**：域名规则同时承担
+    「建立域名白名单」的语义（`permission/network.py` 的②′层用
+    `policy_ruleset.has_allow_for` 判断用户有没有声明过白名单），
+    丢掉它会连带改变**另一层**的行为——一条本意收紧的规则消失之后，
+    「白名单未建立」重新成立，未列出的域名从 DENY 退回 ASK。**那是放宽。**
+
+    **这是本条最容易踩的一脚**，故两个函数分开、调用点也分开
+    （装配层丢弃循环用伞函数，提醒单独收集）。
+    护栏见 `tests/test_classifier_broad.py::BroadDomainTests`。
+
+    ## 判据：这条规则匹配不匹配得上**每一个**主机名
+
+    与 `permission/matching.match_domain` 的「匹配一切」情形逐条对齐：
+
+    | 规则原文 | `Rule.pattern` | 宽泛？ | 为什么 |
+    |---|---|---|---|
+    | `WebFetch`             | `""`          | 是 | 整工具放行，url 分支空模式即命中一切 |
+    | `WebFetch(domain:*)`   | `"domain:*"`  | 是 | `*` 匹配一切主机名 |
+    | `WebFetch(domain:)`    | `"domain:"`   | 是 | 空模式，同上 |
+    | `WebFetch(domain:*.)`  | `"domain:*."` | 是 | 归一化去掉末尾的点之后就是 `*` |
+    | `WebFetch(domain:*.a.com)` | …         | 否 | 只匹配 a.com 的子域 |
+    | `WebFetch(https://x)`  | …             | 否 | 不是域名写法，加载期已按 F13 丢弃 |
+
+    ⚠ **归一化必须与 `match_domain` 同口径**（小写、去首尾空白、去末尾的点），
+    但**刻意不 import 它**：`from rhinecode.permission.matching import ...`
+    会连带执行 `permission/__init__.py`，把引擎与 `rhinecode.tools` 一起拉起来，
+    本包当场不再是叶子（spec N5，与本模块入参收成两个字符串是同一条理由）。
+    代价是这三行归一化在两处各有一份——**成对维护点**，那边改了这边要跟。
+    """
+    if str(tool or "").strip() != URL_RULE_NAME:
+        return False
+
+    text = str(pattern or "").strip()
+    # ① 整工具放行 `allow: WebFetch`：url 分支对空模式一律命中（rules.py）。
+    if not text:
+        return True
+    # 带模式时必须是 `domain:` 前缀，其余写法在 rules.py 里一律不命中，
+    # 即它本来就放行不了任何东西——不提醒。
+    if not text.startswith(DOMAIN_PREFIX):
+        return False
+    # ② 归一化后等价于「匹配一切」的两种形态：空 与 `*`。
+    host_pattern = text[len(DOMAIN_PREFIX):].strip().lower().rstrip(".")
+    return host_pattern in ("", "*")
 
 
 def is_broad_allow(tool: str, pattern: str, *, include_search: bool = True) -> bool:
