@@ -29,7 +29,9 @@ import unittest
 from rhinecode.classifier.broad import (
     INTERPRETERS,
     PACKAGE_RUNNERS,
+    is_broad_allow,
     is_broad_command_allow,
+    is_broad_domain_allow,
     why_broad,
 )
 
@@ -134,6 +136,74 @@ class NonCommandTest(unittest.TestCase):
         丢弃会连带改变**另一层**的行为——那不在本章范围内。
         """
         self.assertFalse(is_broad_command_allow("WebFetch", "domain:*"))
+
+
+class BroadDomainTests(unittest.TestCase):
+    """
+    B2 / spec F22：**全域名放行规则要被认出来**（认出来之后只提醒，不丢弃）。
+
+    一条 `allow: WebFetch(domain:*)` 让结论停在③层，于是**分类器对网络访问
+    零次调用**——那一整类审查被静默关掉。而用户写下这条规则的动机通常只是
+    「我不想每次抓网页都点面板」，他会以为分类器还在把关。
+
+    判定函数从此存在；提醒的接线与它的反证在
+    `tests/test_web_bootstrap.py::BroadDomainWarningTests`。
+    """
+
+    def test_matches_every_host_is_broad(self) -> None:
+        """四种「匹配一切主机名」的写法，与 `matching.match_domain` 逐条对齐。"""
+        for pattern in ("", "domain:*", "domain:", "domain:*.", "domain: * "):
+            with self.subTest(pattern=pattern):
+                self.assertTrue(is_broad_domain_allow("WebFetch", pattern))
+
+    def test_narrow_domain_rules_are_not_broad(self) -> None:
+        """
+        **反证**：窄规则一条都不许命中。
+
+        少了它，一个「所有域名规则都提醒」的实现会让正例全绿，
+        而每个正常配置的用户每次启动都会看到一条无意义的警告——
+        几次之后他就不看启动提示了，那比不做还糟。
+        """
+        for pattern in (
+            "domain:example.com",
+            "domain:*.example.com",
+            "domain:example.*",
+            "domain:a.b.c",
+        ):
+            with self.subTest(pattern=pattern):
+                self.assertFalse(is_broad_domain_allow("WebFetch", pattern))
+
+    def test_non_domain_patterns_are_not_broad(self) -> None:
+        """
+        不带 `domain:` 前缀的写法在 `permission/rules.py` 里本来就不命中任何
+        调用（加载期已按 F13 处理），提醒它只会让用户以为它原本是生效的。
+        """
+        for pattern in ("https://example.com", "*", "DOMAIN:*"):
+            with self.subTest(pattern=pattern):
+                self.assertFalse(is_broad_domain_allow("WebFetch", pattern))
+
+    def test_other_tools_are_ignored(self) -> None:
+        for tool in ("Bash", "Read", "Write", "WebSearch", "run_agent"):
+            with self.subTest(tool=tool):
+                self.assertFalse(is_broad_domain_allow(tool, "domain:*"))
+
+    def test_domain_judgement_stays_out_of_the_umbrella(self) -> None:
+        """
+        ⚠ **本条最容易踩的一脚**：域名判定**不能**进 `is_broad_allow` 伞函数。
+
+        伞函数的语义是「宽到**该被丢弃**」——装配层那个丢弃循环直接拿它的
+        返回值决定丢不丢。而 F22 明说域名规则**不丢，只提醒**：它同时承担
+        「建立域名白名单」的语义，丢掉它会让「白名单未建立」重新成立，
+        未列出的域名从 DENY 退回 ASK——**那是放宽**。
+        """
+        for pattern in ("", "domain:*", "domain:"):
+            for include_search in (True, False):
+                with self.subTest(pattern=pattern, include_search=include_search):
+                    self.assertFalse(
+                        is_broad_allow("WebFetch", pattern, include_search=include_search),
+                        "域名规则一律不进伞函数——进去就会被装配层丢掉，"
+                        "而丢掉它会放宽②′层的白名单语义",
+                    )
 
 
 class WhyBroadTest(unittest.TestCase):

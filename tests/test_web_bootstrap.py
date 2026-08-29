@@ -366,5 +366,77 @@ class SwitchChainTests(BootstrapFixture):
         )
 
 
+# =============================================================================
+# B2 / c16 spec F22 · AC32：全域名放行规则的启动提醒
+# =============================================================================
+class BroadDomainWarningTests(BootstrapFixture):
+    """
+    `render_broad_domain_warning()` 写好了却**从未被调用**（全仓提及次数 = 1，
+    只有定义处）——承诺在、兑现没了，与已知项 #18「错误的安全承诺比没有承诺
+    更危险」同型。这一组把接线钉住。
+
+    ⚠ **四条缺一不可**，前两条是正反一对：
+    - 全域名规则 → 启动提示里出现该规则原文；
+    - **窄规则 → 不出现**（少了它，一个「无条件提醒所有域名规则」的实现会
+      全绿，而那会让每个正常配置的用户每次启动都看到一条无意义的警告，
+      几次之后他就不看启动提示了——比不做还糟）；
+    - 规则**必须仍在规则集里**（F22 只提醒不丢弃：丢掉它会让「白名单未建立」
+      重新成立，未列出的域名从 DENY 退回 ASK，**那是放宽**）；
+    - 分类器关着 / 网络访问关着时都不提醒（提醒一件不会发生的事只会让人困惑）。
+    """
+
+    def _rules(self, result):
+        return {
+            (r.effect, r.tool, r.pattern)
+            for r in result.manager.permission_engine.file_ruleset.rules
+        }
+
+    def test_broad_domain_rule_produces_a_startup_notice(self) -> None:
+        self._write_project_rule('allow:\n  - "WebFetch(domain:*)"\n')
+        notice = self.build().manager.startup_notice or ""
+        self.assertIn("WebFetch(domain:*)", notice, "要说清是哪一条规则")
+        self.assertIn("分类器", notice, "要说清后果：那一类审查不生效了")
+
+    def test_narrow_domain_rule_says_nothing(self) -> None:
+        """**反证**：窄规则不该产生这条提醒（理由见类 docstring）。"""
+        self._write_project_rule('allow:\n  - "WebFetch(domain:example.com)"\n')
+        notice = self.build().manager.startup_notice or ""
+        self.assertNotIn("对网络访问完全不生效", notice)
+
+    def test_broad_domain_rule_is_not_dropped(self) -> None:
+        """
+        F22：**只提醒，不丢弃**。它同时承担「建立域名白名单」的语义——
+        丢掉它会连带改变②′层的行为（未列出的域名从 DENY 退回 ASK）。
+        """
+        self._write_project_rule('allow:\n  - "WebFetch(domain:*)"\n')
+        result = self.build()
+        self.assertIn(("allow", "WebFetch", "domain:*"), self._rules(result))
+        self.assertTrue(
+            result.manager._engine.policy_ruleset.has_allow_for("WebFetch"),
+            "白名单语义必须原样保留",
+        )
+
+    def test_silent_when_classifier_is_off(self) -> None:
+        """分类器关着时这条提醒无从谈起——它说的就是「分类器看不到」。"""
+        self._write_project_rule('allow:\n  - "WebFetch(domain:*)"\n')
+        notice = self.build(_cfg(classifier_enabled=False)).manager.startup_notice or ""
+        self.assertNotIn("对网络访问完全不生效", notice)
+
+    def test_silent_when_web_fetch_is_off(self) -> None:
+        """
+        与 `include_search` 同一条理由（F4）：**关掉的能力不该影响用户的规则文件**。
+        """
+        self._write_project_rule('allow:\n  - "WebFetch(domain:*)"\n')
+        notice = self.build(_cfg(web_fetch_enabled=False)).manager.startup_notice or ""
+        self.assertNotIn("对网络访问完全不生效", notice)
+
+    def test_whole_tool_allow_also_warns(self) -> None:
+        """`allow: WebFetch`（不带括号）同样放行一切主机名。"""
+        self._write_project_rule('allow:\n  - "WebFetch"\n')
+        notice = self.build().manager.startup_notice or ""
+        self.assertIn("WebFetch", notice)
+        self.assertIn("分类器", notice)
+
+
 if __name__ == "__main__":
     unittest.main()

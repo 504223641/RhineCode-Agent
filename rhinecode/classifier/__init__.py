@@ -69,6 +69,7 @@ from rhinecode.classifier.models import (
 from rhinecode.classifier.broad import (
     is_broad_allow,
     is_broad_command_allow,
+    is_broad_domain_allow,
     is_broad_search_allow,
     why_broad,
 )
@@ -93,6 +94,7 @@ __all__ = [
     "VerdictKind",
     "is_broad_allow",
     "is_broad_command_allow",
+    "is_broad_domain_allow",
     "is_broad_search_allow",
     "why_broad",
 ]
