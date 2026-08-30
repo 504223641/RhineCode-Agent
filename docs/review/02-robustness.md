@@ -1110,3 +1110,1052 @@ traceback 照样打印 `During handling of the above exception, another exceptio
 ⚠ **`repro_c8.py` 那份本机 SSE 服务器值得留下来**——它让「Provider 层在各种网络异常
 下的行为」第一次变得可测，而 C7 的错误分类表若要写护栏，需要的正是这个东西
 （本项目此前验 Provider 只能靠真实凭据或剧本 Provider，两者都验不到网络层的异常）。
+
+---
+---
+
+# R4 · 剩余异常吞噬 + flaky 逐条评估
+
+> 2026-08-30 实测。本轮**不改任何代码，也不改任何测试**——包括那条真复现出来的
+> flaky，它只被记录、没被动过。
+>
+> 与上面 R3 的关系：R3 坐实的是 `README.md` 已经点名的九条，R4 走的是**没人看过的
+> 那一片**——121 处 `except Exception` 里「吞掉之后做了别的事」的那 67 处，以及
+> 五条被点名为高风险但从未评估过的用例。
+>
+> ⚠ **本轮的三个数字与题面给的口径对不上，先更正**，见下一节。
+> ⚠ **本轮真复现出一条 flaky**（`tests/test_bootstrap.py`），且它的**失败形态比
+> 「偶尔红一下」更糟：为排查而写的那段诊断代码自己也会超时，把它要给的证据丢掉。**
+
+## 先更正三个数字
+
+题面（`NEXT.md` 的 R4 一键 Prompt）写的是「121 处 `except Exception`，其中 40 处
+直接 `pass`，**剩下 81 处**」。用 AST 重数一遍，三个数字都要改：
+
+| 口径 | 题面 | 实测（2026-08-30） | 差在哪 |
+| --- | --- | --- | --- |
+| `except Exception` 总处数 | 121 | **115** | 121 是 `grep` 行数去重后的值，**其中 6 处在 docstring / 注释里**（`conversation.py:524`、`glob_files.py:32`、`grep_content.py:36`、`tui/app.py:1444`、`web/manager.py:84`、`search_manager.py:172`——都是在**讲解**这个模式，不是在用它） |
+| 直接 `pass` 的 | 40 | **50** | 50 与 `00-baseline.md` 记的 ruff `S110 = 50` 一致。40 这个数不知从何而来，且它与 81 相加也不等于 121 |
+| 「吞掉后做了别的事」的 | 81 | **67** | = 115 − 50 + 2（另有 2 处 `except BaseException`：`subagents/runner.py:911`、`run_command.py:290`，`grep "except Exception"` 抓不到它们，但它们同属本轮范围） |
+
+**这不是吹毛求疵**：81 与 67 差 14 处，照 81 去核对会一直觉得「还有十几处没找到」。
+复现方式在附四。
+
+⚠ **50 处 `pass` 的分类结论不受影响。** 逐个核过它们的所在文件，仍然全部落在题面
+列的五类刻意 fail-safe 里（观测漏斗 `_safe_emit` / Hook 分发点 / TUI 渲染兜底 /
+资源关闭阶段 / 进程树强杀），**没有新增可疑项**。多出来的 10 处集中在
+`tui/app.py`(8) 与 `mcp/transport.py`(5) 这两个本来就是大户的文件上。
+另：题面说「4 处可疑已记在 `docs/review/README.md`」——**`README.md` 里找不到这四处**
+（全文搜 `except` 只有三处提及，都是 C3 / C7 的行号引用）。那份清单要么没写进去、
+要么写在别处，本轮无法核对。
+
+---
+
+# 第一部分 · 67 处「吞掉之后做了别的事」
+
+## 判据
+
+题面给的两问就是判据，逐处只回答这两句：
+
+1. **吞掉之后做的那件事，是不是让用户/模型看到了真实情况？**
+2. **还是把一个真故障伪装成了正常结果？**
+
+按回答把 67 处分成六类。**要紧的只有 E 类那 8 处**，其余 59 处的答案都是「看到了」。
+
+| 类 | 含义 | 处数 | 结论 |
+| --- | --- | --- | --- |
+| **A** | 转成 `ToolResult(ok=False, ...)` 回灌模型，带具体原因 | **22** | ✅ 干净。这是 `Tool.execute` 的契约（「绝不向上抛」），模型拿到的是可据以决策的失败 |
+| **B** | 转成一句可读的中文原因给**用户**（启动通知 / 系统行 / `/hooks` / `/mcp` / 结论正文） | **17** | ✅ 干净 |
+| **C** | fail-safe **偏严**：判拒绝 / 不删 / 判命中 / 不覆盖 | **12** | ✅ 干净，且方向正确（错拒可恢复，错放不可） |
+| **D** | 降级到一个较弱的结果，但**降级这件事本身有痕迹** | **5** | ✅ 干净 |
+| **E** | **降级且无痕**——观察者看到的东西与「一切正常」无法区分 | **8** | ⚠ **本轮的全部产出在这一类** |
+| **F** | 纯冗余：被吞的那个东西根本不会抛 | **3** | 无害，但也无用 |
+
+**59 / 67 干净，是个很高的比例。** 尤其 A 类那 22 处几乎逐字相同
+（`return ToolResult(ok=False, output=f"…失败：{exc}")`），说明「工具绝不向上抛」
+这条契约是真的被贯彻了，不是写在 docstring 里的。
+
+⚠ **但比例高恰恰是 E 类值得单独看的理由**：一个通篇都在「失败要说出来」的代码库里，
+剩下这 8 处的沉默不像是风格，更像是漏了。
+
+---
+
+## R4-1 🔴 一个存成 GBK 的 `RHINE.md` 会让三层项目指令**全部**消失，而 `/memory` 里连一行都看不到
+
+**位置**：`rhinecode/memory/manager.py:134-136`
+
+```python
+try:
+    self._instructions = load_instructions(self._user_dir, self._project_root)
+except Exception:
+    self._instructions = LoadedInstructions(text="", layers=[])
+```
+
+### 为什么这一处与别处不同
+
+`load_instructions`（`memory/instructions.py:74`）**本身写得很好**：三层逐层处理，
+每层的读取失败进 `layer.errors`、`@include` 越界/成环/超深度也进 `layer.errors`，
+缺层记 `loaded=False`。它被设计成**永远返回一个能说清楚发生了什么的对象**。
+
+问题在于它只 `except OSError`：
+
+```python
+try:
+    raw = path.read_text(encoding="utf-8")
+except OSError as e:
+    layer.errors.append(f"读取失败：{e}")
+```
+
+而 **`UnicodeDecodeError` 是 `ValueError` 的子类，不是 `OSError`**。于是一个非 UTF-8
+的 `RHINE.md` 会让异常**穿过**这层精心设计的逐层容错，被最外面那个
+`except Exception` 接住，然后连同**另外两层已经读好的内容**一起被
+`LoadedInstructions(text="", layers=[])` 整个替换掉。
+
+⚠ **`layers=[]` 是这条的关键，不是 `text=""`。** `layers` 空掉之后，`/memory` 报告里
+那个负责说真话的循环（`manager.py:504`）一次都不会执行。
+
+### 复现（实跑，三组对照）
+
+```python
+# 用户级 RHINE.md 正常 UTF-8；项目根 RHINE.md 用 GBK 存（中文 Windows 上极常见）
+(user / "RHINE.md").write_text("# 用户级指令\n请始终用中文回答。\n", encoding="utf-8")
+(proj / "RHINE.md").write_bytes("# 项目指令\n禁止推送到 main。\n".encode("gbk"))
+mgr = MemoryManager(P(), "m", proj, user, memories_enabled=False)
+mgr.startup(resume_latest=False, history=[])
+```
+
+实跑输出：
+
+```
+startup() 返回： None                 ← 没有任何提示
+custom_instructions() 长度： 0        ← 用户级那份也一起没了
+```
+
+`/memory` 报告的对照——**三组的输入只差一个文件的编码**：
+
+```
+==== A 三层全缺（真的没有 RHINE.md）====
+RHINE.md 项目指令：
+  [用户级] …\RHINE.md — 未找到
+  [项目级 .rhinecode] …\RHINE.md — 未找到
+  [项目根] …\RHINE.md — 未找到
+
+==== B 一层正常 + 一层坏编码 ====
+RHINE.md 项目指令：
+                                      ← 整段空白，一行都没有
+
+==== C 一层正常 + 一层 @include 越界（load_instructions 自己兜住的那类）====
+RHINE.md 项目指令：
+  [用户级] …\RHINE.md — 已加载（5 字符）
+  [项目级 .rhinecode] …\RHINE.md — 未找到
+  [项目根] …\RHINE.md — 已加载（25 字符）
+    警告：@include 目标不存在，未展开：include
+```
+
+**B 是唯一什么都不说的那一组，而它恰恰是唯一「用户的指令确实存在、却没生效」的那一组。**
+A 和 C 都如实说了。
+
+### 同一个输入，别的加载器都会说话
+
+```
+permissions.yaml(GBK) -> ([], ["配置文件解析失败（…\permissions.yaml）：
+                                'utf-8' codec can't decode byte 0xcf in position 4: …"])
+```
+
+四个 YAML 加载器（`permission/config.py:257`、`hooks/config.py:195`、
+`mcp/config.py:213`、`mcp/auto_config.py:445`）在**完全相同的输入**下都返回一句
+可读的中文原因——它们正是题面里「已确认干净、不用再看」的那批。
+**`RHINE.md` 是唯一的例外**，而它是三层配置里唯一直接决定模型行为的那份。
+
+### 影响面
+
+| 观察点 | 看到的 |
+| --- | --- |
+| 启动提示 | 无 |
+| 系统提示词 | 「自定义指令」槽位**整个消失**（`prompt/builder.py` 的 `build` 第 2 步：content 去空白后为空的模块直接跳过） |
+| `/memory` | 「RHINE.md 项目指令：」后面**一片空白** |
+| `--trace` | 无（`load_instructions` 不埋点） |
+| 模型行为 | 「它怎么突然不按我写的规矩来了」 |
+
+**没有任何一条通路会说出真相。** 而这正是 c9 存在的理由——RHINE.md 是用户表达
+「这个项目要怎么做事」的唯一手段。
+
+⚠ **触发概率不低。** 项目主力平台是中文 Windows，而记事本、旧版编辑器、
+`cmd` 的 `>` 重定向默认都写 GBK/ANSI。用户**不需要做错任何事**，只需要用一个
+没设 UTF-8 的编辑器新建一次 `RHINE.md`。
+
+### 修法
+
+**两处都要改，而且顺序有讲究**：
+
+1. **`instructions.py:105` 的 `except OSError` 扩成 `except (OSError, ValueError)`**
+   ——让编码错误落回它本来就该落的地方（`layer.errors`），报告与 A/C 两组一致。
+   这一处修完，本条的主要触发路径就没了。
+2. **`manager.py:136` 的兜底不要丢 `layers`**——改成保留一份「三层，全部
+   `loaded=False`，第一层带一条 `errors=["加载指令时发生意外错误：…"]`」的结构，
+   并让 `startup()` 把这句话放进它的返回值（那是启动提示的既有通道，
+   `bootstrap.py` 已经在用）。
+
+⚠ **只做 ① 不够**：`_expand_includes` 里还有别的可能抛非 `OSError` 的路径
+（`_safe_resolve` 只吞 `OSError`，而 `Path.resolve` 在 Windows 上对畸形路径会抛
+`ValueError`）。② 是纵深防御，且它才是「以后再冒出一种没想到的异常时，
+用户仍然看得见」的那道。
+
+### 代价与成对维护点
+
+改动很小（一个 `except` 元组 + 一个兜底对象 + 一句提示），但它引入**一处新的成对维护点**：
+`instructions.py` 的每层容错口径与 `manager.py` 的兜底对象**必须保持「都产出 layers」**。
+建议连一条反证测试一起加：**喂一个 GBK 的 `RHINE.md`，断言 `/memory` 报告里
+仍然出现三行层信息且至少一行带「警告」**——这条在今天会红。
+
+---
+
+## R4-2 🟠 `write_file` / `edit_file` 在「已经把文件截断了」之后，报告的是「写入失败」
+
+**位置**：`rhinecode/tools/write_file.py:102`、`rhinecode/tools/edit_file.py:194`
+
+两处都是标准的 A 类写法，模型拿到 `ToolResult(ok=False, output="写入文件失败: …")`。
+**问题不在它说了失败，而在于它说的失败与磁盘上的真实状态对不上。**
+
+```python
+with open(abs_path, "w", encoding="utf-8") as f:   # ← 这一行就已经把文件截断成 0 字节
+    f.write(content)                                # ← 抛在这里 / 或抛在退出 with 的 flush 上
+```
+
+`open(..., "w")` 是**先截断后返回**的。因此从 `open` 成功到 `write`+`flush` 完成
+之间的任何失败（磁盘满 ENOSPC、配额、网络盘掉线、Windows 上被杀软锁住），
+留下的都是一个**空文件或半截文件**，而模型收到的字面意思是「这次写入没有发生」。
+
+模型据此做的下一步通常是**换个方式重试、或者放弃这一步继续往下走**——两种都建立在
+「原文件还在」这个错误前提上。放弃并继续是三种里最坏的：源文件已经没了，
+而对话里没有任何一句话提到过它没了。
+
+### 与已知项 #3 的关系（不是同一条）
+
+已知项 #3 是「`write_file` / `edit_file` 的文件系统级原子写入」，那条讲的是
+**持久性**（崩溃/断电时的完整性）。本条讲的是**报告的准确性**：
+即使不做原子写入，这个 `except` 也可以说实话。两条可以分开做，而且本条**便宜得多**。
+
+### 修法（两种，都不必上原子写入）
+
+- **便宜的**：把 `open` 从 `try` 内部单独拆出来，用一个布尔记住「文件是否已经被截断」，
+  异常分支据此给两种不同的文案——
+  `"写入文件失败（原文件未改动）: …"` 与
+  `"⚠ 写入中途失败，{path} 已被截断/部分写入，内容不完整: …"`。
+  改动约 6 行，**模型立刻能据此做对的事**（后者它会去补救，前者它会重试）。
+- **彻底的**：同目录临时文件 + `os.replace`，即已知项 #3。那时异常分支可以
+  **诚实地**说「原文件未改动」，因为那就是事实。
+
+⚠ **不要只做「彻底的」而跳过文案**：原子写入之后文案仍然要改（从含糊的
+「写入文件失败」改成明确的「原文件未改动」），否则模型还是不知道该不该补救。
+
+### 代价与成对维护点
+
+`write_file` 与 `edit_file` **必须同改**——两处同型、隔着一个文件，是典型的
+「只改一处不报错」。护栏可以用 mock 让 `f.write` 抛，断言两个工具的 output
+里都出现「已被截断」字样。
+
+---
+
+## R4-3 🟠 隔离工作区的启动清理有**三层** fail-safe，三层全部通向「什么都没发生」，**而且连一条 trace 都不产**
+
+**位置**：`bootstrap.py:581`、`worktree/cleanup.py:165`、`worktree/cleanup.py:118`
+
+三层套在一起：
+
+| 层 | 代码 | 失败后 |
+| --- | --- | --- |
+| 最外 | `bootstrap.py:581` | `worktree_cleanup = None` → 下一行 `if ... is not None` 直接跳过通知 |
+| 中间 | `cleanup.py:165` `_iter_candidates` 失败 | `return CleanupReport()`（`is_empty` 为真） |
+| 最内 | `cleanup.py:118` `_guess_branch` 失败 | `return ""` |
+
+⚠ **真正让它无法排查的是第四件事**：埋点被 `is_empty` 挡在门外——
+
+```python
+if recorder is not None and not report.is_empty:
+    recorder.emit(TraceEventType.WORKTREE_CLEANUP, ...)
+```
+
+失败路径返回的正是一个 `is_empty` 的空报告，**于是 `--trace` 里也一个字节都没有**。
+界面、`/agents`、trace，**三条出口同时沉默**。
+
+### 这个项目自己已经写下了正确的做法
+
+`hooks/manager.py:385-388`，同一件事，结论相反：
+
+> **零命中也产出这条事件**：它是排查「我的 hook 为什么没跑」的第一现场。
+> 看到「命中 0 条」说明事件确实触发了、是条件没匹配上；一条都看不到则说明
+> 分发点压根没接上——**两种情况的排查方向完全不同**。
+
+把「hook」换成「清理」，这段话逐字成立：看到「扫了 0 个」说明清理跑了、只是没有
+过期项；一条都看不到则说明它压根没跑成——而现在这两种情况**产出完全一样**。
+
+### 影响面
+
+后果是**磁盘单调增长且无人知晓**。隔离工作区是**完整的源码 checkout**
+（`CLAUDE.md` c14 第 ⑥ 条：「它是一份完整的源码 checkout，且环境初始化可能把本地配置
+（含密钥）复制进去」），一个中等项目每个几十到几百 MB。清理静默失效之后，
+`.rhinecode/worktrees/` 会一直攒——**而它在 `.gitignore` 里，`git status` 也不会提醒**。
+
+严重性定在 🟠 而不是 🔴，因为：① 触发它需要 `_iter_candidates` 或 `scan_and_clean`
+整体抛异常，这本身不常见（每个条目已经单独兜过一层，`cleanup.py:214`，
+那一层是**留痕**的、写进 `kept`）；② 后果是空间不是正确性。
+
+### 修法
+
+**只改一处就够**：把 `cleanup.py` 末尾的埋点条件从 `not report.is_empty` 改成
+无条件，并给失败路径也走一次埋点（带 `error=` 字段）。`bootstrap.py:581` 那层
+可以顺手把异常文本挂进 `add_startup_notice`——**它同一个文件的 `:472`
+（分类器建不起来）已经是这么做的，还写了理由**：
+
+> ⚠ **整段 fail-safe**：分类器建不起来绝不能阻断启动。
+> 但**必须说出来**——静默不启用等于静默关掉一层安全机制。
+
+同一个文件里，109 行之隔，一处说了一处没说。
+
+### 代价与成对维护点
+
+小。⚠ 但注意**别顺手把 `is_empty` 这个门槛整个删掉**——它挡的是
+「每次启动刷一堆『这个还新鲜』」（`cleanup.py:174` 写了理由），那个理由仍然成立。
+要区分的是「空报告」与「失败」，不是「空」与「非空」。
+
+---
+
+## R4-4 🟠 `glob` / `grep` 的过滤器崩了，会被报成「被权限规则拒绝」
+
+**位置**：`rhinecode/tools/glob_files.py:74`、`rhinecode/tools/grep_content.py:83`
+
+```python
+def _is_allowed(self, rel_path, base) -> bool:
+    try:
+        return bool(self._path_filter(rel_path, base))
+    except Exception:
+        return False
+```
+
+**fail-safe 的方向是对的**（宁可少返回也不错放），项目自己在
+`glob_files.py:32` 的 docstring 里就把这条写清楚了，甚至预言了后果：
+
+> 一个漏改的过滤器会**把所有文件都判成拒绝**，而工具照常返回 ok=True
+
+**没被写下来的是文案。** 计数最后是这么呈现的（`glob_files.py:130,143`）：
+
+```
+…（跳过 N 个被权限规则拒绝的文件）
+```
+
+过滤器崩了的时候，这句话是**假的**——用户的权限规则一条都没被求值。
+而用户看到这句话会去做的第一件事，就是打开 `permissions.yaml` 找那条不存在的规则。
+
+⚠ **这与已知项 #18「错误的安全承诺比没有承诺更危险」同型**，只是方向相反：
+那条是承诺了一个不存在的保护，这条是**归因给了一个不存在的原因**。两者的共同后果
+一样——**把排查引向错误的地方**。
+
+### 修法
+
+`_is_allowed` 分两个返回值（或让调用方各记一个计数器）：正常判拒的进「被权限规则拒绝」，
+异常判拒的进「过滤时出错」，两句话分开显示。异常那一支**顺手埋一次点**——
+它意味着某个过滤器实现坏了，是个应该被人看见的事件。
+
+### 代价与成对维护点
+
+⚠ **`glob_files.py` 与 `grep_content.py` 必须同改**（两处逐字相同、`PathFilter`
+是同一个协议）。这一对本身就该进 `paired-maintenance`——它们此前没进去，
+是因为过去没人改到这里。
+
+---
+
+## R4-5 🟡 `pre_tool_use` 分发失败 = 静默 fail-open，而 `/hooks` 会告诉用户「从未触发，去查你的字段名」
+
+**位置**：`agent/loop.py:525`、`hooks/manager.py:329`（两层套一起）
+
+```python
+# hooks/manager.py:329 —— 内层，有埋点
+except Exception as exc:
+    self._safe_emit(TraceEventType.HOOK_DISPATCH, ..., error=f"{type(exc).__name__}: {exc}")
+    return EMPTY_DISPATCH
+
+# agent/loop.py:525 —— 外层，纵深防御，无埋点
+except Exception:
+    return NO_VERDICT
+```
+
+`NO_VERDICT` / `EMPTY_DISPATCH` 的语义是「不表态」，于是一条本该 deny 的
+`pre_tool_use` 规则**变成不拦**。这在方向上与 C12 那条不变量
+（「Hook 只能收紧不能放宽」）是相反的——虽然它不是「被放宽」，是「整个没生效」。
+
+**真正糟的是用户会看到什么。** `_dispatch` 里抛异常的位置若早于
+`_execute`（`payload_factory()` 或那个求条件值的列表推导），**统计一次都不会写**，
+于是 `/hooks` 显示（`hooks/report.py:108`）：
+
+```
+触发：0 次（本次运行内从未触发——若与预期不符，先检查条件里的字段名）
+```
+
+这句话在正常情况下是极好的排查提示，在这里**却把用户送到了完全错误的方向**——
+他会反复检查 `if:` 里的字段名，而根因是分发本身抛了异常。
+
+### 但要如实说：本轮**没有找到可达的抛出点**
+
+逐条查过了：`evaluate` / `_match_one` 是纯函数、缺失字段提前返回；
+`stringify` 的输入来自 JSON 解析结果，可序列化；`_tool_fields` 只做字典拼装。
+**没能构造出一个现实的触发路径**，所以定级 🟡 而不是 🟠。
+
+它值得记下来的理由是**后果的形态**而不是概率：两层 catch-all 叠在一起，
+其中一层连埋点都没有，而唯一会说话的那句话说的是错的方向。
+一旦将来 `_tool_fields` 里加进任何会抛的东西（比如给某个工具加一个需要读文件的
+派生字段），这条就从 🟡 变成 🟠，而**没有任何测试会在那时候红**。
+
+### 修法
+
+- `agent/loop.py:525` 补一次 `_safe_emit`（它旁边 `:563` 那个 `post_tool` 的同款
+  也是纯 `pass`，可以一起）。
+- `/hooks` 的「从未触发」那句话，在**本次运行内出现过 dispatch 异常**时换一种说法。
+  最小改动是给 manager 加一个「本次运行内分发异常次数」的计数，报告里非零就多印一行。
+
+---
+
+## R4-6 🟡 记忆更新**成功会通知，失败不会**
+
+**位置**：`memory/manager.py:308`
+
+```python
+if applied:
+    self._last_memory_result = f"已更新 {applied} 条记忆。"
+    if self.notify is not None:
+        self.notify(f"已更新记忆（{applied} 条）")     # ← 成功：主动推一条系统行
+...
+except Exception as e:
+    self._last_memory_result = f"最近一次更新失败：{e}"   # ← 失败：只留在 /memory 里
+```
+
+`F17`「记忆是尽力而为的增强项，任何异常都静默」是**明写的设计**，本条不主张推翻它。
+指出的是**不对称**：用户在会话里会习惯性地看到「已更新记忆（N 条）」，
+于是「这次没看到」变成唯一的信号——而那与「本轮没什么值得记的」（同样不通知）
+完全无法区分。
+
+`/memory` 里能查到，但**得先想到去查**。
+
+### 修法
+
+两种，二选一即可：
+
+- 失败也 `notify` 一次，但用最低的那一档（`[dim]` 系统行，与「预授权被丢弃」同档）。
+- 或者反过来——**成功也别 notify**，只留在 `/memory` 里。这一种更贴合 F17 的原意
+  （「尽力而为」意味着它不该在正常路径上占用户的注意力），且改动更小。
+
+⚠ **不要两边都保持现状**：现在是「好消息主动说、坏消息等你问」，
+这在任何观测设施里都是要避免的形态。
+
+---
+
+## R4-7 六处「看着可疑、实际干净」的（附理由，免得下一轮再查一遍）
+
+| 位置 | 为什么第一眼可疑 | 为什么实际干净 |
+| --- | --- | --- |
+| `mcp/transport.py:204` | stderr drain 线程 `except Exception: return`——**线程一死，子进程写日志就会被管道写满阻塞**，正是这个线程存在的理由（`CLAUDE.md` 架构表把它列为 ⚠ 不变量） | 最可能的触发（非 UTF-8 日志行）**在上游就被堵掉了**：`Popen(..., encoding="utf-8", errors="replace")`，注释还写明了理由「个别坏字节替换而非抛异常，避免 reader 线程被一行坏数据搞死」。剩下的只有关闭期的 `ValueError: I/O operation on closed file`，那时阻塞已无意义 |
+| `web/manager.py:126` | 抽取失败 → `fallback_outcome(page_text, ...)`，**把原始网页正文当成抽取结果返回**，像是拿降级结果冒充正常结果 | `degraded_reason` 一路带到 `web/render.py:119`，模型看到的是「注意：抽取未能完成（…）」。降级**留了痕**，属 D 类 |
+| `permission/protected.py:259` | 保护路径层的 `except Exception` —— 安全边界上的 catch-all | **fail-closed 且写明**：解析失败按「命中保护路径」处理（升级为 ASK），且注释指出填进去的相对路径**永远匹配不上豁免集合**（那里存的是绝对路径），所以连豁免都豁免不掉。**本轮最规范的一处** |
+| `run_command.py:290` | `except BaseException` —— 连 `KeyboardInterrupt` 都接 | 它**不吞**：`_terminate_process_tree(proc)` 之后 `raise`。这是「清理」不是「吞噬」，方向完全正确 |
+| `agent/loop.py:877`、`conversation.py:2474` | `current_scope()` 失败 → `SCOPE_MAIN`，像是会把子 Agent 的 trace 事件**错记成主对话**（`--scope isolated:x` 过滤会静默漏掉） | **不可达**。模块级 `current_scope()`（`trace/recorder.py:48`）读的是 thread-local，未设置时自己就回退 `SCOPE_MAIN`；`NullRecorder.current_scope()` 直接 `return SCOPE_MAIN`。归 F 类（冗余） |
+| `commands/dispatcher.py:147` | 吞掉之后调 `_logger.debug(..., exc_info=True)`，看起来堆栈被写进日志了 | 结论仍然干净（`show_message` + `DispatchResult.ERROR` 都到位了），**但那句 `_logger.debug` 落不到任何地方**——全仓无 `basicConfig`、无任何 handler（实测复核过，见 `README.md` 的 C5）。注释写的「不输出堆栈」是靠**日志系统不存在**兑现的，不是靠设计。C5 一旦做了，这里会突然开始输出堆栈 —— ⚠ **这是 C5 的一处成对维护点** |
+
+---
+
+## 全表：67 处逐条
+
+**E 类（8 处，本轮产出）**
+
+| 位置 | 吞掉后做了什么 | 条目 |
+| --- | --- | --- |
+| `memory/manager.py:135` | 指令置空，`layers` 也清掉 | **R4-1** 🔴 |
+| `bootstrap.py:581` | `worktree_cleanup = None` | **R4-3** 🟠 |
+| `worktree/cleanup.py:165` | 返回空报告（连埋点都被 `is_empty` 挡掉） | **R4-3** 🟠 |
+| `worktree/cleanup.py:118` | `_guess_branch` 返回 `""` | R4-3 附带，低危 |
+| `tools/glob_files.py:74` | 判拒绝，计入「被权限规则拒绝」 | **R4-4** 🟠 |
+| `tools/grep_content.py:83` | 同上 | **R4-4** 🟠 |
+| `agent/loop.py:525` | `NO_VERDICT`（无埋点） | **R4-5** 🟡 |
+| `hooks/manager.py:329` | `EMPTY_DISPATCH`（有埋点，无界面出口） | **R4-5** 🟡 |
+
+另有两处**已被别的轮次记过**，不重复计入：
+`tui/app.py:1884` 与 `tui/clipboard.py:61`（复制失败静默返回 `False`）——
+R5 已记「Linux 剪贴板静默失效且该分支零测试」，见
+[`01-release-blockers.md`](01-release-blockers.md)。
+
+**A 类（22 处）**——`ToolResult(ok=False, ...)` 回灌模型：
+`agent/loop.py:2123`、`agent/loop.py:2272`、`mcp/auto_config.py:344`、
+`mcp/tool_adapter.py:105`、`provider/deepseek.py:264`、`tools/edit_file.py:194`、
+`tools/glob_files.py:149`、`tools/grep_content.py:213`、`tools/load_skill.py:225`、
+`tools/mcp_config.py:144`、`tools/read_file.py:141`、`tools/run_agent.py:245`、
+`tools/run_command.py:465`、`tools/send_message.py:164`、`tools/team_tasks.py:105`、
+`tools/todo_write.py:348`、`tools/web_fetch.py:103`、`tools/web_search.py:126`、
+`tools/write_file.py:102`、`web/fetcher.py:227`、`web/fetcher.py:322`、
+`web/search_manager.py:191`。
+
+其中三处值得点名表扬：`run_command.py:465` 把 `TimeoutExpired` **单独列了一支**
+（超时与「命令失败」是两种事，模型的下一步不同）；`web/search_manager.py:191`
+在失败分支里 `self._release_quota()`（一次失败的搜索不该扣会话配额，
+这是很容易漏的一笔）；`provider/deepseek.py:264` 虽是 C7 记过的「所有错误压成一个
+字符串」，但它至少**没有假装成功**。
+
+**B 类（17 处）**——可读原因给用户：
+`bootstrap.py:472`、`commands/dispatcher.py:147`、`context/manager.py:312`、
+`hooks/actions.py:257`、`hooks/actions.py:380`、`hooks/config.py:195`、
+`hooks/manager.py:419`、`mcp/config.py:213`、`mcp/manager.py:162`、
+`memory/manager.py:146`、`permission/config.py:257`、`permission/engine.py:600`、
+`subagents/runner.py:911`、`subagents/runner.py:959`、`trace/reader.py:559`、
+`worktree/cleanup.py:214`、`worktree/provision.py:207`。
+
+`mcp/manager.py:162` 值得单独看：它在失败分支里**逐个 `registry.unregister`
+回滚本次注册的工具名**再记 `ServerState(connected=False, error=...)`——
+「失败要回滚到干净状态」这一步在 catch-all 里经常被省掉，这里没省。
+
+**C 类（12 处）**——fail-safe 偏严：
+`classifier/service.py:136`、`classifier/service.py:158`、`mcp/auto_config.py:445`、
+`permission/config.py:357`、`permission/protected.py:259`、`tools/display.py:273`、
+`tools/glob_files.py:74`、`tools/grep_content.py:83`、`tools/path_guard.py:331`、
+`tools/path_guard.py:357`、`tools/run_command.py:290`、`web/fetcher.py:186`。
+
+⚠ `glob_files.py:74` / `grep_content.py:83` **同时属于 C 与 E**：判定方向属 C（偏严、正确），
+呈现方式属 E（归因给了错误的原因）——这正是 R4-4 的内容。
+
+**D 类（5 处）**：`agent/loop.py:636`、`agent/prompt/environment.py:94`、
+`memory/manager.py:308`、`web/manager.py:126`、`web/render.py:145`。
+
+**F 类（3 处）**：`agent/loop.py:877`、`conversation.py:2474`、`mcp/transport.py:204`。
+
+---
+
+# 第二部分 · flaky 逐条评估
+
+## 方法
+
+**不靠读代码下结论。** 每条先静态分析给一个预测，再用两种方式验：
+
+1. **裸跑**：连跑 N 轮，确认基线干净。
+2. **加载跑**：起 **48 个纯 CPU 忙循环进程**压满 16 核（约 3× 超订），
+   把机器人为地拖慢，再连跑 N 轮。
+
+第 2 步是照着 F4 那轮 CI 的经验来的——`NEXT.md` 记着：
+
+> Windows runner 慢到足以把一批**潜伏的时间假设**同时照出来……
+> 共同点只有一个：**判据或实现里藏着「这一步会很快」的假设**。
+
+本机跑不出 GitHub runner 的形态，但**「把机器拖慢一个数量级」这件事可以复制**。
+实测拖慢倍率：纯逻辑模块 20.8s → 197.9s（**9.5×**），
+`test_bootstrap` 16.3s/轮 → 110s/轮（**6.8×**）。
+
+## 结论摘要
+
+| 用例 | 题面的判断 | 实测结论 | 假红 / 假绿 |
+| --- | --- | --- | --- |
+| `test_memory_manager.py:177` | 「否定式断言配固定睡眠，机器慢时假绿。**这条最隐蔽，优先看**」 | ⚠ **前提不成立**：那 0.05 秒后面没有任何并发，断言是确定性的 | **都不是**。但护栏钉的不是它想钉的性质 |
+| `test_subagent_gate.py:142` | 裸 sleep 编排跨线程时序 | ⚠ 部分成立：唯一的假红面是那句 `assertLess(…, 3.0)`，**而它防不住它想防的东西** | 理论假红；20 轮 × 9.5 倍负载未复现 |
+| `test_subagent_gate.py:246` | 「无超时忙等」 | ⚠ 忙等属实，但**不会假红**（循环会等）。真问题是**一条恒真断言** | 都不是 |
+| `test_subagent_gate.py:278` | 裸 sleep 编排跨线程时序 | ✅ **确定性**（循环阻塞等，睡多久都不影响结论） | 都不是 |
+| `test_team_mailbox.py:84` | 「依赖 `time.time()` 单调（项目别处用 `monotonic`）」 | ⚠ **前提不成立**：`team/` 全模块用 `time.time()`，且 `sent_at` **只用于显示格式化**，`monotonic` 在这里连语义都不对 | 仅时钟回拨时假红 |
+| `test_bootstrap.py:319-364` | 「起真子进程 + 60 秒轮询」 | 🔴 **实测复现**：6 轮里 1 轮红，**3 个调用点全挂**。且**诊断路径自己会二次超时** | **假红，且丢失证据** |
+| `tests/e2e/c14_scenarios.py:612` | 「依赖系统时钟」 | ⚠ **它不是测试**：不被任何 `test*.py` import，不进 `discover`、不进 CI。30 天余量也远大于任何现实漂移 | 都不是。真脆弱点在别处 |
+
+⚠ **一条应该先说的背景**：这里的前六条**已经在 F4 的 CI 上跑过 6 个格子**
+（`{windows, ubuntu} × {3.11, 3.12, 3.13}`），而那几轮 CI 的 runner 慢到把
+**五处**互不相干的潜伏时间假设同时照了出来——**这六条一处都不在其中**。
+本轮的负载实测与那个结果一致。（第七条 `c14_scenarios.py` 从来没被 CI 跑过，
+因为它压根不在 `discover` 的收集范围里。）
+
+---
+
+## F-1 `tests/test_memory_manager.py:177` —— 题面的前提不成立，但它确实钉错了东西
+
+```python
+def test_notes_disabled_noop(self) -> None:
+    provider = FakeProvider([_action_json()])
+    mgr = self._manager(provider, memories_enabled=False)
+    mgr.on_natural_stop([Message(role="user", content="x")])
+    time.sleep(0.05)
+    self.assertEqual(provider.calls, [])  # 完全不调 LLM（F21）
+```
+
+### 为什么它不会假绿
+
+`on_natural_stop`（`memory/manager.py:262`）的**第一行**就是：
+
+```python
+if not self.memories_enabled:
+    return
+```
+
+**同步返回，线程根本没被创建。** 没有并发就没有竞态：`provider.calls` 在这条用例里
+不可能在任何时刻变成非空，睡 0.05 秒和睡 0 秒的结果完全一样。
+
+实测佐证：`test_memory_manager` 在 9.5 倍负载下连跑 20 轮，全绿。
+
+### 但它确实有问题——**钉的不是它想钉的性质**
+
+这条用例的意图（F21：记忆未启用时完全不调 LLM）是靠「早返回发生在
+`on_natural_stop` 里」这个事实成立的，而**这个事实它一个字都没断言**。
+如果哪天有人把 `memories_enabled` 的判断挪进 `_update_memories`
+（线程照起、进去再 bail——这是个很自然的重构），那么：
+
+- 用例**在快机器上仍然全绿**；
+- 而它此刻才**真的**变成题面描述的那种「0.05 秒赌一把」的用例；
+- 意图（不调 LLM）可能仍然满足，但**这条用例已经不能证明它了**。
+
+即：题面担心的那个形态不是**现状**，是**一次无害重构之后的必然结果**，
+而没有任何东西会在那一刻报警。
+
+### 改法
+
+```python
+mgr.on_natural_stop([Message(role="user", content="x")])
+# 早返回是同步的：线程压根不该被创建 —— 这才是 F21 真正的判据
+self.assertFalse(mgr._memory_inflight.is_set())
+self.assertEqual(provider.calls, [])
+```
+
+`_memory_inflight` 在 `on_natural_stop` 里是**先于**起线程被 `set()` 的
+（`manager.py:270-274`），线程结束才 `clear()`。因此「从未 set」等价于
+「线程从未被创建」，是一个**确定性**判据。`time.sleep(0.05)` 一并删掉。
+
+⚠ **同文件的 `_wait_notes_done`（`:64`）是本项目的正面样板**——
+`while ... is_set(): sleep(0.01)` 配一个 5 秒 deadline 与 `self.fail`。
+两种写法在同一个文件里并存，`:177` 那条只是没用上它（因为它这条本来就不需要等）。
+
+---
+
+## F-2 `tests/test_subagent_gate.py:142` —— 唯一的假红面是一句**防不住任何东西**的断言
+
+```python
+def finish_later():
+    time.sleep(0.15)
+    self.tasks.finish(record.task_id, TaskStatus.COMPLETED, "好了")
+
+threading.Thread(target=finish_later, daemon=True).start()
+started = time.monotonic()
+got = self.gate.wait_any(self.cancel)
+
+self.assertTrue(got)
+self.assertLess(time.monotonic() - started, 3.0)
+```
+
+**两种线程交错都是安全的**：
+
+- 辅助线程后完成 → `wait_any` 阻塞在 `Event` 上被唤醒；
+- 辅助线程先完成 → `wait_any` 走「已有可交付」的快路径立刻返回
+  （同类中的 `test_returns_immediately_when_something_deliverable` 正是钉这条的）。
+
+所以 `assertTrue(got)` 是确定性的。
+
+### `assertLess(…, 3.0)` 防不住它想防的东西
+
+这句话看起来是「防止无限等待」的护栏，**但它写在 `wait_any` 返回之后**。
+如果 `wait_any` 真的不醒，代码根本走不到这一行——用例会**挂住**，
+由 unittest 之外的东西（CI 的 `timeout-minutes: 30`，或人按 Ctrl+C）来终结。
+它唯一能做的事，就是在一台足够慢的机器上**把一次成功变成一次失败**。
+
+即：**它承担 0 的护栏价值，100% 的 flaky 面。**
+
+### 实测
+
+20 轮 × 9.5 倍负载，未复现。`0.15s` 与 `3.0s` 之间有 20 倍余量，
+要撞上需要线程调度被拖到 20 倍以上——本机的 9.5 倍还不够。
+但 F4 那几个 CI 格子的分片跑到了平时的 3 倍，叠加 runner 本身更慢，
+**这个余量不像看上去那么厚**。
+
+### 改法
+
+删掉 `assertLess` 那一行。若确实想防「永远醒不过来」，正确的做法是给
+`wait_any` 传一个测试用的超时上限、或把整条用例包进
+`concurrent.futures` 的 `result(timeout=...)`——那样超时才会变成
+一条**说得清原因**的失败，而不是一次莫名其妙的红。
+
+---
+
+## F-3 `tests/test_subagent_gate.py:246` —— 忙等属实，但真问题是一条**恒真断言**
+
+```python
+def finish_soon():
+    while provider.calls < 2:
+        time.sleep(0.01)
+    tasks.finish(record.task_id, TaskStatus.COMPLETED, "子结论：42 处。")
+...
+hits = [i for i, b in enumerate(provider.bodies, 1) if "42 处" in b]
+self.assertTrue(hits, "结论必须在同一次运行内进入某一轮的请求体")
+self.assertLessEqual(hits[0], len(provider.bodies))
+```
+
+### 它不会假红
+
+看起来的风险是「`finish_soon` 醒得太晚，循环已经结束，结论没赶上」。
+**实际赶得上**：这个任务不是 `background`，因此模型准备收工时循环会
+**停下来等它**（C13 第 ⑧ 条；同文件下一条 `test_loop_waits_before_finishing`
+钉的就是这个）。无论 `finish_soon` 多晚醒，循环都在那儿等着。
+
+实测 20 轮 × 9.5 倍负载，全绿。
+
+### 但有两个真问题
+
+**① `assertLessEqual(hits[0], len(provider.bodies))` 恒真。**
+`hits` 的元素来自 `enumerate(provider.bodies, 1)`，取值范围就是 `1..len(bodies)`。
+`hits[0] <= len(bodies)` **在任何输入下都成立**，它一次都不可能红。
+上一行的注释解释了为什么不断言「第几轮」（那个数字是竞态产物），
+这一行大概是想补一句更弱的判据——但补出来的是个恒等式。
+
+真正想说的应该是「结论必须**在模型给出最终答复的那一轮之前或当轮**到手」，
+而在当前的数据结构下这句话**无法表达**：要表达它得知道「哪一轮是模型给出最终文本
+的那一轮」，而 `provider.bodies` 里没有这个信息（最终答复那一轮恰好就是最后一轮，
+于是判据退化成恒等式）。**诚实的做法是删掉这一行**，把上一行注释里
+「刻意不断言第几轮」的理由留下。
+
+**② 忙等没有 deadline，而它是 daemon 线程。**
+若 `provider.calls` 永远到不了 2（比如将来 gate 的契约变了、循环不再等待），
+这个线程会**空转到进程结束**。在一个分片里跑几百条用例的场景下，
+那是一整个核被白烧掉，而**表现出来只是「这个分片今天特别慢」**。
+
+改法照抄同仓库现成的样板：`_wait_notes_done`（`test_memory_manager.py:64`）
+那种「deadline + `self.fail`」的形态；或者更简单——给循环加一个
+`for _ in range(500)` 的上限，超了就直接 `return`（让主断言去报错，
+那个错误信息比线程里的 fail 有用）。
+
+---
+
+## F-4 `tests/test_subagent_gate.py:278` —— 确定性，`sleep` 只是成本
+
+```python
+def finish_soon():
+    time.sleep(0.2)
+    tasks.finish(record.task_id, TaskStatus.COMPLETED, "子结论：42 处。")
+```
+
+与 F-3 同理：循环会等。睡 0.2 秒还是 2 秒，结论都一样——
+`provider.calls >= 2`、最后一轮请求体里有「42 处」、有一条「等待子 Agent」的提示。
+
+**没有假红也没有假绿，只有 0.2 秒的净成本。** 三条用例合计约 0.35 秒，
+在 `test_subagent_gate` 里不算什么，列在这里只是为了给出完整判断。
+
+若要削：把 `sleep(0.2)` 换成 0 也不会改变任何断言的结论——因为「先完成」
+和「后完成」两条路径都被覆盖（前者走快路径、后者走 Event）。
+但**保留一点延迟是有意义的**：它让这条用例实际走的是「后完成」那条路径，
+删掉之后它多半会退化成只覆盖快路径，与 `test_returns_immediately_...` 重复。
+**建议不动。**
+
+---
+
+## F-5 `tests/test_team_mailbox.py:84` —— 题面的前提不成立
+
+```python
+before = time.time()
+envelope = self.mailbox.send("worker-a", "worker-b", "x").envelope
+self.assertGreaterEqual(envelope.sent_at, before)
+```
+
+题面说「项目别处用的是 `time.monotonic()`」，所以这里用 `time.time()` 是个隐患。
+**实际查下来是反过来的**：
+
+- `team/` 模块**全部**用 `time.time()`：`models.py:229,230,277,328`（`created_at` /
+  `updated_at` / `sent_at` / `last_active`）、`board.py:263,320,382,408`、
+  `roster.py:253,297`。测试与产品**同源**，这正是它该做的。
+- `sent_at` 的**唯一**消费点是 `team/render.py:213`：
+  `time.strftime("%H:%M:%S", time.localtime(env.sent_at))`。
+  它是**给人看的时钟时间**，`monotonic`（一个无意义的开机以来秒数）
+  在这里连语义都不对。
+- 信箱的**顺序**不由 `sent_at` 决定——全仓搜 `sent_at` 只有三处，没有任何排序用到它。
+  （用例的 docstring 写「信箱是按到达顺序排的」，这句话是对的，
+  但那个顺序来自列表的追加次序，与 `sent_at` 无关。）
+
+### 剩下的那点风险
+
+只有一种：`before` 与 `send()` 之间**系统时钟被回拨**（NTP 校正、虚拟机快照恢复、
+用户手动改表）。窗口是微秒级，且真发生时**产品也一起错了**（消息上会显示一个
+比前一条更早的时间）。属**假红**，概率可忽略。
+
+### 改法
+
+不必改。若要更严，可以把断言换成「`sent_at` 不是模型给的」这个真正的意图——
+比如让 `send()` 收一个带 `sent_at` 的伪造载荷，断言它被忽略。
+docstring 说的正是这件事（「让模型给时间戳等于让它有机会给出一个假的顺序」），
+而现在的断言只验到了「系统填了个不早于调用前的值」。
+
+---
+
+## F-6 🔴 `tests/test_bootstrap.py:319-364` —— **实测复现**，而且诊断路径自己会二次超时
+
+**这是本轮唯一真复现出来的 flaky，也是唯一建议尽快改的一条。**
+
+### 实测
+
+| 条件 | 轮数 | 结果 |
+| --- | --- | --- |
+| 裸跑 | 1 | 18 条全绿，16.3 秒 |
+| 48 进程压满 16 核（6.8×） | **6** | **1 轮红，`FAILED (errors=3)`** |
+
+红的那一轮里，`_launch_until_trace` 的**三个调用点全部失败**
+（`:435`、`:454`、`:474`——文件里正好只有这三处）。
+
+### 失败形态比预期糟
+
+预期的失败是「60 秒轮询超时 → `self.fail` 给出一条带子进程 stderr 的信息」。
+**实际拿到的是这个**：
+
+```
+ERROR: test_unknown_granted_tool_starts_normally_in_subprocess
+Traceback (most recent call last):
+  File "tests\test_bootstrap.py", line 435, in test_unknown_granted_tool_starts_normally_in_subprocess
+    path = self._launch_until_trace(
+  File "tests\test_bootstrap.py", line 354, in _launch_until_trace
+    out, err = proc.communicate(timeout=10)
+subprocess.TimeoutExpired: Command '[... '-m', 'rhinecode', '--config', ..., '--trace']'
+                           timed out after 10 seconds
+```
+
+即：**为排查而写的那一行自己也超时了**，`self.fail(...)` 那句带 stderr 的信息
+**一个字都没出现**。
+
+### 根因：那句 `self.fail` 在主要失败路径上不可达
+
+```python
+deadline = time.time() + 60
+while time.time() < deadline:
+    ...
+    if proc.poll() is not None:
+        break
+    time.sleep(0.2)
+# 进程提前退出或超时：把 stderr 带进失败信息，便于定位
+out, err = proc.communicate(timeout=10)
+self.fail("未在超时内看到有内容的记录文件；" f"returncode={...} stderr={...}")
+```
+
+这个 `while` 有**两个**出口，注释也写明了是两种情况，但后面只有一条处理：
+
+| 出口 | 子进程状态 | `communicate(timeout=10)` |
+| --- | --- | --- |
+| `break`（进程提前退出） | 已退出，管道已关 | ✅ 立刻返回，`self.fail` 正常给出 stderr |
+| 循环走完（超时） | **还活着**（那是个 TUI，它就是不会自己退） | ❌ 管道永不关闭，10 秒后抛 `TimeoutExpired` |
+
+而**超时才是需要诊断信息的那一种**。于是这段代码的效果是：
+**最需要证据的时候，恰恰是它唯一拿不到证据的时候。**
+
+⚠ 这与 R4-4 / R4-5 是同一个形态，只是发生在测试里：
+**排查信息把人引向错误的方向**——`TimeoutExpired` 的消息里只有那条命令行，
+看到它的人会先去怀疑「是不是 rhinecode 启动挂了」，
+而真相是「机器慢，60 秒没跑完启动」。
+
+### 顺带：`deadline` 用的是 `time.time()`
+
+`deadline = time.time() + 60` 与 `while time.time() < deadline`——**这里才是**
+题面说的那个「该用 `monotonic` 却用了 `time`」的地方（不是 `test_team_mailbox`）。
+后果很轻（时钟回拨只是让它多等或少等一会儿），但**改起来是一个词**，
+而且它与上面那条 bug 在同一个函数里，顺手改掉即可。
+
+### 改法
+
+```python
+        try:
+            deadline = time.monotonic() + 60          # ① 换单调钟
+            while time.monotonic() < deadline:
+                found = probe()
+                if found is not None and found.exists() and found.stat().st_size > 0:
+                    return found
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+            # ② 先把它停掉，管道才会关，communicate 才回得来
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                _out, err = proc.communicate(timeout=10)
+                detail = err.decode("utf-8", "replace")[:500]
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _out, err = proc.communicate()
+                detail = "（子进程未在终止后 10 秒内退出）" + err.decode("utf-8", "replace")[:500]
+            self.fail(f"未在超时内看到有内容的记录文件；returncode={proc.returncode} stderr={detail}")
+        finally:
+            ...
+```
+
+要点是 **②：`terminate()` 必须在 `communicate()` 之前**。
+现在的顺序（`communicate` 在 `try` 里、`terminate` 在 `finally` 里）
+恰好是反的，而这正是它拿不到证据的原因。
+
+### 顺带一提：另外两个调用点缺一个已经踩过的教训
+
+`:435` 那条的 `probe` 有一段很详细的注释，记录着一个真实踩过的竞态：
+
+> ⚠ 不能只等「文件非空」——`session_start` **不是文件里的第一条事件**……
+> 这个竞态一直都在，但窗口很窄，只在**全量测试的并发负载**下才偶尔命中（单跑必绿）
+
+它的修法是：读出来、`json` 解析、确认目标事件真的在里面，解析失败就继续等
+（`except Exception: return None`）。
+
+**而 `:454` 与 `:474` 两条仍是老写法**——`probe` 只看文件存不存在，
+拿到之后直接 `json.loads(found.read_text().splitlines()[0])`。
+`_launch_until_trace` 的 `st_size > 0` 挡住了空文件，但挡不住**写了一半的行**
+（`trace/recorder.py:241` 是 `write(line + "\n")` 后 `flush()`，
+大负载下的一次大 flush 可能被拆成多次 write）。窗口比 `:435` 那条**窄得多**
+（首条事件是很小的 `skill_state`），所以定性为「同类隐患，未复现」而不是缺陷。
+
+**修法就是把 `:435` 那条的 `try/except → return None` 模式抽成一个共用的 probe 辅助函数**，
+三处都用它。⚠ 这三处是一组成对维护点：**一处踩过坑改了，另外两处没跟上。**
+
+### 代价
+
+小（一个函数内的十来行），但**它必须真跑过才算改完**——
+建议照本轮的方式验：起 48 个忙循环压住机器，连跑 6 轮，看那三条是否还红，
+以及红的时候错误信息里**有没有子进程的 stderr**。
+
+---
+
+## F-7 `tests/e2e/c14_scenarios.py:612` —— 它不是测试，真脆弱点在别处
+
+```python
+old = time.time() - 30 * 86400
+for name in ("clean", "committed", "wip"):
+    for root, _dirs, files in os.walk(base / name):
+        for fname in files:
+            try:
+                os.utime(Path(root) / fname, (old, old))
+            except OSError:
+                pass
+    os.utime(base / name, (old, old))
+```
+
+### 先说清楚它是什么
+
+`tests/e2e/c14_scenarios.py` **不被任何 `test*.py` import**（全仓核过：
+只有三处文档与两处兄弟模块 docstring 提到它）。`unittest discover` 的默认
+收集模式是 `test*.py`，所以它**不在那 3000 多条里，也从来没被 CI 跑过**。
+
+它是 P1a 驱动设施的**手工验收预置**——由宿主用
+`--seed tests.e2e.c14_scenarios:seed_xxx` 显式调起，服务于
+`docs/c14/acceptance/live-model.md` 那八个真实模型会话。
+
+因此「假红 / 假绿」这个问法在这里要换成：**它会不会让一次人工验收得出错误的结论？**
+
+### 时钟依赖不是问题
+
+`old` 比现在早 **30 天**，而产品的 `cutoff = time.time() - max_age_days * 86400`
+默认是 7 天。**余量 23 天。** 任何现实中的时钟漂移、NTP 校正、夏令时都不在这个量级。
+（真要 23 天量级的跳变，那台机器上坏掉的东西远不止这个场景。）
+
+### 真正的脆弱点是那个 `except OSError: pass`
+
+——**又是一处异常吞噬，只是这次在测试设施里。**
+
+`os.utime` 在 Windows 上会因为文件被占用（杀软扫描、索引服务、
+`git worktree add` 刚写完还没放手）而抛 `PermissionError`（`OSError` 的子类）。
+被吞掉之后：
+
+1. 那个文件保持**新鲜**的 mtime；
+2. 产品的 `_latest_mtime`（`cleanup.py:43`）取的是「目录内文件的**最近**修改时间」，
+   一个新鲜文件就够了；
+3. 该工作区被判**未过期** → 连报告都不进（`cleanup.py:174`：「未过期：连报告都不进」）；
+4. 验收的人看到的是「**清理没生效**」，于是去查 c14 的清理逻辑；
+5. **而真正的原因是预置代码里一次被吞掉的 `utime`，它在任何地方都没留下痕迹。**
+
+这与 R4-3 / R4-4 是同一个形态：吞掉之后做的那件事，**把排查引向了错误的地方**。
+放在人工验收里尤其贵——那是要花真实模型额度的场景。
+
+### 改法
+
+```python
+failed: list[str] = []
+for ...:
+    try:
+        os.utime(Path(root) / fname, (old, old))
+    except OSError as exc:
+        failed.append(f"{fname}: {exc}")
+if failed:
+    raise RuntimeError("预置失败：以下文件的 mtime 没能拨回去，"
+                       "本场景的过期判定不成立：\n  " + "\n  ".join(failed))
+```
+
+**预置失败必须硬失败。** 这与 `tests/e2e/seeding.py` 已有的口径一致——
+`architecture.md` 记着它「git 缺失明确抛错不静默跳过——静默跳过会让依赖提交历史的
+场景**假绿**」。同一个模块家族里，一处做对了，这处没有。
+
+---
+
+## F-8 `tests/test_subprocess_timeout.py` 的 `CHILD_SLEEP=6` —— 只评估，不建议改
+
+按题面要求只做评估。**结论：`CHILD_SLEEP=6` 应当保留，理由与文档一致且仍然成立。**
+
+- 它给孙子进程一个「本该还活着」的窗口，标记文件的判定完全依赖它。
+  缩短它会让「进程树有没有被真的杀干净」这个判据**失去分辨力**——
+  而那对应一个真实产品缺陷。
+- 它是**正向余量**（等得久 = 更保守），不是负向余量。慢机器让它更容易通过，
+  不是更容易失败。**这与本轮其它几条的风险方向相反**，因此它不属于
+  「潜伏的时间假设」那一类。
+
+⚠ **但 `THRESHOLD=4.0` 已经不在那份「不要动」清单里了**（2026-08-30 摘掉）。
+`CLAUDE.md` 的「测试」一节记了原委：它当时同时充当「立刻返回」与
+「反证朴素写法必须慢」两半的判据，而**后一半只在 Windows 上成立**——
+装 CI 之后三个 Linux 格子全红在它上面，而产品行为在两个平台上都是对的。
+现在反证改看「朴素写法有没有把命令留在后台继续跑」（标记文件），
+`THRESHOLD` 只留下「立刻返回」那一半。
+
+**这正好印证了本轮方法的价值**：一个「不要动、有理由」的常数，它的理由可以是
+**平台局部的**，而在开发机上无论跑多少遍都发现不了。
+
+---
+
+## 附一 · 本轮对已有材料的更正（共五处）
+
+| # | 材料 | 原说法 | 更正 |
+| --- | --- | --- | --- |
+| 1 | `NEXT.md` R4 的 Prompt | 「121 处 `except Exception`，40 处 `pass`，剩 81 处」 | **115 处（另 2 处 `BaseException`），50 处 `pass`，剩 67 处**。121 含 6 处 docstring 里的提及 |
+| 2 | `NEXT.md` R4 的 Prompt | 「4 处可疑已记在 `docs/review/README.md`」 | **`README.md` 里没有这四处**，无法核对 |
+| 3 | `NEXT.md` R4 的 Prompt | `test_memory_manager.py:177`「机器慢时假绿，**这条最隐蔽，优先看**」 | **前提不成立**：早返回是同步的，没有并发。它的问题是「钉错了性质」，不是假绿 |
+| 4 | `NEXT.md` R4 的 Prompt | `test_team_mailbox.py:84`「依赖 `time.time()` 单调（项目别处用 `monotonic`）」 | **`team/` 全模块都用 `time.time()`，且 `sent_at` 只用于显示格式化**。该用 `monotonic` 而没用的地方是 `test_bootstrap.py:345` |
+| 5 | `NEXT.md` R4 的 Prompt | 把 `tests/e2e/c14_scenarios.py:612` 与其余四条并列为「用例」 | **它不是用例**：不被任何 `test*.py` import，不进 `discover`、从未被 CI 跑过 |
+
+## 附二 · 建议的处理顺序
+
+| 优先 | 条目 | 代价 | 理由 |
+| --- | --- | --- | --- |
+| 1 | **R4-1**（RHINE.md 编码） | 小 | 唯一的 🔴。触发不需要用户做错任何事，后果是「用户写的项目指令整个不生效且查不出来」 |
+| 2 | **F-6**（`_launch_until_trace`） | 小 | 唯一实测复现的 flaky，且**修的是排查能力本身**——不修的话，下次 CI 红在这里会浪费一轮 |
+| 3 | **R4-2**（写入失败的文案） | 小 | 模型会据此做错事，而正确文案只要 6 行 |
+| 4 | R4-3 / R4-4 | 小 | 两条都是「归因给了错误的原因」，改的是一句话 + 一次埋点 |
+| 5 | F-3 的恒真断言、F-2 的 3 秒断言、F-7 的预置硬失败 | 极小 | 三条都是「删掉/改掉一行」，且都能消掉 flaky 面或假判据 |
+| 6 | R4-5 / R4-6 | 小 | 🟡，不阻塞任何事 |
+
+**如果只做一件事**：**R4-1**。它是本轮唯一一处「用户完全没做错、系统完全没提示、
+而他明确写下的指令没有生效」。
+
+**如果只做一天**：1 + 2 + 3。
+
+## 附三 · 本轮没做的
+
+- **67 处里的 A 类没有逐条跑复现**。它们的判据是静态可判的（返回值类型 +
+  文案里有没有 `{exc}`），逐条跑 22 次没有额外信息量。
+- **R4-5 没能构造出可达的抛出点**，因此它是按「后果形态」定级的，不是按概率。
+- **flaky 只在本机拖慢，没有在 GitHub runner 上复跑**。F-6 的修法建议里写了
+  该怎么验；本轮不改代码，所以没验。
+- **`tests/` 目录下的 33 处 `except Exception` 未纳入**（题面限定产品代码）。
+  F-7 那处是个例外——它是顺着 flaky 那条线撞见的。
+
+## 附四 · 复现脚本
+
+| 脚本 | 用途 | 要凭据？ |
+| --- | --- | --- |
+| `scan_except.py` | AST 全量枚举 `except Exception/BaseException`，按处理体分 PASS / RETURN / RAISE / LOG / OTHER | 否 |
+| `scan2.py` | 对每处非-`pass` 的打印 `try` 体 + handler 体全文（67 处逐条判定的输入） | 否 |
+| `repro_r4_1.py` | R4-1 三组对照（三层全缺 / 坏编码 / include 越界）的 `/memory` 输出 | 否 |
+| `stress.py` | 指定模块连跑 N 轮，记录失败轮次与最后 1500 字符 stderr | 否 |
+| `load.py` | 起 N 个纯 CPU 忙循环进程压满机器（本轮用 48 个 / 16 核） | 否 |
+
+⚠ **全部不需要凭据，可以直接重跑核对。**
+⚠ `load.py` 会**真的**把机器压满，跑之前先存盘。它按秒数自己退出，不需要手动清理。
+
+**核对 R4-1 最快的一条**（不需要脚本，在仓库根跑）：
+
+```bash
+python -c "import pathlib,tempfile,sys; sys.path.insert(0,'.'); \
+from rhinecode.memory.instructions import load_instructions; \
+d=pathlib.Path(tempfile.mkdtemp()); u=d/'u'; p=d/'p'; u.mkdir(); p.mkdir(); \
+(p/'RHINE.md').write_bytes('# 项目指令'.encode('gbk')); load_instructions(u,p)"
+```
+
+它会抛 `UnicodeDecodeError`——而**产品里接住它的那个 `except Exception`
+不会留下任何痕迹**，这就是 R4-1 的全部。
