@@ -381,11 +381,23 @@ Textual 的「slow callback」告警会在满量跑时刷几百行，直接 prin
 **那是产品启动路径上的真问题，测试只是先把它照出来了。**
 两次的共同点不是「别动」，是**先搞清楚慢在哪一层再决定动不动**。
 下面这些**明确不要动**（都验过，各有理由）：`test_subprocess_timeout` 的
-`CHILD_SLEEP=6 / THRESHOLD=4.0`（那是判别余量，缩小换速度会引入 flaky，
-而它对应一个真实产品缺陷）、e2e 每条用例起新宿主（`setUp` 而非 `setUpClass`
+`CHILD_SLEEP=6`（它给孙子进程一个「本该还活着」的窗口，标记文件的判定完全靠它，
+而那对应一个真实产品缺陷）、e2e 每条用例起新宿主（`setUp` 而非 `setUpClass`
 是刻意的，共享宿主等于破坏隔离）、TUI 的 `run_test`（每条要干净的 app 实例）、
 驱动器的轮询间隔（已是 30ms 起步、指数退避到 100ms）、`worktree` 每条
 `make_repo()`（每条用例都要改仓库状态）。
+
+⚠️ **`THRESHOLD=4.0` 已从上面这份「不要动」清单里摘掉（2026-08-30）**，
+原文是「`CHILD_SLEEP=6 / THRESHOLD=4.0`（那是判别余量…）」。摘掉的理由不是
+它变得可以随便改，而是**那条理由只在 Windows 上成立**：它当时同时充当
+「立刻返回」与「反证朴素写法必须慢」两半的判据，而后一半在 POSIX 上量不到
+任何东西——装 CI 之后三个 Linux 格子全红在它上面（产品行为在两个平台上都是
+对的，`run_shell_captured` 都是 1 秒返回、进程树都真的死了）。
+现在反证改看「**朴素写法有没有把命令留在后台继续跑**」（标记文件），
+`THRESHOLD` 只留下「立刻返回」那一半。**这是一处成对维护点**：
+改那条判据要同步改这里，两处都不能单改。详见
+[`docs/internals/testing.md`](docs/internals/testing.md) 的对应小节与
+`tests/test_subprocess_timeout.py` 的模块 docstring 末节。
 
 默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
 慢速专项（需 `RHINE_E2E_SLOW=1`）。**本机需装 git**——有预置依赖真实提交历史，

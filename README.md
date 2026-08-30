@@ -1,5 +1,9 @@
 # RhineCode
 
+[![CI](https://github.com/504223641/RhineCode-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/504223641/RhineCode-Agent/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/504223641/RhineCode-Agent/blob/main/pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](https://github.com/504223641/RhineCode-Agent/blob/main/LICENSE)
+
 RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互体验参考 Claude Code。
 
 当前主线到 **C15**，以 DeepSeek Provider 为主。能力是逐章叠加的，下面每一层都仍在生效：

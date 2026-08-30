@@ -473,6 +473,58 @@ class ActivityRowsTest(unittest.TestCase):
         self.tm.create(KIND_ROLE, "explorer", "t")
         self.assertNotIsInstance(self.tm.activity_rows()[0], type(self.tm.snapshot()[0]))
 
+    def test_previous_generation_rows_are_not_painted(self) -> None:
+        """
+        会话切换之后，上一段对话的行不得再出现（tui-display 扩展 F8）。
+
+        ⚠ **这条钉的是「清空之后活动区不会自己冒回来」，而不是「清空的那一刻
+        它空了」** —— 后者由 `clear_conversation` 里那句同步的 `update_rows(())`
+        负责，而界面每 0.5 秒会拿本方法的返回值**重画一遍**：本方法不认代号的话，
+        下一次轮询就把上一段对话的行原样刷回去。
+
+        ⚠ 复现时**刻意不让被取消的任务转终态**：`cancel_all` 是异步的，
+        被取消的子 Agent 要过一会儿才走到终态，而那段窗口正是残影出现的地方。
+        写成「取消后标成终态再断言」的话，它会因为 linger 那条规则而通过，
+        **测不到本条要测的东西**。
+
+        这是 2026-08-30 装 CI 之后查出来的真缺陷：`tests/test_e2e_activity.py`
+        那条端到端用例在一台负载重的 runner 上红了——它在同一个 pause 里断言，
+        平时轮询来不及插进来，机器一慢就插进来了。**症状看起来像 flaky，
+        根因是产品真的会把残影刷回去。**
+        """
+        r = self.tm.create(KIND_ROLE, "explorer", "上一段对话的调研")
+        self.assertEqual(len(self.tm.activity_rows()), 1, "前提：它本来画得出来")
+
+        # `/clear` 走的就是这两步（`cancel_all_for_session_switch`）
+        self.tm.cancel_all()
+        self.tm.begin_session()
+
+        self.assertEqual(
+            self.tm.activity_rows(), (),
+            "上一代的行仍在画——下一轮轮询会把它刷回刚清空的界面上",
+        )
+        self.assertIn(
+            r.task_id, {rec.task_id for rec in self.tm.snapshot()},
+            "记录本身必须留着：`/agents` 与 trace 还要用它，"
+            "别把本条的修法做成「切换时把记录删掉」",
+        )
+
+    def test_new_generation_rows_still_show(self) -> None:
+        """
+        **反证**：代号过滤不能把新一代的行也滤掉。
+
+        少了这一条，一个「切换之后永远返回空元组」的实现会让上面那条全绿，
+        而那是症状正好相反的另一个真实退化（清空之后再委派，活动区再也不亮）。
+        """
+        self.tm.create(KIND_ROLE, "explorer", "上一段")
+        self.tm.cancel_all()
+        self.tm.begin_session()
+
+        self.tm.create(KIND_ROLE, "planner", "新一段")
+        rows = self.tm.activity_rows()
+        self.assertEqual(len(rows), 1, "新一代的行必须照常画")
+        self.assertEqual(rows[0].display_name, "planner")
+
 
 class LockInvariantTest(unittest.TestCase):
     """结构护栏：本类刻意不持有回调，从结构上杜绝「持锁时调回调」。"""

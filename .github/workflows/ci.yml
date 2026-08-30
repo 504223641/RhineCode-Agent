@@ -1,0 +1,137 @@
+# RhineCode 持续集成（审查项 C1）。
+#
+# 背景：这个仓库到装 CI 为止有 620 多次提交、54 个 PR，**没有一次被机器验证过**——
+# 全部测试只在作者那台 Windows 11 / Python 3.11 的开发机上跑过。于是有三件事
+# 一直是盲区：① Linux / macOS 上到底跑不跑得起来；② PR 合并没有任何门禁；
+# ③ 别人提 PR 时没法自动验。本文件解决前两件。
+#
+# 两个 job 各自回答一个不同的问题，**刻意不合并**：
+#
+#   test    —— 源码树上的 3323 条测试在 6 个「操作系统 × Python 版本」组合下过不过
+#   install —— `pip install .` 装出来的**包**能不能用（它与源码树不是一回事：
+#              哪些文件会被复制进包由 pyproject.toml 决定，源码树上有不代表包里有）
+#
+# ⚠ 开发期一直用 `pip install -e .`，那条路径**根本不打包**，只是在 site-packages
+#   里放一个指回源码目录的链接。install 这个 job 是唯一走真实用户路径的地方。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 手动触发。留着它是为了「怀疑某个依赖升级把我搞坏了」时能立刻跑一遍，
+  # 不必先造一个假提交。
+  workflow_dispatch:
+
+# 同一分支上连续 push 时，取消还在跑的上一轮。
+# 6 个矩阵格子 × 每格几分钟，不取消会让队列越排越长。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ⚠ 这一行在 Windows runner 上是**必需的，不是保险**。
+  #
+  # 本项目从测试脚本的进度输出到 argparse 的 --help 文本全是中文。CI 里进程的
+  # stdout 是管道不是控制台，Python 此时按 locale 编码写出——Windows runner 的
+  # locale 是 cp1252，第一句中文就 UnicodeEncodeError，而报出来的栈跟测试内容
+  # 毫无关系，会被当成产品缺陷追很久。
+  #
+  # `tests/run_parallel.py` 给**子进程**设了 PYTHONIOENCODING=utf-8，但它管不到
+  # 自己这个父进程，也管不到 `rhine --help`。所以在 workflow 级别统一设一次。
+  PYTHONUTF8: "1"
+
+jobs:
+  test:
+    name: 测试 (${{ matrix.os }} / Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # ⚠ 刻意关掉 fail-fast。默认值会在第一个格子红掉时取消其余五个，
+      #   而这轮 CI 的**全部价值**就在于「Linux 从来没验过」——
+      #   一个格子红了就看不到另外五个的结果，等于每轮只拿到一条信息。
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        # requires-python 声明的是 >=3.11，而实际只验过 3.11（Win）与 3.12（Linux）。
+        # 3.13 一次都没跑过——把它放进矩阵正是为了让「声明」与「验过」对上。
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # ⚠ 这一步不是仪式，是**前置条件的显式化**。
+      #
+      # 测试套件里有一批用例要造真实的 Git 仓库、真实的提交历史再验行为
+      # （c14 工作区隔离整章、e2e 的若干预置场景）。缺 git 时它们是**硬失败**
+      # 而不是跳过——这是刻意的，静默跳过会让那些场景假绿。
+      #
+      # GitHub 托管 runner 目前两个平台都预装了 git，所以这一步正常情况下
+      # 一定通过。留着它是为了「哪天不预装了」的那一天：那时失败信息是这一行
+      # 明确的「找不到 git」，而不是散落在十几条用例里的各种 git 报错。
+      - name: 确认 runner 上有 git
+        run: git --version
+
+      # 装成 editable。**不能省**：e2e 那批用例会起真实子进程，而子进程的
+      # 工作目录是临时工作区而非仓库根，此时 `import rhinecode` 只能靠装过的包
+      # 找到——不装会得到一片 `No module named rhinecode`，那是环境噪音不是缺陷。
+      - name: 安装项目与依赖
+        run: python -m pip install -e .
+
+      # 记下真实解析出来的版本。依赖上界改动之后，这一段是回答
+      # 「那次 CI 到底装的是哪一版」的唯一凭据。
+      - name: 记录实际装到的依赖版本
+        run: python -m pip list
+
+      # 语法编译。它很便宜，且能在跑 3 分钟测试之前就挡掉语法错误。
+      # ⚠ 但它对**依赖版本**没有任何鉴别力——只做语法编译、不 import 任何第三方包，
+      #   R5 实测 20 个 textual 版本它全过。别把它当成依赖约束的护栏。
+      - name: 语法编译
+        run: python -m compileall -q rhinecode tests
+
+      # 分片并行跑全量。它自己会先做一次「只收集不执行」的 discover 取期望条数，
+      # 跑完比对各分片实际条数，对不上就以退出码 2 报错——所以「某个模块被漏掉」
+      # 这种最危险的失败形态在 CI 上同样兜得住。
+      #
+      # ⚠ 分片隔离靠的是「每个分片一个独立临时目录」（e2e 名片池按临时目录隔离，
+      #   两个分片共用一个会串台）。实现方式是 run_parallel 自己 mkdtemp 之后
+      #   给子进程设 TEMP / TMP / TMPDIR——**它不依赖 runner 预先设好什么**，
+      #   只要系统临时目录可写就成立，因此在 CI 上与本机是同一套机制。
+      #   这里刻意不设 -j：缺省 min(8, CPU 核数)，托管 runner 是 4 核，
+      #   写死 8 只会让 4 核机器上多起 4 个抢 CPU 的进程。
+      - name: 全量测试（分片并行）
+        run: python -m tests.run_parallel
+
+  install:
+    name: 干净安装 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 打包行为与 Python 版本基本无关（它取决于 setuptools 与 pyproject.toml），
+          # 所以这个 job 只跑一个版本，不铺满矩阵——同样的信息花 1/3 的机器时间。
+          python-version: "3.12"
+
+      # 走真实用户路径：`pip install .`（不带 -e）。
+      # 与上面那个 job 的区别是**它真的会把文件复制进包**，而「哪些文件会被复制」
+      # 由 pyproject.toml 决定，源码树上有不代表包里有。
+      - name: 干净安装
+        run: python -m pip install .
+
+      # ⚠ 必须 cd 出仓库根再验，否则 `import rhinecode` 会命中当前目录下的源码树，
+      #   验的就还是源码树而不是装出来的那个包——这个坑 R5 踩过。
+      - name: 装出来的命令能起来（在仓库根之外验）
+        run: python -c "import subprocess,sys,tempfile; sys.exit(subprocess.run(['rhine','--help'],cwd=tempfile.gettempdir()).returncode)"

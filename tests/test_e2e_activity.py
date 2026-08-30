@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
 import unittest
 from pathlib import Path
@@ -326,11 +327,12 @@ class ExpandToggleTest(ActivityFixture):
             # 它只有折叠 / 展开两态，「逐条」与「全文」对它表现一致——
             # 它展开后列的是最近的工具调用，那些本来就没有「更详细」的第二层可展。
             # ⚠ 这一条是 AC15 的护栏：给活动区造出第三态的话，这里当场红。
-            before = _activity_text(view)
+            before = _activity_text_without_clock(view)
             await pilot.press("ctrl+o")
             await pilot.pause()
             self.assertEqual(
-                _activity_text(view), before, "活动区在逐条档与全文档下必须一致"
+                _activity_text_without_clock(view), before,
+                "活动区在逐条档与全文档下必须一致",
             )
 
             # 第三下 → 回到折叠，循环闭合
@@ -415,6 +417,25 @@ def _activity_text(view: ActivityView) -> str:
         return ""
     content = children[0].content
     return content if isinstance(content, str) else str(content)
+
+
+def _activity_text_without_clock(view: ActivityView) -> str:
+    """把活动区文本里的**已耗时秒数**抹掉再返回。
+
+    ⚠ **只给「前后两次快照必须逐字相同」那种判据用**，别拿它写别的断言。
+
+    活动行里带一个一直在走的钟（`运行中 (3s · ↑0 tokens · 1 次调用)`）。
+    拿两个时刻的完整文本做全等比较时，只要中间跨过一个整秒边界，判据就红
+    ——而红的原因与它想守的东西毫无关系。
+
+    实测踩过：CI 上 `windows-latest / Python 3.11` 那个格子（分片跑了 174s，
+    平时约 60s）在 `0s` 与 `1s` 之间跨了一秒，AC15 那条当场红，
+    看起来像「活动区真的多出了第三态」。
+
+    抹掉的只有秒数那一个数字，**其余逐字保留**：token 数、调用次数、
+    展开出来的工具行、提示语全都还在比对范围内，所以真造出第三态时它照样红。
+    """
+    return re.sub(r"\((\d+)s ", "(<秒>s ", _activity_text(view))
 
 
 async def _wait_for(predicate, pilot, timeout: float) -> None:

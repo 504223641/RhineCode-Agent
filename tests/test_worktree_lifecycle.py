@@ -96,6 +96,83 @@ class CreateTest(RepoTestBase):
         self.assertTrue((handle.path / "local.yaml").is_file())
 
 
+class ConcurrentCreateTest(RepoTestBase):
+    """
+    并发创建必须串行走过「动版本库」那一段（2026-08-30，CI 上抓到的缺陷）。
+
+    ## 为什么护栏钉的是「性质」而不是「症状」
+
+    原症状是三个并发隔离委派里有一个失败：
+
+        fatal: could not open '.git/worktrees/<名字>/locked' for writing:
+        No such file or directory
+
+    成因是 `git worktree add` 开工时会隐式 prune 掉「看起来没建完」的工作区目录，
+    而另一个正建到一半的恰好就长那样——两个并发创建互相拆台。
+
+    ⚠ **但那个窗口只在机器够慢时才张开**：本机 8 路 × 6 轮复现不出来，
+    而 CI 上红掉的那个格子分片跑了 150.9s（平时约 60s）。
+    照着症状写判据的话，这条护栏在开发机上**永远绿**，等于没有。
+
+    所以它改为直接断言**修法装进去的那条性质**：任何时刻至多有一个创建
+    处在临界区内。这个判据与机器快慢无关，且「有人把锁去掉」时当场红。
+    """
+
+    def test_no_two_creations_are_inside_the_critical_section(self):
+        """
+        八路并发创建，全程不得出现「两个同时在临界区里」。
+
+        做法：把 `gitcmd.add_worktree` 换成一个会记账的替身——进临界区时把
+        在场人数加一并记下峰值，睡一小会儿放大重叠窗口，再减回去。
+        替身仍然调用真实实现，所以创建结果照常可断言。
+
+        副作用：真的建出八个隔离工作区（由 `cleanup` 统一收走）。
+        """
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        real_add = lifecycle.gitcmd.add_worktree
+        counter_lock = threading.Lock()
+        inside = 0
+        peak = 0
+
+        def counting_add(main_root, target, branch, base):
+            nonlocal inside, peak
+            with counter_lock:
+                inside += 1
+                peak = max(peak, inside)
+            try:
+                # 睡一下把重叠窗口放大——没有它的话，八个调用可能恰好首尾相接，
+                # 于是「峰值 1」既可能是锁的功劳，也可能只是运气好。
+                time.sleep(0.02)
+                return real_add(main_root, target, branch, base)
+            finally:
+                with counter_lock:
+                    inside -= 1
+
+        lifecycle.gitcmd.add_worktree = counting_add
+        self.addCleanup(setattr, lifecycle.gitcmd, "add_worktree", real_add)
+
+        def one(i):
+            handle, _ = lifecycle.create(
+                self.repo, name=f"w{i}", agent_name="a", task_id=str(i)
+            )
+            return handle
+
+        with ThreadPoolExecutor(8) as pool:
+            handles = list(pool.map(one, range(8)))
+
+        self.assertEqual(
+            peak, 1,
+            f"同时有 {peak} 个创建处在临界区内——串行闸门没生效，"
+            "并发的 `git worktree add` 会互相把对方半建好的目录 prune 掉",
+        )
+        # 反证的另一半：串行化不能把功能本身弄坏。
+        self.assertEqual(len({h.path for h in handles}), 8, "八个工作区必须各不相同")
+        self.assertEqual(len({h.branch for h in handles}), 8, "八个分支必须各不相同")
+
+
 class IllegalNameTest(RepoTestBase):
     """
     AC8：非法名字必须在**任何目录被创建之前**就被拒。

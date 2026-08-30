@@ -252,6 +252,13 @@ B4 / B5 两条 🔴 都是这个成因，由 [R2 安全复审](04-security.md) �
 
 ### C1 🔴 零 CI —— 623 次提交没有一次被机器验证过
 
+> ✅ **已做（2026-08-30，PR #58）**：`.github/workflows/ci.yml`，矩阵
+> `{windows-latest, ubuntu-latest} × {3.11, 3.12, 3.13}` 加两个干净安装 job，
+> 全绿、六格各跑满全量。**一装上就抓出五处问题**（两个产品缺陷 + 三处判据
+> 问题），且都只在慢机器上现形，本机再跑多少遍也撞不上——其中一次红发生在
+> **只改了文档**的那一轮。
+> 逐条归因见 [`NEXT.md`](NEXT.md) 的 F4。A2 同 PR 一并改掉。
+
 - **证据**：无 `.github/`、无任何 workflow、无 Makefile / tox.ini / noxfile.py
 - **后果**：三个具体问题——(a) 只在 Windows 上跑过，Linux/macOS 全未知；
   (b) 54 个 PR 合并时无门禁；(c) 别人提 PR 你没法自动验
