@@ -585,7 +585,7 @@ tests/test_subprocess_timeout.py 的 CHILD_SLEEP=6 / THRESHOLD=4.0
 > 且动 `agent/`、`permission/`、`tools/`、`conversation.py`、`bootstrap.py` 等目录前
 > **先加载 `paired-maintenance` Skill**。
 
-## F1 · 第一批：机械清理 ⬜
+## F1 · 第一批：机械清理 ✅
 
 **内容**：A1 LICENSE、C2 `rich` 声明、E3 ruff 自动修、E5 删残留空目录、E6 补 `.gitignore`。
 **前置**：R5 的 LICENSE 选型结论。
@@ -629,7 +629,7 @@ tests/test_subprocess_timeout.py 的 CHILD_SLEEP=6 / THRESHOLD=4.0
 
 ---
 
-## F2 · 第二批：两个产品缺陷 ⬜
+## F2 · 第二批：两个产品缺陷 ✅
 
 **内容**：B1「永久放行」静默降级、B2 安全提醒未接线。
 **前置**：R3 坐实（尤其 B1 的「运行期消息通道存不存在」这个问题）。
@@ -676,7 +676,7 @@ tests/test_subprocess_timeout.py 的 CHILD_SLEEP=6 / THRESHOLD=4.0
 
 ---
 
-## F3 · 第三批：两条护栏（性价比最高）⬜
+## F3 · 第三批：两条护栏（性价比最高）✅
 
 **内容**：C3 `Tool.execute` 签名契约、C4 `tools/__init__.py` 不变量。
 **前置**：无。

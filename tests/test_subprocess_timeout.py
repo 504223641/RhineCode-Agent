@@ -26,15 +26,42 @@ stdout/stderr 管道的写端**——管道要等最后一个写端关闭才会 
 `docs/internals/testing.md` 有一条「不要用挂钟时间做判据」，那条针对的是
 **拿耗时去判顺序**（「主对话先返回」之类）——机器一忙判据就翻。
 
-本文件不一样：**被测的性质本身就是「多久之内返回」**，除了钟没有别的东西
-可以问。为此判据全部留了 2 秒以上的余量，且钉的是「快慢差一个数量级」
+本文件不一样：**被测的性质之一本身就是「多久之内返回」**，除了钟没有别的
+东西可以问。为此判据留了 2 秒以上的余量，且钉的是「快慢差一个数量级」
 而不是某个精确值。
 
 ## ⚠ 为什么必须有反证
 
 改回 `subprocess.run` 之后，所有既有用例**照样全绿**——它们断言的是
-「返回了超时文案」，而那一条改坏了也成立。唯一会变的只有墙上的钟。
+「返回了超时文案」，而那一条改坏了也成立。
 因此本文件里那条跑朴素写法的用例不是冗余，它是这层防护**唯一**的报警器。
+
+## ⚠ 反证的判据不能只看钟（2026-08-30，CI 首次在 Linux 上跑出来的）
+
+反证原先写的是「朴素写法必须**慢**」（耗时 > THRESHOLD）。那句话
+**只在 Windows 上成立**，装了 CI 之后三个 Linux 格子全红在这一条上：
+
+| | 朴素写法耗时 | 孙子进程泄漏了吗 |
+| --- | --- | --- |
+| Windows | **6.05s**（被拖住） | 是 |
+| Linux | **1.00s**（没被拖住） | 是 |
+
+同一个缺陷在两个平台上的**症状不一样**：Windows 上是「又慢又漏」，
+Linux 上是「快但漏」。而原判据量的是耗时——**那只是 Windows 那一侧的症状**。
+
+于是判据换成两条性质的组合，这才是这层防护真正想守住的东西
+（不是「快」，是「**别把命令留在后台继续跑**」）：
+
+- **正面**：`run_shell_captured` 必须**同时**满足「立刻返回」与「没有泄漏」
+- **反证**：朴素写法**至少违反其中一条**
+
+这个形式是平台无关的，且比原来**更严**——它顺带把「修好的那一侧不许泄漏」
+也钉进了同一条对照里。⚠ 若哪天在某个平台上朴素写法两条都满足，这条会红，
+而那时**该做的正是重新核对本文件的整套论证**，不是把它调松。
+
+⚠ **`CHILD_SLEEP` 仍然不能缩小**：它要给孙子进程一个「本该还活着」的窗口，
+标记文件的判定完全靠它。`THRESHOLD` 现在只是「立刻返回」那一半的判据，
+不再独自承担反证。
 """
 
 import subprocess
@@ -52,8 +79,10 @@ from rhinecode.tools.run_command import RunCommandTool, run_shell_captured
 # 子命令要睡多久。取 6 秒是在两头之间折中：
 # 太短则「有没有真的停下来」与噪声分不开，太长则本文件自己变成慢用例。
 CHILD_SLEEP = 6
-# 判据阈值。朴素写法要 ~6s，修好之后是 ~1s + 杀进程树的开销，
-# 放在 4 秒上两边各有 2 秒余量。
+# 「立刻返回」那一半的判据阈值。修好之后是 ~1s + 杀进程树的开销，
+# 放在 4 秒上留了 2 秒以上余量。
+# ⚠ 它**不再是反证的判据**——朴素写法在 Linux 上同样 ~1s（见模块 docstring
+# 那张表），反证改看「泄漏没泄漏」。
 THRESHOLD = 4.0
 # 「进程真的死了没有」那条用例单独用一个更短的睡眠。
 # 它要**等过**这个时刻才能判，因此它直接决定那条用例的耗时；
@@ -97,29 +126,84 @@ def _elapsed(fn) -> float:
 class TimeoutIsARealBoundTest(ScriptMixin, unittest.TestCase):
     """超时后必须立刻返回，且**整棵进程树真的死了**。"""
 
+    def _leaky_probe(self, marker: Path) -> str:
+        """一条「先睡 CHILD_SLEEP 秒、再落一个标记文件」的命令串。
+
+        标记文件是「这条命令有没有被留在后台继续跑」的物证：超时返回之后
+        **等过它本该落盘的时刻**再看，文件在 = 泄漏了。
+
+        :param marker: 该次探测专用的标记文件路径
+        """
+        return self.script(
+            "import time\n"
+            f"time.sleep({CHILD_SLEEP})\n"
+            f"open(r'{marker}', 'w').write('still alive')\n"
+        )
+
     def test_helper_returns_promptly_while_the_naive_form_does_not(self) -> None:
         """
-        正反两跑：朴素 `subprocess.run` 要等满，`run_shell_captured` 不用。
+        正反两跑：`run_shell_captured` 两条性质都满足，朴素写法至少破一条。
 
-        两种写法在**同一条命令**上跑，因此判据不依赖机器有多快——它钉的是
-        两者之差。哪天有人把 `run_shell_captured` 改回 `subprocess.run`，
-        这条会红，而别的用例一条都不会。
+        两种写法跑**同一条命令**，因此判据不依赖机器有多快——它钉的是两者之差。
+        哪天有人把 `run_shell_captured` 改回 `subprocess.run`，这条会红，
+        而别的用例一条都不会（既有用例断言的是「返回了超时文案」，那句话改坏了
+        照样成立）。
+
+        ⚠ **两条性质缺一不可，而且不能只留耗时那条**——那正是 2026-08-30
+        装 CI 之后三个 Linux 格子红掉的原因：同一个缺陷在 Windows 上表现为
+        「又慢又漏」，在 Linux 上表现为「快但漏」，只看钟的话反证在 POSIX 上
+        量不到任何东西。详见模块 docstring 末节那张表。
+
+        执行步骤：
+
+        1. 两种写法**各用各的标记文件**跑一次（共用一个会互相污染——R5 的第一版
+           探针就是这么得出「Linux 上没杀干净」这个错误结论的）
+        2. 等过两者本该落盘的时刻（取两次启动里更晚的那个算）
+        3. 正面：修好的那一侧要**同时**满足「立刻返回」与「没泄漏」
+        4. 反证：朴素写法**至少违反其中一条**
+
+        副作用：起两个 shell 子进程，本条用例耗时约 8 秒（Windows 上约 14 秒，
+        朴素写法在那里真的会被拖满 CHILD_SLEEP 秒）。
         """
-        cmd = self.script(f"import time; time.sleep({CHILD_SLEEP})")
+        naive_marker = self.tmp_path("naive_survived.txt")
+        fixed_marker = self.tmp_path("fixed_survived.txt")
 
+        naive_started = time.monotonic()
         naive = _elapsed(lambda: subprocess.run(
-            cmd, shell=True, capture_output=True, timeout=1))
-        fixed = _elapsed(lambda: run_shell_captured(
-            cmd, cwd=str(main_project_root()), timeout=1))
+            self._leaky_probe(naive_marker),
+            shell=True, capture_output=True, timeout=1))
 
-        self.assertGreater(
-            naive, THRESHOLD,
-            f"朴素写法本应被孙子进程拖住却只用了 {naive:.1f}s——"
-            "若平台行为已变，本文件的整套论证需要重新核对",
-        )
+        fixed_started = time.monotonic()
+        fixed = _elapsed(lambda: run_shell_captured(
+            self._leaky_probe(fixed_marker),
+            cwd=str(main_project_root()), timeout=1))
+
+        # 等过**较晚**那一次本该落盘的时刻再判，否则「还没写」与「不会写」分不开。
+        # 从各自**启动**那一刻算起，不是从调用返回算起——后者会把超时那 1 秒重复计一遍。
+        deadline = max(naive_started, fixed_started) + CHILD_SLEEP + 1.5
+        time.sleep(max(0.0, deadline - time.monotonic()))
+        naive_leaked = naive_marker.exists()
+        fixed_leaked = fixed_marker.exists()
+
+        # ── 正面：修好的那一侧两条都要满足 ──────────────────────────────
         self.assertLess(
             fixed, THRESHOLD,
             f"超时后仍等了 {fixed:.1f}s：进程树没杀干净，`timeout` 又变回一句文案",
+        )
+        self.assertFalse(
+            fixed_leaked,
+            "超时返回后子进程仍活着并写了文件——进程树没杀干净",
+        )
+
+        # ── 反证：朴素写法至少违反一条 ────────────────────────────────
+        # ⚠ 这里刻意写成析取而不是分别断言：两个平台上被违反的**不是同一条**
+        #   （Windows 又慢又漏 / Linux 快但漏），钉死任何单独一条都会在另一个
+        #   平台上红，而那时红的是判据不是产品。
+        self.assertTrue(
+            naive > THRESHOLD or naive_leaked,
+            f"朴素写法这次既没被拖住（{naive:.1f}s）也没泄漏进程——"
+            "两条性质上它都与修好的写法无异，"
+            "若平台行为已变，本文件的整套论证需要重新核对",
         )
 
     def test_the_child_is_really_dead_afterwards(self) -> None:
