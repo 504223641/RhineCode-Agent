@@ -934,9 +934,9 @@ tests/test_subprocess_timeout.py 的 CHILD_SLEEP=6 / THRESHOLD=4.0
 
 ---
 
-## F5 · 第五批：README 重写 + 截图 ⬜
+## F5 · 第五批：README 重写 ⬜
 
-**内容**：A3 README 重写、A4 截图。
+**内容**：A3 README 重写。（A4 截图**已决定不做** —— 2026-08-30 用户拍板，README 走纯文字版，详见 [`README.md`](README.md) 的 A4。）
 **前置**：建议在 F4 之后（这样能带上 CI 徽章）。
 **预计**：一天。分支名建议 `readme-rewrite`。
 
@@ -966,16 +966,11 @@ tests/test_subprocess_timeout.py 的 CHILD_SLEEP=6 / THRESHOLD=4.0
 
 新 README 的结构建议（面向陌生人 + 作品集）：
 1. 一句话讲清这是什么
-2. 一张界面图（见下面第 2 件事）
-3. 30 秒装上跑起来
-4. 核心特性 5–8 条，每条两行以内，链到深度文档
-5. 安全须知（这是个会执行任意命令、联网、读写文件的工具，陌生用户要知道风险）
-6. 架构一图流（用 docs/review/05-maintainability.md 里的 mermaid 图）
-7. 文档索引 → 现有的 1250 行内容降级到 docs/ 下
-
-第二件事：出 3 张界面图放 docs/assets/：
-① 完整对话 + 工具调用 ② 权限确认面板 ③ 子 Agent 并行活动区。
-⚠ 画面里不许出现任何真实路径或密钥。
+2. 30 秒装上跑起来
+3. 核心特性 5–8 条，每条两行以内，链到深度文档
+4. 安全须知（这是个会执行任意命令、联网、读写文件的工具，陌生用户要知道风险）
+5. 架构一图流（用 docs/review/05-maintainability.md 里的 mermaid 图）
+6. 文档索引 → 现有的 1250 行内容降级到 docs/ 下
 
 约束：
 - 旧 README 的内容不要丢，降级到 docs/ 下相应位置。

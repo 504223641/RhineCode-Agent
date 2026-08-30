@@ -9,8 +9,6 @@
 跑命令，边做边把每一步显示给你看——危险的动作会先停下来问你。
 用 Python + [Textual](https://textual.textualize.io/) 写成，交互体验参考 Claude Code。
 
-<img src="docs/assets/01-chat-and-tools.svg" alt="RhineCode 在终端里的一次完整往返：思考、正文、工具调用、结论" width="100%">
-
 ---
 
 ## 30 秒跑起来
@@ -146,8 +144,6 @@ api_key: sk-你的密钥
 | 访问网络（抓网页、搜索） | 结构性硬校验（禁 `file://`、禁内网地址）+ 域名白名单；**未建白名单时每次都弹确认** |
 | 改自己以后的行为（权限规则、Hook） | ②″保护路径：写 `.rhinecode/` 下的配置与 `.git/` **一律要你过目**，没有开关能关掉 |
 
-<img src="docs/assets/02-permission-panel.svg" alt="人在回路的确认面板：模型想写 .rhinecode/hooks.yaml，被保护路径层拦下等待用户决定" width="100%">
-
 **几条具体的**：
 
 1. **缺省是「放手干活」档**（`auto` 预设）。工作区内的文件写入与命令执行**不弹面板**。
@@ -242,8 +238,6 @@ docstring 把它逐条写明，并要求那个文件**保持为空**。
 逐层职责与每层的「⚠ 违反即出事」不变量见 [架构详解](docs/internals/architecture.md)，
 每个包每个模块的一句话职责见 [项目结构](docs/guide/project-structure.md)。
 
-<img src="docs/assets/03-subagents-parallel.svg" alt="两个子 Agent 并行工作时的活动区，主对话在等它们的结论" width="100%">
-
 ---
 
 ## 文档
@@ -275,9 +269,9 @@ python -m tests.run_parallel            # 同一批用例分 8 片并行跑，�
 （需 `RHINE_E2E_SLOW=1`）。**本机需装 git**。
 
 本仓库自带两套跨阶段测试设施：**行为记录器**（`--trace`，把运行过程写成结构化 JSONL）
-与**端到端驱动设施**（`tests/e2e/`，起常驻宿主让 AI 经本机回环通道自己驱动界面跑完整交互）。
-README 里那三张截图就是用后者的剧本模型跑出来的真实界面——
-生成脚本在 [`scripts/capture_screenshots.py`](scripts/capture_screenshots.py)。
+与**端到端驱动设施**（`tests/e2e/`，起常驻宿主让 AI 经本机回环通道自己驱动界面跑完整交互，
+面板应答、按键投递、界面文本导出都走真人入口）。它们用于验收既有能力，
+以及排查那类「界面上看不出、但行为确实不对」的问题。
 
 ## 许可证
 
