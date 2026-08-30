@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import threading
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -41,6 +42,35 @@ from rhinecode.worktree.models import (
 from rhinecode.trace import TraceEventType
 from rhinecode.worktree.naming import generate_name, validate_name
 from rhinecode.worktree.provision import provision
+
+# ---------------------------------------------------------------------------
+# 创建期的串行闸门（2026-08-30，CI 上抓到的并发缺陷）
+# ---------------------------------------------------------------------------
+# **`git worktree add` 在同一个版本库上不是并发安全的。** 它开工时会先做一次
+# 隐式的 prune，把「看起来没建完」的 `.git/worktrees/<名字>/` 清掉——而另一个
+# 正建到一半的 worktree 恰好就长那个样子。于是两个并发的创建会互相拆台，
+# 输的那个报：
+#
+#     fatal: could not open '.git/worktrees/<名字>/locked' for writing:
+#     No such file or directory
+#
+# 而 C14 明确支持**并发隔离委派**（`test_three_isolated_delegations_get_distinct_worktrees`
+# 就是照着这个场景写的），所以这不是理论风险：CI 的 windows/3.12 那一格真的红过一次。
+#
+# ⚠ **这个窗口只在机器够慢时才张开**：本机 8 路 × 6 轮复现不出来，
+# 而红掉的那个 CI 格子分片跑了 150.9s（平时约 60s）。
+#
+# 除了 `add` 本身，`_pick_branch` 那段「先查在不在、再拿来用」同样是 check-then-act，
+# 并发下两个线程可能同时认定某个分支名可用。两者一并收进同一把锁。
+#
+# ⚠ **这把锁持有期间会跑 git 子进程，看起来违反本项目「临界区只做纯内存读写」
+# 那条纪律——但那条纪律针对的是 `SkillManager` / `HookManager` / `TaskManager`
+# 那类被界面线程碰的 manager 锁**，它们的危险在于「持锁时做跨线程调度」会与
+# Textual 的阻塞式 `call_from_thread` 组成确定性死锁。这把锁不同：它是模块级的、
+# 只被子 Agent 工作线程走到、**不持有任何回调、不碰界面、不做任何跨线程调度**，
+# 因此不可能参与那类死锁。代价只有一个：并发隔离委派的**创建那一步**排队进行
+# （每次几百毫秒），委派跑起来之后各走各的，一点不受影响。
+_CREATE_LOCK = threading.Lock()
 
 
 def _emit(recorder, event, **fields) -> None:
@@ -245,6 +275,10 @@ def create(
     6. `git worktree add`。
     7. 按清单初始化环境（失败只记警告，不影响创建成败）。
 
+    ⚠ **第 4~6 步在一把进程内的锁里串行执行**（`_CREATE_LOCK`）：它们动的是
+    同一个版本库，而 `git worktree add` 在同一个版本库上并发调用会互相把对方
+    半建好的目录 prune 掉。理由与实测见那个常量上方的说明。第 7 步不在锁内。
+
     副作用：在磁盘上产生一整份源码 checkout，在版本库中登记工作目录并创建分支；
     按清单复制或软链文件。
     """
@@ -289,19 +323,24 @@ def create(
             ProvisionResult(),
         )
 
-    # ④ 环境确认。
-    gitcmd.ensure_repository(main_root)
-    base = gitcmd.head_commit(main_root)
+    # ④⑤⑥ 一并收进串行闸门——它们全都在动**同一个版本库**，并发下会互相拆台。
+    # 理由见 `_CREATE_LOCK` 上方那段。⚠ 锁的范围到 `add_worktree` 为止：
+    # 第 ⑦ 步的环境初始化只碰新工作区自己的目录，不必排队。
+    with _CREATE_LOCK:
+        # ④ 环境确认。
+        gitcmd.ensure_repository(main_root)
+        base = gitcmd.head_commit(main_root)
 
-    # ⑤ 分支。
-    branch = _pick_branch(main_root, final_name)
+        # ⑤ 分支。⚠ 「查它在不在 → 拿来用」是 check-then-act，
+        # 必须与下面的 add 在同一个临界区里，否则两个线程会挑中同一个名字。
+        branch = _pick_branch(main_root, final_name)
 
-    # ⑥ 建目录。父目录要先建出来（嵌套名字如 a/b 需要）。
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        gitcmd.add_worktree(main_root, target, branch, base)
-    except GitCommandFailed as exc:
-        raise WorktreeError(f"创建隔离工作区失败：{exc}") from exc
+        # ⑥ 建目录。父目录要先建出来（嵌套名字如 a/b 需要）。
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            gitcmd.add_worktree(main_root, target, branch, base)
+        except GitCommandFailed as exc:
+            raise WorktreeError(f"创建隔离工作区失败：{exc}") from exc
 
     handle = WorktreeHandle(
         name=final_name,
