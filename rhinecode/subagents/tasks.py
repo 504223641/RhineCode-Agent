@@ -472,12 +472,28 @@ class TaskManager:
         :returns: 不可变快照元组，按创建顺序。**没有可显示的行时返回空元组**
             ——界面据此把整块隐藏且不占布局空间（F1）
 
-        收哪些行：
-        - 全部**运行中**的任务；
+        收哪些行（三个条件，**代号那条不能少**）：
+        - 只收**当前会话代**的任务；
+        - 其中全部**运行中**的；
         - 加上**刚结束不久**的（`settled_seconds < ACTIVITY_LINGER_SECONDS`）。
           终态行要带着最终成本停留片刻，立刻消失的话用户什么都来不及看；
           但也不能永久留着，否则活动区会慢慢变成第二个历史区——
           永久痕迹由历史区那条记录承担（F6）。
+
+        ⚠ **代号那条是 2026-08-30 补的，此前漏了，而漏掉的后果正是 F8 想挡的
+        那件事。** `/clear` 会同步把活动区清空一次（`clear_conversation` 里那句
+        `update_rows(())`），但界面每 0.5 秒就拿本方法的返回值**重画一遍**——
+        本方法不认代号的话，下一次轮询就把上一段对话的行原样刷回去了。
+        而 `begin_session` **刻意不删记录**（`/agents` 与 trace 还要用它们），
+        `cancel_all` 又是**异步**的（被取消的子 Agent 要过一会儿才转终态），
+        于是那些行在清空之后还会满足「运行中」这个条件好一阵子。
+
+        净效果：用户在一个刚清空的界面上，眼看着上一段对话的活动区**又冒回来**，
+        并停留到那些任务转终态再淡出为止（半秒到几秒）。
+
+        ⚠ **这与 `take_deliverables` 是同一条不变量的两半，两处都必须认代号**
+        （那边是「上一代的结论不得流进新对话」，这边是「上一代的行不得画进新界面」）。
+        改动其一时另一处必须一起看。理由与时序细节见 `begin_session`。
 
         名字口径与 `/agents` 的任务行**刻意保持一致**（`队员名(角色名)`，
         没有队员名时只显示角色名）：用户在两处看到的必须是同一个称呼，
@@ -492,6 +508,9 @@ class TaskManager:
         with self._lock:
             rows = []
             for record in self._tasks.values():
+                # 上一段对话的行一律不画——它们描述的是一段已经不存在的对话。
+                if record.epoch != self._epoch:
+                    continue
                 if record.status.is_terminal and (
                     record.finished_at is None
                     or now - record.finished_at >= ACTIVITY_LINGER_SECONDS
