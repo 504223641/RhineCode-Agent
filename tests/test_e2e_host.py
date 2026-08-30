@@ -305,8 +305,22 @@ class HostFixture(unittest.TestCase):
         实测后果——`quit_host` 返回后 `tearDown` 立刻强杀，把正在删工作区的宿主
         拦腰打断，留下一个只剩 `.git/objects` 的残骸。
         所以这里还要等宿主把自己的名片撤掉（那是它清理流程的**最后一步**）。
+
+        ⚠ **`quit` 这一条是尽力而为的，连接被重置不算失败。** 装配期致命错误
+        那个场景（`expect_exit=1`）里宿主**本来就会自己退**，于是「看到 fatal」
+        与「发 quit」之间存在一个窗口：宿主先走一步，socket 就是
+        `ConnectionResetError: [WinError 10054]`。CI 上真撞到过（那个格子的
+        分片跑了 188.9s，平时约 60s，窗口被拉大）。
+
+        吞掉它**不会把真失败变绿**：真正的判据是下面那两句——退出码必须等于
+        `expect_exit`，名片必须消失。正常场景下 quit 若没送到，宿主根本不会退，
+        `proc.wait(timeout)` 会抛 `TimeoutExpired`，用例照样红。
         """
-        self.cmd({"cmd": "quit"})
+        try:
+            self.cmd({"cmd": "quit"})
+        except (ConnectionError, OSError):
+            # 宿主已经自己退了——那正是本方法想要的终态，交给下面的退出码判据裁决。
+            pass
         assert self.proc is not None
         self.proc.wait(timeout=timeout)
         self.assertEqual(self.proc.returncode, expect_exit, self.host_stderr())
