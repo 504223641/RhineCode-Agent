@@ -842,7 +842,9 @@ class RhineApp(App):
             loop = asyncio.get_running_loop()
             self._sigint_previous = signal.signal(signal.SIGINT, self._on_sigint)
             self._sigint_loop = loop
-        except (ValueError, OSError, RuntimeError):  # noqa: BLE001 —— 见上：装不上就退回原行为
+        # 见上：装不上就退回原行为。⚠ 这里捕的是三个**具体**异常、不是 blind
+        # except，BLE001 压根不适用，故无需任何豁免标注。
+        except (ValueError, OSError, RuntimeError):
             self._sigint_previous = None
             self._sigint_loop = None
 
@@ -938,7 +940,9 @@ class RhineApp(App):
         if self._sigint_previous is not None:
             try:
                 signal.signal(signal.SIGINT, self._sigint_previous)
-            except (ValueError, OSError, RuntimeError):  # noqa: BLE001 —— 还原失败不该阻断退出
+            # 还原失败不该阻断退出。⚠ 捕的是三个**具体**异常、不是 blind except，
+            # BLE001 不适用，故无需任何豁免标注。
+            except (ValueError, OSError, RuntimeError):
                 pass
             self._sigint_previous = None
         self._sigint_loop = None

@@ -354,7 +354,10 @@ def append_local_allow(rule_string: str) -> None:
     if path.exists():
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001 —— 坏文件不覆盖，交由上层会话级规则兜底
+        # ⚠ 同 `mcp/auto_config.py`：下一行 `raise ... from exc` 是**重新抛出**，
+        # 不是吞掉，所以**不需要**标 BLE001。语义不变——
+        # 坏文件不覆盖，交由上层会话级规则兜底。
+        except Exception as exc:
             raise ValueError(f"本地权限配置解析失败，未写入：{path}：{exc}") from exc
         if loaded is None:
             data = {}

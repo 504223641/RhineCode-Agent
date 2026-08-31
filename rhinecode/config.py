@@ -401,8 +401,22 @@ def load(path: str) -> Config:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"{path} 配置文件不存在")
+    except FileNotFoundError as e:
+        # E2：补上 `from e`，与紧邻的下一分支（YAMLError 那支）同风格。
+        #
+        # ⚠ **它的收益比原报告说的小，值得说清楚免得下次高估。** `00-baseline.md`
+        # 写「后果是原始异常的 traceback 丢失」——**不成立**：Python 的隐式异常链
+        # 仍然生效，`__context__` 指向原始异常，traceback 照样打印。R3 实测：
+        #
+        #     E2 复现 -> FileNotFoundError.__cause__ = None  __context__ = FileNotFoundError
+        #
+        # 真实差别只有语气：显式 `from e` 打印「The above exception was the direct
+        # cause of…」（**因果**），隐式的打印「During handling of the above
+        # exception, another exception occurred」（**巧合**）。信息一个字都没少。
+        #
+        # 仍然值得改，理由是**同一个 try 的两个分支风格不一致**——那是笔误的典型
+        # 痕迹，而不一致本身会让读的人怀疑「是不是这里故意不写」。
+        raise FileNotFoundError(f"{path} 配置文件不存在") from e
     except yaml.YAMLError as e:
         raise ValueError(f"配置文件 YAML 解析失败 {e}") from e
 
