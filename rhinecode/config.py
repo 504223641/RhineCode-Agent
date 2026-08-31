@@ -230,6 +230,13 @@ class Config:
     # ⚠ 也刻意**不给主对话用**：主对话的一次请求可能生成几分钟
     # （模型在吐一份大文件的内容），给它设超时会把正常工作腰斩。
     request_timeout: "float | None" = None
+    # C7：**实际生效的**配置文件路径，由 `load()` 填入。
+    #
+    # ⚠ 它不是配置项，是「这份 Config 从哪来的」这条元信息。401 的错误文案必须
+    # 把它报出来——`--config` 与用户级 `~/.rhinecode/config.yaml` 是两条来源，
+    # 而「key 填错了」时用户最常见的下一步动作就是去改**另一个**文件。
+    # 缺省空串：测试与装配层直接构造 Config 时不必给，文案会省掉那半句。
+    source_path: str = ""
 
 
 def _parse_int(
@@ -427,6 +434,7 @@ def load(path: str) -> Config:
     search_timeout = _parse_float(search_raw.get("timeout", 10.0), 10.0)
 
     return Config(
+        source_path=str(path),
         protocol=data["protocol"],
         model=data["model"],
         base_url=data["base_url"],
