@@ -219,18 +219,37 @@ def main() -> int:
     else:
         shutil.rmtree(log_dir, ignore_errors=True)
 
-    print(f"\n用例 {ran_total}/{expected}   墙钟 {wall:.1f}s")
+    # ⚠ **判决必须出现在最后一行 stdout 上，与计数同一行。**
+    #
+    # 此前这里先无条件打一句「用例 N/N   墙钟 Xs」，判决再走 stderr。两股流在管道里
+    # 会重排，于是 `python -m tests.run_parallel | tail -3` 看到的最后一行是那句
+    # **长得像成功摘要**的「用例 3426/3426」——而它回答的是「**有没有漏跑**」，
+    # 不是「**有没有全过**」。
+    #
+    # 真实踩过（2026-08-31）：连续五次把一棵红树读成绿的，一路提了 5 个 PR，
+    # 直到 CI 六格全红才发现。根因不在这个脚本，但**这个脚本的输出让误读变得容易**。
+    # 现在判决与计数同一行、同一股流，`tail` 怎么截都躲不开。
+    #
+    # ⚠ 但**给脚本用的判据始终是退出码**（0 / 1 / 2 三态），不是这行文本。
+    #
+    # ⚠ **判决用文字不用符号**（`✓` / `✗`）。两个理由：① Windows 控制台缺省是
+    #   GBK，打不出这两个字符会**当场 UnicodeEncodeError 把脚本掀翻**（实测踩过，
+    #   而那比读错输出更糟）；② 本项目的符号白名单（tui-display F29）本来就规定
+    #   状态靠**文字前缀**辨认——那是它脱离颜色与字体也能读的唯一依靠。
+    summary = f"\n用例 {ran_total}/{expected}   墙钟 {wall:.1f}s"
 
     # ⚠ 完整性自检：并行最危险的失败形态是「某个模块被漏掉却没人发现」，
     #    所以这一条比「有没有失败用例」还先判。
     if ran_total != expected:
+        print(f"{summary}   —— 失败：用例数对不上")
         print(f"\n错误：用例数对不上（跑了 {ran_total}，期望 {expected}）——有模块被漏掉了",
               file=sys.stderr)
         return 2
     if failed:
+        print(f"{summary}   —— 失败：分片 {failed} 有失败用例")
         print(f"\n错误：分片 {failed} 有失败用例", file=sys.stderr)
         return 1
-    print("\n全部通过")
+    print(f"{summary}   —— 全部通过")
     return 0
 
 
