@@ -59,6 +59,11 @@ class StartupWiringTests(unittest.TestCase):
         """正常构建：同一命令注册表实例注入 RhineApp（spec F3 单一来源）。"""
         registry = CommandRegistry()
         fake_app = MagicMock()
+        # C6：入口在 cleanup 之后会读 `app.return_code` 决定进程退出码。
+        # MagicMock 的属性默认是**真值**，不给它一个真实的 0 会让 `main()` 以为
+        # 程序崩溃了并 `sys.exit(<MagicMock>)`。真 App 上这个字段是 int。
+        # ⚠ 同一处修改在 `tests/test_skill_startup.py` 也要做——两份都调 `entry.main()`。
+        fake_app.return_code = 0
         with (
             patch.object(entry, "load", return_value=_fake_config()),
             patch.object(bootstrap, "build_builtin_registry", return_value=registry) as build,
