@@ -25,7 +25,11 @@ from typing import Callable, Optional
 from rhinecode.provider.base import BaseProvider, Message
 from rhinecode.trace import SCOPE_MEMORY, NullRecorder, TraceRecorderProtocol
 from rhinecode.memory import lockfile
-from rhinecode.memory.instructions import LoadedInstructions, load_instructions
+from rhinecode.memory.instructions import (
+    LoadedInstructions,
+    fallback_instructions,
+    load_instructions,
+)
 from rhinecode.memory.session import SessionStore, SessionInfo
 from rhinecode.memory.memories import (
     CATEGORIES,
@@ -104,6 +108,10 @@ class MemoryManager:
         }
 
         # RHINE.md 加载结果：startup 时填充，之后整个会话期只读。
+        # ⚠ 这里的 `layers=[]` 与 startup 的兜底分支**不是同一件事**，别顺手统一：
+        # 它表示「startup 还没跑过、压根没加载过」，而那边表示「加载过、但失败了」
+        # ——后者必须带 layers 才能在 /memory 里说出真相（见 startup 的注释）。
+        # 协调层构造时会立刻调 startup，所以这个初值实际不会被 /memory 读到。
         self._instructions = LoadedInstructions(text="", layers=[])
         # 一次性动态提醒（时间跨度等）：consume_pending_notice 取走即清。
         self._pending_notice: str = ""
@@ -133,10 +141,53 @@ class MemoryManager:
         副作用：读文件系统；清理过期存档；恢复时改写 history、持有会话锁。
         全程 fail-safe：任何一步异常都退化为「没有这部分记忆」，不阻断启动（N2）。
         """
+        # 本方法可能攒出**两段**提示（指令加载 + 会话恢复），故先收集再拼接。
+        # 原写法是「哪一段有就 return 哪一段」，加第二个生产者时必然丢一段。
+        notices: list[str] = []
+
         try:
             self._instructions = load_instructions(self._user_dir, self._project_root)
-        except Exception:
-            self._instructions = LoadedInstructions(text="", layers=[])
+        except Exception as e:
+            # ⚠ **兜底对象必须带 layers**（B6 修复的第二处）。原写法是
+            # `LoadedInstructions(text="", layers=[])`——`text=""` 只让系统提示里
+            # 的「自定义指令」槽位消失（还算符合直觉），真正致命的是 `layers=[]`：
+            # `/memory` 报告靠遍历 layers 说话，空列表让那个循环一次都不执行，
+            # 于是「RHINE.md 项目指令：」后面一片空白，用户既看不到「加载成功」
+            # 也看不到「加载失败」。
+            self._instructions = fallback_instructions(
+                self._user_dir,
+                self._project_root,
+                f"加载指令时发生意外错误：{e}",
+            )
+            # 走启动提示这条既有通道（bootstrap → conversation.startup_notice →
+            # TUI 挂载时写进聊天区）。**刻意不新造一条通道**：这里是启动早期，
+            # `print` 会被 Textual 的 alternate screen 整个盖住，用户要等到退出
+            # 程序才看得见。
+            notices.append(
+                "RHINE.md 项目指令加载失败，本次会话不会注入任何项目指令"
+                f"（{e}）。详情见 /memory。"
+            )
+        else:
+            # 单层加载失败（最常见的是**编码不对**：GBK 存的 RHINE.md）在
+            # `load_instructions` 内部已被兜住、进了该层的 errors，另外两层照常
+            # 生效——但那些 errors 只有敲 `/memory` 才看得见，而**一个不知道
+            # 出了事的人不会去敲 /memory**。所以「整层没读进来」这一类要在启动时
+            # 就说出来。
+            #
+            # 判据是「文件存在（有 errors）却 loaded=False」，**刻意只涵盖这一类**：
+            # `@include` 越界/成环那些发生在 loaded=True 的层上，绝大部分内容仍然
+            # 生效，把它们也搬到启动提示上会稀释掉这条真正要紧的。
+            broken = [
+                f"[{layer.label}] {layer.path}：{'；'.join(layer.errors)}"
+                for layer in self._instructions.layers
+                if layer.errors and not layer.loaded
+            ]
+            if broken:
+                notices.append(
+                    "以下 RHINE.md 未能读入，该层指令本次不会生效"
+                    "（常见原因是文件不是 UTF-8 编码）：\n"
+                    + "\n".join(f"- {b}" for b in broken)
+                )
 
         try:
             self._session.cleanup_expired()
@@ -145,13 +196,14 @@ class MemoryManager:
 
         if resume_latest:
             try:
-                return self._resume_latest(history)
+                notices.append(self._resume_latest(history))
             except Exception:
                 # 恢复失败退化为新会话，不阻断启动。
                 self._session.start_new()
-                return "恢复最近会话失败，已开始新会话。"
-        self._session.start_new()
-        return None
+                notices.append("恢复最近会话失败，已开始新会话。")
+        else:
+            self._session.start_new()
+        return "\n\n".join(n for n in notices if n) or None
 
     def _resume_latest(self, history: list[Message]) -> str:
         """
@@ -533,7 +585,17 @@ class MemoryManager:
         """/memory 的只读报告（F19）：指令层、索引、记忆数、最近更新、会话与锁状态。"""
         lines = ["记忆系统状态", "", "RHINE.md 项目指令："]
         for layer in self._instructions.layers:
-            mark = f"已加载（{layer.size} 字符）" if layer.loaded else "未找到"
+            # 三态而不是两态：`loaded=False` 现在有**两种**成因，而它们对用户的
+            # 含义完全相反——「未找到」是「你没写这一层」（正常），「读取失败」
+            # 是「你写了、但它没生效」（要动手修）。B6 修复之前后者根本到不了这里
+            # （异常穿透、整份报告一片空白），现在到得了，就必须分辨得出来：
+            # 一个明明存在的文件被报成「未找到」会把人引去建一个已经存在的文件。
+            if layer.loaded:
+                mark = f"已加载（{layer.size} 字符）"
+            elif layer.errors:
+                mark = "读取失败"
+            else:
+                mark = "未找到"
             lines.append(f"  [{layer.label}] {layer.path} — {mark}")
             for err in layer.errors:
                 lines.append(f"    警告：{err}")

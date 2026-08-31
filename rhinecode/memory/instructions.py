@@ -71,6 +71,57 @@ class LoadedInstructions:
     layers: list[InstructionLayer]
 
 
+def _layer_specs(
+    user_dir: Path, project_root: Path
+) -> "list[tuple[str, Path, Path]]":
+    """
+    三层的 (层名, 文件路径, include 边界目录) 定义——**全项目唯一一份**。
+
+    抽成函数是为了让 `load_instructions` 与 `fallback_instructions` 共用同一份
+    层次定义：兜底对象必须与正常结果长得一样（三层、同名、同路径），否则
+    `/memory` 在正常与兜底两条路径下会显示成两副样子，而用户无从分辨。
+
+    边界按「宿主文件所属层」划定（F2）：用户级那层的 include 只能落在用户级
+    目录内，两个项目层的 include 只能落在项目根内。
+    """
+    return [
+        ("用户级", user_dir / "RHINE.md", user_dir),
+        ("项目级 .rhinecode", project_root / ".rhinecode" / "RHINE.md", project_root),
+        ("项目根", project_root / "RHINE.md", project_root),
+    ]
+
+
+def fallback_instructions(
+    user_dir: Path, project_root: Path, reason: str
+) -> LoadedInstructions:
+    """
+    `load_instructions` 意外抛异常时的兜底对象（B6 修复的第二处）。
+
+    **它存在的唯一理由是「layers 不能是空的」。** 调用方（`MemoryManager.startup`）
+    原先在兜底分支里造的是 `LoadedInstructions(text="", layers=[])`，而 `/memory`
+    报告靠遍历 `layers` 说话——空列表让那个循环一次都不执行，于是
+    「RHINE.md 项目指令：」后面是**一片空白**：既不说加载成功，也不说加载失败。
+    三组对照里，「文件不存在」与「@include 越界」都如实说了话，只有这一条路径
+    什么都不说，而它恰恰是「用户的指令确实存在、却没生效」的那一组。
+
+    :param user_dir: 用户级目录（只用来算路径，不读盘）
+    :param project_root: 项目根（同上）
+    :param reason: 写进第一层 errors 的可读原因（会显示在 /memory 的「警告：」行）
+    :returns: 三层、全部 loaded=False、第一层带一条 errors 的 LoadedInstructions
+
+    副作用：无（纯构造，**刻意不碰文件系统**——它被调用的场合正是
+    「读文件这件事本身出了意料之外的问题」，再读一次只会再炸一次）。
+    """
+    layers = [
+        InstructionLayer(label=label, path=path)
+        for label, path, _boundary in _layer_specs(user_dir, project_root)
+    ]
+    # 原因只挂在第一层：三层挂同一句话会让 /memory 出现三条重复警告，
+    # 而这是**一次**整体失败，不是三层各自失败。
+    layers[0].errors.append(reason)
+    return LoadedInstructions(text="", layers=layers)
+
+
 def load_instructions(user_dir: Path, project_root: Path) -> LoadedInstructions:
     """
     加载三层 RHINE.md 并拼接。
@@ -86,23 +137,30 @@ def load_instructions(user_dir: Path, project_root: Path) -> LoadedInstructions:
 
     副作用：只读文件系统，不写任何内容。
     """
-    # (层名, 文件路径, include 边界目录)；边界按「宿主文件所属层」划定（F2）。
-    layer_specs = [
-        ("用户级", user_dir / "RHINE.md", user_dir),
-        ("项目级 .rhinecode", project_root / ".rhinecode" / "RHINE.md", project_root),
-        ("项目根", project_root / "RHINE.md", project_root),
-    ]
-
     layers: list[InstructionLayer] = []
     parts: list[str] = []
-    for label, path, boundary in layer_specs:
+    for label, path, boundary in _layer_specs(user_dir, project_root):
         layer = InstructionLayer(label=label, path=path)
         layers.append(layer)
         if not path.is_file():
             continue
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
+            # ⚠ `UnicodeDecodeError` 是 `ValueError` 的子类、**不是 `OSError`**。
+            # 少了它，一个存成 GBK 的 RHINE.md（中文 Windows 上的记事本、旧编辑器、
+            # `cmd` 的 `>` 重定向默认都写 GBK/ANSI）会让异常**穿过**本函数这层
+            # 逐层容错，一路冒到 `MemoryManager.startup` 的 catch-all，连同**另外
+            # 两层已经读好的内容**一起被清空——而三条通路（启动提示 / 系统提示 /
+            # `/memory`）没有一条会说出真相。
+            #
+            # 为什么写 `UnicodeDecodeError` 而不是更宽的 `ValueError`：本 try 块里
+            # 只有一次 `read_text`，它的失败形态只有两种——I/O 出错（OSError）与
+            # 解码失败（UnicodeDecodeError）。而 `ValueError` 是 Python 里最常见的
+            # **编程错误**载体（参数不合法、转换失败……），拿它兜底等于给日后往
+            # 这个 try 里塞进来的任何代码提供一次静默吞噬，而本项目吃过的亏正是
+            # 「异常被吞掉、行为悄悄不对了」。窄的那个既够用、又把「这里防的到底
+            # 是什么」写在了代码上。
             layer.errors.append(f"读取失败：{e}")
             continue
         # include 展开：visited 以「本层的 RHINE.md 自身」起步，防止子文件反引宿主成环。
@@ -123,10 +181,21 @@ def load_instructions(user_dir: Path, project_root: Path) -> LoadedInstructions:
 
 
 def _safe_resolve(path: Path) -> Path:
-    """resolve 的 fail-safe 包装：解析失败时退回原路径（后续比较自然不会通过）。"""
+    """
+    resolve 的 fail-safe 包装：解析失败时退回原路径（后续比较自然不会通过）。
+
+    ⚠ 这里必须连 `ValueError` 一起接住，而且理由与上面 `read_text` 那处**不同**：
+    `Path.resolve()` 在 Windows 上遇到畸形路径（典型是内嵌 NUL 字符）抛的是
+    `ValueError: embedded null byte` 而不是 `OSError`。本函数的契约就是「绝不抛」
+    ——它被 `_expand_includes` 在 `re.sub` 的替换回调里调用，一旦抛出就会穿过
+    整个逐层容错，复现 B6 那条「三层指令一起消失」的路径，只是入口换成了
+    RHINE.md 里写了一个畸形的 `@路径`。
+    这一处用宽的 `ValueError` 是安全的：try 块里只有一次 `path.resolve()`，
+    没有任何自家逻辑可供它顺手吞掉。
+    """
     try:
         return path.resolve()
-    except OSError:
+    except (OSError, ValueError):
         return path
 
 
@@ -203,7 +272,12 @@ def _expand_includes(
                 return match.group(0)
             try:
                 content = resolved.read_text(encoding="utf-8")
-            except OSError as e:
+            except (OSError, UnicodeDecodeError) as e:
+                # 与上面第 ①/② 处同一个洞的第三个入口：被 @include 引用的**子文件**
+                # 存成 GBK 时同样抛 UnicodeDecodeError。少了它，宿主 RHINE.md 明明
+                # 是干净的 UTF-8，却因为引了一个坏编码的子文件而让整整三层一起消失
+                # ——排查时几乎不可能想到根因在被引用的那个文件上。
+                # 窄写法的理由同上：本 try 块里只有一次 read_text。
                 errors.append(f"@include 读取失败，未展开：{raw_ref}（{e}）")
                 return match.group(0)
             # 递归展开子文件自身的 include：基准目录换成子文件所在目录，
