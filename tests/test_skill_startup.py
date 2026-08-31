@@ -72,6 +72,10 @@ class SkillStartupTest(unittest.TestCase):
         self.home = Path(self._home.name)
 
         self.app = MagicMock()
+        # C6：入口在 cleanup 之后会读 `app.return_code` 决定进程退出码。
+        # MagicMock 的属性默认是个**真值**，不给它一个真实的 0 会让每条用例
+        # 都以为程序崩溃了（`sys.exit(<MagicMock>)`）。真 App 上它是 int。
+        self.app.return_code = 0
         self.captured: dict = {}
 
     def tearDown(self) -> None:
@@ -244,6 +248,10 @@ class SkillStartupTest(unittest.TestCase):
         self.assertIn("proj", report1)
 
         self.app = MagicMock()
+        # C6：入口在 cleanup 之后会读 `app.return_code` 决定进程退出码。
+        # MagicMock 的属性默认是个**真值**，不给它一个真实的 0 会让每条用例
+        # 都以为程序崩溃了（`sys.exit(<MagicMock>)`）。真 App 上它是 int。
+        self.app.return_code = 0
         self._run_main()
         self.assertIn("项目级 Skill", self._skill_report())
 

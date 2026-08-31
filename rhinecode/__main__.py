@@ -59,6 +59,11 @@ def main() -> None:
       Skill 白名单笔误）
     三类情况均打印可读错误信息后 sys.exit(1)，不向用户暴露堆栈。
 
+    退出码（C6 缺口一）：正常退出 0；TUI 运行期崩溃 1（读 `app.return_code`，
+    它由 Textual 的 `_handle_exception` 置位）；事件循环自身抛异常也是 1。
+    此前**从不读 return_code**，于是崩溃退出的进程退出码是 0，CI 与包装脚本
+    一律认为这次运行成功了。
+
     副作用：可能生成配置模板、连接外部 MCP Server、创建会话存档与锁、
     创建行为记录文件。
     """
@@ -80,7 +85,7 @@ def main() -> None:
     )
     # --trace（trace spec F8/F25）：**三态**语义，靠 nargs="?" + const 实现——
     #   ① 完全没写 --trace       → args.trace 为 None（default）       → 关闭
-    #   ② 写了 --trace 但没给值  → args.trace 为 _TRACE_DEFAULT（const）→ 缺省路径
+    #   ② 写了 --trace 但没给值  → args.trace 为 _PATH_DEFAULT（const）→ 缺省路径
     #   ③ 写了 --trace <路径>    → args.trace 为该路径                  → 指定路径
     #
     # 为什么必须有 const：不给的话「给了但无值」也会拿到 None，与「未给」无法区分，
@@ -195,6 +200,7 @@ def main() -> None:
 
     # try/finally 保证无论正常退出还是异常，都统一回收资源（清理动作幂等，
     # 五步顺序与理由见 bootstrap.build_app 里的 cleanup）。
+    crashed = False
     try:
         result.app.run()
     except KeyboardInterrupt:
@@ -204,8 +210,37 @@ def main() -> None:
         # 那两个窗口里没有界面可提示，退出是唯一合理的结果——但**不要甩回溯**：
         # 用户按的是 Ctrl+C，不是程序出了错。
         pass
+    except Exception as e:  # noqa: BLE001 —— 见下方那段说明
+        # C6 形态②：异常发生在 `_process_messages` 自身，逃出了 Textual 的接管。
+        #
+        # ⚠ **它是补漏不是主菜。** 绝大多数崩溃发生在消息处理器与事件回调里
+        # （`on_mount` / `on_key` / Worker 的 done callback），那些被 Textual 的
+        # `_handle_exception` 接住、`app.run()` **正常返回**，这个 except 一个字
+        # 都收不到——真正治那一类的是 `RhineApp._handle_exception` 那个覆写。
+        # 本分支只覆盖罕见的形态②，而它同样不该把 traceback 甩给用户。
+        _logger.exception("Textual 事件循环异常退出")
+        path = logsetup.log_path()
+        where = f"完整堆栈见 {path}" if path else "用 `rhine --log-file` 重跑可留下完整堆栈"
+        print(f"RhineCode 遇到未预期的错误已退出：{e}（{where}）", file=sys.stderr)
+        crashed = True
     finally:
         result.cleanup()
+
+    # C6 缺口一：把退出码交出去。
+    #
+    # 在此之前，`app.run()` 之后直接走 `finally: result.cleanup()` 就结束了，
+    # **从不读 `app.return_code`**——于是一次崩溃退出的进程退出码是 **0**，
+    # CI、包装脚本、`&&` 链、systemd/supervisor 一律认为这次运行成功了。
+    # 上游那 5 处配置/装配错误的 `sys.exit(1)` 都做对了，唯独运行期崩溃这条漏了，
+    # 而它恰恰是最需要被上游知道的一种。
+    #
+    # ⚠ **必须放在 `finally: result.cleanup()` 之后**：`sys.exit` 抛的是
+    # `SystemExit`，写进 try 里会跳过清理（MCP 子进程、会话锁、trace 句柄全留着）。
+    # 装配层 cleanup 的五步顺序与幂等守卫一个字都不要动，退出码只排在它后面。
+    if crashed:
+        sys.exit(1)
+    if result.app.return_code:
+        sys.exit(result.app.return_code)
 
 
 if __name__ == "__main__":

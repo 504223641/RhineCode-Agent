@@ -19,8 +19,10 @@ RhineApp 是 TUI 层的核心，负责：
 """
 
 import asyncio
+import logging
 import signal
 import threading
+import traceback
 from time import monotonic
 from typing import Optional
 
@@ -30,6 +32,7 @@ from textual.events import Key
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static, Input
 
+from rhinecode import logsetup
 from rhinecode.config import Config
 from rhinecode.subagents.tasks import STATUS_LABELS, TaskManager
 from rhinecode.commands import (
@@ -144,6 +147,10 @@ def _subagent_finish_text(record) -> str:
         f"({format_activity_cost(row)})\n"
         f"  结论将在下一轮对话中自动交给 AI。"
     )
+
+
+# C6：崩溃处理要写日志，见 `RhineApp._handle_exception`。
+_logger = logging.getLogger(__name__)
 
 
 class RhineApp(App):
@@ -856,6 +863,75 @@ class RhineApp(App):
         except RuntimeError:
             # 循环已经关了（退出竞态）。此时程序本来就在收尾，忽略即可。
             pass
+
+    # ── 崩溃处理（C6 缺口二）───────────────────────────────────────────
+    #
+    # ⚠ **先说清楚 C6 原报告错在哪，免得下一个人照着它改。** 原报告说「异常会
+    # 崩到终端、用户可能得敲 reset」，R3 实跑推翻了：`App.run_async` 的
+    # `finally: await asyncio.shield(app._shutdown())` **无条件执行**，备用屏幕
+    # 缓冲与 raw mode 两种形态下都复位了。终端不会坏。而且在 `app.run()` 外面
+    # 包 catch-all **兜不住主要形态**——绝大多数崩溃发生在消息处理器与事件回调
+    # 里（`on_mount`、`on_key`、Worker 的 done callback），Textual 的
+    # `_handle_exception` 会把它接住、把 app 关掉，`app.run()` 正常返回，
+    # 外面那个 `except Exception` 一个字都收不到。
+    #
+    # 真缺口是另外两条，下面这两个覆写治的是第二条（第一条是退出码，在
+    # `__main__.py` 里）：**崩溃时把带 locals 的完整回溯甩给用户，且没有日志**。
+    # `App._fatal_error()` 用的是 `rich.traceback.Traceback(show_locals=True, …)`，
+    # 它渲染**每一帧**的局部变量——崩溃时栈上若有 `DeepSeekProvider.__init__`
+    # （局部变量 `config` 含明文 `api_key`）、或任何持有文件内容的帧，那些内容
+    # 会原样打进终端。本项目对 trace 的配置快照做了逐字段掩码（`redact_config`），
+    # **而这条路径上一道掩码都没有**。
+
+    def _handle_exception(self, error: Exception) -> None:
+        """
+        Textual 留给应用的未捕获异常钩子；**这是形态①真正经过的那个点**。
+
+        :param error: 逃出来的异常
+
+        本覆写只多做一件事：把完整堆栈写进日志。随后**原样交给基类**，
+        由它去做 `_return_code = 1`、记 `_exception`、置 `_exception_event`
+        这些簿记——那几件事 `run_test` 要靠着重新抛出异常，测试框架与 e2e
+        宿主都依赖它，**自己复制一份等于给未来的 textual 升级埋雷**。
+
+        ⚠ 日志写在 `super()` **之前**：基类那一步会关掉整个 app，万一它自己
+        再抛一次，至少崩溃证据已经落盘了。
+
+        副作用：往日志文件写一条 ERROR（未开 `--log-file` 时什么都不写）。
+        """
+        # 完整堆栈只进**日志文件**，不进终端——终端上那份见 `_fatal_error`。
+        # ⚠ 这里刻意用 `traceback.format_exception` 而不是 rich 的 Traceback：
+        # 我们要的正是**不带 locals** 的那一份（locals 是泄漏面，见上面那段）。
+        _logger.error(
+            "未捕获异常，应用即将退出：\n%s",
+            "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+        )
+        super()._handle_exception(error)
+
+    def _fatal_error(self) -> None:
+        """
+        覆写基类的崩溃展示：终端上只留一句话，完整堆栈去日志里看。
+
+        基类版本会把 `Traceback(show_locals=True, …)` 追加进退出渲染列表，
+        于是每一帧的局部变量都打在用户屏幕上（可能含明文 api_key 与文件内容）。
+        本版本换成一行说明 + 日志路径。
+
+        ⚠ **只用公开 API `panic()`**：它做的事与基类 `_fatal_error` 的后半段
+        逐字相同（渲染 → 追加进 `_exit_renderables` → `_close_messages_no_wait`），
+        但不碰任何私有字段。基类那两个私有名字哪天改了，这里也不会跟着碎。
+
+        ⚠ **反过来说，覆写这件事本身依赖 `_fatal_error` 这个名字还在。**
+        它要是被上游改名，本覆写会变成一段谁也不调的死代码，而**掩码会静默
+        消失**——那正是本项目最忌讳的形态。`tests/test_tui_crash.py` 里有一条
+        用例专门断言这个方法在基类上存在，textual 升级掉它时当场红。
+
+        副作用：响铃、追加退出渲染、关闭消息泵（= 退出应用）。
+        """
+        self.bell()
+        path = logsetup.log_path()
+        where = f"完整堆栈已写入 {path}" if path else "用 `rhine --log-file` 重跑可把完整堆栈写进文件"
+        # 不用图形符号：错误靠「错误：」文字前缀辨认（tui-display F29 的符号白名单）。
+        self.panic(f"错误：RhineCode 遇到未预期的错误已退出。{where}。")
 
     def on_unmount(self) -> None:
         """还原 SIGINT 处理器，避免把进程级状态留给退出之后的代码。"""
