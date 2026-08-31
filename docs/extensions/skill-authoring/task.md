@@ -495,7 +495,7 @@
 **步骤：**
 1. 删除 `1-skill-authoring.md`（本扩展已完成）。
 2. 把 `2-web-search.md` 重命名为 `1-web-search.md`、
-   `3-p1b-unattended.md` 重命名为 `2-p1b-unattended.md`。
+   `3-p1b-unattended.md` 重命名为 `3-p1b-unattended.md`。
 3. 改两份文档内部的序号标题，**以及正文与开工 Prompt 段里的自引用**——
    陈旧引用不只在标题：`2-web-search.md` 与 `3-p1b-unattended.md` 的正文里
    都有「见 docs/todo/<带序号的文件名>」这类句子。
@@ -503,7 +503,7 @@
    那一节加一行**（既有三条都按该格式登记过，漏加会让那节看起来停更了）。
 5. 全仓库检索这三份文档的旧路径引用并一并更新。
 
-**验证：** `ls docs/todo/` 只剩 `README.md`、`1-web-search.md`、`2-p1b-unattended.md`；
+**验证：** `ls docs/todo/` 只剩 `README.md`、`1-web-search.md`、`3-p1b-unattended.md`；
 
 ```
 grep -rn "1-skill-authoring\|2-web-search\|3-p1b" . --include=*.md \
