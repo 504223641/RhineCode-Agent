@@ -210,6 +210,13 @@ python -m rhinecode --config config.yaml  # 未安装/开发调试时的等价�
 rhine --trace                             # 写 <项目根>/.rhinecode/traces/<时间戳>.jsonl
 rhine --trace /tmp/x.jsonl                # 指定文件
 
+# 运行日志（C5；缺省关闭，不开则一个字节都不写）
+# ⚠ 与 --trace 是两件事：trace 记完整请求/响应/工具输出**原文**（与会话存档同级敏感，
+#   可能含明文 API Key），日志只记「哪一步、什么结果、耗时多少」的一行摘要。
+#   排查「它卡在哪一步了」用日志就够，不必交出一份含对话原文的产物。
+rhine --log-file                          # 写 <项目根>/.rhinecode/logs/<时间戳>.log
+rhine --log-file /tmp/x.log               # 指定文件
+
 # 阅读产出（只读；刻意不注册控制台入口，避免给 PATH 多一个命令）
 python -m rhinecode.trace.reader <文件>                          # 时间线摘要，每事件一行
 python -m rhinecode.trace.reader <文件> --type api_request       # 按类型过滤（逗号分隔多个）

@@ -90,6 +90,12 @@ python -m rhinecode --config config.yaml
 ```bash
 rhine --trace                 # 写 <项目根>/.rhinecode/traces/<时间戳>.jsonl
 rhine --trace /tmp/x.jsonl    # 指定文件
+
+# 运行日志（缺省关闭）。它与 --trace 不是一回事：trace 记的是完整的请求、响应与
+# 工具输出**原文**（可能含明文 API Key，勿外传），日志只记「哪一步、什么结果、
+# 耗时多少」一行。报障时贴日志就够，不必交出 trace。
+rhine --log-file              # 写 <项目根>/.rhinecode/logs/<时间戳>.log
+rhine --log-file /tmp/x.log   # 指定文件
 ```
 
 读产出（只读；刻意不注册控制台命令，避免给 PATH 多一个入口）：

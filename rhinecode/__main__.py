@@ -5,10 +5,10 @@ RhineCode 命令行入口模块。
 构造行为记录器，然后把真正的装配工作交给 `rhinecode.bootstrap.build_app`。
 
 执行流程：
-1. 解析 --config / --continue / --trace 参数
+1. 解析 --config / --continue / --trace / --log-file 参数
 2. 首次运行时生成三类用户级配置模板
 3. 加载并校验 YAML 配置文件（含占位符 api_key 拦截）
-4. 按 --trace 的三态语义构造行为记录器
+4. 按 --trace 的三态语义构造行为记录器，按 --log-file 的三态语义装日志 handler
 5. 调 build_app 完成装配，启动 Textual 事件循环，退出时统一清理
 
 用法：
@@ -17,15 +17,19 @@ RhineCode 命令行入口模块。
     rhine --continue               # 启动时恢复最近一次会话
     rhine --trace                  # 开启行为记录，写 <项目根>/.rhinecode/traces/
     rhine --trace /tmp/x.jsonl     # 开启行为记录并指定文件
+    rhine --log-file               # 开启运行日志，写 <项目根>/.rhinecode/logs/
+    rhine --log-file /tmp/x.log    # 开启运行日志并指定文件
     python -m rhinecode            # 未安装或开发调试时的等价入口
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 from rhinecode.bootstrap import BootstrapError, build_app
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
+from rhinecode import logsetup
 from rhinecode.permission import config as perm_config
 from rhinecode.hooks import config as hook_config
 from rhinecode.mcp import config as mcp_config
@@ -34,9 +38,15 @@ from rhinecode.tools.path_guard import main_project_root
 from rhinecode.trace import NullRecorder, default_trace_path
 from rhinecode.trace.recorder import create_recorder
 
-# `--trace` 不带值时 argparse 填进 args.trace 的哨兵字符串。
+# `--trace` / `--log-file` 不带值时 argparse 填进 args 的哨兵字符串。
 # 取一个不可能是真实路径的值，与「用户显式给了路径」区分开。
-_TRACE_DEFAULT = "<default>"
+# 两个选项共用同一个哨兵：它们的三态语义逐字相同，各写一份只会让
+# 「改了一个忘了另一个」成为可能。
+_PATH_DEFAULT = "<default>"
+
+# 入口层的 logger。日志缺省关闭，因此这些调用在不开 --log-file 时**零开销地
+# 什么都不做**（根 logger 上没有 handler）。
+_logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -80,12 +90,40 @@ def main() -> None:
     parser.add_argument(
         "--trace",
         nargs="?",
-        const=_TRACE_DEFAULT,
+        const=_PATH_DEFAULT,
         default=None,
         metavar="PATH",
         help="开启行为记录（测试设施）；不给值时写 <项目根>/.rhinecode/traces/<时间戳>.jsonl",
     )
+    # --log-file（C5）：三态语义与 --trace 完全一致，理由也一样（见上面那段注释）。
+    #
+    # ⚠ 它与 --trace 是**两件事**，别合成一个开关：trace 记的是完整请求/响应/工具
+    # 输出**原文**（与会话存档同级敏感，可能含明文 API Key），日志记的是「哪一步、
+    # 什么结果、耗时多少」的一行摘要。排查「它卡在哪了」只需要后者，而让用户为此
+    # 交出一份含对话原文的产物是不成比例的代价。
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        nargs="?",
+        const=_PATH_DEFAULT,
+        default=None,
+        metavar="PATH",
+        help="开启运行日志；不给值时写 <项目根>/.rhinecode/logs/<时间戳>.log",
+    )
     args = parser.parse_args()
+
+    # 日志要**尽早**装上——它的用途之一就是排查启动期的问题（配置加载、MCP 连接、
+    # Provider 初始化），装晚了那段恰恰记不到。
+    # ⚠ 位置仍在 parse_args 之后：路径要用到 args。
+    if args.log_file is None:
+        log_file = None
+    elif args.log_file == _PATH_DEFAULT:
+        log_file = logsetup.default_log_path(main_project_root())
+    else:
+        log_file = Path(args.log_file)
+    # configure 自己 fail-safe（路径不可写时提示一行、返回 None），不会抛。
+    logsetup.configure(log_file)
+    _logger.info("RhineCode 启动：argv=%s", sys.argv[1:])
 
     # 决定实际配置路径：显式 --config 优先，否则用用户级全局配置。
     # explicit 用于区分「用户点名的文件」和「缺省全局文件」——只有缺省文件缺失时才自动生成模板，
@@ -138,7 +176,7 @@ def main() -> None:
     # （trace spec AC22 明确要求这种情形不阻断）。
     if args.trace is None:
         recorder = NullRecorder()
-    elif args.trace == _TRACE_DEFAULT:
+    elif args.trace == _PATH_DEFAULT:
         recorder = create_recorder(default_trace_path(main_project_root()))
     else:
         recorder = create_recorder(Path(args.trace))

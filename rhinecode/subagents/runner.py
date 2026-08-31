@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -475,6 +476,12 @@ def _extract_conclusion(
     return "子 Agent 自然结束，但没有产出任何正文。", False
 
 
+# C5：子 Agent 的启停是第三条关键路径。它们全程在后台线程里跑、界面上只有一行
+# 活动区，用户报「委派出去就没动静了」时此前只能开 trace。
+# ⚠ 与另外两处同一条纪律：**只记形状，不记任务正文与结论正文**——那两样是对话原文。
+_logger = logging.getLogger(__name__)
+
+
 def _emit_start(
     recorder,
     *,
@@ -532,6 +539,15 @@ def _emit_start(
         isolated=handle is not None,
         permission_mode=_resolve_mode(runtime, spec).value,
     )
+    _logger.info(
+        "子 Agent 开始 kind=%s agent=%s task_id=%s 工具=%d 个 档位=%s 隔离=%s",
+        kind,
+        agent_label,
+        record.task_id,
+        len(toolset.allowed),
+        _resolve_mode(runtime, spec).value,
+        handle is not None,
+    )
 
 
 def _emit_end(
@@ -559,6 +575,14 @@ def _emit_end(
         )
     except Exception:  # noqa: BLE001 —— 观测设施绝不能反过来影响被观测的系统
         pass
+    _logger.info(
+        "子 Agent 结束 agent=%s task_id=%s 状态=%s 轮次=%d 停止原因=%s",
+        agent_label,
+        record.task_id,
+        status.value,
+        turns,
+        stop_reason.value,
+    )
 
 
 def _await_wake(team, member_name: str, record) -> "Optional[list[Message]]":

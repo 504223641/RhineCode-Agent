@@ -28,11 +28,19 @@ DeepSeek 的 API 与 OpenAI 基本兼容，但新版（deepseek-v4-flash / deeps
 """
 
 import json
+import logging
+import time
 from typing import Iterator, Optional
 import openai
 
 from rhinecode.config import Config
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
+
+# C5：Provider 是「它卡住了」这类报障最常见的落点（等首字节、限流重试、
+# 连不上端点），因此它是日志设施的头号关键路径。
+# ⚠ **只记形状与结果，绝不记内容**：不记消息正文、不记工具参数、不记 api_key。
+# 要看原文请开 --trace（那份产物的敏感度与会话存档同级）。
+_logger = logging.getLogger(__name__)
 
 
 class DeepSeekProvider(BaseProvider):
@@ -178,6 +186,18 @@ class DeepSeekProvider(BaseProvider):
         if tools:
             create_kwargs["tools"] = tools
 
+        # 只记「这次请求长什么样」——条数、开没开思考、带没带工具。
+        # 三个数字合起来足以回答「是不是历史太长了」「是不是工具集太大了」，
+        # 而它们一个字节的对话内容都不含。
+        _logger.info(
+            "请求模型 model=%s 消息=%d 条 thinking=%s 工具=%d 个",
+            self._model,
+            len(sdk_messages),
+            thinking_effort,
+            len(tools or []),
+        )
+        started = time.monotonic()
+
         try:
             stream = self._client.chat.completions.create(**create_kwargs)
 
@@ -259,7 +279,15 @@ class DeepSeekProvider(BaseProvider):
                     tool_call=ToolCall(id=buf["id"], name=buf["name"], arguments=parsed),
                 )
 
+            _logger.info("请求完成 耗时=%.1fs", time.monotonic() - started)
             yield StreamChunk(type="done", content="")
 
         except Exception as e:
+            # 这里是**唯一**能看到 SDK 原始异常类型的地方（往上只剩一个字符串），
+            # 因此类型名必须记下来——它是「401 还是连不上」这个问题的唯一答案。
+            # ⚠ 不记 `str(e)`：服务端的 message 里可能回显掩码后的 key 与请求细节，
+            # 格式随服务端变，不适合进一份用户会随手贴出来的日志。
+            _logger.warning(
+                "请求失败 耗时=%.1fs 异常=%s", time.monotonic() - started, type(e).__name__
+            )
             yield StreamChunk(type="error", content=str(e))

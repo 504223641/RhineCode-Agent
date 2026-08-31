@@ -40,6 +40,7 @@ allow 规则消解」，而不是「代码位置在③上面」。语义与 C12 
 不变」是**结构性成立**的，不靠测试兜。
 """
 
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +55,15 @@ from rhinecode.permission.models import (
 )
 from rhinecode.permission.rules import RuleSet
 from rhinecode.tools.path_guard import is_readable_path, is_within_workspace
+
+# C5：权限判定是第二条关键路径——「它为什么不肯写这个文件」「面板为什么又弹了」
+# 这类问题的答案全在**哪一层说了话**上，而那个信息此前只存在于 trace 里。
+#
+# ⚠ **刻意不记工具参数**（命令串、文件路径、URL）。命令串是本项目里最可能夹带
+# 密钥的一类文本（`export KEY=...`、带令牌的地址），而日志的定位是「用户能随手
+# 贴出来的东西」。记 tool + kind + 结论 + 层，足以回答上面那两个问题；
+# 要看具体参数请开 --trace。
+_logger = logging.getLogger(__name__)
 
 # ── 权限模式的「严格程度」排序（c13）──
 #
@@ -247,7 +257,15 @@ class PermissionEngine:
 
         副作用：无（纯判定）。
         """
-        return self._apply_protected(request, self._decide_core(request))
+        result = self._apply_protected(request, self._decide_core(request))
+        _logger.info(
+            "权限判定 tool=%s kind=%s -> %s（%s）",
+            request.tool_name,
+            request.kind,
+            result.decision.value,
+            result.layer.value,
+        )
+        return result
 
     def _apply_protected(
         self, request: PermissionRequest, result: DecisionResult
