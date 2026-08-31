@@ -1878,11 +1878,70 @@ class RhineApp(App):
 
         now = monotonic()
         if now - self._last_quit_request <= self.QUIT_CONFIRM_SECONDS:
+            self._settle_pending_before_quit()
             self.exit()
             return
 
         self._last_quit_request = now
         self._arm_quit_hint()
+
+    def _settle_pending_before_quit(self) -> None:
+        """
+        退出前把还挂着的交互结算掉（C10-a）。
+
+        ## 这条缺口的实测后果比原报告严重一档
+
+        原报告说后果是「线程停到天亮」。R3 实跑出来的是**整个进程退不掉**：
+
+            ⚠ app.run() 在 25 秒后仍未返回 —— 退出被那个 wait() 挡住了
+            ThreadPoolExecutor 线程 daemon = False
+            3.11 的 shutdown_default_executor 签名: (self)
+
+        链条是这样的：`run_worker(thread=True)` 最终走
+        `loop.run_in_executor(None, …)`，用的是 **asyncio 的默认线程池**；
+        `ThreadPoolExecutor` 的线程**不是 daemon**；`asyncio.run()` 收尾时调
+        `loop.shutdown_default_executor()`，而 **Python 3.11 的这个方法没有
+        timeout 参数**（3.12 才加），于是它**无限期等待**那个停在
+        `Event.wait()` 上的线程。
+
+        结果：`app.run()` 永不返回 → `__main__.py` 的 `finally: result.cleanup()`
+        **永不执行** → MCP 子进程不回收、会话锁不释放、trace 文件句柄不关闭。
+        用户看到的是「按了退出，程序卡死了」。
+
+        ## 触发路径
+
+        `ctrl+c` 那条绑定是 `priority=True`，面板持有焦点时照样能触发；
+        而退出分支此前直接 `self.exit()`，**不检查 `_pending_interaction`**。
+        所以「面板挂着 → 连按两次 Ctrl+C」这条路径在真实入口下会踩中。
+
+        ⚠ **e2e 宿主复现不了这一条**（它走 `app.run_test()`，收尾语义不同，
+        R3 实测宿主干净退出了）。证据来自真实 `app.run(headless=True)`。
+
+        ## 为什么是「结算」而不是「给 wait 加超时」
+
+        `None` 在三类面板上的语义都已经是「取消 / 拒绝 / 跳过」，语义现成，
+        且它必须走 `_resolve_interaction`——那是**唯一**会 `box["event"].set()`
+        的地方。
+
+        ⚠ **绝不能写成「`wait(timeout=N)` 然后按超时返回一个默认结果」**：
+        那等于「用户没答，我替他答了」，在确认面板上就是**替用户点了放行或
+        拒绝**。超时只能用来**跳出等待**，不能用来**编造结果**。这里用的是
+        用户按 Ctrl+C 这个明确动作，不是超时。
+
+        ## 两条路都要走
+
+        会话选择面板走的是**另一条**结算路径（`_settle_session`），它同样在
+        退出时不被结算。只修一条是半个修复。
+
+        副作用：唤醒被阻塞的 Worker 线程；可能隐藏面板、还焦输入框。
+        """
+        # 确认 / 澄清 / 审批三类面板：None = 取消 / 拒绝 / 跳过
+        if self._pending_interaction is not None:
+            self._resolve_interaction(None, source="shutdown")
+        # 会话选择面板：它有自己的结算入口（`_settle_session` 是唯一入口，
+        # 走别处会丢埋点与幂等守卫）
+        if self._session_panel_active:
+            self._settle_session(None, source="shutdown")
 
     def _arm_quit_hint(self) -> None:
         """
@@ -3069,6 +3128,10 @@ class RhineApp(App):
             - `human`        面板按键路径（真人敲键，也包括测试用 Pilot 模拟的按键）
             - `driver`       端到端驱动设施经控制通道直接结算
             - `driver_forced` 驱动设施退出时的强制结算（仍属外部驱动者，单列以便审计）
+            - `shutdown`     **产品自己**退出前的强制结算（C10-a，见
+              `_settle_pending_before_quit`）。⚠ 与 `driver_forced` 刻意分开：
+              那条是外部驱动者掐掉的，这条是用户按了两次 Ctrl+C——
+              合并之后，一次真人退出会在审计记录里显示成「测试设施干的」
             - `policy`       P1b 的固定策略应答者预留
 
             ⚠️ 它标注的是**结算走的哪条路径**，不是对操作者身份的断言——
