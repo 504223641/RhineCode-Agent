@@ -12,12 +12,19 @@ MCPClient 只负责「按协议组织这三步」，具体收发交给注入的 
 
 from typing import Optional
 
+from rhinecode import __version__ as rhinecode_version
 from rhinecode.mcp.transport import Transport
 
 # 客户端自报信息与支持的协议版本（对齐 MCP 规范 2025-11-25）。
 _PROTOCOL_VERSION = "2025-11-25"
 _CLIENT_NAME = "RhineCode"
-_CLIENT_VERSION = "0.1.0"
+# C9：版本号取自包元数据（唯一事实源是 pyproject.toml），**不再硬编码**。
+#
+# ⚠ 这里原本写着 `_CLIENT_VERSION = "0.1.0"` —— 一个与 pyproject.toml 之间
+# 没有任何关联的副本。发版时改了一处忘了另一处**不会报错**，只是远端 MCP
+# Server 的日志里记着一个早就不存在的版本号，而那正是排查兼容性问题时
+# 唯一能看到的信息。
+_CLIENT_VERSION = rhinecode_version
 
 # 握手/列表阶段的默认超时（秒）。工具调用超时单独由 call_timeout 控制。
 _HANDSHAKE_TIMEOUT = 30.0

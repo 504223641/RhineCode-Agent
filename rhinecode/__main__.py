@@ -5,10 +5,10 @@ RhineCode 命令行入口模块。
 构造行为记录器，然后把真正的装配工作交给 `rhinecode.bootstrap.build_app`。
 
 执行流程：
-1. 解析 --config / --continue / --trace 参数
+1. 解析 --config / --continue / --trace / --log-file 参数
 2. 首次运行时生成三类用户级配置模板
 3. 加载并校验 YAML 配置文件（含占位符 api_key 拦截）
-4. 按 --trace 的三态语义构造行为记录器
+4. 按 --trace 的三态语义构造行为记录器，按 --log-file 的三态语义装日志 handler
 5. 调 build_app 完成装配，启动 Textual 事件循环，退出时统一清理
 
 用法：
@@ -17,15 +17,19 @@ RhineCode 命令行入口模块。
     rhine --continue               # 启动时恢复最近一次会话
     rhine --trace                  # 开启行为记录，写 <项目根>/.rhinecode/traces/
     rhine --trace /tmp/x.jsonl     # 开启行为记录并指定文件
+    rhine --log-file               # 开启运行日志，写 <项目根>/.rhinecode/logs/
+    rhine --log-file /tmp/x.log    # 开启运行日志并指定文件
     python -m rhinecode            # 未安装或开发调试时的等价入口
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 from rhinecode.bootstrap import BootstrapError, build_app
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
+from rhinecode import logsetup
 from rhinecode.permission import config as perm_config
 from rhinecode.hooks import config as hook_config
 from rhinecode.mcp import config as mcp_config
@@ -34,9 +38,15 @@ from rhinecode.tools.path_guard import main_project_root
 from rhinecode.trace import NullRecorder, default_trace_path
 from rhinecode.trace.recorder import create_recorder
 
-# `--trace` 不带值时 argparse 填进 args.trace 的哨兵字符串。
+# `--trace` / `--log-file` 不带值时 argparse 填进 args 的哨兵字符串。
 # 取一个不可能是真实路径的值，与「用户显式给了路径」区分开。
-_TRACE_DEFAULT = "<default>"
+# 两个选项共用同一个哨兵：它们的三态语义逐字相同，各写一份只会让
+# 「改了一个忘了另一个」成为可能。
+_PATH_DEFAULT = "<default>"
+
+# 入口层的 logger。日志缺省关闭，因此这些调用在不开 --log-file 时**零开销地
+# 什么都不做**（根 logger 上没有 handler）。
+_logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -48,6 +58,11 @@ def main() -> None:
     - BootstrapError（装配阶段三类致命错误：命令注册冲突 / Provider 初始化失败 /
       Skill 白名单笔误）
     三类情况均打印可读错误信息后 sys.exit(1)，不向用户暴露堆栈。
+
+    退出码（C6 缺口一）：正常退出 0；TUI 运行期崩溃 1（读 `app.return_code`，
+    它由 Textual 的 `_handle_exception` 置位）；事件循环自身抛异常也是 1。
+    此前**从不读 return_code**，于是崩溃退出的进程退出码是 0，CI 与包装脚本
+    一律认为这次运行成功了。
 
     副作用：可能生成配置模板、连接外部 MCP Server、创建会话存档与锁、
     创建行为记录文件。
@@ -70,7 +85,7 @@ def main() -> None:
     )
     # --trace（trace spec F8/F25）：**三态**语义，靠 nargs="?" + const 实现——
     #   ① 完全没写 --trace       → args.trace 为 None（default）       → 关闭
-    #   ② 写了 --trace 但没给值  → args.trace 为 _TRACE_DEFAULT（const）→ 缺省路径
+    #   ② 写了 --trace 但没给值  → args.trace 为 _PATH_DEFAULT（const）→ 缺省路径
     #   ③ 写了 --trace <路径>    → args.trace 为该路径                  → 指定路径
     #
     # 为什么必须有 const：不给的话「给了但无值」也会拿到 None，与「未给」无法区分，
@@ -80,12 +95,40 @@ def main() -> None:
     parser.add_argument(
         "--trace",
         nargs="?",
-        const=_TRACE_DEFAULT,
+        const=_PATH_DEFAULT,
         default=None,
         metavar="PATH",
         help="开启行为记录（测试设施）；不给值时写 <项目根>/.rhinecode/traces/<时间戳>.jsonl",
     )
+    # --log-file（C5）：三态语义与 --trace 完全一致，理由也一样（见上面那段注释）。
+    #
+    # ⚠ 它与 --trace 是**两件事**，别合成一个开关：trace 记的是完整请求/响应/工具
+    # 输出**原文**（与会话存档同级敏感，可能含明文 API Key），日志记的是「哪一步、
+    # 什么结果、耗时多少」的一行摘要。排查「它卡在哪了」只需要后者，而让用户为此
+    # 交出一份含对话原文的产物是不成比例的代价。
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        nargs="?",
+        const=_PATH_DEFAULT,
+        default=None,
+        metavar="PATH",
+        help="开启运行日志；不给值时写 <项目根>/.rhinecode/logs/<时间戳>.log",
+    )
     args = parser.parse_args()
+
+    # 日志要**尽早**装上——它的用途之一就是排查启动期的问题（配置加载、MCP 连接、
+    # Provider 初始化），装晚了那段恰恰记不到。
+    # ⚠ 位置仍在 parse_args 之后：路径要用到 args。
+    if args.log_file is None:
+        log_file = None
+    elif args.log_file == _PATH_DEFAULT:
+        log_file = logsetup.default_log_path(main_project_root())
+    else:
+        log_file = Path(args.log_file)
+    # configure 自己 fail-safe（路径不可写时提示一行、返回 None），不会抛。
+    logsetup.configure(log_file)
+    _logger.info("RhineCode 启动：argv=%s", sys.argv[1:])
 
     # 决定实际配置路径：显式 --config 优先，否则用用户级全局配置。
     # explicit 用于区分「用户点名的文件」和「缺省全局文件」——只有缺省文件缺失时才自动生成模板，
@@ -138,7 +181,7 @@ def main() -> None:
     # （trace spec AC22 明确要求这种情形不阻断）。
     if args.trace is None:
         recorder = NullRecorder()
-    elif args.trace == _TRACE_DEFAULT:
+    elif args.trace == _PATH_DEFAULT:
         recorder = create_recorder(default_trace_path(main_project_root()))
     else:
         recorder = create_recorder(Path(args.trace))
@@ -157,6 +200,7 @@ def main() -> None:
 
     # try/finally 保证无论正常退出还是异常，都统一回收资源（清理动作幂等，
     # 五步顺序与理由见 bootstrap.build_app 里的 cleanup）。
+    crashed = False
     try:
         result.app.run()
     except KeyboardInterrupt:
@@ -166,8 +210,37 @@ def main() -> None:
         # 那两个窗口里没有界面可提示，退出是唯一合理的结果——但**不要甩回溯**：
         # 用户按的是 Ctrl+C，不是程序出了错。
         pass
+    except Exception as e:  # noqa: BLE001 —— 见下方那段说明
+        # C6 形态②：异常发生在 `_process_messages` 自身，逃出了 Textual 的接管。
+        #
+        # ⚠ **它是补漏不是主菜。** 绝大多数崩溃发生在消息处理器与事件回调里
+        # （`on_mount` / `on_key` / Worker 的 done callback），那些被 Textual 的
+        # `_handle_exception` 接住、`app.run()` **正常返回**，这个 except 一个字
+        # 都收不到——真正治那一类的是 `RhineApp._handle_exception` 那个覆写。
+        # 本分支只覆盖罕见的形态②，而它同样不该把 traceback 甩给用户。
+        _logger.exception("Textual 事件循环异常退出")
+        path = logsetup.log_path()
+        where = f"完整堆栈见 {path}" if path else "用 `rhine --log-file` 重跑可留下完整堆栈"
+        print(f"RhineCode 遇到未预期的错误已退出：{e}（{where}）", file=sys.stderr)
+        crashed = True
     finally:
         result.cleanup()
+
+    # C6 缺口一：把退出码交出去。
+    #
+    # 在此之前，`app.run()` 之后直接走 `finally: result.cleanup()` 就结束了，
+    # **从不读 `app.return_code`**——于是一次崩溃退出的进程退出码是 **0**，
+    # CI、包装脚本、`&&` 链、systemd/supervisor 一律认为这次运行成功了。
+    # 上游那 5 处配置/装配错误的 `sys.exit(1)` 都做对了，唯独运行期崩溃这条漏了，
+    # 而它恰恰是最需要被上游知道的一种。
+    #
+    # ⚠ **必须放在 `finally: result.cleanup()` 之后**：`sys.exit` 抛的是
+    # `SystemExit`，写进 try 里会跳过清理（MCP 子进程、会话锁、trace 句柄全留着）。
+    # 装配层 cleanup 的五步顺序与幂等守卫一个字都不要动，退出码只排在它后面。
+    if crashed:
+        sys.exit(1)
+    if result.app.return_code:
+        sys.exit(result.app.return_code)
 
 
 if __name__ == "__main__":

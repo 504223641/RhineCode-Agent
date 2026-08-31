@@ -8,8 +8,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rhinecode"
+# ⚠ **这是版本号的唯一事实源。** `rhinecode/__init__.py` 的 `__version__` 走
+# importlib.metadata 从这里读，`mcp/client.py` 自报给外部 MCP Server 的客户端
+# 版本又引用那个——三处一条链，改这一行即可。此前 mcp/client.py 有一份硬编码
+# 副本，与本行之间没有任何东西把它们关联起来（C9）。
 version = "0.1.0"
 requires-python = ">=3.11"
+
+# C9 包元数据。在此之前 [project] 里只有 name/version/requires-python/license，
+# 于是 `pip show rhinecode` 与 PyPI 页面上**没有一句话说明这是什么**——
+# 对一个要开源、要当作品集展示的项目，那是最先被看到也最容易补的一处。
+description = "终端 AI 编程助手：用 Python + Textual 实现，交互体验参考 Claude Code"
+readme = "README.md"
+authors = [{ name = "Jinbiao Wang" }]
+keywords = ["ai", "agent", "cli", "tui", "textual", "coding-assistant", "deepseek"]
+# 分类器只写**经得起核对**的几条，不堆砌。
+# ⚠ 「Programming Language :: Python :: 3.x」要与 requires-python 一致：
+# 多写一个没测过的版本等于一句没有依据的兼容性承诺，而 CI 的六格矩阵
+# （windows/ubuntu × 3.11/3.12/3.13）恰好是这三行的依据。
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Utilities",
+]
 
 # 许可证（A1）。选型结论见 docs/review/01-release-blockers.md 的 R5-10：
 # 依赖全是宽松许可证、不构成任何约束，MIT 在「被读、被用、被记住」三件事上
@@ -75,6 +102,13 @@ dependencies = [
     # 却会在 openai 升级到某个新 0.x 时先一步把安装拧死。
     "httpx>=0.27,<1",
 ]
+
+# C9：仓库地址。`pip show` 与 PyPI 页面上的「Homepage」就是从这里来的——
+# 没有它，装了包的人**没有任何办法找回项目主页**去看文档或提 issue。
+[project.urls]
+Homepage = "https://github.com/504223641/RhineCode-Agent"
+Repository = "https://github.com/504223641/RhineCode-Agent"
+Issues = "https://github.com/504223641/RhineCode-Agent/issues"
 
 [project.scripts]
 # 安装后暴露的全局命令名。包名/源码目录仍是 rhinecode，这里只改对外命令为 rhine，

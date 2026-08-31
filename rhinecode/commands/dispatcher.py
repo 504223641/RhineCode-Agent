@@ -145,8 +145,15 @@ class CommandDispatcher:
         try:
             spec.handler(invocation, controller)
         except Exception as exc:  # noqa: BLE001 —— 错误隔离边界（spec N5）
-            # 命令失败必须可恢复：显示简洁本地错误（不输出堆栈），
+            # 命令失败必须可恢复：显示简洁本地错误（**界面上不输出堆栈**），
             # 绝不把失败命令降级为普通消息重发给模型。
+            #
+            # ⚠ C5 之后这句话的兑现方式变了，值得说清楚：此前全仓没有任何 handler，
+            # 所以「不输出堆栈」是靠**日志系统不存在**兑现的，不是靠设计。现在
+            # `--log-file` 装的是 INFO 级的 handler，DEBUG 仍然被级别挡掉；
+            # 而即便有人把级别调到 DEBUG，堆栈也只进**文件**，不进界面
+            # （logsetup 刻意不挂 stderr handler，理由见那个模块的 docstring）。
+            # 两种情况下界面行为都逐字不变。
             _logger.debug("command %s failed", spec.name, exc_info=True)
             message = f"命令 {spec.name} 执行失败：{exc}"
             controller.show_message(message)
