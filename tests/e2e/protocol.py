@@ -110,6 +110,13 @@ _CLARIFY_SKIP = "skip"
 # 判据细节见 `control._is_quiescent`（尤其「待命队员为什么不算」那段）。
 UNTIL_VALUES = frozenset({"terminal", "quiescent"})
 
+# 交互结算的 `source` 取值集合（**产品侧的权威定义在 `tui/app.py` 的
+# `_resolve_interaction` docstring 里**，这里是驱动设施这一侧的镜像）：
+#   human / driver / driver_forced / shutdown / policy
+# ⚠ `shutdown` 是 C10-a 新增的：**产品自己**退出前的强制结算（用户按两次
+#   Ctrl+C）。它与 `driver_forced`（外部驱动者掐掉的）刻意分开——合并之后
+#   一次真人退出会在审计记录里显示成「测试设施干的」。
+#
 # `via` 决定应答走哪条路径：
 # - channel：驱动器直接调产品的结算方法，来源记为应答者的 source（本轮是 `driver`）
 # - keys   ：模拟按键走面板自身的按键路径，来源保持产品默认的 `human`

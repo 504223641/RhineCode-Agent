@@ -110,6 +110,9 @@ class MemoryManager:
         # 记忆线程状态：in-flight 标志（进程内互斥）、高水位（上次审视到的消息数）、
         # 最近一次更新结果（/memory 报告用）。
         self._memory_inflight = threading.Event()
+        # C10-c：最近一次记忆更新线程的引用，`close()` 退出时 join 它。
+        # ⚠ 只保留**最近一次**就够——`_memory_inflight` 保证同一时刻至多一个在跑。
+        self._memory_thread: "threading.Thread | None" = None
         self._memory_watermark = 0
         self._last_memory_result = "（本次会话尚未触发）"
         # /resume 最近一次列表的缓存：让「/resume 看列表 → /resume 2 选编号」之间
@@ -272,6 +275,34 @@ class MemoryManager:
         thread = threading.Thread(
             target=self._update_memories, args=(new_msgs,), daemon=True, name="rhine-memory"
         )
+        # C10-c：留住线程引用，供 `close()` 在退出时等它一小会儿。
+        #
+        # ⚠ **daemon=True 保持不变**，别改成 False。CPython 在解释器终结开始后
+        # 会直接结束 daemon 线程，而 `Path.write_text` 先以 "w" 打开（**当场截断**）
+        # 再写——线程可以恰好停在这两步之间。R3 构造实测（在截断与写入之间插一个
+        # 2 毫秒的 sleep 放大窗口）**12 次里 10 次留下一个空文件**：
+        #
+        #     原文件（一条完整的记忆，含 frontmatter 与正文）: 非空
+        #     open(mode='w') 之后、还没写入时: ''
+        #     → 只要线程停在 open 与 write 之间，这条记忆就没了
+        #
+        # 丢的是**持久化数据且不可恢复**（被截断的是一条已经存在的记忆，或整份
+        # MEMORY.md 索引）。连带的第二个后果更难查：`_apply_actions` 的
+        # `finally: lockfile.release(lock)` 同样跑不到，`.lock` 留在原地，而
+        # `MEMORY_LOCK_STALE = 600.0`——**下一次运行的记忆更新会被挡最多 10 分钟**，
+        # 用户看到的现象是「记忆功能好像不工作了，过一会儿又好了」。
+        #
+        # ⚠ **那 10/12 是刻意放大过的命中率，不是真实概率。** 真实窗口很窄
+        # （时间几乎全花在 `_decide_actions` 那次 LLM 调用上，写盘只有毫秒级），
+        # 但它是「低概率 × 不可恢复」，与「高概率 × 可恢复」不是一回事。
+        #
+        # ⚠ **别照抄 `subagents/runner.py:1005` 那条 daemon 化的取舍记录。**
+        # 那里写的是**临时状态**（跑一半的子任务丢了就丢了），这里写的是
+        # **持久化数据**。取舍不同，而此前策略抄了同一个。
+        #
+        # 正确的组合是 **daemon + join(timeout)**：改成非 daemon 会让「记忆线程
+        # 正在等一个卡住的 LLM 调用」直接演变成「程序退不掉」，与 C10-a 同型。
+        self._memory_thread = thread
         thread.start()
 
     def _update_memories(self, new_msgs: list[Message]) -> None:
@@ -567,6 +598,32 @@ class MemoryManager:
         """TUI 心跳定时器：刷新会话锁 mtime（活着即新鲜，F23）。"""
         self._session.touch_lock()
 
+    #: C10-c：等记忆线程收尾的上限（秒）。
+    #
+    # ⚠ **必须有上限**：`_update_memories` 里那次 LLM 调用可能卡住，无限等
+    # 会让程序退不掉——那正好变成 C10-a 那个形态（按了退出、程序卡死）。
+    # 5 秒的依据：真实窗口只有写盘那毫秒级的一段，等它够了；而 LLM 还在跑时
+    # 5 秒也等不出结果，等下去只是让用户干瞪眼。**超时了就放手**——那时线程
+    # 仍是 daemon，进程照常退出，最坏结果退回本条修复之前的状态。
+    MEMORY_JOIN_TIMEOUT = 5.0
+
     def close(self) -> None:
-        """退出：释放会话锁（与 MCP close_all 并列在 __main__ 的 finally 里）。"""
+        """
+        退出：先等记忆线程收尾，再释放会话锁。
+
+        ⚠ **顺序是刻意的**：记忆线程要用 memory 目录的锁（不是会话锁），
+        但它写完之后才轮得到「这次运行结束了」。先释放会话锁再等它，
+        会让一个仍在写盘的线程活在「会话已结束」的状态里。
+
+        ⚠ **`join` 必须带 timeout**（`MEMORY_JOIN_TIMEOUT`），理由见该常量。
+
+        副作用：最多阻塞 `MEMORY_JOIN_TIMEOUT` 秒；释放会话锁。
+        本方法由 `bootstrap.build_app` 的 cleanup 第②步调用，
+        **那五步的顺序与幂等守卫一个字都不要动**——join 加在这一步**内部**，
+        不新加一步。
+        """
+        # C10-c：给记忆线程一点时间把「截断了但还没写」那个窗口走完。
+        thread = self._memory_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.MEMORY_JOIN_TIMEOUT)
         self._session.release()
