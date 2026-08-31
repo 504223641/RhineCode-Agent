@@ -45,6 +45,20 @@ api_key: YOUR_API_KEY
 
 # ---- 可选项（不写即用缺省值）----
 
+# 等待模型响应时，**两个数据块之间**的最长间隔（秒），缺省 90。
+#
+# ⚠ 它**不是**「一次请求的总时长上限」。模型吐一份大文件可能连续生成好几分钟，
+#   那完全不受本项影响——块与块之间通常只隔几毫秒。它治的是另一种情况：
+#   流中途卡住、一个字都不来。不设它的话最长要干等 10 分钟（SDK 默认值），
+#   而那段时间里「模型在想」和「连接死了」在界面上长得一模一样。
+#
+# ⚠ 别把它当总时长去调大到几千——那等于关掉它。真嫌它短的话，
+#   多半是网络不稳或首字节太慢，调到 180 就足够宽松了。
+# stream_idle_timeout: 90
+
+# 连接阶段的超时（秒），缺省 10。连不上就是连不上，这个值该短。
+# stream_connect_timeout: 10
+
 # 网络访问工具（web_fetch）的总开关，缺省启用。
 # 关掉之后：工具不注册、系统提示不含「外部不可信内容」约束、
 # 权限规则里的 WebFetch(domain:...) 不做语法校验——行为与没有这个工具时一致。
@@ -174,6 +188,10 @@ class Config:
     - context_window：上下文窗口上限（token），作为「历史是否逼近溢出」的判断基准（c8 F1）。
                  可选字段，缺省 65536；不同模型/账号窗口不同，可按需调大调小。非法或 <=0 时
                  由 load() 回退默认值，不阻断启动（fail-safe）。
+    - stream_idle_timeout / stream_connect_timeout：主对话等模型响应时的**块间空闲**
+      超时与连接超时（秒，C8）。可选字段，缺省 90 / 10。⚠ 前者**不是总时长上限**，
+      详见字段定义处那段（把两者当成一回事是个很自然的直觉错误，原注释就栽在这上面）。
+      两者都走「回退默认」口径（调优项，写错了最坏是数值不对，不该阻断启动）。
     - web_fetch_enabled：网络访问工具的总开关（web_fetch 扩展 F4）。可选字段，缺省 True。
     - worktree.cleanup_days / worktree.copy / worktree.link：子 Agent 隔离工作区的
       清理阈值与环境初始化清单（c14 F10/F19）。整段可缺省。
@@ -227,9 +245,49 @@ class Config:
     # 外面的计时器一点用都没有（`run_shell_captured` 那次
     # 「shell+捕获下 timeout 是假的」是同一个教训）。
     #
-    # ⚠ 也刻意**不给主对话用**：主对话的一次请求可能生成几分钟
-    # （模型在吐一份大文件的内容），给它设超时会把正常工作腰斩。
+    # ⚠ 也刻意**不给主对话用**——**但这句话给的理由是错的，见下面 C8 那段。**
+    # 主对话现在有自己的超时字段（`stream_idle_timeout`），本字段仍然只给分类器。
     request_timeout: "float | None" = None
+
+    # C8：主对话的**块间空闲超时**（秒）。
+    #
+    # ⚠ **它是「两个数据块之间的最长间隔」，不是「一次请求的总时长上限」。**
+    # 这句话必须读懂再改，否则下一个人会照着「总时长」把它设成 3600。
+    #
+    # 上面 `request_timeout` 的注释曾写着「主对话的一次请求可能生成几分钟，
+    # 给它设超时会把正常工作腰斩」——**R3 实测把这条推翻了**。起一个流式吐 SSE
+    # 的本机服务器做三组对照：
+    #
+    #   A 长但连续的生成（4 秒，每 0.2s 一块），超时设 2 秒 → 4.2s 跑完，无错
+    #   B 中途卡住（发 2 块后停 30 秒），超时设 2 秒       → 2.2s 返回超时
+    #   C 同 B 但不设超时（= 改这条之前的行为）            → **干等 30.4 秒**
+    #
+    # A 是关键那一格：**2 秒的超时没有腰斩一次 4 秒的生成。** 原因是 httpx 的
+    # `read` 超时是**每次读操作**的预算，不是整次请求的总预算——流式响应下只要
+    # 块与块之间的间隔没超过它就不会触发，而一个吐了五分钟的正常回答，
+    # 块间间隔通常在毫秒级。那句注释把「总时长上限」与「块间间隔上限」当成一回事
+    # 了。这不是笔误，是个很自然的直觉错误（本项目在 `run_shell_captured` 那次
+    # 踩过一个同类的、方向相反的坑：以为 timeout 管用，实际是假的）。
+    #
+    # C 那一格坐实了旧行为的代价：SDK 默认 `read=600`，也就是**最长 10 分钟界面
+    # 完全静止**，而用户唯一的手段是按 Esc——但他大概率会先以为程序死了。
+    # 后果不是「慢」，是**分不清「模型在想」和「连接死了」**，这两种状态在界面上
+    # 长得一模一样。
+    #
+    # ⚠ 取值不能太小：`read` 超时同样管**首字节**（time-to-first-token），
+    # 长提示词 + 高负载时段的 TTFT 可能有若干秒。90 秒对「块间间隔」而言极其宽松
+    # （正常是毫秒级），同时把「卡死」从 10 分钟压到一分半。
+    stream_idle_timeout: float = 90.0
+    # C8：连接阶段的超时（秒）。连不上就是连不上，该短；读阶段该长。
+    # SDK 直接接受 `httpx.Timeout` 对象，故两个值分开给。
+    stream_connect_timeout: float = 10.0
+    # C7：**实际生效的**配置文件路径，由 `load()` 填入。
+    #
+    # ⚠ 它不是配置项，是「这份 Config 从哪来的」这条元信息。401 的错误文案必须
+    # 把它报出来——`--config` 与用户级 `~/.rhinecode/config.yaml` 是两条来源，
+    # 而「key 填错了」时用户最常见的下一步动作就是去改**另一个**文件。
+    # 缺省空串：测试与装配层直接构造 Config 时不必给，文案会省掉那半句。
+    source_path: str = ""
 
 
 def _parse_int(
@@ -362,6 +420,12 @@ def load(path: str) -> Config:
     # context_window 为可选项：缺省 65536，非法/非正值回退默认（c8 F1，见 _parse_int）。
     context_window = _parse_int(data.get("context_window", 65536), "context_window", 65536)
 
+    # C8：两个超时都走 `_parse_float` 的「回退默认」口径（与 context_window 同，
+    # 与 web_fetch_enabled 的「非法值抛错」不同）。理由是它们纯属调优项——
+    # 写错了最坏是数值不对，不该阻断启动。
+    stream_idle_timeout = _parse_float(data.get("stream_idle_timeout", 90.0), 90.0)
+    stream_connect_timeout = _parse_float(data.get("stream_connect_timeout", 10.0), 10.0)
+
     # web_fetch_enabled 为可选项：缺省 True。走 _parse_bool（非法值**抛错**），
     # 与 debug_log 同口径——一个开关被写成 "maybe" 是明确的配置错误，
     # 静默回退会让用户以为自己关掉了网络访问而实际上没关。
@@ -427,12 +491,15 @@ def load(path: str) -> Config:
     search_timeout = _parse_float(search_raw.get("timeout", 10.0), 10.0)
 
     return Config(
+        source_path=str(path),
         protocol=data["protocol"],
         model=data["model"],
         base_url=data["base_url"],
         api_key=data["api_key"],
         debug_log=debug_log,
         context_window=context_window,
+        stream_idle_timeout=stream_idle_timeout,
+        stream_connect_timeout=stream_connect_timeout,
         web_fetch_enabled=web_fetch_enabled,
         worktree_cleanup_days=worktree_cleanup_days,
         worktree_copy=worktree_copy,

@@ -31,9 +31,12 @@ import json
 import logging
 import time
 from typing import Iterator, Optional
+
+import httpx
 import openai
 
 from rhinecode.config import Config
+from rhinecode.provider import errors
 from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
 
 # C5：Provider 是「它卡住了」这类报障最常见的落点（等首字节、限流重试、
@@ -74,13 +77,39 @@ class DeepSeekProvider(BaseProvider):
         # 使既有行为逐字不变。
         #
         # 当前唯一的传入方是装配层给**分类器专用**的那个 Provider 副本
-        # （`bootstrap.py`）。主对话刻意不设超时：它的一次请求可能生成几分钟
-        # （模型在吐一份大文件的内容），设超时会把正常工作腰斩。
+        # （`bootstrap.py`）。
+        #
+        # C8：`request_timeout` 没给时（= 主对话）**不再退回 SDK 默认值**，
+        # 改用一个显式的 `httpx.Timeout`。
+        #
+        # ⚠ 这里原先的注释写着「主对话刻意不设超时：它的一次请求可能生成几分钟，
+        # 设超时会把正常工作腰斩」——**R3 实测推翻了它**（三组对照见
+        # `config.py` 的 `stream_idle_timeout` 那段）。`read` 超时是**每次读操作**
+        # 的预算而不是整次请求的总预算，流式下它管的是**块间间隔**：2 秒的超时
+        # 没有腰斩一次 4 秒的连续生成。而不设它的代价是 SDK 默认 `read=600`，
+        # 即**最长 10 分钟界面完全静止**，用户分不清「模型在想」和「连接死了」。
+        #
+        # 两个值分开给：连接阶段该短（连不上就是连不上），读阶段该长。
+        # `write` / `pool` 跟 read 走——它们不是本条要治的东西，给同一个宽松值即可。
         client_kwargs = {"api_key": config.api_key, "base_url": config.base_url}
         if getattr(config, "request_timeout", None) is not None:
             client_kwargs["timeout"] = config.request_timeout
+        else:
+            read = getattr(config, "stream_idle_timeout", 90.0)
+            client_kwargs["timeout"] = httpx.Timeout(
+                connect=getattr(config, "stream_connect_timeout", 10.0),
+                read=read,
+                write=read,
+                pool=read,
+            )
         self._client = openai.OpenAI(**client_kwargs)
         self._model = config.model
+        # C7：错误分类要用到的三样上下文。都是**已经在 Config 里的值**，
+        # 只是此前没人往下传——401 那条文案必须报出实际生效的配置文件路径
+        # （`--config` 与用户级两条来源，用户常改错文件），连接类那条必须
+        # 报出主机名。
+        self._base_url = config.base_url
+        self._config_path = config.source_path
 
     def _to_sdk_messages(self, messages: list[Message]) -> list[dict]:
         """
@@ -287,7 +316,27 @@ class DeepSeekProvider(BaseProvider):
             # 因此类型名必须记下来——它是「401 还是连不上」这个问题的唯一答案。
             # ⚠ 不记 `str(e)`：服务端的 message 里可能回显掩码后的 key 与请求细节，
             # 格式随服务端变，不适合进一份用户会随手贴出来的日志。
-            _logger.warning(
-                "请求失败 耗时=%.1fs 异常=%s", time.monotonic() - started, type(e).__name__
+            # C7：按异常类型分派，给出「一句中文说明 + 服务端原文」。
+            #
+            # ⚠ 此前这里是 `content=str(e)`，于是 401 / 429 / 断网 / 模型名写错
+            # 四类在界面上长得**一模一样**（R3 实跑四类确认），而紧接着的
+            # 「因流错误已停止」同样不含任何行动信息。分类表在 `errors.py`——
+            # 它是 SDK 的知识，不该漏到 agent/ 或 tui/。
+            _logger.log(
+                errors.log_level_for(e),
+                "请求失败 耗时=%.1fs 异常=%s",
+                time.monotonic() - started,
+                type(e).__name__,
+                # 已被 SDK 分好类的九类不带堆栈（那只是噪音）；
+                # 未预期的那一类才需要，它是作者唯一能拿到的线索。
+                exc_info=not errors.is_sdk_error(e),
             )
-            yield StreamChunk(type="error", content=str(e))
+            yield StreamChunk(
+                type="error",
+                content=errors.classify(
+                    e,
+                    model=self._model,
+                    base_url=self._base_url,
+                    config_path=self._config_path,
+                ),
+            )
