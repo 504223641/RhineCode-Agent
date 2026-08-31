@@ -123,7 +123,7 @@ test                10      34      1287       有       5     0
 | 架构分册写明位置与理由 | `architecture.md` 补 `audit.py`，并纠正「六模块串联」画法——`render` 与 `validation` 同层并列 |
 | 测试分册记下覆盖与理由 | `testing.md` 补 39 条覆盖清单、四条反向用例、以及「零建议刻意不建断言」的理由 |
 | 扩展索引加一行 | `docs/extensions/README.md` |
-| 待办已清理 | `docs/todo/` 只剩 `README.md` / `1-web-search.md` / `2-p1b-unattended.md`；正文自引用与「已完成」节均已更新；排除本扩展自身文档后**无旧路径残留** |
+| 待办已清理 | `docs/todo/` 只剩 `README.md` / `1-web-search.md` / `3-p1b-unattended.md`；正文自引用与「已完成」节均已更新；排除本扩展自身文档后**无旧路径残留** |
 
 ---
 
