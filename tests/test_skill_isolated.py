@@ -4,6 +4,10 @@
 覆盖 spec AC18–AC23（子对话隔离、结论回流、配对结构、工具集排除 load_skill）
 与 AC33（子对话独立迭代预算）。按 T49a/b/c 三段分组，便于定位失败。
 
+另有 `HookDispatchTest`（审查报告 B3）：钉住「fork 子对话里工具级三个 Hook
+事件照常分发」。它不属于 c11 的验收范围——那是 c12 的一条安全承诺在这条
+路径上的落点，而这里是唯一能构造出那条路径的地方。
+
 用假 Provider 与真实 SkillManager；不触任何网络。
 """
 
@@ -14,6 +18,14 @@ from pathlib import Path
 
 from rhinecode.config import Config
 from rhinecode.conversation import ConversationManager
+from rhinecode.hooks import NullHookManager
+from rhinecode.hooks.models import (
+    NO_VERDICT,
+    DispatchResult,
+    HookDecision,
+    HookEventType,
+    HookVerdict,
+)
 from rhinecode.agent.events import AgentEventType, StopReason
 from rhinecode.provider.base import Message, StreamChunk, ToolCall
 from rhinecode.skills.manager import SkillManager
@@ -63,6 +75,16 @@ def _config(model: str = "main-model") -> Config:
         debug_log=False,
     )
 
+
+# 工具级三事件。它们**全部由 `Agent` 内部分发**，因此是「fork 子对话有没有
+# 拿到 hooks」这件事唯一可观测的证据（回合级事件由协调层分发，不经 Agent）。
+_TOOL_EVENTS = frozenset(
+    {
+        HookEventType.PRE_TOOL_USE,
+        HookEventType.POST_TOOL_USE,
+        HookEventType.POST_TOOL_USE_FAILURE,
+    }
+)
 
 # 测试用的已知工具名全集（含 Plan Mode 的两个特殊工具）。
 _KNOWN_TOOLS = frozenset(
@@ -118,7 +140,9 @@ class IsolatedTestBase(unittest.TestCase):
         for mgr in self._managers:
             mgr.skill_manager.startup()
 
-    def _manager(self, provider=None, registry=None, tools=()) -> ConversationManager:
+    def _manager(
+        self, provider=None, registry=None, tools=(), hook_manager=None
+    ) -> ConversationManager:
         provider = provider or ScriptedProvider()
         if registry is None:
             registry = ToolRegistry()
@@ -131,7 +155,15 @@ class IsolatedTestBase(unittest.TestCase):
             has_short_command=lambda _n: True,
         )
         sm.startup()
-        mgr = ConversationManager(provider, _config(), registry, skill_manager=sm)
+        # `hook_manager` 缺省仍是 None（协调层用 `NullHookManager()` 兜底），
+        # 只有 HookDispatchTest 会传一个记录型的假实现进来。
+        mgr = ConversationManager(
+            provider,
+            _config(),
+            registry,
+            skill_manager=sm,
+            hook_manager=hook_manager,
+        )
         mgr.approve_plan_callback = lambda _p: True
         # 默认关掉 c9 的自动记忆钩子：它在自然停止时起一个 daemon 线程，
         # 用**同一个**假 Provider 再发一次 tools=None 的请求。那条请求会混进
@@ -472,6 +504,190 @@ class ContextLayerTest(IsolatedTestBase):
         # 第二层未被调用：所有请求都带着 tools（摘要请求会强制 tools=None）。
         for call in provider.calls:
             self.assertIsNotNone(call["tools"], "出现了摘要请求（第二层被调用了）")
+
+
+class _RecordingHooks(NullHookManager):
+    """
+    只对三个**工具级**事件表态的假 Hook 编排者，用来观测「分发到底有没有发生」。
+
+    继承 `NullHookManager` 而不是从零手写一个类，理由有两条：
+    ① 协调层与上下文管理器还会调 `bind_context` / `consume_injections` /
+       `warnings` 等方法，逐个补全等于把接口抄一遍，将来 `HookManager`
+       加方法时这里会 `AttributeError`；
+    ② 空对象的语义正是「什么都不做」，本类只覆盖需要观测的那两个方法，
+       读的人一眼就知道其余行为与真实的「没配 Hook」逐字一致。
+
+    :param verdict: `pre_tool_use` 要返回的结论。缺省 `NO_VERDICT`（不表态），
+                    传 DENY 时表示「用户写了一条拦截规则」。
+    """
+
+    def __init__(self, verdict: HookVerdict = NO_VERDICT) -> None:
+        self._verdict = verdict
+        # 记录 (事件, 工具名)，测试据此断言「哪个事件在子对话里真的分发过」。
+        self.seen: list[tuple[HookEventType, str]] = []
+
+    def has_listeners(self, event) -> bool:
+        # 只认工具级三事件：回合级 / 会话级事件在子对话里走的是另一条通道
+        # （协调层直接分发，不经 Agent），混进来会让断言分不清是哪一半在起作用。
+        return event in _TOOL_EVENTS
+
+    def dispatch(self, event, payload_factory=None, cwd=None):
+        # 负载工厂必须真的调用一次——`Agent._tool_fields` 里出的错（比如将来给
+        # 工具级负载加字段时写错取值）只有在这里被调用时才暴露得出来。
+        fields = payload_factory() if payload_factory else {}
+        self.seen.append((event, fields.get("tool", "")))
+        if event is HookEventType.PRE_TOOL_USE:
+            return DispatchResult(verdict=self._verdict, matched=1, executed=1)
+        return DispatchResult(matched=1, executed=1)
+
+    def events_for(self, tool_name: str) -> list:
+        """取某个工具上分发过的事件列表（顺序保留）。"""
+        return [ev for ev, name in self.seen if name == tool_name]
+
+
+class _FakeCommandTool(Tool):
+    """
+    冒充 `run_command` 的假工具：非只读、命令类，因此走串行桶、过完整权限管线。
+
+    刻意用 `run_command` 这个名字而不是自造一个：`permission/adapter.py` 按
+    工具名映射 `kind`，换个名字会落进 `other` 分支，判定路径与真实场景不同。
+
+    :param ok: 执行结果的成败。为 False 时用来触发 `post_tool_use_failure`。
+    """
+
+    name = "run_command"
+    description = "假的命令执行器"
+    parameters = {"type": "object", "properties": {"command": {"type": "string"}}}
+    read_only = False
+
+    def __init__(self, ok: bool = True) -> None:
+        self._ok = ok
+        self.executed = 0
+
+    def execute(self, args: dict) -> ToolResult:
+        self.executed += 1
+        if self._ok:
+            return ToolResult(ok=True, output="done", summary="ok")
+        return ToolResult(ok=False, output="boom", summary="命令失败")
+
+
+class HookDispatchTest(IsolatedTestBase):
+    """
+    `context: fork` 的 Skill 子对话里，**工具级三个 Hook 事件照常分发**。
+
+    ## 违反会发生什么（这是安全判据，不是功能判据）
+
+    `pre_tool_use` / `post_tool_use` / `post_tool_use_failure` 三个事件
+    **全部由 `Agent` 内部分发**，而 `Agent.__init__` 的 `hooks` 缺省是
+    `NullHookManager()`。`conversation.py` 的 `_run_forked_skill` 一旦漏传
+    `hooks=self._hooks`（**它真的漏过，见审查报告 B3**），这条子对话里那三个
+    事件一次都不分发，且**不报错、不告警、其余测试全绿**。
+
+    用户看到的形态是：他写了一条
+    `pre_tool_use` + `command contains "git push"` → `deny` 的规则，
+    在主对话里试过、确实拦住了；之后模型加载一个 `context: fork` 的 Skill
+    （或用户自己敲那个 Skill 的短命令），正文里那句 `git push` **直接跑掉**，
+    而 `/hooks` 报告显示这条规则「触发 0 次」。他会去改 `if:` 条件，
+    而根因在一个跟条件毫无关系的地方。
+
+    这与 C13「Hook 对子 Agent 全量生效」是**同一条安全承诺的两个落点**：
+    委派那条路由 `tests/test_subagent_integration.py::HookIntegrationTest`
+    钉着，Skill 这条路此前没有任何东西钉。而 Skill 更容易走到——
+    一次 `load_skill` 就够，不需要写角色定义文件。
+
+    ## 为什么这条不能简化
+
+    ① **不能只断言 `pre_tool_use`。** 三个事件走的是 `Agent` 里**两个不同的**
+       方法（`_dispatch_pre_tool` / `_dispatch_post_tool`）。只验前置的话，
+       一个「前置接上了、后置没接」的实现照样全绿，而用户拿 `post_tool_use`
+       做的审计日志会在 Skill 子对话里静默漏记。
+    ② **不能只断言「事件被分发过」，必须同时断言 DENY 真的拦住了。**
+       只看 `seen` 的话，一个「分发了但把结论丢掉」的实现（求值完不用
+       `hook_verdict`）照样全绿，而那正是安全边界失效的形态。
+    ③ **不能拿只读工具代替。** 只读工具走并发桶那个 `_dispatch_post_tool`
+       调用点，非只读走串行桶那个；用非只读的命令类工具才与「用户想拦
+       `git push`」这个真实场景同形。
+    ④ **假 Hook 必须真的调一次 `payload_factory`。** 不调的话，负载构造里的
+       错误（`_tool_fields` 将来加字段写错取值）在这里永远暴露不出来。
+    """
+
+    def _run_with(self, hooks: "_RecordingHooks", tool: "_FakeCommandTool"):
+        """
+        跑一次「Skill 子对话里调一次命令工具」的完整流程。
+
+        执行流程：第一轮模型发起 `run_command`，第二轮收口成一段文本结论。
+
+        :returns: 那个假 Provider，便于需要时检查逐轮请求
+
+        副作用：`hooks.seen` 被填上本次分发过的事件。
+        """
+        provider = ScriptedProvider(
+            [
+                _tool_call("run_command", args={"command": "git push origin main"}),
+                _text("我停手了。"),
+            ]
+        )
+        mgr = self._manager(provider, tools=[tool], hook_manager=hooks)
+        self._write_skill()
+        list(mgr.run_skill("rev", "", "/rev"))
+        return provider
+
+    def test_pre_tool_use_deny_blocks_the_command_inside_a_forked_skill(self) -> None:
+        """
+        一条 `pre_tool_use` 的 deny 规则在 fork 子对话里**同样拦得住**。
+
+        两个断言缺一不可：事件确实分发过（否则规则「触发 0 次」），
+        且工具**一次都没执行**（否则规则形同虚设）。
+        """
+        hooks = _RecordingHooks(
+            HookVerdict(HookDecision.DENY, "禁止 git push", "no-push")
+        )
+        tool = _FakeCommandTool()
+
+        self._run_with(hooks, tool)
+
+        self.assertIn(
+            HookEventType.PRE_TOOL_USE,
+            hooks.events_for("run_command"),
+            "fork 子对话里的工具调用必须触发 pre_tool_use"
+            "——不触发的话用户写的拦截规则在这条路径上等于不存在",
+        )
+        self.assertEqual(tool.executed, 0, "被 Hook 拦下的命令绝不能真的执行")
+
+    def test_post_tool_use_fires_after_a_successful_call(self) -> None:
+        """
+        不表态时工具照常执行，且**执行之后**分发 `post_tool_use`。
+
+        这条同时反证了上一条：DENY 那次「没执行」确实是 Hook 拦的，
+        不是这条链路本来就跑不通。
+        """
+        hooks = _RecordingHooks()
+        tool = _FakeCommandTool(ok=True)
+
+        self._run_with(hooks, tool)
+
+        events = hooks.events_for("run_command")
+        self.assertEqual(tool.executed, 1, "不表态时命令应照常执行")
+        self.assertIn(HookEventType.PRE_TOOL_USE, events)
+        self.assertIn(HookEventType.POST_TOOL_USE, events)
+        self.assertNotIn(HookEventType.POST_TOOL_USE_FAILURE, events)
+
+    def test_post_tool_use_failure_fires_when_the_call_fails(self) -> None:
+        """
+        工具返回 `ok=False` 时分发的是 `post_tool_use_failure` 而不是 `post_tool_use`。
+
+        两个事件的分工是「跑了且成功」与「跑了但失败」，混用会让
+        「统计工具失败率」这类 Hook 用途在 Skill 子对话里直接失真。
+        """
+        hooks = _RecordingHooks()
+        tool = _FakeCommandTool(ok=False)
+
+        self._run_with(hooks, tool)
+
+        events = hooks.events_for("run_command")
+        self.assertEqual(tool.executed, 1)
+        self.assertIn(HookEventType.POST_TOOL_USE_FAILURE, events)
+        self.assertNotIn(HookEventType.POST_TOOL_USE, events)
 
 
 if __name__ == "__main__":
