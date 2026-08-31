@@ -410,6 +410,25 @@ class TaskManager:
         with self._lock:
             return self._tasks.get(task_id)
 
+    def current_epoch(self) -> int:
+        """
+        当前会话代号（C10-b）。
+
+        :returns: `begin_session` 递增的那个整数
+
+        用途：`/agents` 报告据此把「本段对话的任务」与「`/clear` 之前的」分开。
+        此前报告拿到的是 `snapshot()` 的全量，而 `begin_session` 只把代号 +1、
+        **一条记录都不删**——于是用户 `/clear` 之后敲 `/agents`，看到的仍是上一段
+        对话的任务列表，而他想知道的是「**现在**有谁在跑」。
+
+        ⚠ 临界区只做一次纯内存读——本类的加锁不变量（回调与跨线程调度一律在锁外）
+        原样成立。
+
+        副作用：无。
+        """
+        with self._lock:
+            return self._epoch
+
     def snapshot(self) -> tuple[TaskRecord, ...]:
         """
         取全部任务的只读快照，按创建顺序。

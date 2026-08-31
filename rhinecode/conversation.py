@@ -1434,6 +1434,9 @@ class ConversationManager:
             effective_mode_for=effective_mode_for,
             project_dir=str(main_project_root() / ".rhinecode" / "agents"),
             user_dir=str(self._user_dir / "agents"),
+            # C10-b：只列本段对话的任务。`/clear` 只把代号 +1、一条记录都不删，
+            # 不传这个的话用户清空之后敲 `/agents` 看到的仍是上一段的任务列表。
+            current_epoch=service.tasks.current_epoch(),
         )
         # c15 F26：花名册接在报告末尾。
         #

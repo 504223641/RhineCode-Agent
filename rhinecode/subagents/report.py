@@ -143,6 +143,92 @@ def _task_line(record: TaskRecord) -> str:
     return head
 
 
+# `/agents` 任务段最多列几行（C10-b）。
+#
+# 与 `tasks.ACTIVITY_RECENT_LIMIT` **刻意分开**：那个管的是活动区展开时每个队员
+# 列几次工具调用（一个很窄的视图，5 条正好），这里管的是「本段对话发起过哪些
+# 委派」——一次十几步的任务派出七八个队员是正常的，卡到 5 会把用户正在找的那条
+# 挡掉。两个数字合一之后，调其中一个必然把另一个调坏。
+TASK_LIST_LIMIT = 15
+
+
+def _task_section(
+    tasks: tuple[TaskRecord, ...], current_epoch: Optional[int]
+) -> list[str]:
+    """
+    渲染 `/agents` 的任务段（C10-b）。
+
+    :param tasks: 全部任务记录（含 `/clear` 之前的）
+    :param current_epoch: 当前会话代号；None 表示调用方没提供，退回旧行为（列全部）
+    :returns: 该段的行列表（末尾带一个空行）
+
+    ## 这一段治的是什么
+
+    R3 实测：`begin_session`（`/clear` 走它）只做 `self._epoch += 1`，让旧记录
+    **不再被交付**，但记录本身一条不少、全文件里一处删除都没有。于是：
+
+    - **`/agents` 的输出无界，且含已清空会话的任务。** 一次跑过 60 次委派的会话
+      会刷出 60 行，其中大半来自 `/clear` 之前——而用户敲 `/agents` 想知道的是
+      「**现在**有谁在跑」。
+    - 对照同文件的 `recent_tools` 是有界的（`[-ACTIVITY_RECENT_LIMIT:]`）：
+      **「一切展示都有界」这条只落到了列表层，没落到字典层。**
+
+    ## ⚠ 为什么只治展示、不治存储
+
+    R3 的建议是「先只治展示」，理由是删记录有三条约束（运行中的一条都不能删、
+    终态但未交付的不能删、删了会让完成通知失去成本数字），而它换来的只有约
+    3 KB/次委派的内存——**不值得为它引入一个新的成对维护点**。本函数一条记录
+    都不删。
+
+    ## ⚠ 运行中的任务永不被裁掉
+
+    截断只作用在**终态**任务上。用户敲 `/agents` 的第一诉求就是「还有谁在跑」，
+    把正在跑的那条截掉等于把这个命令最有用的部分砍了——而且**不报错**。
+
+    副作用：无（纯函数）。
+    """
+    if not tasks:
+        return ["本次运行尚未发起过委派。", ""]
+
+    if current_epoch is None:
+        # 调用方没给代号：退回旧行为，一条不筛。保留这一支是为了让
+        # 既有的直接调用（测试、将来别的入口）不必被迫改签名。
+        current, earlier = list(tasks), []
+    else:
+        current = [t for t in tasks if t.epoch == current_epoch]
+        earlier = [t for t in tasks if t.epoch != current_epoch]
+
+    lines: list[str] = []
+    if current:
+        # 终态的才参与截断；运行中的一条不少地全列出来。
+        done = [t for t in current if t.status.is_terminal]
+        hidden = max(0, len(done) - TASK_LIST_LIMIT)
+        if hidden:
+            # 只在真的超了才重排：留最近 TASK_LIST_LIMIT 条终态的，
+            # 加上全部运行中的。⚠ 用集合成员判断而不是「running + done[-N:]」，
+            # 为的是**保持创建顺序**——后者会把所有运行中的提到最前面，于是同一份
+            # 列表在超限前后顺序不一样，用户会以为任务被重排了。
+            keep = {id(t) for t in done[-TASK_LIST_LIMIT:]}
+            shown = [t for t in current if not t.status.is_terminal or id(t) in keep]
+        else:
+            shown = current
+
+        lines.append(f"本次对话的任务（{len(current)} 个）：")
+        lines.extend(_task_line(record) for record in shown)
+        if hidden:
+            lines.append(f"  （另有 {hidden} 条已结束的任务未列出）")
+    else:
+        lines.append("本次对话尚未发起过委派。")
+
+    if earlier:
+        # ⚠ 一行汇总，不逐条列。它们已经不会再交付了（代号对不上），
+        # 用户此刻要的是「现在」，但完全不提又会让「我明明派过活」显得可疑。
+        lines.append(f"另有 {len(earlier)} 条属于此前的会话，已不再交付。")
+
+    lines.append("")
+    return lines
+
+
 def render_report(
     catalog: AgentCatalog,
     tasks: tuple[TaskRecord, ...],
@@ -150,6 +236,7 @@ def render_report(
     effective_mode_for: Callable[[AgentSpec], PermissionMode],
     project_dir: Optional[str] = None,
     user_dir: Optional[str] = None,
+    current_epoch: Optional[int] = None,
 ) -> str:
     """
     渲染 `/agents` 的完整报告（spec F24）。
@@ -161,6 +248,8 @@ def render_report(
     :param effective_mode_for: 角色 → 实际生效的权限档位
     :param project_dir: 项目级角色目录路径，展示在末尾
     :param user_dir: 用户级角色目录路径
+    :param current_epoch: 当前会话代号（C10-b）。给了就只列本段对话的任务、
+        对更早的给一行汇总；不给则退回旧行为（列全部），见 `_task_section`
     :returns: 多行文本
 
     分五段，**空段不出现**（无错误时不该有一个空的「加载错误」标题，
@@ -209,13 +298,7 @@ def render_report(
         lines.append("")
 
     # ── 任务段 ──
-    if tasks:
-        lines.append(f"本次运行的任务（{len(tasks)} 个）：")
-        for record in tasks:
-            lines.append(_task_line(record))
-    else:
-        lines.append("本次运行尚未发起过委派。")
-    lines.append("")
+    lines.extend(_task_section(tasks, current_epoch))
 
     # ── 位置与提示 ──
     if project_dir:
