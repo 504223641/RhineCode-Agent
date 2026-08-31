@@ -8,6 +8,10 @@
 
 `config.yaml`（git 忽略，从 `config.example.yaml` 复制）字段：`protocol`（**只支持 `deepseek`**——anthropic / openai 两个 Provider 已于 2026-08-20 删除，配成这两个值会在装配期报错并给出迁移说明；字段本身刻意保留，环境信息 / 状态栏 / trace 配置快照都在读它）、`model`、`base_url`、`api_key`。可选字段 `debug_log` 控制是否写入 `.rhinecode_debug.log` 缓存命中调试日志，默认开启。可选字段 `context_window`（c8）声明上下文窗口上限（token），作为「历史是否逼近溢出、何时压缩」的判断基准；缺省 / 非法 / 非正值都由 `_parse_int` fail-safe 回退默认 65536（不抛异常），故首次生成的模板**不含**此项——没写即用默认值，想调大/调小手动加一行即可。注意它只影响 RhineCode 的压缩时机，不改变模型真实上限，应贴近所用模型的实际上下文长度。 可选字段 `web_fetch_enabled`（web_fetch 扩展）是网络访问工具的总开关，缺省 `true`；设为 `false` 后工具不注册、系统提示不含「外部不可信内容」那条约束、权限规则里的 `WebFetch(domain:...)` 不做语法校验也不产生警告——**行为与该扩展之前逐字一致**。注意它走 `_parse_bool`：**非法值抛 ValueError**（与 `debug_log` 同口径），而不是像 `context_window` 那样回退默认——一个开关被写成 `maybe` 是明确的配置错误，静默回退会让用户以为自己关掉了网络访问而实际上没关。
 
+可选字段 `stream_idle_timeout` / `stream_connect_timeout`（C8）是**主对话**等模型响应时的两个超时（秒），缺省 90 / 10。⚠ **前者是「两个数据块之间的最长间隔」，不是「一次请求的总时长上限」**——这两件事很容易被当成一回事，而 `provider/deepseek.py` 里那句「主对话刻意不设超时，设了会把正常工作腰斩」的老注释正是栽在这上面。R3 用本机 SSE 服务器实测三组：2 秒的超时**没有**腰斩一次 4 秒的连续生成（httpx 的 `read` 超时是每次读操作的预算，流式下只要块间间隔没超过它就不触发，而正常回答的块间间隔在毫秒级）；反过来不设它的代价是 SDK 默认 `read=600`，即**最长 10 分钟界面完全静止**，而那段时间里「模型在想」与「连接死了」在界面上长得一模一样。两者都走 `_parse_float` 的「回退默认」口径（与 `context_window` 同，与 `web_fetch_enabled` 的「非法值抛错」不同）——它们是调优项，写错了最坏是数值不对。⚠ 注意与**分类器专用**的 `classifier.timeout` / 内部字段 `request_timeout` 区分：那两个的合理取值比这里小一个数量级，刻意不复用同一个字段。
+
+⚠ **本条是一处成对维护点**：`config.py` 的字段定义 ↔ 本文件 ↔ `_CONFIG_TEMPLATE`（首次运行生成的模板）。`request_timeout` 此前正是靠「刻意不进模板」维持一致的，而这两个新字段**进了模板**，于是三处从此必须同步。护栏见 `tests/test_config_timeout.py::TemplateAndDocsTest`。
+
 可选段 `worktree`（c14）配置子 Agent 隔离工作区的两件事：`cleanup_days`（启动时清理多少天没动过的工作区，缺省 7；**0 或负数 = 不清理**——这是它与 `context_window` 的关键差别，后者遇到 0 会回退默认，而这里 0 是合法语义，靠 `_parse_int` 的 `allow_zero=True` 表达）、`copy` 与 `link`（环境初始化清单，两段都缺省为空）。整段可缺省；**非法结构一律回退默认、不抛错**——与 `web_fetch_enabled` 刻意不同口径，理由是这三项都不是安全开关，写错了最坏是「没清理」或「没复制文件」，而 `web_fetch_enabled` 写错会让用户以为关掉了网络访问却没关。
 
 ⚠ **清理与「有没有变更」的关系要说清楚**：`cleanup_days` 只决定「要不要考察某个工作区」，**不决定能不能删**。有未提交改动的工作区**永远不会**被清理（不论多老）；有提交、无未提交改动的只删目录、**保留分支**（成果仍可 `git checkout` 取回）。

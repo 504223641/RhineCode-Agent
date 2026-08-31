@@ -169,7 +169,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 ⚠ **动下面任何一处代码之前，先加载它**——`agent/`、`permission/`、
 `classifier/`、`subagents/`、`team/`、`todo/`、`worktree/`、`hooks/`、`skills/`、
 `tui/`、`trace/`、`web/`、`tests/e2e/`、`bootstrap.py`、`conversation.py`、
-`presets.py`、`tools/`、`commands/`、`context/`、`memory/`、`mcp/`。
+`presets.py`、`tools/`、`commands/`、`context/`、`memory/`、`mcp/`、
+`provider/`、`config.py`。
 **拿不准就加载。**
 
 ⚠ **web_search 扩展新增三条**（都在 `paired-maintenance` Skill 里）：搜索类的
