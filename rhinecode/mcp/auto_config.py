@@ -442,7 +442,11 @@ def _load_yaml_for_update(path: Path) -> dict[str, Any]:
         return {}
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - never overwrite broken user config
+    # ⚠ 这里没有吞异常——下一行 `raise ... from exc` 把它重新抛出去了，
+    # 所以**不需要**标 BLE001（那条规则只管「捕获了却不再抛」）。
+    # 原注释「never overwrite broken user config」说的是语义，仍然成立：
+    # 解析失败时不写盘，交由上层处理。
+    except Exception as exc:
         raise ValueError(f"MCP config parse failed, not writing {path}: {exc}") from exc
     if loaded is None:
         return {}

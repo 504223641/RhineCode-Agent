@@ -210,7 +210,9 @@ def main() -> None:
         # 那两个窗口里没有界面可提示，退出是唯一合理的结果——但**不要甩回溯**：
         # 用户按的是 Ctrl+C，不是程序出了错。
         pass
-    except Exception as e:  # noqa: BLE001 —— 见下方那段说明
+    except Exception as e:
+        # ⚠ 这里**不需要**标 BLE001（宽泛 except）：本分支用 `_logger.exception`
+        # 记了完整堆栈，而那条规则对「捕获后真的记录了」的写法本来就不触发。
         # C6 形态②：异常发生在 `_process_messages` 自身，逃出了 Textual 的接管。
         #
         # ⚠ **它是补漏不是主菜。** 绝大多数崩溃发生在消息处理器与事件回调里

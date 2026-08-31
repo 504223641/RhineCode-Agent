@@ -83,7 +83,21 @@ from rhinecode.skills.models import (
     builtin_skills_dir,
 )
 from rhinecode.skills.render import render_active_body, render_invocation_text
-from rhinecode.agent.loop import Agent, RunOptions
+# E1：`AskFn` 挂在这条**既有的**运行期 import 上。
+#
+# `_build_ask` 的返回注解写的是字符串 `"AskFn"`，而这个名字**全文只在那一行
+# 出现过**——`typing.get_type_hints()` 当场 NameError（ruff 与 mypy 用不同机制
+# 各自独立报了它）。运行期无害（字符串注解不求值），但任何做 introspection 的
+# 东西都会炸。
+#
+# ⚠ **这里刻意没用 `if TYPE_CHECKING:`，尽管 R3 的修法那样写。** 那种写法能让
+# ruff 与 mypy 闭嘴，但 `get_type_hints()` **照样 NameError**（TYPE_CHECKING 块
+# 运行期不执行）——而那正是本条列出的影响面。本文件已经在这一行运行期 import
+# `agent.loop` 了，多带一个名字零成本、零新依赖、不可能成环，却真的把问题修掉。
+#
+# ⚠ **别把注解改成 `Callable[..., bool]` 之类的泛化写法**：同文件已有语义相近的
+# `ConfirmCallback`，再引入第三种表达同一件事的写法只会让下一个人更困惑。
+from rhinecode.agent.loop import Agent, AskFn, RunOptions
 from rhinecode.agent.prompt import build_default_prompt, collect_environment
 from rhinecode.agent.events import (
     AgentEvent,
