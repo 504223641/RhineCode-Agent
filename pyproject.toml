@@ -146,3 +146,19 @@ include = ["rhinecode*"]
 # （一个 Skill 一个目录，就到底了），两条显式模式在所有版本上都成立。
 [tool.setuptools.package-data]
 "rhinecode.skills" = ["builtin/*.md", "builtin/*/*.md"]
+# ⚠ A5：这一行此前**是漏的**，后果是 C13 的「定义式委派」在任何
+# `pip install .`（注意不是 `-e`）出来的副本里整个失效——wheel 与 sdist 里
+# `rhinecode/subagents/builtin/` 一个文件都没有，explorer / planner /
+# general-purpose 三个内置角色全丢。而它**完全静默**：分层扫描对缺失的层
+# 是设计上的静默跳过（那个容错本是为「用户没建 .rhinecode/agents/」写的），
+# 于是结果是「0 个角色、0 个错误」；无角色时 render_agent_index 又刻意返回
+# 空串，系统提示里那一段整个消失。全链路上唯一会说出真相的，是模型猜错
+# 角色名时的回灌文案。完整论证见 docs/review/01-release-blockers.md 的 R5-1。
+#
+# ⚠ 它与上面 skills 那条的**模式条数不一样是对的，不是漏写**：
+# 一个角色 = 一个 md 文件、不嵌套（builtin/explorer.md），所以一条就够；
+# Skill 另有目录型（builtin/skill-creator/SKILL.md），才需要第二条。
+# **将来若角色也支持目录型，这里必须跟着加一条 `builtin/*/*.md`**——
+# 这是一处成对维护点（`subagents/builtin/` 的目录结构 ↔ 本行的模式），
+# 漏改一律不报错，护栏是 tests/test_package_data.py。
+"rhinecode.subagents" = ["builtin/*.md"]
