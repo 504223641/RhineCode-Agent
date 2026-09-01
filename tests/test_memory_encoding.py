@@ -67,8 +67,7 @@ from rhinecode.memory.instructions import (
     load_instructions,
 )
 from rhinecode.memory import manager as manager_module
-from rhinecode.memory.manager import MemoryManager
-from rhinecode.memory.manager import INDEX_FILENAME
+from rhinecode.memory.manager import INDEX_FILENAME, MemoryManager
 from rhinecode.provider.base import BaseProvider
 
 
@@ -529,6 +528,61 @@ class MemoryIndexEncodingTest(_MemoryFilesFixture):
         )
         self.assertIn("禁止推送到 main", mgr.memory_index())
         self.assertNotIn("读取失败", self._project_row(mgr))
+
+
+class UnexpectedIndexErrorTest(_MemoryFilesFixture):
+    """
+    第二层：**没想到的**失败也不许要了整个会话的命。
+
+    与 B6 在 `instructions.py`（已知失败落回 `layer.errors`）↔ `startup()`
+    （没想到的失败仍带着三层结构冒出来）之间那对是同一个形状，因此本类与
+    `MemoryIndexEncodingTest` **缺一不可**：
+    只补窄捕获 → 下一种没预料到的异常仍会让每一轮对话都炸；
+    只补兜底 → 一份坏编码的索引会被记成「意外错误」，而它其实是**已知**的、
+    该给用户一句「多半不是 UTF-8 编码」的可操作提示。
+    """
+
+    def test_unexpected_error_does_not_kill_every_turn(self) -> None:
+        """`memory_index()` 里冒出任何异常都不许穿出去——它每轮都跑。"""
+        self._write_good_user_index()
+        mgr = self._manager()
+        with mock.patch.object(
+            MemoryManager, "_read_index", side_effect=RuntimeError("谁也没想到的错误")
+        ):
+            try:
+                mgr.memory_index()
+            except RuntimeError as e:  # pragma: no cover - 只在回归时走到
+                self.fail(f"意外错误从 memory_index() 穿出去了，每一轮对话都会炸：{e}")
+
+    def test_unexpected_error_is_still_visible_in_the_report(self) -> None:
+        """
+        ⚠ 兜底**不许把话咽回去**。
+
+        这条是上一条的另一半：一个 `except Exception: continue` 同样能让上一条
+        全绿，而那就是本项目通篇最忌讳的**静默吞噬**——索引凭空不再注入，
+        三条通路没有一条会说出为什么。
+        """
+        mgr = self._manager()
+        with mock.patch.object(
+            MemoryManager, "_read_index", side_effect=RuntimeError("谁也没想到的错误")
+        ):
+            mgr.memory_index()
+        self.assertIn("谁也没想到的错误", mgr.memory_report())
+
+    def test_the_other_level_survives_an_unexpected_error(self) -> None:
+        """只跳过出事的那一级：另一级照常注入（与坏编码那条同源）。"""
+        self._write_good_user_index()
+        (self.project_mem / INDEX_FILENAME).write_text("# 记忆索引\n- x\n", encoding="utf-8")
+        mgr = self._manager()
+        real = MemoryManager._read_index
+
+        def only_project_blows_up(self_, scope):  # noqa: ANN001
+            if scope == "project":
+                raise RuntimeError("只有这一级出事")
+            return real(self_, scope)
+
+        with mock.patch.object(MemoryManager, "_read_index", only_project_blows_up):
+            self.assertIn("中文回答", mgr.memory_index(), "干净的那一级被连坐了")
 
 
 class MemoryBodyEncodingTest(_MemoryFilesFixture):

@@ -298,13 +298,32 @@ class MemoryManager:
             # 编码失败在那里被兜住并登记（详见该方法的注释）。⚠ 这一处是本条
             # 最要紧的调用点——它**每次构建系统提示都会跑**，此前一个坏编码的
             # MEMORY.md 会让每一轮对话都抛 UnicodeDecodeError。
-            raw = self._read_index(scope)
-            if not raw.strip():
+            try:
+                raw = self._read_index(scope)
+                if not raw.strip():
+                    continue
+                parts.append(
+                    f"### {label}记忆索引（全文位于 {self._memory_dirs[scope]}，"
+                    f"需要细节时用读文件工具按文件名读取）\n{truncate_index(raw)}"
+                )
+            except Exception as e:  # noqa: BLE001 —— 见下方整段说明
+                # **没想到的失败**的兜底，与 `_read_index` 里那些窄捕获是**两层**、
+                # 缺一不可（与 B6 在 `instructions.py` ↔ `startup()` 之间那对是同一
+                # 个形状，见 `paired-maintenance`）：窄捕获让**已知**的失败落回它该
+                # 落的地方，这一层让**下一种还没想到的**失败也不至于要了整个会话
+                # 的命——本方法每次构建系统提示都会跑，从这里抛出去等于**每一轮
+                # 对话都炸**，而用户拿不到任何可操作的信息。
+                #
+                # ⚠ 为什么这里用宽的 `except Exception`，而 `_read_index` 里刻意用
+                # 窄的：**判据不是「宽窄」，是「接住之后还说不说得出话」。** 本项目
+                # 忌讳的是**静默**吞噬，而这一支把原因登记进 `_index_errors`，
+                # `/memory` 那一行照样会说「读取失败（…）」——它没把话咽回去。
+                # 反过来，`_read_index` 那个 try 块里只有一次 `read_text`，写宽了
+                # 纯粹是给日后塞进去的代码提供一次白吞，一点好处都没有。
+                #
+                # 只跳过**这一级**：另一级的索引照常注入（同「不被连坐」那条）。
+                self._index_errors[scope] = f"意外错误：{e}"
                 continue
-            parts.append(
-                f"### {label}记忆索引（全文位于 {self._memory_dirs[scope]}，"
-                f"需要细节时用读文件工具按文件名读取）\n{truncate_index(raw)}"
-            )
         if not parts:
             return ""
         header = (
