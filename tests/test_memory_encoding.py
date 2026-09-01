@@ -67,7 +67,9 @@ from rhinecode.memory.instructions import (
     load_instructions,
 )
 from rhinecode.memory import manager as manager_module
+from rhinecode.memory import session as session_module
 from rhinecode.memory.manager import INDEX_FILENAME, MemoryManager
+from rhinecode.memory.session import SessionStore
 from rhinecode.provider.base import BaseProvider
 
 
@@ -683,6 +685,173 @@ class IndexReadHasOneEntryPointTest(unittest.TestCase):
             self.ALLOWED,
             "manager.py 里读文件的函数变了。新增一个读点就要新增一份「读失败之后"
             "怎么办」，而漏写它不报错——先想想能不能走 `_read_index`：\n"
+            f"实际={found}",
+        )
+
+
+# ---------------------------------------------------------------------- #
+# 第三处：会话存档的坏编码（同一个洞在 session.py 里的落点）
+# ---------------------------------------------------------------------- #
+
+_GOOD_LINE_1 = '{"ts":"2026-01-01T00:00:00","role":"user","content":"第一句"}'
+_GOOD_LINE_2 = '{"ts":"2026-01-01T00:01:00","role":"user","content":"第三句"}'
+# ⚠ 这一行的**结构部分全是 ASCII**，只有中文那几个字节是 GBK ——
+# 这正是 `errors="replace"` 那条路会翻车的形状，见 `_iter_archive_lines` 的说明。
+_BAD_LINE = '{"ts":"2026-01-01T00:00:30","role":"user","content":"坏行"}'
+
+
+class _ArchiveFixture(unittest.TestCase):
+    """一个 sessions 目录 + 一份「好 / 坏 / 好」三行存档。"""
+
+    SESSION_ID = "20260101-000000-aaaa"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name) / "sessions"
+        self.dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_archive(self, *, with_bad_line: bool) -> Path:
+        """写一份存档；`with_bad_line` 决定中间那行是不是坏编码。"""
+        chunks = [_GOOD_LINE_1.encode("utf-8")]
+        if with_bad_line:
+            chunks.append(_BAD_LINE.encode("gbk"))
+        chunks.append(_GOOD_LINE_2.encode("utf-8"))
+        path = self.dir / f"{self.SESSION_ID}.jsonl"
+        path.write_bytes(b"\n".join(chunks) + b"\n")
+        return path
+
+    def _store(self) -> SessionStore:
+        return SessionStore(self.dir)
+
+
+class ArchiveEncodingTest(_ArchiveFixture):
+    """
+    坏编码的会话存档不许炸掉 `/resume`，也不许把乱码塞进历史。
+
+    修复前 `list_sessions()` 与 `load()` **都直接抛 `UnicodeDecodeError`**
+    （实测过）：`open(encoding="utf-8")` 的解码失败发生在**迭代那一行**时，
+    而三处的 `except OSError` 一个都接不住它。
+    """
+
+    def test_listing_does_not_blow_up(self) -> None:
+        """会话面板 / `/resume` 列表不许被一份坏编码的存档炸掉。"""
+        self._write_archive(with_bad_line=True)
+        try:
+            infos = self._store().list_sessions()
+        except UnicodeDecodeError as e:  # pragma: no cover - 只在回归时走到
+            self.fail(f"坏编码的存档让 /resume 列表炸了：{e}")
+        self.assertEqual([i.session_id for i in infos], [self.SESSION_ID])
+
+    def test_listing_still_reads_the_title(self) -> None:
+        """
+        坏行只该花掉它自己：标题仍从第一条好行取到。
+
+        只断言「没炸」的话，一个「碰到坏行就 `return None`」的实现会全绿，
+        而那份会话会**从列表里整个消失**——用户根本不知道它存在过，
+        比抛异常更难查。
+        """
+        self._write_archive(with_bad_line=True)
+        info = self._store().list_sessions()[0]
+        self.assertEqual(info.title, "第一句")
+
+    def test_load_recovers_the_good_messages(self) -> None:
+        """两条好消息照常恢复——**不是**「整份会话载不进来」。"""
+        self._write_archive(with_bad_line=True)
+        result = self._store().load(self.SESSION_ID)
+        self.assertEqual([m.content for m in result.messages], ["第一句", "第三句"])
+
+    def test_bad_line_lands_in_the_existing_skipped_counter(self) -> None:
+        """
+        坏行落进**既有的**坏行通路，用户因此在 `/resume` 的回执里看得到
+        「跳过损坏行 N 条」。
+
+        这条钉的是「没有另造一条通路」——本模块本来就为坏行准备好了一条，
+        编码问题该走上去，而不是新开一个只有开发者看得懂的分支。
+        """
+        self._write_archive(with_bad_line=True)
+        self.assertEqual(self._store().load(self.SESSION_ID).skipped_lines, 1)
+
+    def test_no_replacement_characters_reach_the_history(self) -> None:
+        """
+        ⚠ **本组最关键的一条，也是唯一挡得住那个「简化」的。**
+
+        `open(..., errors="replace")` 看起来是更省事的写法，**实测是错的**：
+        存档行的 JSON 结构部分全是 ASCII，在任何中文编码下都与 UTF-8 逐字节
+        相同，于是 `json.loads` **照常成功**，产出一条内容是 `����` 的消息——
+        它不进坏行通路（`skipped_lines` 仍是 0），而是**静默地进入对话历史
+        并被发给模型**。
+
+        上面那条「跳过 1 条」的断言**挡不住它**（那种实现下跳过数是 0，
+        断言会红没错——但把它改成 `assertGreaterEqual(0)` 就又绿了）。
+        真正不可绕过的判据是这一条：**恢复出来的内容里一个替换字符都不许有。**
+        「救回一条乱码」比「丢掉一条并说出来」更糟。
+        """
+        self._write_archive(with_bad_line=True)
+        result = self._store().load(self.SESSION_ID)
+        for msg in result.messages:
+            self.assertNotIn(
+                "�",
+                msg.content or "",
+                f"恢复出来的消息里有替换字符，说明走了 errors='replace' 那条路：{msg.content!r}",
+            )
+
+    def test_clean_archive_reports_no_damage(self) -> None:
+        """
+        反向反证：一份干净的存档必须**一条都不跳**、内容逐字还原。
+
+        少了它，一个「把每行都当坏行」的实现会让上面几条全绿
+        （不炸、没有替换字符），而 `/resume` 什么都恢复不出来。
+        """
+        self._write_archive(with_bad_line=False)
+        result = self._store().load(self.SESSION_ID)
+        self.assertEqual(result.skipped_lines, 0)
+        self.assertEqual([m.content for m in result.messages], ["第一句", "第三句"])
+
+    def test_message_count_does_not_blow_up(self) -> None:
+        """`/memory` 报告要读当前存档的行数——那条路径同样不许被坏编码炸掉。"""
+        self._write_archive(with_bad_line=True)
+        store = self._store()
+        store.attach(self.SESSION_ID)
+        try:
+            self.assertEqual(store.message_count, 3)
+        except UnicodeDecodeError as e:  # pragma: no cover
+            self.fail(f"坏编码的存档让 /memory 的行数统计炸了：{e}")
+
+
+class ArchiveReadHasOneEntryPointTest(unittest.TestCase):
+    """
+    结构护栏：`session.py` 里**读**存档只经 `_iter_archive_lines` 一处。
+
+    与 `manager.py` 那条同源，理由也一样：原先三个读点各写各的 `except`，
+    同一个洞要修三遍、漏一处**不报错**。
+
+    ⚠ **写入那处刻意不在内**（`append` 仍是直接 `open(..., "a")`）：读的时候
+    「尽量救回来」是对的，写的时候做任何容错都是在**制造**坏数据。所以本条
+    断言的是「`open` 只出现在两个地方」——读的那一个和写的那一个——
+    而不是「所有 open 都走辅助函数」。
+    """
+
+    ALLOWED = {"_iter_archive_lines", "append"}
+
+    def test_open_only_appears_in_the_reader_and_the_writer(self) -> None:
+        source = Path(session_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        found: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "open":
+                    found[node.name] = found.get(node.name, 0) + 1
+        self.assertEqual(
+            set(found),
+            self.ALLOWED,
+            "session.py 里 open() 的分布变了。新增一个**读**点要走 "
+            "`_iter_archive_lines`（否则那一处又接不住 UnicodeDecodeError）；"
+            "新增**写**点则刻意不该走它：\n"
             f"实际={found}",
         )
 

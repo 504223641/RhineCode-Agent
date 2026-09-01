@@ -49,6 +49,55 @@ LIST_LIMIT = 10
 TITLE_MAX_CHARS = 30
 
 
+def _iter_archive_lines(path: Path):
+    """
+    读存档的**唯一开档入口**（三个读点共用：`message_count` / `_scan_one` / `load`）。
+
+    :param path: 存档文件路径
+    :yields: 每行的文本；**这一行解码不出来时 yield `None`**
+    :raises OSError: 文件不存在 / 权限不足等——在**首次取值**时抛出，
+                     由各调用方按既有方式退化（生成器的惰性：`open` 发生在
+                     第一次迭代时，所以调用方的 `try` 必须裹住 for 循环本身，
+                     现有三处都是这么写的）
+
+    ⚠ **「按二进制读、逐行自己解码」是这里唯一的设计点，理由值得写全。**
+
+    本模块**早就有一条「坏行跳过并计数」的通路**（`_deserialize_line` 返回 None
+    → `skipped_lines` → `/resume` 回执里那句「跳过损坏行 N 条」）。问题在于
+    `open(encoding="utf-8")` 的解码失败发生在**迭代那一行的时候**，会把整个 for
+    循环掀翻——于是一行坏字节的代价不是「少一条消息」，而是**整份会话都载不
+    进来**，且异常直接冒到 `/resume` 与会话面板上（实测两处都抛
+    `UnicodeDecodeError`）。逐行解码把失败**限制在那一行**，于是它落进上面那条
+    早就准备好的通路：**一行坏字节只花掉一条消息**，其余照常恢复，用户还能从
+    回执里看到跳了几条。
+
+    ⚠ **不要「优化」成 `open(..., errors="replace")`**——那个写法看起来更简单，
+    实测**是错的**：存档行的 JSON 结构部分（`{"role":"user","content":"`）全是
+    ASCII，在任何中文编码下都与 UTF-8 逐字节相同，坏掉的只有中文那几个字节。
+    于是 `errors="replace"` 之后 `json.loads` **照常成功**，产出一条内容是
+    `����` 的消息——它**不会**进坏行通路（`skipped_lines` 仍是 0），而是**静默
+    地进入对话历史并被发给模型**。实跑三行样本（好 / 坏 / 好）确认过：
+    `errors="replace"` 恢复 3 条、跳过 0 条，中间那条是乱码；逐行解码恢复 2 条、
+    跳过 1 条并如实告知。**「救回一条乱码」比「丢掉一条并说出来」更糟。**
+
+    ⚠ 同理不用 `errors="surrogateescape"`：那会把坏字节变成落单的代理字符，
+    JSON 照样解析得动，而那种字符在后续编码进 API 请求时才会炸——把问题从
+    「读存档时」推迟到「发请求时」，追起来更难。
+
+    ⚠ **写入路径刻意不共用本函数**（`append` 仍是 `encoding="utf-8"` 直接写）：
+    读的时候「尽量救回来」是对的，写的时候做任何容错都是在**制造**坏数据。
+    """
+    # 二进制打开：迭代产出 bytes 行，解码由下面逐行进行，一行坏不影响下一行。
+    with open(path, "rb") as f:
+        for raw in f:
+            try:
+                yield raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # ⚠ 只吞这一行。调用方按各自的既有方式处理 None：
+                # `load` 计入 skipped_lines（用户看得见），扫描与计数则跳过解析。
+                yield None
+
+
 @dataclass
 class SessionInfo:
     """
@@ -119,8 +168,11 @@ class SessionStore:
         if not self._created:
             return 0
         try:
-            with open(self._archive_path(), "r", encoding="utf-8") as f:
-                return sum(1 for _ in f)
+            # 走唯一开档入口：解码失败被限制在单行，不会掀翻这里的计数循环
+            # （此前一份坏编码的存档会让 `/memory` 整个抛 UnicodeDecodeError）。
+            # 解码不出来的行**照数**，与 SessionInfo.message_count 的既有口径
+            # 「坏行也计入」一致——这里要的是「存档有多大」，不是「能读出几条」。
+            return sum(1 for _ in _iter_archive_lines(self._archive_path()))
         except OSError:
             return 0
 
@@ -219,27 +271,32 @@ class SessionStore:
             title = ""
             count = 0
             last_ts: Optional[str] = None
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
+            for line in _iter_archive_lines(path):
+                if line is None:
+                    # 这一行解码不出来：照既有的「坏行」口径**计数但不解析**
+                    # （标题与时间取不到就取不到，不该因此丢掉整个会话——
+                    # 列表里少一项，用户根本不知道它存在过）。
                     count += 1
-                    try:
-                        data = json.loads(line)
-                    except ValueError:
-                        continue  # 坏行不影响扫描
-                    if not isinstance(data, dict):
-                        continue
-                    ts = data.get("ts")
-                    if isinstance(ts, str):
-                        last_ts = ts
-                    if not title and data.get("role") == "user":
-                        # 标题优先用显示内容（c10 F26）：/init 等提示词命令的会话
-                        # 在列表里显示原命令而非展开后的长提示词；缺失或空则回退 content。
-                        display = data.get("display_content")
-                        raw = display if isinstance(display, str) and display.strip() else data.get("content", "")
-                        content = str(raw).strip().replace("\n", " ")
-                        title = content[:TITLE_MAX_CHARS]
+                    continue
+                if not line.strip():
+                    continue
+                count += 1
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue  # 坏行不影响扫描
+                if not isinstance(data, dict):
+                    continue
+                ts = data.get("ts")
+                if isinstance(ts, str):
+                    last_ts = ts
+                if not title and data.get("role") == "user":
+                    # 标题优先用显示内容（c10 F26）：/init 等提示词命令的会话
+                    # 在列表里显示原命令而非展开后的长提示词；缺失或空则回退 content。
+                    display = data.get("display_content")
+                    raw = display if isinstance(display, str) and display.strip() else data.get("content", "")
+                    content = str(raw).strip().replace("\n", " ")
+                    title = content[:TITLE_MAX_CHARS]
             last_time = _parse_ts(last_ts)
             if last_time is None:
                 try:
@@ -280,17 +337,23 @@ class SessionStore:
         skipped = 0
         last_ts: Optional[str] = None
         try:
-            with open(self._archive_path(session_id), "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    msg, ts = _deserialize_line(line)
-                    if msg is None:
-                        skipped += 1
-                        continue
-                    if ts:
-                        last_ts = ts
-                    raw_messages.append(msg)
+            for line in _iter_archive_lines(self._archive_path(session_id)):
+                if line is None:
+                    # 解码不出来 = 坏行，走既有计数（用户会在 /resume 的回执里
+                    # 看到「跳过损坏行 N 条」）。⚠ 别改成「救回来一条乱码」：
+                    # 那会静默地把 U+FFFD 塞进对话历史并发给模型，见
+                    # `_iter_archive_lines` 里那段实测记录。
+                    skipped += 1
+                    continue
+                if not line.strip():
+                    continue
+                msg, ts = _deserialize_line(line)
+                if msg is None:
+                    skipped += 1
+                    continue
+                if ts:
+                    last_ts = ts
+                raw_messages.append(msg)
         except OSError:
             return SessionLoadResult([], 0, 0, None)
 
