@@ -1619,7 +1619,24 @@ class ConversationManager:
             sub_provider = (
                 self._provider_for(spec.model) if spec.model else self._provider
             )
-            sub_agent = Agent(sub_provider, self._registry, recorder=self._recorder)
+            # ⚠ `hooks=` **不可省**（本行曾漏传，见审查报告 B3）：
+            # `pre_tool_use` / `post_tool_use` / `post_tool_use_failure`
+            # 三个工具级事件**全部由 Agent 内部分发**，而 `Agent.__init__` 的
+            # `hooks` 缺省是 `NullHookManager()`——不传不报错，只是这条子对话里
+            # 那三个事件一次都不分发。失效形态：用户写了一条
+            # `pre_tool_use` + `command contains "git push"` → `deny` 的规则，
+            # 在主对话里验过确实拦得住；之后模型加载一个 `context: fork` 的 Skill，
+            # 正文里那句 `git push` **直接跑掉**，而 `/hooks` 显示这条规则
+            # 「触发 0 次」——用户会去改 `if:` 条件，而根因在这一行。
+            # 这与 C13「Hook 对子 Agent 全量生效」是同一条安全承诺的两个落点：
+            # 委派那条路早就堵上了，Skill 这条路更容易走到（一次 load_skill 就够）。
+            # 上面 `sub_dynamic` 里的注入通道注释写着「两处都要接」，说的就是它。
+            sub_agent = Agent(
+                sub_provider,
+                self._registry,
+                recorder=self._recorder,
+                hooks=self._hooks,
+            )
 
             # 取消信号必须**重建**：`request_cancel()` 置的就是 `self._cancel_event`，
             # 而它原本只在 `_run()` 里重建。上一次运行残留的置位会让子对话开局即被取消。
