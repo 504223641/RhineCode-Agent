@@ -62,3 +62,4 @@ TemText.txt
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+.claude/worktrees/
