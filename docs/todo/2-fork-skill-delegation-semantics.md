@@ -86,7 +86,7 @@ C13 的契约里，这两件事合起来叫「委派永不阻塞，但你要的�
 先跑 git branch --show-current，如果在 main 上就先 git checkout -b fork-skill-delegation。
 动 conversation.py 与 skills/ 之前先加载 paired-maintenance Skill。
 
-我要做 docs/todo/3-fork-skill-delegation-semantics.md 记的这件事：
+我要做 docs/todo/2-fork-skill-delegation-semantics.md 记的这件事：
 context: fork 的 Skill 子对话可以派活给子 Agent（run_agent 在它的工具集里），
 但它的 run() 不传 subagent_gate，于是循环退化成 NullGate ——
 不会每轮注入子 Agent 结论，模型准备收工时也不会停下来等它。
