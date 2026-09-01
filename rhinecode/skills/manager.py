@@ -55,6 +55,7 @@ from rhinecode.skills.models import (
     ActiveSkill,
     DegradeKind,
     LOAD_SKILL_TOOL,
+    RUN_AGENT_TOOL,
     ReloadOutcome,
     SkillCatalog,
     SkillCommandInfo,
@@ -564,18 +565,60 @@ class SkillManager:
 
     def fork_excluded_tools(self) -> frozenset[str]:
         """
-        子对话中要排除的工具名（防止 Skill 里再激活 Skill）。
+        `context: fork` 子对话中要排除的工具名。
 
-        :returns: 恒为 `{load_skill}`
+        :returns: 恒为 `{load_skill, run_agent}`
 
         **这是 C11 的 `ToolPolicy` 三元组塌缩后唯一留下的用途。**
         排除只是不把 schema 发给模型；模型仍可能凭训练先验硬造出一次调用，
-        因此循环层还有一道「调用了本轮未提供的工具就拒绝」的兜底判定——
-        两者缺一，嵌套防线就不成立。
+        因此循环层还有一道「调用了本轮未提供的工具就拒绝」的兜底判定
+        （`agent/loop.py` 的 `out_of_scope` 分支）——**两者缺一，防线就不成立**。
+
+        ## 两个工具、同一条不变量：「一层子对话不许再往下开一层」
+
+        - `load_skill`：防**直接**嵌套——Skill 里再激活一个 `context: fork`
+          的 Skill，深度没有上限。
+        - `run_agent`：防**横向**扩层——fork 子对话派一个子 Agent 出去。
+
+        ⚠ **`run_agent` 这一条是 2026-09-01 补的，此前它一直漏在外面。**
+        补的理由**不是**「防无限嵌套」（那是 `load_skill` 的理由，对它并不成立：
+        子 Agent 的 `GLOBAL_DENIED_TOOLS` 已经挡掉了 `run_agent` 与 `load_skill`，
+        所以「fork → 子 Agent」这条路深度封顶在一层、递归不下去）。真正的理由是
+        另外三条：
+
+        ① **闸门在这条路上没法正确接。** 主对话那侧给 `run()` 传了
+           `subagent_gate`，于是「每轮把结论注入历史」与「模型准备收工时停下来等」
+           都成立；fork 侧没传，循环退化成 `NullGate`，后半句就没了。
+           而**照抄主对话那个闸门是错的**：`SubAgentGate.take_pending()` 底下是
+           `TaskManager.take_deliverables()`，它取的是**全进程**「已终态且未交付」
+           的任务、**不按发起方分桶**，取走即置 `delivered`。把它交给 fork 子对话，
+           主对话委派出去的结论会被注入到 fork 那份**用完即弃**的历史里并标成
+           「已交付」——而 fork 只把最后一段结论字符串带回主对话。**那是丢结果，
+           比现在的时序不一致严重一个量级。** `CompositeGate` 里的
+           `TeamGate(MAIN_NAME)` 同理：fork 会把发给 `main` 的队友消息吃掉，
+           而消息是 C15 里叫醒待命队员的唯一手段，发送方会坐等一个永远不来的结果。
+           要正确接，得先有一份「按本次运行分桶」的任务视图——那是新机制，
+           不是接一根线。
+
+        ② **子 Agent 那一侧早就把 fork Skill 当成「一层子对话」了。**
+           `GLOBAL_DENIED_TOOLS` 里 `load_skill` 那条的注释逐字写着「一个
+           `context: fork` 的 Skill 会再开一层子对话」。两张表本是同一条不变量的
+           两个落点，只是 fork 这一侧漏了一格——**不对称才是异常，排除不是**。
+
+        ③ **fork 本身就是「把调研赶出主上下文」那个机制。** 它的定位与
+           `run_agent` 的定位逐字相同，套两层买不到什么：子 Agent 的结论先被
+           压成一段字符串塞进 fork 的上下文，fork 的上下文再被压成一段字符串
+           回主对话——两次有损压缩。何况 fork 的生命周期盖不住它派出去的活
+           （`SKILL_MAX_ITERATIONS` 只有 15 轮），fork 收工时那个子 Agent 还在跑，
+           结论最后落在主对话里，而主对话并没有要过它。
+
+        ⚠ **别顺手给 fork 侧的 `RunOptions` 补 `subagent_gate`。** 补了它，
+        这里的排除就让那个闸门永远走不到——一段永远走不到的代码比没有更糟。
+        两种语义只落地一种。
 
         副作用：无。
         """
-        return frozenset({LOAD_SKILL_TOOL})
+        return frozenset({LOAD_SKILL_TOOL, RUN_AGENT_TOOL})
 
     # ────────────────────────── 查询 ──────────────────────────
 
