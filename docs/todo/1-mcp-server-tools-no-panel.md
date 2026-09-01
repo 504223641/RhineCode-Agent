@@ -80,7 +80,7 @@ B4 修完之后，用户至少会在添加时看到一次面板 —— 但**他�
 先跑 git branch --show-current，如果在 main 上就先 git checkout -b mcp-tool-confirm。
 动 permission/ 与 tui/ 之前先加载 paired-maintenance Skill。
 
-我要做 docs/todo/2-mcp-server-tools-no-panel.md 记的这件事：
+我要做 docs/todo/1-mcp-server-tools-no-panel.md 记的这件事：
 MCP Server 提供的工具（mcp__<server>__<tool>）在缺省预设下是 allow @ mode，
 一次面板都不弹，而项目对 MCP 的定性是「远端是外部程序、不可信」。
 
