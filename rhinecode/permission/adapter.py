@@ -282,6 +282,14 @@ def to_allow_rule(request: PermissionRequest) -> tuple[str, str]:
         # 分类器的宽泛规则丢弃（F16）只处理 `Bash` 与 `WebSearch` 两类，
         # 不碰这条。因此确认面板对 `launch` 照常给四个选项——
         # 别顺手把它加进 `no_permanent`。
+        #
+        # ⚠ **2026-09-01 本工具纳入 C16 分类器之后这条仍然成立，别跟着改。**
+        # 写下的 `allow: mcp_add_server` 会在③层命中并短路④层，因此它连带把
+        # 分类器也关掉了——那是③层「用户写的 allow 直接短路分类器」这条既有
+        # 性质，不是缺口：规则是**人写下来的**，而模型改不了 `permissions.yaml`
+        # （②″保护路径）。把它加进 F16 的丢弃范围会让「永久放行」重新变成
+        # 骗人的按钮（点了、写下去了、下次还弹），而搜索类正是为此不得不砍掉
+        # 那个选项。护栏见 `tests/test_mcp_launch_classifier.py`。
         return request.rule_name, ""
     if request.kind == "search":
         # ⚠ **必须返回空模式（整工具形式）。**

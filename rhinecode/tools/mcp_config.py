@@ -19,6 +19,13 @@ auto-plan 扩展把缺省档换成 `PERMISSIVE`（`presets.py` 的 `DEFAULT_PRES
 被规范化为 `kind == "launch"`，第④层在放行档下对它判 ASK（与 url / search
 两个既有例外同格）。改动那处映射等于把这条承诺再拿掉一次，
 护栏见 `tests/test_perm_launch_layer.py`。
+
+⚠ **2026-09-01 起面板之前还有一道：C16 分类器（启动类）。**
+面板看得到「要跑什么命令」，看不到「用户到底有没有要求过引入这个 Server」——
+后者只有完整对话上下文才回答得了，而那恰恰是这一类真正的判据（`command`
+通常是一条人畜无害的 `npx -y <包名>`）。**代价是分类器判放行时面板不再弹**，
+于是判放行的那条路上它是唯一的一道；熔断时退回上面那一格。
+护栏见 `tests/test_mcp_launch_classifier.py`。
 """
 
 from __future__ import annotations
