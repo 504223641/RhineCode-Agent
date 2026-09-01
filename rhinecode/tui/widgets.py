@@ -3480,6 +3480,72 @@ class ConfirmPanel(NumberedPanel):
             lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
         return lines
 
+    def _launch_detail_lines(self, tool_call, decision) -> list[str]:
+        """
+        为「启动外部程序」类请求（`mcp_add_server`）生成补充展示行。
+
+        :param tool_call: 本次工具调用（从中取未经截断的原始参数）
+        :param decision: DecisionResult（提供 layer）
+        :returns: 已转义、可直接进 markup 的行文本列表
+
+        ⚠ **这几行不是装饰，是这次确认唯一的判断依据**（审查报告 B4/S1）。
+
+        表头那一行走 `summarize_args`，**每个参数值只留 30 个字符**——
+        一条 `config={'command': 'curl', 'args': ['-d', '@~/.rhinecode/co…`
+        会在 `command` 刚露头的地方被切断，而用户要放行的正是「跑这条命令」。
+        与 url / search 两类是同一条理由：被截断意味着只要把危险部分放在可见
+        范围之后，人在回路这一层就形同虚设。
+
+        三行分别回答用户必然会问的三件事：
+        1. **要启动什么**（命令 + 全部参数，或远端地址）——不截断；
+        2. **写到哪份配置**（项目级 / 用户级；用户级在**工作区之外**）；
+        3. 判定来自哪一层。
+
+        ⚠ 参数进 markup 前一律用本模块的 `escape`，绝不要 `rich.markup.escape`。
+        命令行参数里出现落单的 `[` 完全正常（`--filter=a[0]` 之类），
+        而 rich 那版只转义「看起来像完整标签」的 `[...]`，落单的会被整个放过，
+        然后在 Textual 的布局阶段抛 MarkupError——那是没有任何 try/except
+        兜得住、会直接拆掉整个 app 的那一类。
+        """
+        args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        config = args.get("config")
+        config = config if isinstance(config, dict) else {}
+        lines: list[str] = []
+
+        server_name = str(args.get("server_name") or "").strip()
+        if server_name:
+            lines.append(f"   [dim]服务器名：[/dim]{escape(server_name)}")
+
+        command = config.get("command")
+        url = config.get("url")
+        if command:
+            parts = [str(command)]
+            extra = config.get("args")
+            if isinstance(extra, (list, tuple)):
+                parts.extend(str(one) for one in extra)
+            # **不截断**：这一行的全部价值就在于让用户看到将被执行的完整命令。
+            lines.append(f"   [dim]将要执行：[/dim]{escape(' '.join(parts))}")
+        elif url:
+            lines.append(f"   [dim]远端地址：[/dim]{escape(str(url))}")
+
+        # scope 的口径与 `mcp/auto_config._config_path_for_scope` 一致：
+        # `auto` 落项目级。⚠ 这里刻意不 import 那个函数——面板是主线程布局路径，
+        # 为了一行说明去拉起 mcp 包不值得；而这句话说错的代价只是措辞，
+        # 真正的写入位置由工具自己决定。
+        scope = str(args.get("scope") or "auto").strip().lower() or "auto"
+        where = {
+            "user": "用户级 ~/.rhinecode/mcp.yaml（在工作区之外）",
+            "project": "项目级 .rhinecode/mcp.yaml",
+        }.get(scope, "项目级 .rhinecode/mcp.yaml（scope=auto）")
+        lines.append(f"   [dim]写入：[/dim]{escape(where)}")
+
+        layer = getattr(decision, "layer", None)
+        layer_value = getattr(layer, "value", layer)
+        if layer_value:
+            label = self._LAYER_LABELS.get(str(layer_value), str(layer_value))
+            lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
+        return lines
+
     def show_for(self, tool_call, tool, decision=None) -> None:
         """
         为一次工具调用填充并显示确认面板（c6 四态放行）。
@@ -3548,6 +3614,9 @@ class ConfirmPanel(NumberedPanel):
         elif decision is not None and getattr(decision, "kind", "") == "search":
             for line in self._search_detail_lines(tool_call, decision):
                 self._add_static(line)
+        elif decision is not None and getattr(decision, "kind", "") == "launch":
+            for line in self._launch_detail_lines(tool_call, decision):
+                self._add_static(line)
         # 四个可选项带序号（F23），用户可以直接按数字键选中。
         # 改造前这里是四个彩色 emoji（`✅ 🟢 💾 ❌`）——四种颜色反而盖过了
         # 「哪个是当前选中」这个唯一重要的信息。语义现在由序号 + 文字承担。
@@ -3589,6 +3658,14 @@ class ConfirmPanel(NumberedPanel):
         # **不报错，但那次放行不生效**，用户点完下次还弹。
         # 因此：`no_permanent` 管选项条数，`protected` 管说明文字与
         # `conversation.py` 那侧的机制。
+        #
+        # ⚠ **`launch` 类（`mcp_add_server`）刻意不加进 `no_permanent`**，
+        # 别看它也是「④层放行档下的例外」就顺手归到搜索类那一档。
+        # 判据是那条推导链走不通：它的规则形状是整工具的 `allow: mcp_add_server`，
+        # 而 F16 的宽泛规则丢弃**只处理 `Bash` 与 `WebSearch` 两类**
+        # （见 `classifier/broad.py` 的两个常量），不碰它。于是那条规则下次启动
+        # 会照常在③层命中并短路④层——**「永久放行」在这一类上是诚实的**。
+        # 砍掉它反而是拿走一个真的有用的选项。
         protected = layer_value == "protected"
         is_search = decision is not None and getattr(decision, "kind", "") == "search"
         no_permanent = protected or is_search

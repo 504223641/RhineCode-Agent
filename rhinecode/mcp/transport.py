@@ -33,6 +33,9 @@ from rhinecode.mcp.jsonrpc import (
     is_response,
     next_id,
 )
+# ⚠ 复用命令工具那份敏感环境变量过滤，**不另抄一份黑名单**（理由见
+# `StdioTransport.start` 的 docstring）。`mcp` → `tools` 是既有依赖方向。
+from rhinecode.tools.run_command import filtered_environ
 
 
 def resolve_stdio_command(command: str) -> str:
@@ -159,10 +162,39 @@ class StdioTransport(Transport):
         """
         拉起子进程并启动 reader 线程。
 
-        环境：继承当前进程 os.environ 再叠加配置 env（多数 Server 依赖 PATH 等基础环境，
-        配置 env 优先级更高）。stderr 单独捕获，避免污染 stdout 的 JSON 流。
+        环境：继承当前进程环境（**已剔除疑似密钥的变量**）再叠加配置 env
+        （多数 Server 依赖 PATH 等基础环境，配置 env 优先级更高）。
+        stderr 单独捕获，避免污染 stdout 的 JSON 流。
+
+        ⚠ **这里此前是 `{**os.environ, **self._env}`，把完整环境（含
+        `DEEPSEEK_API_KEY`）交给了一个外部程序**（审查报告 B4）。
+
+        MCP Server 是外部程序、项目自己把它定性为**不可信**，而 `mcp.yaml`
+        可能来自 `git clone` 来的项目级配置。同一条理由在 `run_command` 那边
+        早已落实（auto-plan 扩展 F17：「命令全放行之后，一句打印环境的命令
+        就能拿到 API Key」），MCP 这条路径当时漏了——**而它比命令更隐蔽**：
+        命令串会出现在确认面板与行为记录里，一个 MCP Server 自己去读环境变量
+        不留任何痕迹。
+
+        ⚠ **配置里的 `env` 仍然覆盖在最上层，这是刻意的。** 用户在 `mcp.yaml`
+        里显式写下的 `${GITHUB_TOKEN}` 是**他自己的授权决定**，过滤掉它等于让
+        「配了却不生效」成为常态；过滤只针对**本进程环境的无差别继承**
+        ——那部分不是任何人的决定。
+
+        ⚠ **复用 `tools/run_command.filtered_environ()`，不另抄一份黑名单。**
+        抄一份的话两处会各自漂移，而漏改**不报错**：新增一个敏感片段只在
+        `run_command` 生效，MCP 这侧照样漏出去。依赖方向上 `mcp` → `tools`
+        是既有的（`mcp/config.py` → `tools/path_guard`、`mcp/manager.py` →
+        `tools/registry`、`mcp/tool_adapter.py` → `tools/base`），
+        且 `tools/run_command.py` 只 import `tools.base` 与 `tools.path_guard`，
+        不成环；`tools/__init__.py` 保持为空这条不变量也不受影响。
+
+        护栏见 `tests/test_mcp_env_filter.py`（真起子进程读它拿到的环境，
+        另有「不是把环境清空」「配置 env 仍然覆盖得上」两条反证）。
         """
-        merged_env = {**os.environ, **self._env}
+        # 只取过滤后的环境；丢弃条数在这里用不上（那是给命令工具做提示用的）。
+        inherited, _dropped = filtered_environ()
+        merged_env = {**inherited, **self._env}
         # 先解析命令再启动子进程，避免 Windows 下 `command: npx` 找不到真实批处理入口。
         command = resolve_stdio_command(self._command)
         try:

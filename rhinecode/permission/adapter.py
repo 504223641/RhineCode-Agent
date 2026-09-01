@@ -10,12 +10,12 @@
 
 ⚠ **成对维护点**：新增一种 `kind` 时，除了 `_TOOL_MAP`，**同文件的 `to_allow_rule`
 也要跟着加分支**。漏改后者不报错——本次调用照常放行，要到下次启动才发现那条
-「永久放行」写下的规则是废的。目前有两种 kind 需要在两处同步：`url`（写
-`domain:` 模式）与 `search`（写空模式）。
+「永久放行」写下的规则是废的。目前有三种 kind 需要在两处同步：`url`（写
+`domain:` 模式）、`search`（写空模式）与 `launch`（写空模式）。
 
 ⚠ 新增 `kind` 时还要看第三处：`permission/engine.py` 第④层的模式兜底。
-`url` 与 `search` 在放行档下都判 ASK（各有各的理由文案），而其余种类判 ALLOW
-——漏改那里的表现是「配了放行档之后搜索就再也不问了」，也不报错。
+`url` / `search` / `launch` 在放行档下都判 ASK（各有各的理由文案），而其余种类
+判 ALLOW——漏改那里的表现是「配了放行档之后搜索就再也不问了」，也不报错。
 """
 
 from pathlib import Path
@@ -28,7 +28,51 @@ from rhinecode.permission.models import PermissionMode, PermissionRequest
 # 单个工具的映射规则：给定参数字典，返回 (rule_name, specifier, kind)。
 _Mapper = Callable[[dict], tuple[str, str, str]]
 
-# 工具名 → 映射函数。集中登记 6 个核心工具的「规则名 / 取哪个参数作 specifier / 种类」。
+def _launch_specifier(args: dict) -> str:
+    """
+    把一次 `mcp_add_server` 调用压成一行「要启动什么」的人类可读描述。
+
+    :param args: 模型给出的参数字典（`server_name` / `config`）
+    :returns: 形如 `context7 · npx -y @upstash/context7-mcp`；取不到时尽量降级
+
+    ## 为什么要有它
+
+    `launch` 类的 specifier **不参与任何规则匹配**（它落 `rules._rule_matches`
+    的「其它类」分支，那个分支只认 `rule.pattern == ""` 的整工具规则）。
+    它唯一的消费方是**行为记录与原因展示**——而「那次委派到底把什么程序拉起来了」
+    正是事后排查时唯一想知道的事。留空串的话记录里只剩一个工具名。
+
+    ⚠ **刻意不截断。** 与 url / search 两类同一条理由：这段文字是用户判断
+    放不放行的依据，截断意味着只要把危险部分放在可见范围之后，人在回路这一层
+    就形同虚设。（确认面板另有专用展示行，见 `tui/widgets.ConfirmPanel`。）
+
+    ⚠ **绝不抛异常。** 它跑在权限判定的入口上，参数是模型产出的任意 JSON——
+    `config` 完全可能不是字典、`args` 完全可能不是列表。判定层抛异常会让
+    整轮工具执行炸掉，而这里只是在拼一句给人看的话。
+
+    副作用：无（纯数据转换）。
+    """
+    name = str(args.get("server_name") or "").strip()
+    config = args.get("config")
+    target = ""
+    if isinstance(config, dict):
+        command = config.get("command")
+        url = config.get("url")
+        if command:
+            parts = [str(command)]
+            extra = config.get("args")
+            if isinstance(extra, (list, tuple)):
+                parts.extend(str(one) for one in extra)
+            target = " ".join(parts)
+        elif url:
+            target = str(url)
+    if name and target:
+        return f"{name} · {target}"
+    return name or target
+
+
+# 工具名 → 映射函数。集中登记各内置工具的「规则名 / 取哪个参数作 specifier / 种类」。
+# ⚠ 这里刻意不写「共 N 个」——加一行映射就得回来改一次数字，而漏改不报错。
 _TOOL_MAP: dict[str, _Mapper] = {
     # run_command：整条命令进①黑名单 + ③Bash 命令匹配。
     "run_command": lambda a: ("Bash", str(a.get("command") or ""), "command"),
@@ -46,6 +90,29 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # specifier 刻意用**完整 URL 原文**而非主机名——确认面板与行为记录里要留下
     # 模型实际请求的那个地址；主机名另放在 PermissionRequest.host（见 to_request）。
     "web_fetch": lambda a: ("WebFetch", str(a.get("url") or ""), "url"),
+    # mcp_add_server：**启动外部程序类**（B4 修复）。
+    #
+    # ⚠ 它此前落在未映射的 `other` 兜底分支上，而那个分支在缺省预设（auto =
+    # 放行档）下的结论是 `allow @ mode`——**六层防御一层都碰不到它**：
+    # ①黑名单只认 `command`、②沙箱只认路径类、②′网络只认 `url`、
+    # ②″保护路径第一行就是 `if request.kind != "write_path": return result`，
+    # ③层要用户主动写下 `deny: mcp_add_server` 才拦得住。
+    # 于是模型可以在一次调用里、不弹任何面板地写一条 `mcpServers` 配置
+    # 并立刻把它拉起来，而 `command` 是**任意本地命令**。
+    #
+    # 这条洞不是新引入的，是**一条老承诺失去了兑现它的那一层**：
+    # `tools/mcp_config.py` 的 docstring 写着「交给现有权限确认流程拦截」，
+    # 那句话写于 C7——当时缺省档是 `DEFAULT`，④层对 `other` 类判 ASK，面板照弹。
+    # auto-plan 扩展把缺省档换成 `PERMISSIVE` 之后，那一层就不再说话了。
+    #
+    # 修法因此是**把承诺还给④层**：新增一种 kind `launch`，在④层放行档下判 ASK
+    # （与 `url` / `search` 两个既有例外同格，见 `engine._decide_core`）。
+    # 选它而不是「出口收紧器」的理由见 `engine` 里那一支的注释。
+    #
+    # specifier 取「服务器名 · 将要执行的命令（或远端地址）」——它是行为记录里
+    # 唯一能回答「那次到底启动了什么」的字段。规则匹配用不到它（`launch` 落
+    # 「其它类」分支，只认不带括号的整工具规则），因此可以放人看的文本。
+    "mcp_add_server": lambda a: ("mcp_add_server", _launch_specifier(a), "launch"),
     # web_search：完整查询词进③整工具规则匹配 + ④模式兜底（web_search 扩展 F10）。
     # specifier 用**完整查询词原文**——确认面板与行为记录里要留下模型实际搜了什么，
     # 那是用户放不放行的唯一依据（spec F7）。
@@ -162,6 +229,20 @@ def to_allow_rule(request: PermissionRequest) -> tuple[str, str]:
         # 所以只在 host 确实非空时才生成 domain: 模式。
         if request.host:
             return request.rule_name, f"domain:{request.host}"
+        return request.rule_name, ""
+    if request.kind == "launch":
+        # ⚠ **必须返回空模式（整工具形式）**，理由与搜索类逐字相同：
+        # `launch` 落规则匹配的「其它类」分支，那个分支只认 `rule.pattern == ""`。
+        # 返回 `("mcp_add_server", "context7 · npx …")` 会写出一条
+        # **永远不会命中任何东西的废规则**——用户点了「永久放行」，
+        # 下次添加 MCP 还是弹面板，而配置文件里明明躺着一条他亲手点出来的规则。
+        #
+        # ⚠ 与搜索类不同的是：`launch` 的「永久放行」是**诚实的**。
+        # 写下的 `allow: mcp_add_server` 下次启动属于文件规则集，在③层命中并
+        # **短路④层**（本层的 ASK 就是④层给的），所以那个按钮真的会生效。
+        # 分类器的宽泛规则丢弃（F16）只处理 `Bash` 与 `WebSearch` 两类，
+        # 不碰这条。因此确认面板对 `launch` 照常给四个选项——
+        # 别顺手把它加进 `no_permanent`。
         return request.rule_name, ""
     if request.kind == "search":
         # ⚠ **必须返回空模式（整工具形式）。**

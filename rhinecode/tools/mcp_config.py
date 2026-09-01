@@ -3,6 +3,22 @@
 工具层负责把底层 resolver/writer 暴露给模型，并把所有异常转换成 `ToolResult`。其中
 `mcp_resolve_server` 是只读工具；`mcp_add_server` 会写入配置并启动外部 MCP，因此标记为
 非只读，交给现有权限确认流程拦截。
+
+⚠ **「交给现有权限确认流程拦截」这句话一度是假的**，记在这里免得下一个人
+再照着它推理（审查报告 B4 / `docs/review/04-security.md` 的 S1）。
+
+它写于 C7，当时缺省权限档是 `DEFAULT`、第④层对未映射工具判 ASK，面板照弹。
+auto-plan 扩展把缺省档换成 `PERMISSIVE`（`presets.py` 的 `DEFAULT_PRESET`）之后，
+本工具落在 `other` 兜底分支上，实测判定是 `allow @ mode`——**六层防御一层都碰不到
+它**（①黑名单只认命令类、②沙箱只认路径类、②′只认 url、②″保护路径第一行就是
+`if request.kind != "write_path"`、③层要用户主动写 `deny` 才拦得住）。
+于是模型可以在一次调用里、不弹任何面板地写一条 `mcpServers` 配置并立刻拉起来，
+而 `command` 是任意本地命令。
+
+**现在这句话由 `permission/adapter.py` 的 `launch` 类映射兑现**：本工具的请求
+被规范化为 `kind == "launch"`，第④层在放行档下对它判 ASK（与 url / search
+两个既有例外同格）。改动那处映射等于把这条承诺再拿掉一次，
+护栏见 `tests/test_perm_launch_layer.py`。
 """
 
 from __future__ import annotations
@@ -66,6 +82,10 @@ class MCPAddServerTool(Tool):
 
     副作用包含两部分：更新用户级或项目级 `mcp.yaml`，以及尝试连接新 MCP 并注册其工具。
     因为这可能运行第三方命令或访问远端 URL，本工具必须保持 `read_only=False`。
+
+    ⚠ `read_only=False` 是**必要条件、不是充分条件**：它只保证请求不走「只读简化
+    分支」、会进第④层，而第④层在放行档下对未映射工具给的是 ALLOW。真正让它过人眼
+    的是 `permission/adapter.py` 把它映射成 `kind == "launch"`（见模块 docstring）。
     """
 
     name = "mcp_add_server"
