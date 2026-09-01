@@ -1664,8 +1664,26 @@ class ConversationManager:
                     max_iterations=SKILL_MAX_ITERATIONS,
                     record_usage=False,   # 别拿子对话的 usage 污染主历史锚点
                     allow_summary=False,  # 只跑 C8 第一层（F21）
-                    # 防嵌套：子对话里看不到加载工具，也调不动它。
+                    # 防嵌套：子对话里看不到加载工具与**委派工具**，也调不动它们。
+                    # 「已经是一层子对话的东西，不许再往下开一层」——两个工具的
+                    # 逐条理由见 `fork_excluded_tools()` 的 docstring。
                     excluded_tools=self.skill_manager.fork_excluded_tools(),
+                    # ⚠ **这里刻意没有 `subagent_gate=`，别顺手补上**（2026-09-01 定）。
+                    #
+                    # 主对话那次 `run()` 是传了的，两处不一样看起来就像漏了一行。
+                    # 但补上它等于同时落地两种相反的语义：上面已经把 `run_agent`
+                    # 排除掉了，这条路上创建不出任何子 Agent，闸门**永远走不到**
+                    # ——一段永远走不到的代码比没有更糟。
+                    #
+                    # 而且照抄主对话那个闸门是**错的**：`SubAgentGate.take_pending()`
+                    # 底下是 `TaskManager.take_deliverables()`，它取的是全进程
+                    # 「已终态且未交付」的任务、**不按发起方分桶**，取走即置
+                    # `delivered`。交给 fork 子对话，主对话委派出去的结论会被注入到
+                    # 这份**用完即弃**的历史里并标成「已交付」，而 fork 只把最后一段
+                    # 结论字符串带回主对话——**那是丢结果**。`CompositeGate` 里的
+                    # `TeamGate(MAIN_NAME)` 同理会把发给 `main` 的队友消息吃掉。
+                    #
+                    # 护栏见 `tests/test_skill_isolated.py::NoGateOnTheForkPathTest`。
                     # c16：fork 子对话同样要过分类器——否则「把跑命令包进一个
                     # Skill」就能整层绕过。
                     classifier=self.classifier,

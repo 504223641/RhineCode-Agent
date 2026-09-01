@@ -34,7 +34,7 @@
 
   **两阶段加载**：启动时清单（命令名 + `description` + `when_to_use`）进 priority 140 稳定槽位；模型调 `load_skill` 后完整正文进 priority 120 动态槽位，**每轮重建**、多个可同时激活、重复激活幂等。正文超单体上限截断（TRUNCATED）、超总量上限整段丢弃（DROPPED），措辞不同且对用户可见。
 
-  **「在哪执行」与「谁能触发」是正交两维**（C11 曾把它们捆在一起）：`context: fork` 开子对话跑完只回流结论（主历史**恰好新增两条配对消息**）；`disable-model-invocation` 决定模型能否自行发起；`user-invocable: false` 则不进斜杠菜单但模型仍可发起。子对话固定只带那条自包含调用消息，工具集排除 `load_skill` 防嵌套。
+  **「在哪执行」与「谁能触发」是正交两维**（C11 曾把它们捆在一起）：`context: fork` 开子对话跑完只回流结论（主历史**恰好新增两条配对消息**）；`disable-model-invocation` 决定模型能否自行发起；`user-invocable: false` 则不进斜杠菜单但模型仍可发起。子对话固定只带那条自包含调用消息，工具集**同时排除 `load_skill` 与 `run_agent`**——不变量是「已经是一层子对话的东西，不许再往下开一层」，子 Agent 那一侧（`GLOBAL_DENIED_TOOLS`）挡的是同样两个。⚠ **fork 子对话因此派不了活**，这是 2026-09-02 定的语义：它**刻意不接**子 Agent 闸门（主对话那次 `run()` 是接了的），因为闸门底下的 `TaskManager.take_deliverables()` 不按发起方分桶，接上去会让主对话委派出去的结论被 fork 那份用完即弃的历史取走并标成「已交付」。两种语义只落地一种，理由见 `skills/manager.py` 的 `fork_excluded_tools()`。
 
   **`allowed-tools` 是预授权，不是收窄**：列出的操作在**本次执行内**免于人工确认，**不限制**模型能调用什么。取值词汇与 `permissions.yaml` 的规则名一致（`Bash(git *)` / `Read` / `Write` / `Edit`，标准里的 `Glob`/`Grep` 映射到 `Read`），实现为权限引擎第③层的 `turn_rules`，排在①黑名单②沙箱**之后**——因此翻不过前两层。用户发出下一条消息即失效。无法识别的项跳过 + 警告，**不 fail-fast**（外部 Skill 里出现 `Task` / `TodoWrite` 这类名字是正常现象；`WebFetch` 自 web_fetch 扩展起是**真工具**，可以写，但括号里必须是 `domain:` 前缀）。
 

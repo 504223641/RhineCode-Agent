@@ -166,6 +166,19 @@ ENTRY_FILENAME = "SKILL.md"
 # 第二阶段加载工具的名字（spec F7/F8）。它是系统级工具，不受任何 Skill 白名单约束。
 LOAD_SKILL_TOOL = "load_skill"
 
+# 委派工具的名字（c13）。本模块只需要这个**字符串**，故写字面量而不是
+# `from rhinecode.tools.run_agent import RunAgentTool`——理由与
+# `subagents/toolset.py` 里那份字面量逐字相同：`skills` 包的依赖清单是
+# 「`permission` 的两个模块 + `trace`」，为了一个名字把 `tools` 整个拉进来
+# 会让 `tools ↔ skills` 的包级互依从「只有一个入口文件参与」扩散到解析层。
+#
+# ⚠ **成对维护点**：它与 `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS` 是
+# **同一条不变量的两个落点**——「已经是一层子对话的东西，不许再往下开一层」。
+# 子 Agent 那一侧两个工具都挡（`run_agent` + `load_skill`），fork 子对话这一侧
+# 一度只挡了 `load_skill`，于是同一条不变量在两条路上说法不一样。见
+# `fork_excluded_tools()` 的 docstring。
+RUN_AGENT_TOOL = "run_agent"
+
 # SOP 正文中的参数占位符（spec F12）。用户传入的参数原样替换到这里，
 # 不做 shell 分词、不做任何模板求值。
 PLACEHOLDER = "$ARGUMENTS"

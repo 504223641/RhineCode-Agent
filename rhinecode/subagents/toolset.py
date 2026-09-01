@@ -29,9 +29,18 @@ from rhinecode.subagents.models import AgentSpec
 # 入口文件参与」变成「解析层也参与」，而本模块被 `parser` / `discovery` 之外
 # 的纯逻辑测试直接使用，不该背上那份依赖。
 #
-# ⚠ **成对维护点**：新增「任何子 Agent 都不该看到」的工具 → 加进这里。
+# ⚠ **成对维护点（其一）**：新增「任何子 Agent 都不该看到」的工具 → 加进这里。
 # **漏改不报错**，只是子 Agent 多出一个能力，而配置和界面上都看不出异常。
 # 护栏见 `tests/test_subagent_toolset.py`（遍历本集合逐个断言）。
+#
+# ⚠ **成对维护点（其二）**：新增一个「会再开一层子对话」的工具 →
+# 这里**与** `skills/manager.py` 的 `fork_excluded_tools()` **两处齐改**。
+# 两张表是**同一条不变量的两个落点**——「已经是一层子对话的东西，不许再往下
+# 开一层」；子 Agent 是一层，`context: fork` 的 Skill 也是一层（下面
+# `load_skill` 那条的理由逐字就是这句）。**只改一处不报错**：另一条路上那个
+# 工具照常可见、照常能调，而两条路的行为从此不一样，界面上完全看不出来。
+# 真踩过：`run_agent` 从 C13 起就漏在 fork 那一侧，2026-09-01 才补齐。
+# 护栏见 `tests/test_skill_isolated.py::ForkDelegationTest`。
 GLOBAL_DENIED_TOOLS = frozenset(
     {
         # 委派工具自身：防无限嵌套（spec「不做的事」明确列出，子 Agent 之间不互相委派）。
