@@ -44,33 +44,74 @@ from rhinecode.worktree.naming import generate_name, validate_name
 from rhinecode.worktree.provision import provision
 
 # ---------------------------------------------------------------------------
-# 创建期的串行闸门（2026-08-30，CI 上抓到的并发缺陷）
+# 版本库改动的串行闸门（2026-08-30 加入，2026-09-01 扩到回收路径）
 # ---------------------------------------------------------------------------
-# **`git worktree add` 在同一个版本库上不是并发安全的。** 它开工时会先做一次
-# 隐式的 prune，把「看起来没建完」的 `.git/worktrees/<名字>/` 清掉——而另一个
-# 正建到一半的 worktree 恰好就长那个样子。于是两个并发的创建会互相拆台，
-# 输的那个报：
+# ⚠ **它原名 `_CREATE_LOCK`**，只圈住创建那半边。改名是因为它现在同时圈住
+# 创建与回收——名字还写着 create，会让下一个人以为回收不归它管，
+# 而那恰恰就是 2026-08-31 那次 CI 红灯的成因。
 #
-#     fatal: could not open '.git/worktrees/<名字>/locked' for writing:
-#     No such file or directory
+# **同一个版本库上的「建工作区」与「回收工作区」不能并发跑。**
 #
-# 而 C14 明确支持**并发隔离委派**（`test_three_isolated_delegations_get_distinct_worktrees`
-# 就是照着这个场景写的），所以这不是理论风险：CI 的 windows/3.12 那一格真的红过一次。
+# git 那边的三条事实（v2.50.1 `builtin/worktree.c` 逐字核对 + 本机实测）：
 #
-# ⚠ **这个窗口只在机器够慢时才张开**：本机 8 路 × 6 轮复现不出来，
-# 而红掉的那个 CI 格子分片跑了 150.9s（平时约 60s）。
+# * **回收路径会删掉共享的父目录。** `git worktree remove` 与 `git worktree prune`
+#   都走到 `delete_worktrees_dir_if_empty()`，那就是一句 `rmdir(.git/worktrees)`
+#   ——只要它空了就删。实测：两条命令都会让 `.git/worktrees` 整个消失。
+# * **prune 还会删掉半成品条目。** `.git/worktrees/<名字>/` 只要还没写出
+#   `locked` / `gitdir`，就被判为失效条目并递归删除，随后父目录一空又被 rmdir。
+#   实测确认。
+# * **创建路径没有任何保护。** `add_worktree()` 里 `safe_create_leading_directories`
+#   （建出 `.git/worktrees`）与 `mkdir(.git/worktrees/<名字>)` 是**相邻两句**，
+#   中间什么都没有；mkdir 拿到 ENOENT 就
+#   `die_errno("could not create directory of '%s'")`。
 #
-# 除了 `add` 本身，`_pick_branch` 那段「先查在不在、再拿来用」同样是 check-then-act，
-# 并发下两个线程可能同时认定某个分支名可用。两者一并收进同一把锁。
+# 于是两次 CI 红灯是**同一个成因在两个相邻瞬间**的两种表现：
 #
-# ⚠ **这把锁持有期间会跑 git 子进程，看起来违反本项目「临界区只做纯内存读写」
-# 那条纪律——但那条纪律针对的是 `SkillManager` / `HookManager` / `TaskManager`
-# 那类被界面线程碰的 manager 锁**，它们的危险在于「持锁时做跨线程调度」会与
-# Textual 的阻塞式 `call_from_thread` 组成确定性死锁。这把锁不同：它是模块级的、
-# 只被子 Agent 工作线程走到、**不持有任何回调、不碰界面、不做任何跨线程调度**，
-# 因此不可能参与那类死锁。代价只有一个：并发隔离委派的**创建那一步**排队进行
-# （每次几百毫秒），委派跑起来之后各走各的，一点不受影响。
-_CREATE_LOCK = threading.Lock()
+#     2026-08-30 windows/3.12
+#       fatal: could not open '.git/worktrees/<名字>/locked' for writing:
+#       No such file or directory
+#       ——子目录已建、`locked` 还没写出，被并发的 prune 当成半成品删掉了
+#
+#     2026-08-31 windows/3.11（PR #63）
+#       fatal: could not create directory of '.git/worktrees/<名字>':
+#       No such file or directory
+#       ——父目录刚建好还空着，被并发回收的 rmdir 抢先删掉了
+#
+# ⚠ **第一次的修法认错了对象，这一点必须写下来，否则下一个人会照着改第三遍。**
+# 当时的判断是「`git worktree add` 开工时会做一次隐式 prune，于是两个并发的 add
+# 互相拆台」，据此把创建的三步收进锁里。**「add 会隐式 prune」是错的**——
+# v2.50.1 的 `add()` 与 `add_worktree()` 里都没有 `prune_worktrees()` 调用。
+# 真正会 prune、会 rmdir 的是**回收路径**，而它当时根本不在锁里：
+# 两个真正会碰撞的操作**从来没有互斥过**，锁住 add 只是把并发面收窄了一点。
+#
+# ⚠ **窗口有多窄，决定了它为什么本机复现不出来。** 实测 `add` 里「父目录已建、
+# 子目录未建」这个状态只存在 **<10µs**（高频轮询观测器四轮只抓到一次）。
+# 用未改动的 git 复现，要靠一个独立进程死循环 rmdir 那个父目录，8 轮才中 1 轮
+# （中的那轮报的就是上面第二条，一字不差）。CI 上真正发生的是**受害进程恰好在
+# 那两句之间被调度器抢走**——所以它只在机器够慢时张开（红掉的两格分片分别跑了
+# 150.9s 与 175.8s，平时约 60s），也所以「本机 8 路 × 6 轮跑不出来」
+# **不构成「它不存在」的证据**。
+#
+# ⚠ 顺带排除掉两个曾被怀疑的方向：不是 Windows 的目录创建瞬时失败（杀毒持句柄
+# 给的是 EACCES / 共享冲突，而这里是 ENOENT，且实测「父目录被删」能一字不差地
+# 复现出那句报错），也不是残留的 daemon 线程（受害者与凶手都在同一次委派的
+# 生命周期内，时序完全对得上）。
+#
+# 因此闸门圈住**两条路径**：`create` 的第 ④⑤⑥ 步与 `remove` 的全过程。
+# `_pick_branch` 那段「先查在不在、再拿来用」是 check-then-act，一并留在里面。
+#
+# ⚠ **回收路径收进来之后，「这把锁不参与死锁」那段论证必须重新成立，已逐条核过。**
+# 它是模块级的，只被两处走到：`subagents/runner.py` 的结算段（子 Agent 工作线程）
+# 与 `worktree/cleanup.py` 的 `scan_and_clean`（启动时的主线程，那一刻还没有任何
+# 子 Agent 线程，因此连争用都不可能发生）。**两处都不持有任何回调、不碰界面、
+# 不做任何跨线程调度**，因此不可能与 Textual 的阻塞式 `call_from_thread` 组成
+# 那类确定性死锁；`remove` 也不会反过来调 `create`，这把非重入锁不存在自锁。
+# 代价只有排队：创建与回收各自几百毫秒，最坏受 `gitcmd._TIMEOUT`（120 秒）封顶，
+# 委派跑起来之后各走各的，一点不受影响。
+#
+# 护栏：`tests/test_worktree_lifecycle.py::ConcurrentCreateAndRemoveTest`
+# ——它把那 <10µs 的窗口用 sleep 摆成最坏情况，把本锁去掉当场红。
+_REPO_LOCK = threading.Lock()
 
 
 def _emit(recorder, event, **fields) -> None:
@@ -275,9 +316,11 @@ def create(
     6. `git worktree add`。
     7. 按清单初始化环境（失败只记警告，不影响创建成败）。
 
-    ⚠ **第 4~6 步在一把进程内的锁里串行执行**（`_CREATE_LOCK`）：它们动的是
-    同一个版本库，而 `git worktree add` 在同一个版本库上并发调用会互相把对方
-    半建好的目录 prune 掉。理由与实测见那个常量上方的说明。第 7 步不在锁内。
+    ⚠ **第 4~6 步在一把进程内的锁里串行执行**（`_REPO_LOCK`）：它们动的是
+    同一个版本库，而**回收路径（`remove`）会 rmdir 掉两者共用的**
+    `.git/worktrees` **父目录**，正建到一半的 `add` 会当场拿到
+    `No such file or directory`。理由与实测见那个常量上方的说明。
+    第 7 步不在锁内（它只碰新工作区自己的目录）。
 
     副作用：在磁盘上产生一整份源码 checkout，在版本库中登记工作目录并创建分支；
     按清单复制或软链文件。
@@ -324,9 +367,9 @@ def create(
         )
 
     # ④⑤⑥ 一并收进串行闸门——它们全都在动**同一个版本库**，并发下会互相拆台。
-    # 理由见 `_CREATE_LOCK` 上方那段。⚠ 锁的范围到 `add_worktree` 为止：
+    # 理由见 `_REPO_LOCK` 上方那段。⚠ 锁的范围到 `add_worktree` 为止：
     # 第 ⑦ 步的环境初始化只碰新工作区自己的目录，不必排队。
-    with _CREATE_LOCK:
+    with _REPO_LOCK:
         # ④ 环境确认。
         gitcmd.ensure_repository(main_root)
         base = gitcmd.head_commit(main_root)
@@ -516,41 +559,55 @@ def remove(
     留下一个「版本库不认、磁盘上还在」的残骸，而且此后 `git worktree remove`
     会报「不是一个工作目录」——只有独立的目录删除兜底能收拾它。
 
+    ⚠ **获得许可之后的全过程在 `_REPO_LOCK` 里串行执行**（2026-09-01 加入）。
+    第 1、2 步动的是**与创建路径同一个版本库**：`git worktree remove` 与
+    `git worktree prune` 都会 rmdir 掉两者共用的 `.git/worktrees` 父目录，
+    而一次正在进行的 `git worktree add` 会当场拿到
+    `could not create directory of '.git/worktrees/<名字>': No such file or directory`。
+    这就是 2026-08-31 那次 CI 红灯。完整论证（含「为什么这把锁不参与死锁」
+    在把本函数收进来之后仍然成立）见 `_REPO_LOCK` 上方那段。
+
+    ⚠ **`judge_removal` 也在锁内**：它的第②层要问「版本库认不认这个目录」，
+    而并发的创建正在改那份登记——判定与据此执行的删除必须看到同一个版本库状态。
+
     副作用：删除磁盘目录、修改版本库登记、可能删除一个分支。
     """
-    verdict = judge_removal(main_root, path, status)
-    if not verdict.allowed:
-        # ⚠ 一步都不往下走。这是三层过滤唯一的意义所在。
-        return verdict
+    # ⚠ 判定与删除**必须在同一个临界区里**，理由见 docstring 与 `_REPO_LOCK`
+    # 上方那段：并发的创建正在改同一份版本库登记，而第②层归属判定读的就是它。
+    with _REPO_LOCK:
+        verdict = judge_removal(main_root, path, status)
+        if not verdict.allowed:
+            # ⚠ 一步都不往下走。这是三层过滤唯一的意义所在。
+            return verdict
 
-    target = Path(path)
+        target = Path(path)
 
-    # 1. 让 git 自己来（它会同时清掉登记）。
-    try:
-        gitcmd.remove_worktree(main_root, target)
-    except WorktreeError:
-        # 失败是预期内的一种情形（见 docstring 的实测形态），继续走兜底。
-        pass
-
-    # 2. 修剪失效登记。
-    try:
-        gitcmd.prune_worktrees(main_root)
-    except WorktreeError:
-        pass
-
-    # 3. 目录仍在 → 独立兜底。
-    if target.exists():
-        _force_rmtree(target)
-
-    # 4. 分支。
-    if branch and not verdict.keep_branch:
+        # 1. 让 git 自己来（它会同时清掉登记）。
         try:
-            gitcmd.delete_branch(main_root, branch)
+            gitcmd.remove_worktree(main_root, target)
         except WorktreeError:
-            # 分支删不掉不影响「目录已回收」这个主要目的，不向上抛。
+            # 失败是预期内的一种情形（见 docstring 的实测形态），继续走兜底。
             pass
 
-    return verdict
+        # 2. 修剪失效登记。
+        try:
+            gitcmd.prune_worktrees(main_root)
+        except WorktreeError:
+            pass
+
+        # 3. 目录仍在 → 独立兜底。
+        if target.exists():
+            _force_rmtree(target)
+
+        # 4. 分支。
+        if branch and not verdict.keep_branch:
+            try:
+                gitcmd.delete_branch(main_root, branch)
+            except WorktreeError:
+                # 分支删不掉不影响「目录已回收」这个主要目的，不向上抛。
+                pass
+
+        return verdict
 
 
 __all__ = [

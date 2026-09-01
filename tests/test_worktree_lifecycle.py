@@ -10,6 +10,10 @@ c14 T9：隔离工作区的生命周期（spec F6–F10 / F16 / F20 / F21 / F22�
    表现是**用户的成果无声消失**，测试全绿。
 """
 
+import errno
+import os
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -476,6 +480,136 @@ class RemoveTest(RepoTestBase):
             self.repo, self.handle.path, self.handle.branch, ChangeStatus(False, 0)
         )
         self.assertFalse(v.allowed)  # 第二次因②层归属不过而拒绝，不抛异常
+
+
+class ConcurrentCreateAndRemoveTest(RepoTestBase):
+    """
+    并发的「建工作区」与「回收工作区」不许互相拆台（2026-08-31 的 CI flake）。
+
+    **这条护栏钉的是 `_REPO_LOCK` 圈住了 `remove`**，把那把锁从 `remove` 上拿掉
+    就会当场红。完整成因与证据见 `lifecycle._REPO_LOCK` 上方那段注释，这里只记
+    与测试写法直接相关的两点：
+
+    1. **窗口必须人为放大。** 真实的窗口在 `git worktree add` 内部
+       （`safe_create_leading_directories` 与 `mkdir` 之间），实测只有 **<10µs**
+       ——本机靠对撞根本撞不上（未改动的 git + 独立进程死循环 rmdir，8 轮才中
+       1 轮）。CI 上真正发生的是受害进程恰好在那两句之间被调度器抢走，
+       所以这里用一个 sleep 把那次**抢占**摆成最坏情况。
+       ⚠ 被模拟的是**抢占**，不是失败本身：失败仍由真实的
+       `os.mkdir` 在真实的 `.git/worktrees/<名字>` 上以真实的 ENOENT 产生。
+    2. **必须配一条反证**（`test_the_amplified_window_really_bites`）。
+       只断言「并发下创建成功」是不够的：如果放大手法本身失效（窗口没张开、
+       两个线程压根没重叠），这条用例照样全绿，而它什么都没验到。
+    """
+
+    #: 放大后的窗口。取值只需明显大于两个 git 子进程的启动开销（各约 50ms），
+    #: 让回收方稳定地落在窗口里；再大只是让用例变慢。
+    WINDOW_S = 0.3
+
+    def _slow_add(self, in_window: threading.Event):
+        """
+        把 git 那两句相邻的系统调用摆开，中间留出「被抢占」的时间。
+
+        完全照 `builtin/worktree.c` 的顺序做：
+          ① `safe_create_leading_directories` → 建出 `.git/worktrees`
+          ② 这里是 CI 上被调度器抢走的那一瞬
+          ③ `mkdir(.git/worktrees/<名字>)` —— 父目录没了就是 ENOENT
+        ③ 成功则把目录让回去，交给真正的 git 跑完整个 add。
+        """
+        real_add = gitcmd.add_worktree
+
+        def slow_add(root, path, branch, base):
+            parent = Path(root) / ".git" / "worktrees"
+            child = parent / Path(path).name
+            parent.mkdir(parents=True, exist_ok=True)          # ①
+            in_window.set()
+            time.sleep(self.WINDOW_S)                           # ②
+            os.mkdir(child)                                     # ③ 父目录没了就抛
+            os.rmdir(child)
+            real_add(root, path, branch, base)
+
+        return slow_add
+
+    def _race(self, recycle):
+        """
+        跑一次对撞：创建方停在窗口里，回收方在窗口期回收另一个工作区。
+
+        :param recycle: 回收动作，入参是待回收工作区的句柄
+        :returns: 创建方抛出的异常（没抛则为 None）
+
+        场景与 CI 上那次一致：仓库里此刻**只有一个**已跑完的工作区，
+        把它删掉会让 `.git/worktrees` 变空，于是 git 顺手 rmdir 掉父目录——
+        而那正是创建方下一步要往里 mkdir 的地方。
+        """
+        done = lifecycle.create(self.repo, name="done-worker")[0]
+        self.assertTrue((self.repo / ".git" / "worktrees" / "done-worker").is_dir())
+
+        in_window = threading.Event()
+        failure: list[BaseException] = []
+        original = gitcmd.add_worktree
+        gitcmd.add_worktree = self._slow_add(in_window)
+        try:
+            def creator():
+                try:
+                    lifecycle.create(self.repo, name="late-worker")
+                except BaseException as exc:  # noqa: BLE001
+                    failure.append(exc)
+
+            def remover():
+                in_window.wait(30)
+                recycle(done)
+
+            threads = [threading.Thread(target=creator), threading.Thread(target=remover)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(120)
+                self.assertFalse(t.is_alive(), "对撞线程没能在 120 秒内收尾")
+        finally:
+            gitcmd.add_worktree = original
+        return failure[0] if failure else None
+
+    def test_recycling_does_not_break_a_concurrent_create(self):
+        """回收路径走产品的 `lifecycle.remove` → 被闸门挡在窗口外，创建照常成功。"""
+        exc = self._race(
+            lambda h: lifecycle.remove(
+                self.repo, h.path, h.branch, ChangeStatus(dirty=False, commits=0)
+            )
+        )
+        self.assertIsNone(exc, f"并发回收把正在创建的工作区拆台了：{exc}")
+        self.assertTrue((self.repo / ".rhinecode" / "worktrees" / "late-worker").is_dir())
+
+    def test_the_amplified_window_really_bites(self):
+        """
+        反证：**绕开闸门**直接跑 git 的回收命令，同一个窗口必然把创建拆台。
+
+        它证明上一条不是空转——放大手法确实张开了窗口、两个线程确实重叠。
+        少了它，一个「窗口根本没张开」的写法会让上一条永远绿，
+        而 `_REPO_LOCK` 被谁删掉都没人知道。
+        """
+        def bypass(h):
+            # 与 `lifecycle.remove` 的第 1、2 步逐字相同，只是不进闸门。
+            try:
+                gitcmd.remove_worktree(self.repo, h.path)
+            except WorktreeError:
+                pass
+            try:
+                gitcmd.prune_worktrees(self.repo)
+            except WorktreeError:
+                pass
+
+        exc = self._race(bypass)
+
+        # ⚠ **断言认 errno 与路径，不认报错文案。** `strerror` 会跟着系统语言走
+        # （本机是「系统找不到指定的路径。」，CI 上是 "No such file or directory"），
+        # 拿文案做判据等于让这条护栏在换个 locale 的机器上莫名其妙地红。
+        self.assertIsInstance(exc, FileNotFoundError)
+        self.assertEqual(exc.errno, errno.ENOENT)
+        # 而且必须是 CI 上那一句的成因：**父目录没了**，所以建不出 `<名字>` 这一级。
+        failed_on = Path(exc.filename)
+        self.assertEqual(failed_on.name, "late-worker")
+        self.assertEqual(failed_on.parent.name, "worktrees")
+        self.assertFalse(failed_on.parent.exists(), "父目录还在的话就不是这个成因")
 
 
 if __name__ == "__main__":
