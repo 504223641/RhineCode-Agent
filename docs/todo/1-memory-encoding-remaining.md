@@ -73,7 +73,7 @@
 先跑 git branch --show-current，如果在 main 上就先 git checkout -b memory-encoding-remaining。
 动 memory/ 之前先加载 paired-maintenance Skill。
 
-我要修 docs/todo/2-memory-encoding-remaining.md 记的这件事：
+我要修 docs/todo/1-memory-encoding-remaining.md 记的这件事：
 rhinecode/memory/manager.py 里读记忆文件的四处 except OSError
 （memory_index / _read_index / 两处 parse_memory）接不住 UnicodeDecodeError
 ——它继承自 ValueError，不是 OSError。

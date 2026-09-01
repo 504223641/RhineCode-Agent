@@ -84,7 +84,7 @@ C16 给四类动作接了一个独立的分类器模型做执行前审查：跑�
 ⚠ 动 classifier/ 与 agent/ 之前**必须**先加载 paired-maintenance Skill
 ——本条要改的正是它登记的一处四点维护点。
 
-我要做 docs/todo/4-mcp-add-server-classifier.md 记的这件事：
+我要做 docs/todo/3-mcp-add-server-classifier.md 记的这件事：
 给 mcp_add_server 加上 classifier_scope，让它进 C16 分类器审查。
 
 ⚠ 先搞清楚这不是补漏：B4 已于 2026-08-31 修完，那个动作现在必弹面板
