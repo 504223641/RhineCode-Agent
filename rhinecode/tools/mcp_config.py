@@ -118,6 +118,25 @@ class MCPAddServerTool(Tool):
         "required": ["server_name", "config"],
     }
     read_only = False
+    # c16 第五类：把一个外部程序拉起来，要经分类器审查。
+    #
+    # ⚠ **这不是给 B4 补漏，是给它接第二道。** B4（`permission/adapter.py` 的
+    # `launch` 类映射）已经让本工具在缺省预设下必弹面板；本行加的是**面板之前
+    # 的那一眼**——面板看得到「要跑什么命令」，看不到「用户到底有没有要求过
+    # 引入这个 Server」，而后者恰恰是完整对话上下文才回答得了的问题。
+    #
+    # ⚠ **它会让面板在日常消失**：分类器判放行时把④层的 ASK 覆写成 ALLOW
+    # （`agent/loop.py::_apply_classifier`），与网络类 / 搜索类同形；熔断时
+    # 退回逐次弹面板（④层基线是 ASK，见 `permission/engine.py` 的 launch 分支）。
+    # 换言之**判放行的那条路上分类器是唯一的一道**——①②②′②″一层都碰不到
+    # 这类动作。这是评审时明知并接受的取舍，登记在 CLAUDE.md 的安全边界一节。
+    #
+    # ⚠ 这里写**字面量**而不是 import `classifier.models.SCOPE_LAUNCH`，
+    # 与 `web_fetch` / `web_search` 同一先例：`import` 那个模块会连带执行
+    # `classifier/__init__.py`，把服务、熔断、缓存与 `provider.base` 一起拉进
+    # 工具层的导入图，而工具层只需要一个字符串。
+    # 两者相等由 `tests/test_mcp_launch_classifier.py` 的一条断言钉住。
+    classifier_scope = "launch"
 
     def __init__(self, mcp_manager: "MCPManager", registry: "ToolRegistry"):
         """注入运行时依赖，使添加后可以立即连接并注册 MCP 工具。"""

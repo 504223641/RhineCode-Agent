@@ -22,6 +22,7 @@ Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_ph
   Plan Mode 开关本身仍由上层维持（下一条用户消息会重新从规划阶段开始）。
 """
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -61,6 +62,7 @@ from rhinecode.hooks import (
 )
 from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
 from rhinecode.classifier import (
+    SCOPE_LAUNCH,
     SCOPE_MESSAGE,
     SCOPE_SEARCH,
     SCOPE_URL,
@@ -70,7 +72,14 @@ from rhinecode.classifier import (
     VerdictKind,
 )
 from rhinecode.classifier import render as classifier_render
-from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
+from rhinecode.permission import (
+    Decision,
+    DecisionResult,
+    Layer,
+    PermissionEngine,
+    launch_specifier,
+    to_request,
+)
 # c16：待判动作要带主机与端口（网络判定的缓存键）。复用②′层那份解析，
 # **不在这里另写一份**——`permission/network.py` 的模块 docstring 明写着
 # 「判定期与连接期共用同一份实现」，本处是第三个使用者。
@@ -650,6 +659,16 @@ class Agent:
             # 然后因为「看不出有什么问题」而放行，且**完全无声**。
             specifier = str(args.get("query") or "")
             recipient = ""
+        elif scope == SCOPE_LAUNCH:
+            # c16 第五类：把一个外部 MCP Server 写进配置并立刻启动它。
+            #
+            # ⚠ 这一支**不能并进下面的 else**（命令类）：那边取的是
+            # `args["command"]`，而 `mcp_add_server` 没有这个顶层参数——
+            # 它的命令藏在 `args["config"]["command"]` 里。照抄会让分类器拿到
+            # **空的待判内容**，然后因为「看不出有什么问题」而放行，
+            # 且**完全无声**。这与搜索类那一支是同一个坑的第二次。
+            specifier = Agent._launch_review_subject(args)
+            recipient = ""
         else:
             specifier = str(args.get("command") or "")
             recipient = ""
@@ -662,6 +681,55 @@ class Agent:
             port=port,
             cwd=str(cwd) if cwd is not None else "",
         )
+
+    @staticmethod
+    def _launch_review_subject(args: dict) -> str:
+        """
+        把一次 `mcp_add_server` 调用压成分类器要判的那段材料（c16 启动类）。
+
+        :param args: 模型给出的参数字典（`server_name` / `config` / `scope`）
+        :returns: 一行文本，形如
+                  `context7 · npx -y @upstash/context7-mcp · 写入 project 级 mcp.yaml
+                  · 完整配置：{"args":[...],"command":"npx"}`
+
+        副作用：无（纯数据转换）。
+
+        ## 为什么开头那半句要复用 `permission.adapter.launch_specifier`
+
+        **单一事实源。** 那半句同时出现在确认面板与行为记录里；各拼一份的话
+        「面板上写的」与「分类器看到的」会悄悄分叉，而那种不一致最难解释——
+        两处都「看起来对」，只是不相等。（同 `tui/widgets.format_activity_cost`
+        那条成对维护点的理由。）
+
+        ## 为什么后面还要接上写入位置与完整配置原文
+
+        `launch_specifier` 只给「服务器名 · 要跑什么」，它是给**人**看的一行；
+        而分类器要判的东西有两样它没带上：
+
+        - **`env` / `headers`**：`env` 里一句 `NODE_OPTIONS=--require /tmp/x.js`
+          能让一条看起来干净的 `npx` 加载任意脚本，`headers` 里可能夹带令牌。
+          不给它看等于把这一面藏起来，**而藏得看不出来**。
+        - **写入哪一层**（`scope`）：写用户级意味着这条配置对**以后每一个项目**
+          生效，那与只写当前项目不是同一件事。
+
+        ⚠ **不做任何截断**（spec F6），与其余四类同一条纪律：被截掉的地方连痕迹
+        都没有，记录上只会显示「判定通过」。
+
+        ⚠ **绝不抛异常。** 它跑在决策预扫里，`config` 完全可能不是字典、
+        参数里可能混进不可序列化的东西；抛出去会让整轮工具执行炸掉。
+        """
+        head = launch_specifier(args)
+        # `scope` 缺省是 "auto"，语义等于 project（见 `mcp/auto_config.py`）。
+        # 照抄模型写的那个词而不是替它解析：分类器要判的是**它声明了什么**。
+        where = str(args.get("scope") or "auto")
+        config = args.get("config")
+        try:
+            raw = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            # 与 `prompt._dump_arguments` 同口径：退回 repr 而不是抛错——
+            # 分类器少看懂一段配置，好过整次判定失败而按拒绝处理。
+            raw = repr(config)
+        return f"{head} · 写入 {where} 级 mcp.yaml · 完整配置：{raw}"
 
     def _apply_classifier(
         self,

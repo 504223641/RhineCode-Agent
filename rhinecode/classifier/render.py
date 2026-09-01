@@ -31,6 +31,7 @@ from typing import Iterable, Sequence
 
 from rhinecode.classifier.models import (
     SCOPE_COMMAND,
+    SCOPE_LAUNCH,
     SCOPE_MESSAGE,
     SCOPE_SEARCH,
     SCOPE_URL,
@@ -41,11 +42,15 @@ from rhinecode.classifier.models import (
 )
 
 # 各类别在文案里的说法。集中一处，免得四个函数各写一遍中文措辞。
+#
+# ⚠ 漏登记一类**不报错**：`_SCOPE_LABELS.get(scope, "动作")` 会退回那个兜底词，
+# 于是界面上出现「安全审查拦下了一次动作」——用户看不出被拦的是哪一类。
 _SCOPE_LABELS = {
     SCOPE_COMMAND: "命令",
     SCOPE_URL: "网络访问",
     SCOPE_MESSAGE: "队友消息",
     SCOPE_SEARCH: "网络搜索",
+    SCOPE_LAUNCH: "MCP Server 启动",
 }
 
 
@@ -136,6 +141,34 @@ def render_denied_notice(action: ReviewAction, verdict: Verdict) -> str:
             "先前提到过的敏感内容会一直影响它）；或关掉分类器"
             "（classifier.enabled: false）。"
         )
+    elif action.scope == SCOPE_LAUNCH:
+        # ⚠ **启动类必须单独一支，不能落进下面那个 else**，与搜索类同一个坑。
+        #
+        # 那句「写一条**具体的** allow 规则（写窄，别写通配）」对它同样是**死路**：
+        # `launch` 落规则匹配的「其它类」分支，那个分支只认 `rule.pattern == ""`
+        # ——`allow: mcp_add_server(context7)` 一律不命中**且不产生任何警告**。
+        #
+        # ⚠ 但它与搜索类的出路**不同，别顺手合并成一支**：整工具的
+        # `allow: mcp_add_server` 是**真的管用**的（`launch` 不在
+        # `classifier/broad.py` 的丢弃范围内，理由见 `permission/adapter.to_allow_rule`
+        # 那一支的说明），所以这里要把它写出来；而搜索类那条恰恰会被 F16 丢弃，
+        # 那边只能给「换个说法重搜」。
+        #
+        # ⚠ 第一条出路刻意排在最前，因为它是**本类特有**的：本类的判据就是
+        # 「用户有没有要求过」，所以「在对话里直接说出你要哪个 Server」真的会改变
+        # 下一次的判定结果——其余四类都没有这种出路（换个说法搜同一件事、
+        # 换个域名抓同一个页面，判据一个字都没变）。
+        lines.append(
+            "  这个 MCP Server 没有被写入配置，也没有被启动。这一类的判据是"
+            "**「用户有没有在对话里要求过引入它」**，所以最直接的做法是："
+            "你自己说明要引入哪个 Server（说出名字、包名或地址），再让它重试。"
+        )
+        lines.append(
+            "  另外两条：在 permissions.yaml 里写 `allow: mcp_add_server`"
+            "（⚠ **必须不带括号**——带括号的写法一律不命中，且没有任何警告；"
+            "这条整工具规则会让分类器与确认面板对这一类都不再生效）；"
+            "或关掉分类器（classifier.enabled: false）。"
+        )
     else:
         lines.append(
             "  若这是你要的操作，可在 permissions.yaml 里为它写一条**具体的** "
@@ -197,7 +230,8 @@ def render_breaker_notice(state: BreakerState) -> str:
     return "\n".join([
         head,
         cause,
-        "  之后：跑命令与访问网络会**逐次弹确认面板**交给你决定；队友消息恢复为直接投递。",
+        "  之后：跑命令、访问网络、添加 MCP Server 会**逐次弹确认面板**交给你决定；"
+        "队友消息恢复为直接投递。",
         "  恢复：在确认面板上批准一次即可重新启用。",
     ])
 

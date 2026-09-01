@@ -38,7 +38,7 @@ from rhinecode.permission.models import PermissionMode, PermissionRequest
 # 单个工具的映射规则：给定参数字典，返回 (rule_name, specifier, kind)。
 _Mapper = Callable[[dict], tuple[str, str, str]]
 
-def _launch_specifier(args: dict) -> str:
+def launch_specifier(args: dict) -> str:
     """
     把一次 `mcp_add_server` 调用压成一行「要启动什么」的人类可读描述。
 
@@ -55,6 +55,14 @@ def _launch_specifier(args: dict) -> str:
     ⚠ **刻意不截断。** 与 url / search 两类同一条理由：这段文字是用户判断
     放不放行的依据，截断意味着只要把危险部分放在可见范围之后，人在回路这一层
     就形同虚设。（确认面板另有专用展示行，见 `tui/widgets.ConfirmPanel`。）
+
+    ⚠ **它是公开函数，因为 c16 分类器那一侧也用它**
+    （`agent/loop.py::_launch_review_subject` 把它当成开头那一行，后面再接上
+    写入位置与完整配置原文）。这是刻意的**单一事实源**：两边各拼一次
+    「服务器名 · 要跑什么」的话，确认面板上写的与分类器看到的会悄悄分叉，
+    而那种不一致最难解释——两处都「看起来对」，只是不相等。
+    它**刻意只给这一行**（不含 `env` / `headers`），分类器需要的完整配置由
+    调用方自己接上去；改这里的输出格式要顺带看一眼那个调用点。
 
     ⚠ **绝不抛异常。** 它跑在权限判定的入口上，参数是模型产出的任意 JSON——
     `config` 完全可能不是字典、`args` 完全可能不是列表。判定层抛异常会让
@@ -122,7 +130,7 @@ _TOOL_MAP: dict[str, _Mapper] = {
     # specifier 取「服务器名 · 将要执行的命令（或远端地址）」——它是行为记录里
     # 唯一能回答「那次到底启动了什么」的字段。规则匹配用不到它（`launch` 落
     # 「其它类」分支，只认不带括号的整工具规则），因此可以放人看的文本。
-    "mcp_add_server": lambda a: ("mcp_add_server", _launch_specifier(a), "launch"),
+    "mcp_add_server": lambda a: ("mcp_add_server", launch_specifier(a), "launch"),
     # web_search：完整查询词进③整工具规则匹配 + ④模式兜底（web_search 扩展 F10）。
     # specifier 用**完整查询词原文**——确认面板与行为记录里要留下模型实际搜了什么，
     # 那是用户放不放行的唯一依据（spec F7）。
