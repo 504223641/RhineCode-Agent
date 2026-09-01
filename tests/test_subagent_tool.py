@@ -288,7 +288,7 @@ class SameVoiceTest(unittest.TestCase):
         """
         **可数的下限**：一两次工具调用能做完的活自己做。
 
-        `docs/todo/3-delegation-trigger-eval.md` 留下的线索：模型对**有具体可匹配项**
+        `docs/todo/2-delegation-trigger-eval.md` 留下的线索：模型对**有具体可匹配项**
         的指令遵循得好，对抽象判断（「任务之间相不相干」）系统性偷懒。
         所以刹车必须给成可数的，不能只说「简单的活自己做」。
         """
