@@ -22,6 +22,7 @@ Plan Mode 两段式（F13）在循环内体现为每轮局部状态 execution_ph
   Plan Mode 开关本身仍由上层维持（下一条用户消息会重新从规划阶段开始）。
 """
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -61,6 +62,7 @@ from rhinecode.hooks import (
 )
 from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
 from rhinecode.classifier import (
+    SCOPE_LAUNCH,
     SCOPE_MESSAGE,
     SCOPE_SEARCH,
     SCOPE_URL,
@@ -70,7 +72,14 @@ from rhinecode.classifier import (
     VerdictKind,
 )
 from rhinecode.classifier import render as classifier_render
-from rhinecode.permission import Decision, DecisionResult, Layer, PermissionEngine, to_request
+from rhinecode.permission import (
+    Decision,
+    DecisionResult,
+    Layer,
+    PermissionEngine,
+    launch_specifier,
+    to_request,
+)
 # c16：待判动作要带主机与端口（网络判定的缓存键）。复用②′层那份解析，
 # **不在这里另写一份**——`permission/network.py` 的模块 docstring 明写着
 # 「判定期与连接期共用同一份实现」，本处是第三个使用者。
@@ -273,7 +282,7 @@ class RunOptions:
     # c16：安全审查分类器。**缺省 None 即本章之前的行为，不传等于零回归**。
     #
     # 非空时，`run()` 会为本次运行建一个 `ReviewSession`（缓存与转录来源绑在
-    # 那上面），三类声明了 `classifier_scope` 的动作在权限结论来自第④层时
+    # 那上面），声明了 `classifier_scope` 的那几类动作在权限结论来自第④层时
     # 多过一次模型判定。
     classifier: "Optional[ClassifierProtocol]" = None
     # c16 F9：**取用户消息的历史来源**。缺省 None = 用本次运行自己的历史
@@ -612,11 +621,14 @@ class Agent:
         `PermissionRequest` 对**消息类**给不出内容：发消息的工具落 `other` 分支，
         它的 `specifier` 是空串（`permission/adapter.py` 刻意没把协作工具登记进
         `_TOOL_MAP`，理由是它们不碰文件也不执行命令、没有可映射的语义）。
-        三类里有一类取不到，那就三类都从 `tc.arguments` 取——**一种取法比
-        「两类走这条、一类走那条」少一个会漏改的地方**。
+        五类里有一类取不到，那就五类都从 `tc.arguments` 取——**一种取法比
+        「四类走这条、一类走那条」少一个会漏改的地方**。
+        （启动类另有一层理由：它要判的材料是 `server_name` + 完整 `config`，
+        而 `PermissionRequest.specifier` 只有给人看的那一行，不含 `env`。）
 
         ⚠ **参数名与工具的 `parameters` 是成对维护点**：这里写的
-        `command` / `url` / `message` / `to` / `query` 必须与四个工具声明的一致。
+        `command` / `url` / `message` / `to` / `query` / `server_name` / `config` /
+        `scope` 必须与五个工具声明的一致。
         改了工具的参数名而漏改这里不会报错，只表现为分类器收到一个空的
         待判内容——然后它会因为「看不出有什么问题」而放行。
 
@@ -650,6 +662,16 @@ class Agent:
             # 然后因为「看不出有什么问题」而放行，且**完全无声**。
             specifier = str(args.get("query") or "")
             recipient = ""
+        elif scope == SCOPE_LAUNCH:
+            # c16 第五类：把一个外部 MCP Server 写进配置并立刻启动它。
+            #
+            # ⚠ 这一支**不能并进下面的 else**（命令类）：那边取的是
+            # `args["command"]`，而 `mcp_add_server` 没有这个顶层参数——
+            # 它的命令藏在 `args["config"]["command"]` 里。照抄会让分类器拿到
+            # **空的待判内容**，然后因为「看不出有什么问题」而放行，
+            # 且**完全无声**。这与搜索类那一支是同一个坑的第二次。
+            specifier = Agent._launch_review_subject(args)
+            recipient = ""
         else:
             specifier = str(args.get("command") or "")
             recipient = ""
@@ -662,6 +684,55 @@ class Agent:
             port=port,
             cwd=str(cwd) if cwd is not None else "",
         )
+
+    @staticmethod
+    def _launch_review_subject(args: dict) -> str:
+        """
+        把一次 `mcp_add_server` 调用压成分类器要判的那段材料（c16 启动类）。
+
+        :param args: 模型给出的参数字典（`server_name` / `config` / `scope`）
+        :returns: 一行文本，形如
+                  `context7 · npx -y @upstash/context7-mcp · 写入 project 级 mcp.yaml
+                  · 完整配置：{"args":[...],"command":"npx"}`
+
+        副作用：无（纯数据转换）。
+
+        ## 为什么开头那半句要复用 `permission.adapter.launch_specifier`
+
+        **单一事实源。** 那半句同时出现在确认面板与行为记录里；各拼一份的话
+        「面板上写的」与「分类器看到的」会悄悄分叉，而那种不一致最难解释——
+        两处都「看起来对」，只是不相等。（同 `tui/widgets.format_activity_cost`
+        那条成对维护点的理由。）
+
+        ## 为什么后面还要接上写入位置与完整配置原文
+
+        `launch_specifier` 只给「服务器名 · 要跑什么」，它是给**人**看的一行；
+        而分类器要判的东西有两样它没带上：
+
+        - **`env` / `headers`**：`env` 里一句 `NODE_OPTIONS=--require /tmp/x.js`
+          能让一条看起来干净的 `npx` 加载任意脚本，`headers` 里可能夹带令牌。
+          不给它看等于把这一面藏起来，**而藏得看不出来**。
+        - **写入哪一层**（`scope`）：写用户级意味着这条配置对**以后每一个项目**
+          生效，那与只写当前项目不是同一件事。
+
+        ⚠ **不做任何截断**（spec F6），与其余四类同一条纪律：被截掉的地方连痕迹
+        都没有，记录上只会显示「判定通过」。
+
+        ⚠ **绝不抛异常。** 它跑在决策预扫里，`config` 完全可能不是字典、
+        参数里可能混进不可序列化的东西；抛出去会让整轮工具执行炸掉。
+        """
+        head = launch_specifier(args)
+        # `scope` 缺省是 "auto"，语义等于 project（见 `mcp/auto_config.py`）。
+        # 照抄模型写的那个词而不是替它解析：分类器要判的是**它声明了什么**。
+        where = str(args.get("scope") or "auto")
+        config = args.get("config")
+        try:
+            raw = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            # 与 `prompt._dump_arguments` 同口径：退回 repr 而不是抛错——
+            # 分类器少看懂一段配置，好过整次判定失败而按拒绝处理。
+            raw = repr(config)
+        return f"{head} · 写入 {where} 级 mcp.yaml · 完整配置：{raw}"
 
     def _apply_classifier(
         self,
@@ -699,7 +770,7 @@ class Agent:
         ## ⚠ 触发条件三个，缺一不可
 
         1. 会话非空（分类器已启用）
-        2. 工具声明了 `classifier_scope`（三类之一）
+        2. 工具声明了 `classifier_scope`（五类之一）
         3. **结论来自第④层**（`layer is Layer.MODE`）
 
         第 3 条是本层全部安全论证的落点，它同时给出两条性质：
@@ -709,24 +780,32 @@ class Agent:
 
         ⚠ 只读短路给出的也是 `Layer.RULE`，所以只读工具天然不进这里。
 
-        ## ⚠ 网络类是唯一一处分类器可以「放宽」的地方
+        ## ⚠ 基线是 ASK 的那几类，分类器可以「放宽」
 
-        三类的基线不同：
+        五类的基线不同，而**能不能放宽完全由基线决定**（下面的 ALLOW 分支
+        只对 `Decision.ASK` 做覆写，一行特判都没有）：
 
         | 类别 | ④层的既有结论 | 分类器能做什么 |
         | --- | --- | --- |
         | 命令 | ALLOW（放行档） | 只能变严 |
         | 消息 | ALLOW（对④层免疫） | 只能变严 |
         | **网络** | **ASK**（放行档对网络不生效，web_fetch 扩展 F7） | **放行时把 ASK 覆写成 ALLOW** |
+        | **搜索** | **ASK**（web_search 扩展 F12） | 同上 |
+        | **Server 启动** | **ASK**（`launch` 类，B4） | 同上 |
 
         网络那一格是 spec F3 明确要的：用一个真的会看的把关人，换掉一个用户
         已经不看的面板（用户面对第 20 次确认面板时是不看的）。
-        **因此本章对网络类不再是「只收紧」**，安全边界一节写的是分工版而不是
+        **因此本章对这三类不再是「只收紧」**，安全边界一节写的是分工版而不是
         「加进来之后能通过的集合只会变小」——那句话现在只对命令类与消息类成立。
+
+        ⚠ **启动类那一格的代价单独记一笔**：①②②′②″对它一层都碰不到，
+        因此判放行的那条路上**分类器是唯一的一道**。这是评审时明知并接受的
+        取舍（登记在 CLAUDE.md 的安全边界一节），而它成立的前提是最后那行——
+        熔断之后退回④层的 ASK，人在回路重新出现。
 
         ## 熔断后的退路按类别分流（F16a）
 
-        - 命令 / 网络 → `ASK`（弹面板，人在回路仍在）
+        - 命令 / 网络 / 搜索 / Server 启动 → `ASK`（弹面板，人在回路仍在）
         - 消息 → **保持原结论**（一律投递，回到本章之前）
 
         消息类不接面板是刻意的：让用户在毫无上下文的情况下判断「两个子 Agent

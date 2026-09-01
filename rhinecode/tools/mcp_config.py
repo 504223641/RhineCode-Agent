@@ -19,6 +19,13 @@ auto-plan 扩展把缺省档换成 `PERMISSIVE`（`presets.py` 的 `DEFAULT_PRES
 被规范化为 `kind == "launch"`，第④层在放行档下对它判 ASK（与 url / search
 两个既有例外同格）。改动那处映射等于把这条承诺再拿掉一次，
 护栏见 `tests/test_perm_launch_layer.py`。
+
+⚠ **2026-09-01 起面板之前还有一道：C16 分类器（启动类）。**
+面板看得到「要跑什么命令」，看不到「用户到底有没有要求过引入这个 Server」——
+后者只有完整对话上下文才回答得了，而那恰恰是这一类真正的判据（`command`
+通常是一条人畜无害的 `npx -y <包名>`）。**代价是分类器判放行时面板不再弹**，
+于是判放行的那条路上它是唯一的一道；熔断时退回上面那一格。
+护栏见 `tests/test_mcp_launch_classifier.py`。
 """
 
 from __future__ import annotations
@@ -118,6 +125,25 @@ class MCPAddServerTool(Tool):
         "required": ["server_name", "config"],
     }
     read_only = False
+    # c16 第五类：把一个外部程序拉起来，要经分类器审查。
+    #
+    # ⚠ **这不是给 B4 补漏，是给它接第二道。** B4（`permission/adapter.py` 的
+    # `launch` 类映射）已经让本工具在缺省预设下必弹面板；本行加的是**面板之前
+    # 的那一眼**——面板看得到「要跑什么命令」，看不到「用户到底有没有要求过
+    # 引入这个 Server」，而后者恰恰是完整对话上下文才回答得了的问题。
+    #
+    # ⚠ **它会让面板在日常消失**：分类器判放行时把④层的 ASK 覆写成 ALLOW
+    # （`agent/loop.py::_apply_classifier`），与网络类 / 搜索类同形；熔断时
+    # 退回逐次弹面板（④层基线是 ASK，见 `permission/engine.py` 的 launch 分支）。
+    # 换言之**判放行的那条路上分类器是唯一的一道**——①②②′②″一层都碰不到
+    # 这类动作。这是评审时明知并接受的取舍，登记在 CLAUDE.md 的安全边界一节。
+    #
+    # ⚠ 这里写**字面量**而不是 import `classifier.models.SCOPE_LAUNCH`，
+    # 与 `web_fetch` / `web_search` 同一先例：`import` 那个模块会连带执行
+    # `classifier/__init__.py`，把服务、熔断、缓存与 `provider.base` 一起拉进
+    # 工具层的导入图，而工具层只需要一个字符串。
+    # 两者相等由 `tests/test_mcp_launch_classifier.py` 的一条断言钉住。
+    classifier_scope = "launch"
 
     def __init__(self, mcp_manager: "MCPManager", registry: "ToolRegistry"):
         """注入运行时依赖，使添加后可以立即连接并注册 MCP 工具。"""

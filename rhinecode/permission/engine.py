@@ -530,6 +530,12 @@ class PermissionEngine:
             # 交出去）。放在④层则三个选项全部诚实：③层命中就短路本层，
             # 而模型改不了 `permissions.yaml`（那是②″保护路径），
             # 因此那条 allow 规则只可能出自人手。
+            #
+            # ⚠ **2026-09-01 起正常情况下用户看不到这个面板**：`mcp_add_server`
+            # 已纳入 C16 分类器（启动类），分类器判放行时会把这里的 ASK 覆写成
+            # ALLOW（`agent/loop.py::_apply_classifier`），与 url / search 同形。
+            # **这一支因此更重要而不是更不重要**：它是分类器熔断之后退回的那一格。
+            # 把它改成 ALLOW「反正分类器会看」，等于让接口一不通就变成一律放行。
             if request.kind == "launch":
                 return _verdict(
                     Decision.ASK,

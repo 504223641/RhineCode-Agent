@@ -15,7 +15,7 @@ from rhinecode.permission.models import (
     Rule,
 )
 from rhinecode.permission.engine import PermissionEngine
-from rhinecode.permission.adapter import to_allow_rule, to_request
+from rhinecode.permission.adapter import launch_specifier, to_allow_rule, to_request
 
 __all__ = [
     "Decision",
@@ -27,4 +27,5 @@ __all__ = [
     "PermissionEngine",
     "to_allow_rule",
     "to_request",
+    "launch_specifier",
 ]

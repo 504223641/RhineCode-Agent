@@ -26,7 +26,7 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 
-# ── 四类被审查的动作 ──────────────────────────────────────────────────────
+# ── 五类被审查的动作 ──────────────────────────────────────────────────────
 #
 # 取值与 `Tool.classifier_scope` 一一对应。空串表示「该工具不进分类器」，
 # 那是绝大多数工具的情况（文件读写、委派、Skill 加载、任务清单……）。
@@ -42,6 +42,18 @@ SCOPE_MESSAGE = "message"
 # 复用 SCOPE_URL 那一支会让分类器拿到空内容然后放行，而且完全无声
 # （`_review_action` 对 SCOPE_URL 取的是 `args["url"]`）。
 SCOPE_SEARCH = "search"
+# 第五类：把一个外部 MCP Server 写进配置并**立刻启动它**（`mcp_add_server`）。
+#
+# ⚠ **取值与权限层的 `PermissionRequest.kind` 刻意逐字相同**（都是 "launch"）。
+# 两处仍是两份独立的常量、**不互相 import**（本包是叶子，见模块 docstring），
+# 相等由 `tests/test_mcp_launch_classifier.py` 的一条断言钉住。取同一个词是为了
+# 让排查的人在 trace 里看到 `kind=launch` 与 `scope=launch` 时不必再对一次表。
+#
+# ⚠ **它的审查口径与其余四类不同，别套命令类的。** 那四类问的是「这个动作
+# 本身危不危险」；这一类的 `command` 通常是一条人畜无害的 `npx -y <包名>`，
+# 真正的问题是**「用户有没有要求过引入这个 Server」**——即那个包名/地址
+# 是不是助手自己编出来的。口径写在 `prompt.render_pending` 的对应分支里。
+SCOPE_LAUNCH = "launch"
 
 
 @dataclass(frozen=True)
@@ -52,11 +64,12 @@ class ReviewAction:
     `frozen=True` 与 `PermissionRequest` 同理由：它是值对象，构造后只被纯函数
     读取、断言，不该被中途改写。
 
-    :param scope: 三类之一（见上方常量）。决定走哪种缓存、渲染成什么措辞
+    :param scope: 五类之一（见上方常量）。决定走哪种缓存、渲染成什么措辞
     :param tool_name: 真实工具名（如 "run_command"），仅用于文案展示
     :param specifier: 待判的主体内容——
                       命令类是**完整命令串**、网络类是**完整地址**、
-                      消息类是**完整正文**、搜索类是**完整查询词**
+                      消息类是**完整正文**、搜索类是**完整查询词**、
+                      启动类是**服务器名 + 写入位置 + 完整配置原文**
     :param recipient: 仅消息类填充：收件人的名字
     :param host: 仅网络类填充：已归一化的主机名（小写、去末尾点）
     :param port: 仅网络类填充：端口。与 host 一起构成缓存键（spec F18）
@@ -124,7 +137,7 @@ class ClassifierConfig:
     """
     分类器的三个配置项（spec F25），整段在 `config.yaml` 里可缺省。
 
-    :param enabled: 总开关，**缺省开**。关掉之后三类动作回到本章之前的行为
+    :param enabled: 总开关，**缺省开**。关掉之后各类动作回到本章之前的行为
                     （命令一律放行、网络仍然每次弹面板、队友消息一律投递），
                     且宽泛放行规则不再被丢弃
     :param model: 分类器用哪个模型。**空串 = 跟主对话同一个模型**。

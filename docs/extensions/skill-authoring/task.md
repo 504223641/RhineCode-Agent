@@ -29,7 +29,7 @@
 | 改 | `docs/internals/testing.md` | 新增测试文件的覆盖清单 |
 | 改 | `docs/extensions/README.md` | 当前扩展表加一行 |
 | 删 | `docs/todo/1-skill-authoring.md` | 本扩展做完即删 |
-| 改 | `docs/todo/2-web-search.md`、`5-p1b-unattended.md` | 重排序号为 1、2 |
+| 改 | `docs/todo/2-web-search.md`、`4-p1b-unattended.md` | 重排序号为 1、2 |
 
 ---
 
@@ -495,15 +495,15 @@
 **步骤：**
 1. 删除 `1-skill-authoring.md`（本扩展已完成）。
 2. 把 `2-web-search.md` 重命名为 `1-web-search.md`、
-   `5-p1b-unattended.md` 重命名为 `5-p1b-unattended.md`。
+   `4-p1b-unattended.md` 重命名为 `4-p1b-unattended.md`。
 3. 改两份文档内部的序号标题，**以及正文与开工 Prompt 段里的自引用**——
-   陈旧引用不只在标题：`2-web-search.md` 与 `5-p1b-unattended.md` 的正文里
+   陈旧引用不只在标题：`2-web-search.md` 与 `4-p1b-unattended.md` 的正文里
    都有「见 docs/todo/<带序号的文件名>」这类句子。
 4. 更新 `docs/todo/README.md`：清单与序号引用，**并往「已完成（已从本文件夹移除）」
    那一节加一行**（既有三条都按该格式登记过，漏加会让那节看起来停更了）。
 5. 全仓库检索这三份文档的旧路径引用并一并更新。
 
-**验证：** `ls docs/todo/` 只剩 `README.md`、`1-web-search.md`、`5-p1b-unattended.md`；
+**验证：** `ls docs/todo/` 只剩 `README.md`、`1-web-search.md`、`4-p1b-unattended.md`；
 
 ```
 grep -rn "1-skill-authoring\|2-web-search\|3-p1b" . --include=*.md \

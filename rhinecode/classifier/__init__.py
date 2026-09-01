@@ -1,10 +1,11 @@
 """
-分类器审查包（c16）：在权限管线第④层给三类动作接一次独立的模型判定。
+分类器审查包（c16）：在权限管线第④层给五类动作接一次独立的模型判定。
 
 ## 一句话
 
-`auto` 档下，跑命令、访问网络、给队友发消息这三类动作在执行前先问一个**独立的
-分类器模型**「这该不该做」。代码守边界，模型判语义。
+`auto` 档下，跑命令、访问网络、给队友发消息、上网搜索、把一个外部 MCP Server
+拉起来——这五类动作在执行前先问一个**独立的分类器模型**「这该不该做」。
+代码守边界，模型判语义。
 
 ## 它在整条管线里的位置
 
@@ -38,7 +39,7 @@
 
 | 模块 | 管什么 |
 | --- | --- |
-| `models` | 值对象、三类 scope 常量、`ClassifierProtocol` |
+| `models` | 值对象、五类 scope 常量、`ClassifierProtocol` |
 | `prompt` | 分类器能看到什么、按什么顺序排、怎么无害化 |
 | `parse` | 两阶段输出解析（两个阶段的失败语义**刻意不同**） |
 | `breaker` | 两种熔断（拦得太多 / 连不上），加锁 |
@@ -53,6 +54,7 @@
 
 from rhinecode.classifier.models import (
     SCOPE_COMMAND,
+    SCOPE_LAUNCH,
     SCOPE_MESSAGE,
     SCOPE_SEARCH,
     SCOPE_URL,
@@ -78,6 +80,7 @@ from rhinecode.classifier.session import ReviewSession
 
 __all__ = [
     "SCOPE_COMMAND",
+    "SCOPE_LAUNCH",
     "SCOPE_MESSAGE",
     "SCOPE_SEARCH",
     "SCOPE_URL",
