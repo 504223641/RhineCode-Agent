@@ -13,9 +13,19 @@
 「永久放行」写下的规则是废的。目前有三种 kind 需要在两处同步：`url`（写
 `domain:` 模式）、`search`（写空模式）与 `launch`（写空模式）。
 
+⚠ **第四种 `remote`（MCP 远端工具）刻意不在上面那份清单里，别当成漏改补一个分支。**
+它的 specifier **恒为空串**（见 `to_request` 那一支），于是函数末尾那条
+`return request.rule_name, request.specifier` 已经返回了正确的空模式。
+真要加一个分支只是把同一件事写两遍。⚠ 但这条「不必加」是有前提的——
+哪天有人给 `remote` 填上非空 specifier（比如照 `launch` 的样子塞一句
+「服务器名 · 远端原名」给记录看），那条兜底就会立刻开始写出
+`mcp__github__search(github · search)` 这种**永远不命中**的废规则。
+护栏 `tests/test_perm_remote_layer.py::AllowRuleTest` 钉的就是这个前提。
+
 ⚠ 新增 `kind` 时还要看第三处：`permission/engine.py` 第④层的模式兜底。
-`url` / `search` / `launch` 在放行档下都判 ASK（各有各的理由文案），而其余种类
-判 ALLOW——漏改那里的表现是「配了放行档之后搜索就再也不问了」，也不报错。
+`url` / `search` / `launch` / `remote` 在放行档下都判 ASK（各有各的理由文案），
+而其余种类判 ALLOW——漏改那里的表现是「配了放行档之后搜索就再也不问了」，
+也不报错。
 """
 
 from pathlib import Path
@@ -156,8 +166,11 @@ def to_request(
                 **必填**——理由见 `PermissionRequest.cwd` 的说明
     :returns: 规范化后的 PermissionRequest
 
-    映射规则见 _TOOL_MAP；未登记的工具落到 "other" 分支：rule_name 用工具自身的 name，
-    specifier 为空，kind="other"（引擎只按工具名匹配整工具规则 + 走模式兜底）。
+    映射规则见 _TOOL_MAP。未登记的工具分两种落法，**两者只差一个 kind**：
+    声明了 `remote_origin`（即 MCP 远端工具）的落 "remote"，其余落 "other"；
+    两种都是 rule_name 用工具自身的 name、specifier 为空，因此③层的规则匹配
+    行为**完全一致**（含 `allow: mcp__server__*` 这种通配写法）。
+    差别只在第④层：放行档下 "remote" 判 ASK，"other" 判 ALLOW。
 
     副作用：无（纯数据转换）。
     """
@@ -165,6 +178,24 @@ def to_request(
     mapper = _TOOL_MAP.get(tool.name)
     if mapper is not None:
         rule_name, specifier, kind = mapper(a)
+    elif getattr(tool, "remote_origin", False):
+        # **MCP 远端工具**（审查报告 S2 那一半）。名字是运行期由
+        # `mcp/tool_adapter.sanitize_mcp_tool_name` 生成的（`mcp__<server>__<tool>`），
+        # 因此进不了上面那张按名字登记的静态表——靠工具自己声明的
+        # `remote_origin` 标志识别（理由见 `tools/base.Tool` 的对应 docstring）。
+        #
+        # ⚠ **`rule_name` 与 `specifier` 与下面的 `other` 分支逐字相同，只有
+        # `kind` 不一样，这是刻意的**：③层的规则匹配对这两种 kind 走的是同一条
+        # 「其它类」分支（`rules._rule_matches` 最后一行，空模式 + 工具名 fnmatch），
+        # 于是 c7 spec AC9 那条 `allow: mcp__everything__*` 的写法**一个字都不用改**。
+        # 本次新增的全部行为差异只发生在第④层那一格。
+        #
+        # ⚠ **specifier 必须留空串。** 它一旦非空，`to_allow_rule` 末尾那条兜底
+        # 就会把它写进「永久放行」的规则模式里，而「其它类」分支只认空模式——
+        # 那是一条永远不会命中的废规则（`WebFetch(https://…?token=abc)` 同形）。
+        # 要给记录/面板补展示信息，走 `tui/widgets._remote_detail_lines` 那条路，
+        # 它读的是工具调用的原始参数，不占用 specifier。
+        rule_name, specifier, kind = tool.name, "", "remote"
     else:
         rule_name, specifier, kind = tool.name, "", "other"
 

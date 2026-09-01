@@ -181,6 +181,15 @@ class PermissionRequest:
                         规则匹配走「其它类」分支；④层兜底与 url/search 同格：
                         放行档下仍判 ASK，理由是这一类**没有任何兜底边界**，
                         而 `command` 字段是任意本地命令）、
+                 "remote"（**MCP 远端工具**，`mcp__<server>__<tool>`。
+                        specifier **恒为空串**，rule_name 取工具名——即与 "other"
+                        分支逐字相同，于是③层匹配行为完全一致（`allow:
+                        mcp__server__*` 照常可用）。⚠ 它与 "other" **只差第④层
+                        那一格**：放行档下判 ASK 而不是 ALLOW，理由是「实现这个
+                        工具的代码不是本项目写的」，而①②②′②″一层都碰不到它。
+                        这一支兑现的是 C7 spec F11 那句「外部 Server 不可信，
+                        默认每次经人在回路确认」——它在 auto-plan 把缺省档换成
+                        放行档之后失去了落点，见审查报告 S2）、
                  "other"（未映射工具，只按工具名进③ + ④兜底）
     :param is_read_only: 是否只读工具。True 走只读简化分支（spec F7）：③未命中即放行，不进④
     :param mode: 当前权限模式，供④层兜底使用

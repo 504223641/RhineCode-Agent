@@ -3480,6 +3480,69 @@ class ConfirmPanel(NumberedPanel):
             lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
         return lines
 
+    def _remote_detail_lines(self, tool_call, decision) -> list[str]:
+        """
+        为「MCP 远端工具」类请求（`mcp__<server>__<tool>`）生成补充展示行。
+
+        :param tool_call: 本次工具调用（从中取未经截断的原始参数）
+        :param decision: DecisionResult（提供 layer）
+        :returns: 已转义、可直接进 markup 的行文本列表
+
+        ⚠ **这几行不是装饰，是这次确认唯一的判断依据**（审查报告 S2）。
+        与 url / launch / search 四类同一条理由：表头那行走 `summarize_args`，
+        每个参数值只留 30 字符，而用户要放行的内容完全可能在第 31 个字符之后。
+
+        三行分别回答用户必然会问的三件事：
+
+        1. **谁提供的**——哪台 Server。这是本类**特有**的一行，也是最要紧的一行：
+           面板问的不是「这个动作危不危险」（那种判断另有 C16 分类器做），
+           而是「**你信不信这台 Server**」。用户脑子里对 `github` 与某个昨天
+           刚 `git pull` 进来的 Server 是两套信任度，而工具名里那段服务器名
+           混在一长串 `mcp__…__…` 中间并不显眼。
+        2. **完整参数**——不截断。
+        3. 判定来自哪一层。
+
+        ⚠ **服务器名是从注册名反解的，只用于展示，不参与任何判定。**
+        `sanitize_mcp_tool_name` 会把非法字符压成 `_`、过长时截断加 hash，
+        因此反解**不保证**逐字还原远端原名。这是可以接受的：这一行的作用是
+        让用户认出「哦是那台」，而真正的身份凭据是完整注册名——它原样在表头。
+        取不到就不显示这一行，**绝不猜**。
+
+        ⚠ 参数进 markup 前一律用本模块的 `escape`，绝不要 `rich.markup.escape`。
+        MCP 参数是远端 schema 决定的任意 JSON，落单的 `[` 完全正常，
+        而 rich 那版会把它整个放过，然后在 Textual 布局阶段抛 MarkupError
+        ——那是没有任何 try/except 兜得住、会直接拆掉整个 app 的那一类。
+        """
+        lines: list[str] = []
+
+        # 注册名形如 `mcp__<server>__<tool>`；按前两个分隔符切三段即可。
+        # 切不出三段（理论上不该发生）就整段跳过，不做任何猜测。
+        name = str(getattr(tool_call, "name", "") or "")
+        parts = name.split("__")
+        if len(parts) >= 3 and parts[0] == "mcp" and parts[1]:
+            server = parts[1]
+            remote = "__".join(parts[2:])
+            lines.append(
+                f"   [dim]由外部 Server 提供：[/dim]{escape(server)}"
+                f"[dim] · 远端工具 [/dim]{escape(remote)}"
+            )
+
+        args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        if args:
+            # **不截断**：这一行的全部价值就在于让用户看到将被发给远端的完整参数。
+            # 用 sorted 固定顺序——同一次调用每次显示得一样，用户才好比对。
+            shown = ", ".join(f"{k}={args[k]!r}" for k in sorted(args, key=str))
+            lines.append(f"   [dim]完整参数：[/dim]{escape(shown)}")
+        else:
+            lines.append("   [dim]完整参数：[/dim]（无）")
+
+        layer = getattr(decision, "layer", None)
+        layer_value = getattr(layer, "value", layer)
+        if layer_value:
+            label = self._LAYER_LABELS.get(str(layer_value), str(layer_value))
+            lines.append(f"   [dim]判定来自：[/dim]{escape(label)}")
+        return lines
+
     def _launch_detail_lines(self, tool_call, decision) -> list[str]:
         """
         为「启动外部程序」类请求（`mcp_add_server`）生成补充展示行。
@@ -3617,6 +3680,9 @@ class ConfirmPanel(NumberedPanel):
         elif decision is not None and getattr(decision, "kind", "") == "launch":
             for line in self._launch_detail_lines(tool_call, decision):
                 self._add_static(line)
+        elif decision is not None and getattr(decision, "kind", "") == "remote":
+            for line in self._remote_detail_lines(tool_call, decision):
+                self._add_static(line)
         # 四个可选项带序号（F23），用户可以直接按数字键选中。
         # 改造前这里是四个彩色 emoji（`✅ 🟢 💾 ❌`）——四种颜色反而盖过了
         # 「哪个是当前选中」这个唯一重要的信息。语义现在由序号 + 文字承担。
@@ -3666,6 +3732,17 @@ class ConfirmPanel(NumberedPanel):
         # （见 `classifier/broad.py` 的两个常量），不碰它。于是那条规则下次启动
         # 会照常在③层命中并短路④层——**「永久放行」在这一类上是诚实的**。
         # 砍掉它反而是拿走一个真的有用的选项。
+        #
+        # ⚠ **`remote` 类（MCP 远端工具）同理，也刻意不加进 `no_permanent`**
+        # （审查报告 S2）。判据是同一条推导链走不通：它的规则形状是
+        # `allow: mcp__<server>__<tool>`（`to_allow_rule` 返回空模式），
+        # 而 F16 的宽泛规则丢弃只处理 `Bash` 与 `WebSearch`，不碰它；
+        # 下次启动那条规则会在③层命中并短路④层，**按钮是诚实的**。
+        #
+        # ⚠ 而且这一类**尤其不该砍**：本类的基线就是「每次都问」，而 MCP
+        # 是高频调用的东西。「永久放行」正是给用户的那条正经出路——他点下去
+        # 写下的是**一条人做的、看得见、改得掉的决定**，这与今天那种
+        # 「放行档替他默默放行」有本质区别。砍掉它只会把人逼去关掉整个机制。
         protected = layer_value == "protected"
         is_search = decision is not None and getattr(decision, "kind", "") == "search"
         no_permanent = protected or is_search

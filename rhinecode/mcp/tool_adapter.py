@@ -4,7 +4,10 @@
 这是 MCP 世界与 RhineCode 工具体系的接缝：
 - 命名：注册名统一加 mcp__<server>__<tool> 前缀，与内置工具、其它 Server 天然隔离（F9）。
 - 参数：直接透传远端 inputSchema 给模型（F10）。
-- 只读性：一律 read_only=False——外部 Server 不可信，默认每次经人在回路确认（F11）。
+- 只读性：一律 read_only=False——外部 Server 不可信（F11）。
+- 来源标注：一律 remote_origin=True——权限层据它判 kind="remote"，第④层在放行档下
+  仍判 ASK。⚠ F11 那句「默认每次经人在回路确认」在 auto-plan 把缺省档换成放行档
+  之后曾整整失效一段时间（审查报告 S2），**兑现它的现在是这个标志**，不是 read_only。
 - 结果转换：把 MCP 的 CallToolResult（content 块数组 + isError）翻译成统一的 ToolResult（F8）。
 - 健壮性：execute 捕获一切异常转 ok=False，绝不外抛（spec N2），保证 Agent Loop 不崩。
 """
@@ -60,6 +63,16 @@ class MCPTool(Tool):
     """
 
     read_only = False  # 外部 Server 不可信：默认走确认（spec F11）
+    # 「本工具由外部程序提供」——权限层据它把请求映射成 kind="remote"，
+    # 于是第④层在放行档下判 ASK 而不是 ALLOW（审查报告 S2 那一半）。
+    #
+    # ⚠ **它与上面的 read_only 是两件事，别合并也别互相推导。**
+    # `read_only=False` 说的是「这次调用可能有副作用」，管的是要不要走④层；
+    # 本标志说的是「实现这个工具的代码不是我们写的」，管的是④层怎么判。
+    # 少了它，MCP 工具会落回 `kind="other"`，而缺省预设（放行档）下那一类
+    # 的结论是**直接放行、零面板**——C7 那句「默认每次调用都经人在回路确认」
+    # 就是在 auto-plan 把缺省档换成放行档之后，从这里悄悄失效的。
+    remote_origin = True
 
     def __init__(
         self,
