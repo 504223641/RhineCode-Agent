@@ -1,5 +1,5 @@
 """
-RHINE.md 的坏编码护栏（审查报告 B6 / R4-1）。
+记忆包的坏编码护栏（审查报告 B6 / R4-1，以及同型的第二处）。
 
 ## 这条护栏钉的是什么
 
@@ -16,6 +16,26 @@ RHINE.md（中文 Windows 上记事本、旧编辑器、`cmd` 的 `>` 重定向�
    空模块）——**连同另外两层已经读好的内容一起没了**；
 2. `layers=[]` → `/memory` 报告里那个负责说真话的循环一次都不执行，
    「RHINE.md 项目指令：」后面**一片空白**：既不说加载成功，也不说加载失败。
+
+## 本模块钉的是**两处**，别只看前半
+
+同一个洞在记忆包里有两个落点，**后果轻重相反**：
+
+| | 前半（B6，已修） | 后半（本轮） |
+| --- | --- | --- |
+| 谁写的文件 | 用户手写的 `RHINE.md` | RhineCode 自己写的 `MEMORY.md` 与记忆正文 |
+| 怎么触发 | 用记事本新建一次就够 | 用户手工用 GBK 编辑器改过 |
+| 失败形态 | **静默**吞掉三层指令 | **异常直接冒出来** |
+| 有多疼 | 那一次会话的指令不生效 | `memory_index()` **每次构建系统提示都被调**，于是**每一轮对话都炸**；`/memory` 同样当场炸 |
+
+⚠ **别因为后半「触发难度较高」就把它当成不要紧的**——`MEMORY.md` 那份文件的用途
+就是给人看、让人改的，`docs/guide/memory.md` 也是这么说的。触发概率低 × 后果是
+「程序从此用不了」，仍然是要修的。
+
+后半的判据与前半刻意不同（`MemoryIndexEncodingTest` 起）：RHINE.md 那边量的是
+**三组对照的相对表现**（因为它的失败是沉默的，只能靠横向比才看得出来），记忆
+这边量的是**请求还跑不跑得通 + 用户看不看得见**（它的失败是抛异常，本来就很响，
+要钉的是「接住之后没把话咽回去」）。
 
 ## 为什么必须是「三组对照」而不是单点断言
 
@@ -36,6 +56,7 @@ R4-1 的实跑结论是：三组输入只差一个文件的编码，「三层全
 变异实测两次分别确认过。
 """
 
+import ast
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,7 +66,9 @@ from rhinecode.memory.instructions import (
     fallback_instructions,
     load_instructions,
 )
+from rhinecode.memory import manager as manager_module
 from rhinecode.memory.manager import MemoryManager
+from rhinecode.memory.manager import INDEX_FILENAME
 from rhinecode.provider.base import BaseProvider
 
 
@@ -349,6 +372,265 @@ class ReportDistinguishesMissingFromUnreadableTest(_MemoryFixture):
         rows = self._report_section(self._manager())
         root_row = next(r for r in rows if "[项目根]" in r)
         self.assertIn("未找到", root_row)
+
+
+# ---------------------------------------------------------------------- #
+# 后半：记忆文件的坏编码（B6 同型的第二处）
+# ---------------------------------------------------------------------- #
+
+# 用户手工用 GBK 编辑器改过的 MEMORY.md：那份文件的用途就是给人看、让人改的。
+_GBK_INDEX = "# 记忆索引\n- [项目约定](a.md) — 禁止推送到 main\n".encode("gbk")
+# 一条编码同样不对的记忆正文（两处 parse_memory 的入口）。
+_GBK_MEMORY_BODY = (
+    "---\nname: a\nsummary: 项目约定\ncategory: project\n---\n禁止推送到 main。\n"
+).encode("gbk")
+# 一条干净的记忆正文：坏文件旁边必须有个好文件，才量得出「只跳过坏的那份」。
+_UTF8_MEMORY_BODY = (
+    "---\nname: b\nsummary: 另一条\ncategory: project\n---\n正常内容。\n"
+)
+
+
+class _MemoryFilesFixture(_MemoryFixture):
+    """在 `_MemoryFixture` 的三层目录之上，再备好两级 memory 目录。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.user_mem = self.user_dir / "memory"
+        self.project_mem = self.project / ".rhinecode" / "memory"
+        self.user_mem.mkdir(parents=True)
+        self.project_mem.mkdir(parents=True)
+
+    def _manager(self) -> MemoryManager:
+        """与父类同构，只是把 memories_enabled 打开（记忆那几行才有内容）。"""
+        mgr = MemoryManager(
+            _SilentProvider(),
+            "test-model",
+            self.project,
+            self.user_dir,
+            memories_enabled=True,
+        )
+        self.notice = mgr.startup(resume_latest=False, history=[])
+        return mgr
+
+    def _write_good_user_index(self) -> None:
+        """用户级放一份干净索引——它的存活与否就是「不被连坐」的判据。"""
+        (self.user_mem / INDEX_FILENAME).write_text(
+            "# 记忆索引\n- [用户偏好](p.md) — 中文回答\n", encoding="utf-8"
+        )
+
+    def _project_row(self, mgr: MemoryManager) -> str:
+        """截出 `/memory` 里项目级记忆目录那一行。"""
+        for line in mgr.memory_report().splitlines():
+            if line.strip().startswith("[项目级]") and "memory" in line:
+                return line
+        self.fail(f"报告里找不到项目级记忆那一行：\n{mgr.memory_report()}")
+
+
+class MemoryIndexEncodingTest(_MemoryFilesFixture):
+    """
+    ⚠ **本轮最要紧的一组。**
+
+    `memory_index()` 被 `conversation.py` 的**三个**提示词构建点无条件调用
+    （且不受 `memories_enabled` 门控），所以它抛出来的异常不是「某个功能失效」，
+    而是**每一轮对话都炸**。修复前这一组里的前四条都会红在同一个
+    `UnicodeDecodeError` 上。
+    """
+
+    def test_bad_index_does_not_blow_up_the_prompt_build(self) -> None:
+        """
+        判据一：坏编码的 `MEMORY.md` **不许让请求炸掉**。
+
+        直接调 `memory_index()`，因为那正是每轮请求踩上去的那一步。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        mgr = self._manager()
+        try:
+            mgr.memory_index()  # 修复前：UnicodeDecodeError
+        except UnicodeDecodeError as e:  # pragma: no cover - 只在回归时走到
+            self.fail(f"坏编码的 MEMORY.md 让系统提示构建炸了：{e}")
+
+    def test_the_other_level_still_gets_injected(self) -> None:
+        """
+        判据二：**只跳过坏的那一级**，另一级照常注入。
+
+        与 B6 那条「另外两层不被连坐清空」同源。只断言「没炸」的话，一个
+        「出错就整段返回空串」的实现会全绿，而用户的记忆索引照样凭空消失。
+        """
+        self._write_good_user_index()
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        mgr = self._manager()
+        self.assertIn("中文回答", mgr.memory_index(), "干净的那一级被坏的那级连坐了")
+
+    def test_startup_notice_names_the_unreadable_index(self) -> None:
+        """
+        判据三：用户**不必敲 `/memory` 就知道出事了**——启动提示点名那个文件。
+
+        这一条钉的是 `startup()` 里那次主动探读。少了它，登记要等到第一次构建
+        系统提示才发生，而那时启动提示这条通道已经用过了，
+        **而一个不知道出了事的人不会去敲 `/memory`**。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        self._manager()
+        self.assertIsNotNone(self.notice, "索引读不出来，startup() 却什么都没说")
+        self.assertIn(str(self.project_mem / INDEX_FILENAME), self.notice)
+
+    def test_report_says_read_failure_not_missing(self) -> None:
+        """
+        判据四：`/memory` 里那一行必须说「读取失败」而**不是**「不存在」。
+
+        与 B6 给 RHINE.md 定的三态同源：把一个明明存在的文件报成「不存在」，
+        会把人引去建一个已经存在的文件——比不说更糟。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        row = self._project_row(self._manager())
+        self.assertIn("索引读取失败", row)
+        self.assertNotIn("索引不存在", row)
+
+    def test_clean_setup_stays_silent(self) -> None:
+        """
+        ⚠ **反向反证：一切正常时不许多冒任何提示。**
+
+        少了它，一个「无条件报一句」的实现会让上面四条全绿，而每次启动都多一段
+        谁也不看的噪声——那正是「提示多到没人看」的开端，也就等于把这条真正
+        要紧的提示一起废掉了。
+        """
+        self._write_good_user_index()
+        (self.project_mem / INDEX_FILENAME).write_text("# 记忆索引\n", encoding="utf-8")
+        mgr = self._manager()
+        self.assertIsNone(self.notice, f"一切正常却冒出提示：{self.notice!r}")
+        row = self._project_row(mgr)
+        self.assertIn("索引存在", row)
+        self.assertNotIn("读取失败", row)
+
+    def test_no_index_at_all_is_not_an_error(self) -> None:
+        """
+        第二条反向反证：**「还没有索引」是全新项目的正常状态**，不是失败。
+
+        它与上一条防的不是同一个退化：上一条防「读成功了还报错」，这一条防
+        「把 FileNotFoundError 也当成读取失败登记」——那会让每个新项目
+        第一次启动就收到一句「你的记忆索引读不出来」。
+        """
+        mgr = self._manager()
+        self.assertIsNone(self.notice, f"没有索引却冒出提示：{self.notice!r}")
+        self.assertIn("索引不存在", self._project_row(mgr))
+
+    def test_fixing_the_encoding_clears_the_warning(self) -> None:
+        """
+        用户按提示把文件改回 UTF-8 之后，登记必须**自己消失**。
+
+        登记只写不清的话，`/memory` 会一直挂着一条已经不成立的警告，而用户没有
+        任何办法让它撤下去（除非重启）——那会让人怀疑自己到底改没改对。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        mgr = self._manager()
+        self.assertIn("索引读取失败", self._project_row(mgr))
+        (self.project_mem / INDEX_FILENAME).write_text(
+            "# 记忆索引\n- [项目约定](a.md) — 禁止推送到 main\n", encoding="utf-8"
+        )
+        self.assertIn("禁止推送到 main", mgr.memory_index())
+        self.assertNotIn("读取失败", self._project_row(mgr))
+
+
+class MemoryBodyEncodingTest(_MemoryFilesFixture):
+    """
+    两处 `parse_memory` 的入口：**记忆正文**（不是索引）编码不对。
+
+    这两处的答案与索引那边不同——不必点名到文件，但必须「跳过坏的那份继续」
+    且**把跳过这件事说出来**：一份读不出来的记忆等于一份不存在的记忆，
+    而只报「1 条」而磁盘上有 2 个文件时，没有任何一条通路会说出第 2 个去哪了。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.project_mem / "a.md").write_bytes(_GBK_MEMORY_BODY)
+        (self.project_mem / "b.md").write_text(_UTF8_MEMORY_BODY, encoding="utf-8")
+
+    def test_report_survives_a_bad_memory_body(self) -> None:
+        """`/memory` 不许被一份坏编码的记忆正文炸掉（修复前实测会抛）。"""
+        mgr = self._manager()
+        try:
+            mgr.memory_report()
+        except UnicodeDecodeError as e:  # pragma: no cover
+            self.fail(f"坏编码的记忆正文让 /memory 炸了：{e}")
+
+    def test_good_memory_beside_it_is_still_counted(self) -> None:
+        """
+        跳过的只是坏的那一份：旁边那条干净记忆照常计数。
+
+        这条不能省——一个「出错就整个目录放弃」的实现同样不抛异常，
+        而它会让用户其余的记忆一起从 `/memory` 上消失。
+        """
+        row = self._project_row(self._manager())
+        self.assertIn("— 1 条", row)
+
+    def test_report_says_how_many_files_are_unreadable(self) -> None:
+        """
+        用户看得见：报告里数出「另有 N 个文件读不出来」。
+
+        少了它，修复只做到「不炸了」——而「不炸」与「悄悄少了一条记忆」
+        对用户来说恰恰是最难分辨的一组。
+        """
+        self.assertIn("另有 1 个文件读不出来", self._project_row(self._manager()))
+
+    def test_all_good_says_nothing_extra(self) -> None:
+        """反向反证：全是干净文件时不许多冒那句「另有 N 个读不出来」。"""
+        (self.project_mem / "a.md").write_text(
+            _UTF8_MEMORY_BODY.replace("name: b", "name: a"), encoding="utf-8"
+        )
+        row = self._project_row(self._manager())
+        self.assertNotIn("读不出来", row)
+
+    def test_rebuild_index_skips_only_the_bad_file(self) -> None:
+        """
+        另一处 `parse_memory`：全量重建索引时坏文件跳过、好文件照收。
+
+        直接调私有的重建入口，因为正常路径要先走一次记忆 LLM。
+        ⚠ 判据是「索引里有 b、没有 a」而不是「重建没抛异常」：后者在一个
+        「碰到坏文件就整体放弃、索引原地不动」的实现下照样成立，而那正是
+        「一个坏文件把其余记忆全从索引里抹掉」的形态。
+        """
+        MemoryManager._rebuild_index_file(self.project_mem)
+        index = (self.project_mem / INDEX_FILENAME).read_text(encoding="utf-8")
+        self.assertIn("另一条", index)
+        self.assertNotIn("项目约定", index)
+
+
+class IndexReadHasOneEntryPointTest(unittest.TestCase):
+    """
+    结构护栏：`manager.py` 里读文件的函数**只有三个**，别再长出第四个。
+
+    这一条钉的是本轮修法的形状而不是某个症状。原先四个读点各写各的 `except`，
+    于是同一个洞要修四遍、漏一处**不报错**——那正是 B6 修完之后本条还剩着的
+    原因（`_index_over_limit` 甚至是第五处，立项时都没数进去）。索引的读入口
+    现在收成 `_read_index` 一个，另两处是按文件遍历的读，形态不同故保留。
+
+    ⚠ 用 AST 而不是数 `read_text` 出现的次数：数字符串的写法在有人把调用挪进
+    一个新函数时照样通过。
+    """
+
+    ALLOWED = {"_read_index", "_rebuild_index_file", "_count_memories"}
+
+    def test_read_text_only_appears_in_the_three_known_readers(self) -> None:
+        source = Path(manager_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        found: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "read_text"
+                ):
+                    found[node.name] = found.get(node.name, 0) + 1
+        self.assertEqual(
+            set(found),
+            self.ALLOWED,
+            "manager.py 里读文件的函数变了。新增一个读点就要新增一份「读失败之后"
+            "怎么办」，而漏写它不报错——先想想能不能走 `_read_index`：\n"
+            f"实际={found}",
+        )
 
 
 if __name__ == "__main__":
