@@ -1,5 +1,5 @@
 """
-RHINE.md 的坏编码护栏（审查报告 B6 / R4-1）。
+记忆包的坏编码护栏（审查报告 B6 / R4-1，以及同型的第二处）。
 
 ## 这条护栏钉的是什么
 
@@ -16,6 +16,26 @@ RHINE.md（中文 Windows 上记事本、旧编辑器、`cmd` 的 `>` 重定向�
    空模块）——**连同另外两层已经读好的内容一起没了**；
 2. `layers=[]` → `/memory` 报告里那个负责说真话的循环一次都不执行，
    「RHINE.md 项目指令：」后面**一片空白**：既不说加载成功，也不说加载失败。
+
+## 本模块钉的是**两处**，别只看前半
+
+同一个洞在记忆包里有两个落点，**后果轻重相反**：
+
+| | 前半（B6，已修） | 后半（本轮） |
+| --- | --- | --- |
+| 谁写的文件 | 用户手写的 `RHINE.md` | RhineCode 自己写的 `MEMORY.md` 与记忆正文 |
+| 怎么触发 | 用记事本新建一次就够 | 用户手工用 GBK 编辑器改过 |
+| 失败形态 | **静默**吞掉三层指令 | **异常直接冒出来** |
+| 有多疼 | 那一次会话的指令不生效 | `memory_index()` **每次构建系统提示都被调**，于是**每一轮对话都炸**；`/memory` 同样当场炸 |
+
+⚠ **别因为后半「触发难度较高」就把它当成不要紧的**——`MEMORY.md` 那份文件的用途
+就是给人看、让人改的，`docs/guide/memory.md` 也是这么说的。触发概率低 × 后果是
+「程序从此用不了」，仍然是要修的。
+
+后半的判据与前半刻意不同（`MemoryIndexEncodingTest` 起）：RHINE.md 那边量的是
+**三组对照的相对表现**（因为它的失败是沉默的，只能靠横向比才看得出来），记忆
+这边量的是**请求还跑不跑得通 + 用户看不看得见**（它的失败是抛异常，本来就很响，
+要钉的是「接住之后没把话咽回去」）。
 
 ## 为什么必须是「三组对照」而不是单点断言
 
@@ -36,6 +56,7 @@ R4-1 的实跑结论是：三组输入只差一个文件的编码，「三层全
 变异实测两次分别确认过。
 """
 
+import ast
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,7 +66,10 @@ from rhinecode.memory.instructions import (
     fallback_instructions,
     load_instructions,
 )
-from rhinecode.memory.manager import MemoryManager
+from rhinecode.memory import manager as manager_module
+from rhinecode.memory import session as session_module
+from rhinecode.memory.manager import INDEX_FILENAME, MemoryManager
+from rhinecode.memory.session import SessionStore
 from rhinecode.provider.base import BaseProvider
 
 
@@ -349,6 +373,487 @@ class ReportDistinguishesMissingFromUnreadableTest(_MemoryFixture):
         rows = self._report_section(self._manager())
         root_row = next(r for r in rows if "[项目根]" in r)
         self.assertIn("未找到", root_row)
+
+
+# ---------------------------------------------------------------------- #
+# 后半：记忆文件的坏编码（B6 同型的第二处）
+# ---------------------------------------------------------------------- #
+
+# 用户手工用 GBK 编辑器改过的 MEMORY.md：那份文件的用途就是给人看、让人改的。
+_GBK_INDEX = "# 记忆索引\n- [项目约定](a.md) — 禁止推送到 main\n".encode("gbk")
+# 一条编码同样不对的记忆正文（两处 parse_memory 的入口）。
+_GBK_MEMORY_BODY = (
+    "---\nname: a\nsummary: 项目约定\ncategory: project\n---\n禁止推送到 main。\n"
+).encode("gbk")
+# 一条干净的记忆正文：坏文件旁边必须有个好文件，才量得出「只跳过坏的那份」。
+_UTF8_MEMORY_BODY = (
+    "---\nname: b\nsummary: 另一条\ncategory: project\n---\n正常内容。\n"
+)
+
+
+class _MemoryFilesFixture(_MemoryFixture):
+    """在 `_MemoryFixture` 的三层目录之上，再备好两级 memory 目录。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.user_mem = self.user_dir / "memory"
+        self.project_mem = self.project / ".rhinecode" / "memory"
+        self.user_mem.mkdir(parents=True)
+        self.project_mem.mkdir(parents=True)
+
+    def _manager(self) -> MemoryManager:
+        """与父类同构，只是把 memories_enabled 打开（记忆那几行才有内容）。"""
+        mgr = MemoryManager(
+            _SilentProvider(),
+            "test-model",
+            self.project,
+            self.user_dir,
+            memories_enabled=True,
+        )
+        self.notice = mgr.startup(resume_latest=False, history=[])
+        return mgr
+
+    def _write_good_user_index(self) -> None:
+        """用户级放一份干净索引——它的存活与否就是「不被连坐」的判据。"""
+        (self.user_mem / INDEX_FILENAME).write_text(
+            "# 记忆索引\n- [用户偏好](p.md) — 中文回答\n", encoding="utf-8"
+        )
+
+    def _project_row(self, mgr: MemoryManager) -> str:
+        """截出 `/memory` 里项目级记忆目录那一行。"""
+        for line in mgr.memory_report().splitlines():
+            if line.strip().startswith("[项目级]") and "memory" in line:
+                return line
+        self.fail(f"报告里找不到项目级记忆那一行：\n{mgr.memory_report()}")
+
+
+class MemoryIndexEncodingTest(_MemoryFilesFixture):
+    """
+    ⚠ **本轮最要紧的一组。**
+
+    `memory_index()` 被 `conversation.py` 的**三个**提示词构建点无条件调用
+    （且不受 `memories_enabled` 门控），所以它抛出来的异常不是「某个功能失效」，
+    而是**每一轮对话都炸**。修复前这一组里的前四条都会红在同一个
+    `UnicodeDecodeError` 上。
+    """
+
+    def test_bad_index_does_not_blow_up_the_prompt_build(self) -> None:
+        """
+        判据一：坏编码的 `MEMORY.md` **不许让请求炸掉**。
+
+        直接调 `memory_index()`，因为那正是每轮请求踩上去的那一步。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        mgr = self._manager()
+        try:
+            mgr.memory_index()  # 修复前：UnicodeDecodeError
+        except UnicodeDecodeError as e:  # pragma: no cover - 只在回归时走到
+            self.fail(f"坏编码的 MEMORY.md 让系统提示构建炸了：{e}")
+
+    def test_the_other_level_still_gets_injected(self) -> None:
+        """
+        判据二：**只跳过坏的那一级**，另一级照常注入。
+
+        与 B6 那条「另外两层不被连坐清空」同源。只断言「没炸」的话，一个
+        「出错就整段返回空串」的实现会全绿，而用户的记忆索引照样凭空消失。
+        """
+        self._write_good_user_index()
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        mgr = self._manager()
+        self.assertIn("中文回答", mgr.memory_index(), "干净的那一级被坏的那级连坐了")
+
+    def test_startup_notice_names_the_unreadable_index(self) -> None:
+        """
+        判据三：用户**不必敲 `/memory` 就知道出事了**——启动提示点名那个文件。
+
+        这一条钉的是 `startup()` 里那次主动探读。少了它，登记要等到第一次构建
+        系统提示才发生，而那时启动提示这条通道已经用过了，
+        **而一个不知道出了事的人不会去敲 `/memory`**。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        self._manager()
+        self.assertIsNotNone(self.notice, "索引读不出来，startup() 却什么都没说")
+        self.assertIn(str(self.project_mem / INDEX_FILENAME), self.notice)
+
+    def test_report_says_read_failure_not_missing(self) -> None:
+        """
+        判据四：`/memory` 里那一行必须说「读取失败」而**不是**「不存在」。
+
+        与 B6 给 RHINE.md 定的三态同源：把一个明明存在的文件报成「不存在」，
+        会把人引去建一个已经存在的文件——比不说更糟。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        row = self._project_row(self._manager())
+        self.assertIn("索引读取失败", row)
+        self.assertNotIn("索引不存在", row)
+
+    def test_clean_setup_stays_silent(self) -> None:
+        """
+        ⚠ **反向反证：一切正常时不许多冒任何提示。**
+
+        少了它，一个「无条件报一句」的实现会让上面四条全绿，而每次启动都多一段
+        谁也不看的噪声——那正是「提示多到没人看」的开端，也就等于把这条真正
+        要紧的提示一起废掉了。
+        """
+        self._write_good_user_index()
+        (self.project_mem / INDEX_FILENAME).write_text("# 记忆索引\n", encoding="utf-8")
+        mgr = self._manager()
+        self.assertIsNone(self.notice, f"一切正常却冒出提示：{self.notice!r}")
+        row = self._project_row(mgr)
+        self.assertIn("索引存在", row)
+        self.assertNotIn("读取失败", row)
+
+    def test_no_index_at_all_is_not_an_error(self) -> None:
+        """
+        第二条反向反证：**「还没有索引」是全新项目的正常状态**，不是失败。
+
+        它与上一条防的不是同一个退化：上一条防「读成功了还报错」，这一条防
+        「把 FileNotFoundError 也当成读取失败登记」——那会让每个新项目
+        第一次启动就收到一句「你的记忆索引读不出来」。
+        """
+        mgr = self._manager()
+        self.assertIsNone(self.notice, f"没有索引却冒出提示：{self.notice!r}")
+        self.assertIn("索引不存在", self._project_row(mgr))
+
+    def test_fixing_the_encoding_clears_the_warning(self) -> None:
+        """
+        用户按提示把文件改回 UTF-8 之后，登记必须**自己消失**。
+
+        登记只写不清的话，`/memory` 会一直挂着一条已经不成立的警告，而用户没有
+        任何办法让它撤下去（除非重启）——那会让人怀疑自己到底改没改对。
+        """
+        (self.project_mem / INDEX_FILENAME).write_bytes(_GBK_INDEX)
+        mgr = self._manager()
+        self.assertIn("索引读取失败", self._project_row(mgr))
+        (self.project_mem / INDEX_FILENAME).write_text(
+            "# 记忆索引\n- [项目约定](a.md) — 禁止推送到 main\n", encoding="utf-8"
+        )
+        self.assertIn("禁止推送到 main", mgr.memory_index())
+        self.assertNotIn("读取失败", self._project_row(mgr))
+
+
+class UnexpectedIndexErrorTest(_MemoryFilesFixture):
+    """
+    第二层：**没想到的**失败也不许要了整个会话的命。
+
+    与 B6 在 `instructions.py`（已知失败落回 `layer.errors`）↔ `startup()`
+    （没想到的失败仍带着三层结构冒出来）之间那对是同一个形状，因此本类与
+    `MemoryIndexEncodingTest` **缺一不可**：
+    只补窄捕获 → 下一种没预料到的异常仍会让每一轮对话都炸；
+    只补兜底 → 一份坏编码的索引会被记成「意外错误」，而它其实是**已知**的、
+    该给用户一句「多半不是 UTF-8 编码」的可操作提示。
+    """
+
+    def test_unexpected_error_does_not_kill_every_turn(self) -> None:
+        """`memory_index()` 里冒出任何异常都不许穿出去——它每轮都跑。"""
+        self._write_good_user_index()
+        mgr = self._manager()
+        with mock.patch.object(
+            MemoryManager, "_read_index", side_effect=RuntimeError("谁也没想到的错误")
+        ):
+            try:
+                mgr.memory_index()
+            except RuntimeError as e:  # pragma: no cover - 只在回归时走到
+                self.fail(f"意外错误从 memory_index() 穿出去了，每一轮对话都会炸：{e}")
+
+    def test_unexpected_error_is_still_visible_in_the_report(self) -> None:
+        """
+        ⚠ 兜底**不许把话咽回去**。
+
+        这条是上一条的另一半：一个 `except Exception: continue` 同样能让上一条
+        全绿，而那就是本项目通篇最忌讳的**静默吞噬**——索引凭空不再注入，
+        三条通路没有一条会说出为什么。
+        """
+        mgr = self._manager()
+        with mock.patch.object(
+            MemoryManager, "_read_index", side_effect=RuntimeError("谁也没想到的错误")
+        ):
+            mgr.memory_index()
+        self.assertIn("谁也没想到的错误", mgr.memory_report())
+
+    def test_the_other_level_survives_an_unexpected_error(self) -> None:
+        """只跳过出事的那一级：另一级照常注入（与坏编码那条同源）。"""
+        self._write_good_user_index()
+        (self.project_mem / INDEX_FILENAME).write_text("# 记忆索引\n- x\n", encoding="utf-8")
+        mgr = self._manager()
+        real = MemoryManager._read_index
+
+        def only_project_blows_up(self_, scope):  # noqa: ANN001
+            if scope == "project":
+                raise RuntimeError("只有这一级出事")
+            return real(self_, scope)
+
+        with mock.patch.object(MemoryManager, "_read_index", only_project_blows_up):
+            self.assertIn("中文回答", mgr.memory_index(), "干净的那一级被连坐了")
+
+
+class MemoryBodyEncodingTest(_MemoryFilesFixture):
+    """
+    两处 `parse_memory` 的入口：**记忆正文**（不是索引）编码不对。
+
+    这两处的答案与索引那边不同——不必点名到文件，但必须「跳过坏的那份继续」
+    且**把跳过这件事说出来**：一份读不出来的记忆等于一份不存在的记忆，
+    而只报「1 条」而磁盘上有 2 个文件时，没有任何一条通路会说出第 2 个去哪了。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.project_mem / "a.md").write_bytes(_GBK_MEMORY_BODY)
+        (self.project_mem / "b.md").write_text(_UTF8_MEMORY_BODY, encoding="utf-8")
+
+    def test_report_survives_a_bad_memory_body(self) -> None:
+        """`/memory` 不许被一份坏编码的记忆正文炸掉（修复前实测会抛）。"""
+        mgr = self._manager()
+        try:
+            mgr.memory_report()
+        except UnicodeDecodeError as e:  # pragma: no cover
+            self.fail(f"坏编码的记忆正文让 /memory 炸了：{e}")
+
+    def test_good_memory_beside_it_is_still_counted(self) -> None:
+        """
+        跳过的只是坏的那一份：旁边那条干净记忆照常计数。
+
+        这条不能省——一个「出错就整个目录放弃」的实现同样不抛异常，
+        而它会让用户其余的记忆一起从 `/memory` 上消失。
+        """
+        row = self._project_row(self._manager())
+        self.assertIn("— 1 条", row)
+
+    def test_report_says_how_many_files_are_unreadable(self) -> None:
+        """
+        用户看得见：报告里数出「另有 N 个文件读不出来」。
+
+        少了它，修复只做到「不炸了」——而「不炸」与「悄悄少了一条记忆」
+        对用户来说恰恰是最难分辨的一组。
+        """
+        self.assertIn("另有 1 个文件读不出来", self._project_row(self._manager()))
+
+    def test_all_good_says_nothing_extra(self) -> None:
+        """反向反证：全是干净文件时不许多冒那句「另有 N 个读不出来」。"""
+        (self.project_mem / "a.md").write_text(
+            _UTF8_MEMORY_BODY.replace("name: b", "name: a"), encoding="utf-8"
+        )
+        row = self._project_row(self._manager())
+        self.assertNotIn("读不出来", row)
+
+    def test_rebuild_index_skips_only_the_bad_file(self) -> None:
+        """
+        另一处 `parse_memory`：全量重建索引时坏文件跳过、好文件照收。
+
+        直接调私有的重建入口，因为正常路径要先走一次记忆 LLM。
+        ⚠ 判据是「索引里有 b、没有 a」而不是「重建没抛异常」：后者在一个
+        「碰到坏文件就整体放弃、索引原地不动」的实现下照样成立，而那正是
+        「一个坏文件把其余记忆全从索引里抹掉」的形态。
+        """
+        MemoryManager._rebuild_index_file(self.project_mem)
+        index = (self.project_mem / INDEX_FILENAME).read_text(encoding="utf-8")
+        self.assertIn("另一条", index)
+        self.assertNotIn("项目约定", index)
+
+
+class IndexReadHasOneEntryPointTest(unittest.TestCase):
+    """
+    结构护栏：`manager.py` 里读文件的函数**只有三个**，别再长出第四个。
+
+    这一条钉的是本轮修法的形状而不是某个症状。原先四个读点各写各的 `except`，
+    于是同一个洞要修四遍、漏一处**不报错**——那正是 B6 修完之后本条还剩着的
+    原因（`_index_over_limit` 甚至是第五处，立项时都没数进去）。索引的读入口
+    现在收成 `_read_index` 一个，另两处是按文件遍历的读，形态不同故保留。
+
+    ⚠ 用 AST 而不是数 `read_text` 出现的次数：数字符串的写法在有人把调用挪进
+    一个新函数时照样通过。
+    """
+
+    ALLOWED = {"_read_index", "_rebuild_index_file", "_count_memories"}
+
+    def test_read_text_only_appears_in_the_three_known_readers(self) -> None:
+        source = Path(manager_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        found: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "read_text"
+                ):
+                    found[node.name] = found.get(node.name, 0) + 1
+        self.assertEqual(
+            set(found),
+            self.ALLOWED,
+            "manager.py 里读文件的函数变了。新增一个读点就要新增一份「读失败之后"
+            "怎么办」，而漏写它不报错——先想想能不能走 `_read_index`：\n"
+            f"实际={found}",
+        )
+
+
+# ---------------------------------------------------------------------- #
+# 第三处：会话存档的坏编码（同一个洞在 session.py 里的落点）
+# ---------------------------------------------------------------------- #
+
+_GOOD_LINE_1 = '{"ts":"2026-01-01T00:00:00","role":"user","content":"第一句"}'
+_GOOD_LINE_2 = '{"ts":"2026-01-01T00:01:00","role":"user","content":"第三句"}'
+# ⚠ 这一行的**结构部分全是 ASCII**，只有中文那几个字节是 GBK ——
+# 这正是 `errors="replace"` 那条路会翻车的形状，见 `_iter_archive_lines` 的说明。
+_BAD_LINE = '{"ts":"2026-01-01T00:00:30","role":"user","content":"坏行"}'
+
+
+class _ArchiveFixture(unittest.TestCase):
+    """一个 sessions 目录 + 一份「好 / 坏 / 好」三行存档。"""
+
+    SESSION_ID = "20260101-000000-aaaa"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name) / "sessions"
+        self.dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_archive(self, *, with_bad_line: bool) -> Path:
+        """写一份存档；`with_bad_line` 决定中间那行是不是坏编码。"""
+        chunks = [_GOOD_LINE_1.encode("utf-8")]
+        if with_bad_line:
+            chunks.append(_BAD_LINE.encode("gbk"))
+        chunks.append(_GOOD_LINE_2.encode("utf-8"))
+        path = self.dir / f"{self.SESSION_ID}.jsonl"
+        path.write_bytes(b"\n".join(chunks) + b"\n")
+        return path
+
+    def _store(self) -> SessionStore:
+        return SessionStore(self.dir)
+
+
+class ArchiveEncodingTest(_ArchiveFixture):
+    """
+    坏编码的会话存档不许炸掉 `/resume`，也不许把乱码塞进历史。
+
+    修复前 `list_sessions()` 与 `load()` **都直接抛 `UnicodeDecodeError`**
+    （实测过）：`open(encoding="utf-8")` 的解码失败发生在**迭代那一行**时，
+    而三处的 `except OSError` 一个都接不住它。
+    """
+
+    def test_listing_does_not_blow_up(self) -> None:
+        """会话面板 / `/resume` 列表不许被一份坏编码的存档炸掉。"""
+        self._write_archive(with_bad_line=True)
+        try:
+            infos = self._store().list_sessions()
+        except UnicodeDecodeError as e:  # pragma: no cover - 只在回归时走到
+            self.fail(f"坏编码的存档让 /resume 列表炸了：{e}")
+        self.assertEqual([i.session_id for i in infos], [self.SESSION_ID])
+
+    def test_listing_still_reads_the_title(self) -> None:
+        """
+        坏行只该花掉它自己：标题仍从第一条好行取到。
+
+        只断言「没炸」的话，一个「碰到坏行就 `return None`」的实现会全绿，
+        而那份会话会**从列表里整个消失**——用户根本不知道它存在过，
+        比抛异常更难查。
+        """
+        self._write_archive(with_bad_line=True)
+        info = self._store().list_sessions()[0]
+        self.assertEqual(info.title, "第一句")
+
+    def test_load_recovers_the_good_messages(self) -> None:
+        """两条好消息照常恢复——**不是**「整份会话载不进来」。"""
+        self._write_archive(with_bad_line=True)
+        result = self._store().load(self.SESSION_ID)
+        self.assertEqual([m.content for m in result.messages], ["第一句", "第三句"])
+
+    def test_bad_line_lands_in_the_existing_skipped_counter(self) -> None:
+        """
+        坏行落进**既有的**坏行通路，用户因此在 `/resume` 的回执里看得到
+        「跳过损坏行 N 条」。
+
+        这条钉的是「没有另造一条通路」——本模块本来就为坏行准备好了一条，
+        编码问题该走上去，而不是新开一个只有开发者看得懂的分支。
+        """
+        self._write_archive(with_bad_line=True)
+        self.assertEqual(self._store().load(self.SESSION_ID).skipped_lines, 1)
+
+    def test_no_replacement_characters_reach_the_history(self) -> None:
+        """
+        ⚠ **本组最关键的一条，也是唯一挡得住那个「简化」的。**
+
+        `open(..., errors="replace")` 看起来是更省事的写法，**实测是错的**：
+        存档行的 JSON 结构部分全是 ASCII，在任何中文编码下都与 UTF-8 逐字节
+        相同，于是 `json.loads` **照常成功**，产出一条内容是 `����` 的消息——
+        它不进坏行通路（`skipped_lines` 仍是 0），而是**静默地进入对话历史
+        并被发给模型**。
+
+        上面那条「跳过 1 条」的断言**挡不住它**（那种实现下跳过数是 0，
+        断言会红没错——但把它改成 `assertGreaterEqual(0)` 就又绿了）。
+        真正不可绕过的判据是这一条：**恢复出来的内容里一个替换字符都不许有。**
+        「救回一条乱码」比「丢掉一条并说出来」更糟。
+        """
+        self._write_archive(with_bad_line=True)
+        result = self._store().load(self.SESSION_ID)
+        for msg in result.messages:
+            self.assertNotIn(
+                "�",
+                msg.content or "",
+                f"恢复出来的消息里有替换字符，说明走了 errors='replace' 那条路：{msg.content!r}",
+            )
+
+    def test_clean_archive_reports_no_damage(self) -> None:
+        """
+        反向反证：一份干净的存档必须**一条都不跳**、内容逐字还原。
+
+        少了它，一个「把每行都当坏行」的实现会让上面几条全绿
+        （不炸、没有替换字符），而 `/resume` 什么都恢复不出来。
+        """
+        self._write_archive(with_bad_line=False)
+        result = self._store().load(self.SESSION_ID)
+        self.assertEqual(result.skipped_lines, 0)
+        self.assertEqual([m.content for m in result.messages], ["第一句", "第三句"])
+
+    def test_message_count_does_not_blow_up(self) -> None:
+        """`/memory` 报告要读当前存档的行数——那条路径同样不许被坏编码炸掉。"""
+        self._write_archive(with_bad_line=True)
+        store = self._store()
+        store.attach(self.SESSION_ID)
+        try:
+            self.assertEqual(store.message_count, 3)
+        except UnicodeDecodeError as e:  # pragma: no cover
+            self.fail(f"坏编码的存档让 /memory 的行数统计炸了：{e}")
+
+
+class ArchiveReadHasOneEntryPointTest(unittest.TestCase):
+    """
+    结构护栏：`session.py` 里**读**存档只经 `_iter_archive_lines` 一处。
+
+    与 `manager.py` 那条同源，理由也一样：原先三个读点各写各的 `except`，
+    同一个洞要修三遍、漏一处**不报错**。
+
+    ⚠ **写入那处刻意不在内**（`append` 仍是直接 `open(..., "a")`）：读的时候
+    「尽量救回来」是对的，写的时候做任何容错都是在**制造**坏数据。所以本条
+    断言的是「`open` 只出现在两个地方」——读的那一个和写的那一个——
+    而不是「所有 open 都走辅助函数」。
+    """
+
+    ALLOWED = {"_iter_archive_lines", "append"}
+
+    def test_open_only_appears_in_the_reader_and_the_writer(self) -> None:
+        source = Path(session_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        found: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "open":
+                    found[node.name] = found.get(node.name, 0) + 1
+        self.assertEqual(
+            set(found),
+            self.ALLOWED,
+            "session.py 里 open() 的分布变了。新增一个**读**点要走 "
+            "`_iter_archive_lines`（否则那一处又接不住 UnicodeDecodeError）；"
+            "新增**写**点则刻意不该走它：\n"
+            f"实际={found}",
+        )
 
 
 if __name__ == "__main__":

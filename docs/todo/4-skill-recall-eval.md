@@ -67,7 +67,7 @@ Claude Code 的 `skill-creator` 插件里有一项叫 **description tuning**，
 
 - **别用自己写的 fixture 验自己的 spec。** 提示词应当取自**真实使用中说过的话**
   （比如「帮我创建个前端页面」就是用户真实报上来的那句），
-  不是为了让测试通过而编的措辞。这条与 `7-p1b-unattended.md` 里记的取样错误同源。
+  不是为了让测试通过而编的措辞。这条与 `6-p1b-unattended.md` 里记的取样错误同源。
 - **误触发率必须一起报。** 只优化召回率的话，最省事的「改进」就是把描述写成
   一堆万能关键词，结果每个请求都加载一堆无关 Skill、把上下文烧光。
 - **真实模型跑批量很贵。** 设计时要考虑用例数量的上限，以及能不能用更便宜的模型
@@ -118,7 +118,7 @@ should-not-trigger 两组提示词，批量跑，统计命中率，据此提改�
 别用自己写的 fixture 验自己的 spec。
 
 先读 docs/extensions/skill-authoring/spec.md 的「R 系列增补」一节，
-再读 docs/todo/5-skill-recall-eval.md 的完整背景与已知的坑。
+再读 docs/todo/4-skill-recall-eval.md 的完整背景与已知的坑。
 
-做完这条后把 docs/todo/5-skill-recall-eval.md 删掉，并重排 docs/todo/ 下其余文档的序号。
+做完这条后把 docs/todo/4-skill-recall-eval.md 删掉，并重排 docs/todo/ 下其余文档的序号。
 ```

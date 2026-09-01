@@ -113,6 +113,16 @@ class MemoryManager:
         # ——后者必须带 layers 才能在 /memory 里说出真相（见 startup 的注释）。
         # 协调层构造时会立刻调 startup，所以这个初值实际不会被 /memory 读到。
         self._instructions = LoadedInstructions(text="", layers=[])
+        # 索引读取失败的登记簿：scope → 可读原因。**只登记「文件在、却读不出来」**，
+        # 不登记「文件不存在」（那是全新项目的正常状态，登记它等于每次启动都报一句
+        # 谁也不该看的话）。这个区分正是 B6 那次 `/memory` 三态的同一条教训：
+        # 「你没写」与「你写了但没生效」对用户的含义完全相反。
+        #
+        # ⚠ 它可能被两个线程写：主线程（每轮构建系统提示时的 `memory_index`）与
+        # 记忆后台线程（`_decide_actions` 里的 `_read_index`）。**刻意不加锁**——
+        # 写的是一个整体赋值的 dict 项、读的只有展示路径，且本项目的加锁不变量是
+        # 「临界区只做纯内存读写」，为一句展示文案引入锁反而是往回走。
+        self._index_errors: dict[str, str] = {}
         # 一次性动态提醒（时间跨度等）：consume_pending_notice 取走即清。
         self._pending_notice: str = ""
         # 记忆线程状态：in-flight 标志（进程内互斥）、高水位（上次审视到的消息数）、
@@ -188,6 +198,23 @@ class MemoryManager:
                     "（常见原因是文件不是 UTF-8 编码）：\n"
                     + "\n".join(f"- {b}" for b in broken)
                 )
+
+        # 主动把两级索引各读一次，让「索引在那儿却读不出来」在**启动时**就说出口。
+        # 不主动探的话，登记要等到第一次构建系统提示才发生，而那时提示通道
+        # （startup 的返回值）已经用过了——用户只能靠自己去敲 `/memory` 才发现，
+        # 而**一个不知道出了事的人不会去敲 `/memory`**（B6 那次的原话）。
+        # 返回值这里刻意丢弃：要的只是它的登记副作用。
+        for _scope in ("user", "project"):
+            self._read_index(_scope)
+        if self._index_errors:
+            notices.append(
+                "以下记忆索引未能读入，这一级记忆本次不会注入系统提示"
+                "（常见原因是文件不是 UTF-8 编码）：\n"
+                + "\n".join(
+                    f"- {self._memory_dirs[scope] / INDEX_FILENAME}：{reason}"
+                    for scope, reason in self._index_errors.items()
+                )
+            )
 
         try:
             self._session.cleanup_expired()
@@ -267,17 +294,36 @@ class MemoryManager:
         """
         parts: list[str] = []
         for scope, label in (("user", "用户级"), ("project", "项目级")):
-            index_path = self._memory_dirs[scope] / INDEX_FILENAME
+            # 走 `_read_index` 而不是自己 read_text：那里是唯一的读入口，
+            # 编码失败在那里被兜住并登记（详见该方法的注释）。⚠ 这一处是本条
+            # 最要紧的调用点——它**每次构建系统提示都会跑**，此前一个坏编码的
+            # MEMORY.md 会让每一轮对话都抛 UnicodeDecodeError。
             try:
-                raw = index_path.read_text(encoding="utf-8")
-            except OSError:
+                raw = self._read_index(scope)
+                if not raw.strip():
+                    continue
+                parts.append(
+                    f"### {label}记忆索引（全文位于 {self._memory_dirs[scope]}，"
+                    f"需要细节时用读文件工具按文件名读取）\n{truncate_index(raw)}"
+                )
+            except Exception as e:  # noqa: BLE001 —— 见下方整段说明
+                # **没想到的失败**的兜底，与 `_read_index` 里那些窄捕获是**两层**、
+                # 缺一不可（与 B6 在 `instructions.py` ↔ `startup()` 之间那对是同一
+                # 个形状，见 `paired-maintenance`）：窄捕获让**已知**的失败落回它该
+                # 落的地方，这一层让**下一种还没想到的**失败也不至于要了整个会话
+                # 的命——本方法每次构建系统提示都会跑，从这里抛出去等于**每一轮
+                # 对话都炸**，而用户拿不到任何可操作的信息。
+                #
+                # ⚠ 为什么这里用宽的 `except Exception`，而 `_read_index` 里刻意用
+                # 窄的：**判据不是「宽窄」，是「接住之后还说不说得出话」。** 本项目
+                # 忌讳的是**静默**吞噬，而这一支把原因登记进 `_index_errors`，
+                # `/memory` 那一行照样会说「读取失败（…）」——它没把话咽回去。
+                # 反过来，`_read_index` 那个 try 块里只有一次 `read_text`，写宽了
+                # 纯粹是给日后塞进去的代码提供一次白吞，一点好处都没有。
+                #
+                # 只跳过**这一级**：另一级的索引照常注入（同「不被连坐」那条）。
+                self._index_errors[scope] = f"意外错误：{e}"
                 continue
-            if not raw.strip():
-                continue
-            parts.append(
-                f"### {label}记忆索引（全文位于 {self._memory_dirs[scope]}，"
-                f"需要细节时用读文件工具按文件名读取）\n{truncate_index(raw)}"
-            )
         if not parts:
             return ""
         header = (
@@ -410,11 +456,44 @@ class MemoryManager:
         return parse_memory_response("".join(parts))
 
     def _read_index(self, scope: str) -> str:
-        """读某级索引文件全文；不存在/失败返回空串。"""
+        """
+        读某级索引文件全文——**全项目读 MEMORY.md 的唯一入口**。
+
+        三个读法完全相同的调用点（系统提示注入 `memory_index`、记忆 LLM 的去重
+        输入 `_decide_actions`、`/memory` 报告）都走这里，是为了让「读失败之后
+        做什么」只有一份实现：照抄三份的话，将来改其中一处的容错**不报错**，
+        只表现为「同一份坏索引在三条路径上表现不一致」。
+
+        :param scope: "user" / "project"
+        :returns: 索引全文；不存在或读不出来时返回空串（**调用方一律按「这一级
+                  没有索引」继续**——记忆是「有更好、没有也能跑」的增强项）
+
+        副作用：读不出来时往 `self._index_errors` 登记一条可读原因（供启动提示与
+        `/memory` 说出真相）；读成功时**主动清掉**该级的旧登记——用户按提示把文件
+        改回 UTF-8 之后不该还挂着一条已经不成立的警告。
+        """
         try:
-            return (self._memory_dirs[scope] / INDEX_FILENAME).read_text(encoding="utf-8")
-        except OSError:
+            raw = (self._memory_dirs[scope] / INDEX_FILENAME).read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            # ⚠ **`UnicodeDecodeError` 继承自 `ValueError`，不是 `OSError`**，
+            # 所以下面那个 `except OSError` 接不住它。少了本分支，一份被用户用 GBK
+            # 编辑器改过的 MEMORY.md（而那份文件的用途就是给人看、让人改的）会让
+            # 异常从 `memory_index()` 一路冒出去——**而它每次构建系统提示都被调用，
+            # 于是每一轮对话都炸**，不是某个功能失效。B6（坏编码的 RHINE.md）
+            # 是同一个洞的第一处，`docs/review/02-robustness.md` R4-1 有完整分析。
+            #
+            # 为什么单独分出这一支而不是并进下面的 `(OSError, UnicodeDecodeError)`：
+            # 两者要做的事不同。**「文件不存在」是正常状态**（全新项目本来就没有
+            # 索引），不该留下任何痕迹；「文件在、但读不出来」是用户要动手修的事，
+            # 必须留痕。合成一支就分辨不出来了。
+            self._index_errors[scope] = f"{e}"
             return ""
+        except OSError:
+            # 不存在 / 权限不足 / 读到一半 I/O 出错。**刻意不登记**：绝大多数情况
+            # 就是「还没有索引」，登记它会让每个新项目启动时都多一句噪声。
+            return ""
+        self._index_errors.pop(scope, None)
+        return raw
 
     def _apply_actions(self, actions: list[MemoryAction]) -> "tuple[int, int]":
         """
@@ -485,7 +564,17 @@ class MemoryManager:
                     continue
                 try:
                     parsed = parse_memory(path.read_text(encoding="utf-8"), filename=path.name)
-                except OSError:
+                except (OSError, UnicodeDecodeError):
+                    # 窄写法（不用宽的 `ValueError`）：本 try 块里只有一次
+                    # `read_text` 加一次纯函数解析，失败形态只有 I/O 与解码两种。
+                    # `ValueError` 是 Python 里最常见的**编程错误**载体，拿它兜底
+                    # 等于给日后塞进这个 try 的代码提供一次静默吞噬。
+                    #
+                    # 接住之后**跳过这一个文件继续**，与本函数既有的「跳过解析失败
+                    # 的坏文件」同一口径：一份读不出来的记忆等于一份不存在的记忆，
+                    # 而重建索引的意义正是「照磁盘上真实读得到的内容重来一遍」。
+                    # ⚠ 别改成整体放弃——那会让一个坏文件把其余全部记忆一起从索引
+                    # 里抹掉，而索引才是模型唯一看得到的入口。
                     continue
                 if parsed is not None:
                     memories.append(parsed)
@@ -604,14 +693,27 @@ class MemoryManager:
         lines.append("自动记忆：" + ("启用" if self.memories_enabled else "未启用（仅 DeepSeek 工具模式）"))
         for scope, label in (("user", "用户级"), ("project", "项目级")):
             target_dir = self._memory_dirs[scope]
-            counts = self._count_memories(target_dir)
+            counts, unreadable = self._count_memories(target_dir)
             total = sum(counts.values())
             detail = "、".join(
                 f"{CATEGORY_LABELS[c]} {counts[c]}" for c in CATEGORIES if counts[c]
             ) or "无记忆"
+            if unreadable:
+                # 刻意不再套一层括号：这句话会被拼进外层的「（…）」里，
+                # 嵌套括号在终端里读起来很难断句。
+                detail += f"；另有 {unreadable} 个文件读不出来，多半不是 UTF-8 编码"
             index_path = target_dir / INDEX_FILENAME
-            over = self._index_over_limit(index_path)
-            index_state = ("存在" + ("，超出注入上限（已截断）" if over else "")) if index_path.is_file() else "不存在"
+            raw = self._read_index(scope)
+            # 索引状态是**三态**，与 B6 给 RHINE.md 那三层定的口径同源：
+            # 「不存在」= 你还没有记忆（正常）、「读取失败」= 它在那儿但没生效
+            # （要动手修）、「存在」= 一切正常。把中间那态并进「不存在」会把人
+            # 引去建一个已经存在的文件，比不说更糟。
+            if scope in self._index_errors:
+                index_state = f"读取失败（{self._index_errors[scope]}）"
+            elif index_path.is_file():
+                index_state = "存在" + ("，超出注入上限（已截断）" if self._index_over_limit(raw) else "")
+            else:
+                index_state = "不存在"
             locked = "占用中" if lockfile.is_fresh(target_dir / ".lock", MEMORY_LOCK_STALE) else "空闲"
             lines.append(f"  [{label}] {target_dir} — {total} 条（{detail}）· 索引{index_state} · 写锁{locked}")
         lines.append(f"  最近一次自动更新：{self._last_memory_result}")
@@ -622,30 +724,50 @@ class MemoryManager:
         return "\n".join(lines)
 
     @staticmethod
-    def _count_memories(target_dir: Path) -> dict[str, int]:
-        """统计某目录四类记忆数量（坏文件不计）。"""
+    def _count_memories(target_dir: Path) -> "tuple[dict[str, int], int]":
+        """
+        统计某目录四类记忆数量（坏文件不计）。
+
+        :returns: (四类计数, **读不出来的文件数**)
+
+        第二个返回值是给 `/memory` 用的：一份读不出来的记忆等于一份不存在的记忆，
+        而「不存在」与「在那儿但读不出来」对用户的含义完全相反——前者不用管，
+        后者要动手改编码。只返回计数的话，用户看到的是「3 条」而磁盘上明明有 4 个
+        文件，**没有任何一条通路会说出第 4 个去哪了**。
+        """
         counts = {c: 0 for c in CATEGORIES}
+        unreadable = 0
         try:
             for path in target_dir.glob("*.md"):
                 if path.name == INDEX_FILENAME:
                     continue
                 try:
                     parsed = parse_memory(path.read_text(encoding="utf-8"), filename=path.name)
-                except OSError:
+                except (OSError, UnicodeDecodeError):
+                    # 窄写法的理由同 `_rebuild_index_file`：本 try 块里只有一次
+                    # `read_text` 与一次纯函数解析。⚠ 修复前这里只接 `OSError`，
+                    # 而 `UnicodeDecodeError` 继承自 `ValueError`——于是一份 GBK 的
+                    # 记忆正文会让 `/memory` 整个抛异常（实测复现过）。
+                    unreadable += 1
                     continue
                 if parsed is not None:
                     counts[parsed.category] += 1
         except OSError:
             pass
-        return counts
+        return counts, unreadable
 
     @staticmethod
-    def _index_over_limit(index_path: Path) -> bool:
-        """判断索引是否超过注入上限（/memory 报告的「已截断」标记）。"""
-        try:
-            raw = index_path.read_text(encoding="utf-8")
-        except OSError:
-            return False
+    def _index_over_limit(raw: str) -> bool:
+        """
+        判断索引是否超过注入上限（`/memory` 报告的「已截断」标记）。
+
+        :param raw: 索引全文，**由调用方经 `_read_index` 取得**
+
+        ⚠ 这里刻意改成吃文本而不是自己读盘：它原先是第四个 `read_text` 调用点，
+        同样只 `except OSError`、同样接不住 `UnicodeDecodeError`。与其在第四处
+        重复一遍容错，不如让它根本不碰文件系统——**读盘的地方越少，下一次
+        「读失败之后怎么办」要同步的地方就越少**。
+        """
         return (
             len(raw.splitlines()) > INDEX_MAX_LINES
             or len(raw.encode("utf-8")) > INDEX_MAX_BYTES

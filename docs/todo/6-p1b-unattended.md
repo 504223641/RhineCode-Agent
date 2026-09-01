@@ -93,7 +93,7 @@ P1b 最大的风险不是做不出来，是**把偏了的取样固化成回归�
 第一步：读 docs/c11/testing/p1-driver/spec.md 的**末节**——P1b 范围清单、
 可复用的七个接缝、P1a 相对 plan 的四处偏离、P0 验收结论都在那里，是开工的全部上下文。
 
-⚠️ 开工前必须先读 docs/todo/7-p1b-unattended.md 里「必须修正的取样方法」一节。
+⚠️ 开工前必须先读 docs/todo/6-p1b-unattended.md 里「必须修正的取样方法」一节。
 摘要：C11 那轮 43/43 全过却漏掉整层，根因是五个被测 Skill 全是我自己写的，
 而我知道契约，写出来的样本天然适配。**用自己写的 fixture 验自己设计的 spec，
 验不出假设本身的问题。**
@@ -114,5 +114,5 @@ P1b 最大的风险不是做不出来，是**把偏了的取样固化成回归�
 删沙箱目录一律走 sandbox.force_rmtree，不要用 shutil.rmtree(ignore_errors=True)。
 真实模型场景不要变成自动化回归——模型行为不确定，今天绿明天红的测试最后一定被 skip 掉。
 
-做完这条后把 docs/todo/7-p1b-unattended.md 删掉，并重排 docs/todo/ 下其余文档的序号。
+做完这条后把 docs/todo/6-p1b-unattended.md 删掉，并重排 docs/todo/ 下其余文档的序号。
 ```
