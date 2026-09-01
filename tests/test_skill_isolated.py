@@ -690,5 +690,266 @@ class HookDispatchTest(IsolatedTestBase):
         self.assertNotIn(HookEventType.POST_TOOL_USE, events)
 
 
+class _FakeDelegateTool(Tool):
+    """
+    假的委派工具：名字、`system_serial`、`read_only` 三项与真 `RunAgentTool` 一致。
+
+    ⚠ **`system_serial = True` 不是抄参数抄顺手了，它是判据的一部分。**
+    循环里系统级工具走的是另一条预扫分支（判 ASK 按 ALLOW 处理、不弹面板），
+    若「本轮没发给你」那道兜底判定排在它**之后**，一次硬造的委派就会照常执行。
+    用一个 `system_serial=False` 的假工具来验，等于把这条最可能出问题的路
+    绕开了——那种护栏挡不住它本该挡的东西。
+
+    真 `RunAgentTool` 要一整套子 Agent 服务才造得出来，而这里要验的是
+    **循环层的过滤**，与它执行什么无关，故用假的。
+    """
+
+    name = "run_agent"
+    description = "委派"
+    parameters = {
+        "type": "object",
+        "properties": {"agent": {"type": "string"}, "task": {"type": "string"}},
+    }
+    read_only = False
+    system_serial = True
+    plan_safe = True
+
+    def __init__(self) -> None:
+        self.executed = 0
+
+    def execute(self, args: dict, **kwargs) -> ToolResult:
+        self.executed += 1
+        return ToolResult(ok=True, output="已委派", summary="ok")
+
+
+class ForkDelegationTest(IsolatedTestBase):
+    """
+    **`context: fork` 的 Skill 不能派活给子 Agent**（2026-09-01 定的语义）。
+
+    ## 钉的是语义，不是某一行代码
+
+    定的产品语义是「已经是一层子对话的东西，不许再往下开一层」。子 Agent
+    那一侧从 C13 起就是这么做的（`GLOBAL_DENIED_TOOLS` 同时挡 `run_agent`
+    与 `load_skill`，后者的注释逐字写着「一个 `context: fork` 的 Skill 会再开
+    一层子对话」）；fork 这一侧却只挡了 `load_skill`，于是同一条不变量在两条
+    路上说法不一样，而**界面上完全看不出来**。
+
+    ## 为什么必须是两条断言，缺一条防线就不成立
+
+    ① **排除只是「不把 schema 发给模型」。** 模型仍会凭训练先验硬造出调用
+       ——C11 场景 10 实测撞到过：那一轮 `tool_names` 里没有 `run_command`，
+       DeepSeek 照样调了出来，参数名还全对。
+    ② **兜底判定只是「调了就拒」。** 少了排除，模型每一轮都看得见这个工具，
+       于是会反复去调、反复被拒，把子对话那 15 轮预算烧在互相拉扯上。
+
+    只验其中一条的话，另一条被删掉时这个文件照样全绿。
+
+    ## ⚠ 另一半语义：闸门**刻意没有**补上
+
+    别看到「fork 子对话拿不到子 Agent 结论」就去给 `RunOptions` 补
+    `subagent_gate`——那两种修法只能落地一种，理由写在
+    `skills/manager.py` 的 `fork_excluded_tools()` docstring 里（要点：
+    `TaskManager.take_deliverables()` 不按发起方分桶，把主对话那个闸门交给
+    fork 会让主对话委派出去的结论被注入到一份**用完即弃**的历史里并标成
+    「已交付」，那是**丢结果**）。`NoGateOnTheForkPathTest` 从另一侧钉住这条。
+    """
+
+    def _run_fork_with_delegate(self, provider: ScriptedProvider) -> _FakeDelegateTool:
+        """
+        跑一条 fork 子对话，注册中心里**真的有**一个叫 `run_agent` 的工具。
+
+        「真的注册了」是必要条件：没注册的话调用会落进「未知工具」分支，
+        那条路无论排不排除都会拒绝，护栏就验不到本条语义了。
+
+        :returns: 那个假委派工具，供调用方检查它执行过几次
+        """
+        tool = _FakeDelegateTool()
+        mgr = self._manager(provider, tools=[EchoTool(), tool])
+        self._write_skill()
+        list(mgr.run_skill("rev", "", "/rev"))
+        return tool
+
+    def test_run_agent_schema_is_not_sent_to_the_fork_sub_conversation(self) -> None:
+        """
+        第一道：fork 子对话每一轮的工具集里都没有 `run_agent`。
+
+        `echo_tool` 的在场是对照组——少了它，一个「工具集整个是空的」的
+        实现（比如排除集算错成全集）也会让上面那条断言通过。
+        """
+        provider = ScriptedProvider([_text("审查完了")])
+        self._run_fork_with_delegate(provider)
+
+        self.assertTrue(provider.calls, "子对话至少要发起一次请求")
+        for i, call in enumerate(provider.calls):
+            names = {t["function"]["name"] for t in (call["tools"] or [])}
+            self.assertNotIn(
+                "run_agent",
+                names,
+                f"第 {i + 1} 轮把委派工具发给了 fork 子对话——"
+                "分身 Skill 本身就是一层子对话，不该再往下开一层",
+            )
+            self.assertIn("echo_tool", names, "对照组：普通工具必须照常可见")
+
+    def test_a_fabricated_delegation_is_refused_and_never_executes(self) -> None:
+        """
+        第二道：模型硬造一次 `run_agent` 调用，工具**一次都不执行**。
+
+        两个断言分工不同：`executed == 0` 说明没跑，回灌文案里那句
+        「本轮未提供给你」说明**是被这条判定拒的**——少了后者，一个
+        「工具压根没注册」的假绿（落进未知工具分支）看起来一模一样。
+        """
+        provider = ScriptedProvider(
+            [
+                _tool_call("run_agent", args={"agent": "explorer", "task": "查一下"}),
+                _text("我自己查完了。"),
+            ]
+        )
+        tool = self._run_fork_with_delegate(provider)
+
+        self.assertEqual(
+            tool.executed,
+            0,
+            "fork 子对话里硬造出来的委派**执行了**——"
+            "排除只是不发 schema，拦住它的是循环层那道兜底判定，两者缺一防线不成立",
+        )
+        # 回灌给模型的那条结果必须说清「为什么没执行」，否则它会换个工具名再试。
+        second_round = provider.calls[1]["messages"]
+        feedback = " ".join(m.content or "" for m in second_round)
+        self.assertIn("本轮未提供给你", feedback)
+
+    def test_the_two_tables_agree_on_which_tools_open_a_layer(self) -> None:
+        """
+        **成对维护点的护栏**：两张表对「哪些工具会再开一层子对话」说法一致。
+
+        `subagents/toolset.py` 的 `GLOBAL_DENIED_TOOLS`（子 Agent 那一侧）与
+        `skills/manager.py` 的 `fork_excluded_tools()`（fork 那一侧）是同一条
+        不变量的两个落点。**只改一处不报错**——另一条路上那个工具照常可见、
+        照常能调，两条路的行为从此不一样，而配置和界面上都看不出异常。
+        这正是 `run_agent` 从 C13 一直漏到 2026-09-01 的形态。
+
+        ⚠ 顺带钉住**表长**：把某一项从 `_LAYER_OPENING_TOOLS` 里删掉是这类
+        遍历式护栏共同的失效方式——遍历一张空表永远绿。
+        """
+        from rhinecode.subagents.toolset import GLOBAL_DENIED_TOOLS
+
+        # 「会再开一层子对话」的工具。委派开的是子 Agent，加载开的是
+        # 另一条 `context: fork` 的子对话——两者都是「一层」。
+        layer_opening = {"run_agent", "load_skill"}
+        self.assertEqual(
+            len(layer_opening), 2, "表长变了就说明这条不变量的覆盖面变了，请一并复核"
+        )
+
+        mgr = self._manager()
+        fork_excluded = mgr.skill_manager.fork_excluded_tools()
+        for name in sorted(layer_opening):
+            self.assertIn(
+                name,
+                GLOBAL_DENIED_TOOLS,
+                f"子 Agent 那一侧漏了 {name}——一条 `tools: [{name}]` 的角色定义就能往下开一层",
+            )
+            self.assertIn(
+                name,
+                fork_excluded,
+                f"fork 那一侧漏了 {name}——两张表说法不一样，而界面上看不出来",
+            )
+
+
+class NoGateOnTheForkPathTest(IsolatedTestBase):
+    """
+    fork 子对话**刻意不接**子 Agent 闸门——钉住「别两个都做」。
+
+    `ForkDelegationTest` 定的语义是「fork 不能派活」，那么再给
+    `RunOptions` 补一个 `subagent_gate` 就等于留下一段**永远走不到**的代码：
+    没有任何工具能在这条路上创建出子 Agent，闸门取到的只会是主对话委派的
+    那些任务——而取走它们正是本轮拒绝的那个丢结果的形态。
+
+    ⚠ 这条护栏的失败方式很特别：它**不测行为，测的是接线**。之所以值得单列，
+    是因为「顺手把闸门也接上，反正多接一根线不会错」看起来永远像个改进。
+    """
+
+    def test_run_options_carry_no_subagent_gate_on_this_path(self) -> None:
+        """
+        fork 侧那次 `agent.run(...)` 既不去**取**闸门，也不把它放进 `RunOptions`。
+
+        ## ⚠ 只断言 `options.subagent_gate is None` 是不够的（变异实测证实）
+
+        `ConversationManager.subagent_gate()` 在两个服务都没启用时返回 `None`，
+        而单测里的管理器正是这种。于是「真的把 `subagent_gate=self.subagent_gate()`
+        加到 fork 路径上」这个变异**照样全绿**——护栏挡不住它本该挡的那一行。
+
+        所以这里把工厂替换成一个返回哨兵的桩：**取没取过**才是可判定的信号。
+        两条断言分工不同——工厂没被调用说明接线上压根没这一步，
+        `RunOptions` 里为空说明就算将来换个取法也传不进去。
+        """
+        captured: list = []
+        asked: list = []
+
+        class _SentinelGate:
+            """
+            行为等价于 `NullGate` 的哨兵闸门。
+
+            ⚠ **必须实现完整协议、不能用裸 `object()`**：接线一旦真的被改回去，
+            循环会立刻调 `take_pending()`，裸对象会抛 `AttributeError` 把整条
+            子对话炸掉——测试确实会红，但红在一个与判据无关的地方，
+            下一个人看到的是一条堆栈而不是「你不该接这个闸门」。
+            """
+
+            def take_pending(self):
+                return []
+
+            def has_awaited(self) -> bool:
+                return False
+
+            def wait_any(self, cancel_event, timeout: float = 0.0) -> bool:
+                return False
+
+            def describe_awaited(self) -> str:
+                return ""
+
+        sentinel = _SentinelGate()
+
+        provider = ScriptedProvider([_text("结论")])
+        mgr = self._manager(provider)
+        self._write_skill()
+
+        # 桩：真实环境里两个服务都启用时这里会返回一个真闸门。
+        # 单测的管理器没启用服务、原方法恒返回 None，那会让本条护栏形同虚设。
+        def fake_gate():
+            asked.append(True)
+            return sentinel
+
+        mgr.subagent_gate = fake_gate
+
+        from rhinecode.agent.loop import Agent
+
+        original = Agent.run
+
+        def spy(self, *args, **kwargs):
+            captured.append(kwargs.get("options"))
+            return original(self, *args, **kwargs)
+
+        Agent.run = spy
+        try:
+            list(mgr.run_skill("rev", "", "/rev"))
+        finally:
+            Agent.run = original
+
+        self.assertTrue(captured, "fork 路径必须真的跑过一次 Agent.run")
+        self.assertEqual(
+            asked,
+            [],
+            "fork 路径去取了子 Agent 闸门——两种语义只能落地一种，"
+            "既排除了委派工具又接闸门的话，那个闸门永远走不到，"
+            "而它取走的会是主对话委派出去的结论（丢结果）",
+        )
+        options = captured[0]
+        self.assertIsNotNone(options, "fork 路径的 RunOptions 不该是 None")
+        self.assertIsNot(
+            getattr(options, "subagent_gate", None),
+            sentinel,
+            "闸门被放进了 fork 路径的 RunOptions",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
