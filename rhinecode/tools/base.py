@@ -189,6 +189,25 @@ class Tool(ABC):
                  与 `system_serial` 同一条理由——那会让分类器包认识具体工具的
                  名字，而它现在是个只依赖 provider 的叶子包。
 
+    - remote_origin：**这个工具由外部程序提供，不是本项目写的代码**（MCP，c7）。
+                 缺省 False = 本项目自己实现的工具，那是绝大多数情况。
+                 目前唯一的置真方是 `mcp/tool_adapter.py` 的 `MCPTool`。
+
+                 `permission/adapter.py` 读它，把这类调用映射成 `kind="remote"`，
+                 于是第④层在放行档下对它判 ASK 而不是 ALLOW（见 `engine._decide_core`）。
+
+                 ⚠ **为什么做成工具自己声明的标志，而不是在权限层按 `mcp__` 前缀判断**：
+                 前缀是 `mcp/tool_adapter.sanitize_mcp_tool_name` 生成的约定，
+                 `skills/models.py` 已经为它存了一份字面量（`MCP_PREFIX`）。
+                 权限层再存第三份的话，三处分开维护而**改一处不报错**。
+                 做成标志则事实源只有一个——与 `classifier_scope` 同一条理由。
+
+                 ⚠ **漏声明的后果是静默放宽权限，不是少个提示。** 新写的远端工具
+                 包装类若忘了置真，它会落回 `kind="other"`，而那一类在缺省预设
+                 （放行档）下的结论是**直接放行、零面板**——那正是本标志要补上的
+                 那个洞（审查报告 S2）。护栏 `tests/test_perm_remote_layer.py`
+                 因此走**真实的 `MCPTool` 构造路径**取 kind，不手写这个标志。
+
     - plan_blocked_hint：**规划阶段被挡下时，追加给模型的一句自述**。
                  缺省空串 = 不追加，用通用文案。
 
@@ -218,6 +237,10 @@ class Tool(ABC):
     system_serial: bool = False
     plan_safe: bool = False
     workspace_aware: bool = False
+    # c7/S2：True = 本工具由外部 MCP Server 提供，不是本项目的代码。
+    # 权限层据它把请求映射成 kind="remote"。语义与「漏声明会静默放宽权限」
+    # 的后果见类 docstring 的对应一节。
+    remote_origin: bool = False
     # 规划阶段被守卫挡下时，追加在通用文案后面的一句自述。空串 = 不追加。
     # 语义与用法见类 docstring 的 `plan_blocked_hint` 一节。
     plan_blocked_hint: str = ""
