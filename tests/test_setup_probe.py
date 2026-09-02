@@ -285,6 +285,79 @@ class SecretRedactionTest(unittest.TestCase):
         self.assertNotIn("\n", result.detail)
 
 
+class DetailIsAlwaysOurOwnWordsTest(unittest.TestCase):
+    """
+    **给用户的每一句话都是本模块写死的固定文案，不含任何服务端字符串。**
+
+    这条比上面 `SecretRedactionTest` 更硬：那组验的是「服务端文本里的密钥被
+    打码了」，而现在服务端文本**根本不进 `detail`**——于是 spec F14
+    「密钥不外泄」从「靠打码」升级成结构性成立，没有载体就没有泄漏。
+
+    起因是真机反馈「文案太复杂了」：英文报错对多数用户没有意义，挤在中文
+    句子里只会让人更慌。安全上的好处是顺带拿到的。
+
+    ⚠ 判据用一个**不可能自然出现的标记串**，而不是只查密钥——只查密钥的话，
+    「把服务端原文原样贴上去、只是恰好没有密钥」照样能通过。
+    """
+
+    MARKER = "ZZ-SERVER-SAID-9137"
+
+    def _details(self):
+        """把每一类失败都跑一遍，收集所有会显示给用户的措辞。"""
+        errors = [
+            openai.AuthenticationError(self.MARKER, response=_make_response(401), body=None),
+            openai.PermissionDeniedError(self.MARKER, response=_make_response(403), body=None),
+            openai.NotFoundError(self.MARKER, response=_make_response(404), body=None),
+            openai.RateLimitError(self.MARKER, response=_make_response(429), body=None),
+            openai.BadRequestError(self.MARKER, response=_make_response(400), body=None),
+            openai.BadRequestError(
+                "model " + self.MARKER, response=_make_response(400), body=None
+            ),
+            openai.APIStatusError(self.MARKER, response=_make_response(402), body=None),
+            openai.InternalServerError(self.MARKER, response=_make_response(503), body=None),
+            openai.APIConnectionError(request=httpx.Request("GET", "https://x/")),
+            RuntimeError(self.MARKER),
+        ]
+        out = []
+        for error in errors:
+            client = _FakeClient(chat_error=error)
+            out.append(probe.verify("k", "u", "m", _client_factory=_factory(client)).detail)
+            client = _FakeClient(models_error=error)
+            out.append(probe.list_models("k", "u", _client_factory=_factory(client)).error)
+        return out
+
+    def test_no_server_text_reaches_the_user(self):
+        for detail in self._details():
+            self.assertNotIn(self.MARKER, detail or "", f"服务端原文漏进了措辞：{detail}")
+
+    def test_every_detail_is_a_short_single_line(self):
+        """
+        每一句都短、都只有一行。
+
+        「太复杂」的具体形态就是长句 + 换行 + 括号里套英文，所以判据直接
+        钉住长度与行数。
+        """
+        for detail in self._details():
+            self.assertTrue(detail)
+            self.assertEqual(detail.splitlines(), [detail], "这句里有换行")
+            self.assertLessEqual(len(detail), 30, f"这句太长了：{detail}")
+
+    def test_non_ascii_key_gets_its_own_message(self):
+        """
+        非 ASCII 的密钥要单独说——这是真机撞出来的。
+
+        原始报错是「'ascii' codec can't encode character ... in position 7」
+        （`"Bearer "` 正好 7 个字符），用户完全不知道该干什么。
+        """
+        client = _FakeClient(
+            chat_error=UnicodeEncodeError("ascii", "●", 0, 1, "ordinal not in range(128)")
+        )
+        result = probe.verify("●●●●", "u", "m", _client_factory=_factory(client))
+        self.assertEqual(result.kind, ProbeFailure.AUTH)
+        self.assertIn("ASCII", result.detail)
+        self.assertNotIn("codec", result.detail)
+
+
 class NeverRaisesTest(unittest.TestCase):
     """
     **两个函数都不许抛。**

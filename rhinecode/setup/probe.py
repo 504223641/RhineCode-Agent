@@ -129,48 +129,63 @@ def _classify(exc: BaseException, api_key: str) -> tuple[ProbeFailure, str]:
     # 不该顺带把 openai SDK 的 import 成本（实测 ~600ms）也付掉。
     import openai
 
+    # `said` **只用于内部分流，绝不显示给用户**（见下面 400 那一支）。
     said = _one_line(str(exc), api_key)
-    suffix = f"（服务端说：{said}）" if said else ""
+
+    # ⚠ **给用户的每一句话都是本模块写死的固定文案，不含任何服务端字符串。**
+    # 这是真机反馈定下来的（「文案太复杂了」）：英文报错对多数用户没有意义，
+    # 而它挤在中文句子里只会让人更慌。
+    #
+    # 顺带它让 spec F14「密钥不外泄」从「靠打码」升级成**结构性成立**——
+    # 服务端说法根本不进 `detail`，也就没有泄漏的载体。护栏见
+    # `tests/test_setup_probe.py::DetailIsAlwaysOurOwnWordsTest`。
+
+    # 非 ASCII 的密钥要单独说，这是真机撞出来的。
+    #
+    # HTTP 头只能是 ASCII，而 `Authorization: Bearer <key>` 里一旦有中文或
+    # 全角符号，httpx 在**发出去之前**就抛 `UnicodeEncodeError`。原始消息是
+    # 「'ascii' codec can't encode character ... in position 7」——
+    # `"Bearer "` 正好 7 个字符，所以位置 7 就是密钥的第一个字。
+    #
+    # 用户看到那句话完全不知道该干什么，而真实成因往往很具体：**从控制台
+    # 网页上复制时，复制到的是打码后的那串圆点**。这一支排在最前面，
+    # 因为它既不是网络问题也不是凭据无效，归到 OTHER 给出的建议全是错的。
+    if isinstance(exc, UnicodeEncodeError):
+        return (ProbeFailure.AUTH, "密钥里有非 ASCII 字符")
 
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
-        return (
-            ProbeFailure.NETWORK,
-            "连不上服务器。检查一下网络，或者上一屏的接口地址是不是写错了。",
-        )
+        return (ProbeFailure.NETWORK, "连不上服务器")
 
     if isinstance(exc, openai.AuthenticationError):
-        return (ProbeFailure.AUTH, f"密钥无效或已失效，回上一屏换一个试试。{suffix}")
+        return (ProbeFailure.AUTH, "密钥无效或已失效")
 
     if isinstance(exc, openai.PermissionDeniedError):
-        return (
-            ProbeFailure.AUTH,
-            f"这个密钥没有访问权限（可能是账号受限或用错了服务商）。{suffix}",
-        )
+        return (ProbeFailure.AUTH, "密钥没有访问权限")
 
     if isinstance(exc, openai.NotFoundError):
-        return (ProbeFailure.MODEL, f"服务端说这个模型不存在，换一个试试。{suffix}")
+        return (ProbeFailure.MODEL, "服务端上没有这个模型")
 
     if isinstance(exc, openai.RateLimitError):
-        return (ProbeFailure.OTHER, f"被限流了，等一会儿再试。{suffix}")
+        return (ProbeFailure.OTHER, "被限流了，稍后再试")
 
     code = _status_code(exc)
 
     if code == 402:
-        return (ProbeFailure.OTHER, f"账户余额不足。{suffix}")
+        return (ProbeFailure.OTHER, "账户余额不足")
 
     if code == 400:
         # ⚠ 400 是个筐，模型名不对最常落在这里（DeepSeek 对未知模型返回的
-        # 就是 400 而不是 404）。靠**服务端说法里有没有提到 model** 来分流：
-        # 猜错的代价只是措辞不够贴切，而不分流的代价是「模型填错了」永远
-        # 被显示成「未知错误」。
+        # 就是 400 而不是 404）。靠**服务端说法里有没有提到 model** 来分流——
+        # 那句话只参与判断，不进 `detail`。猜错的代价只是措辞不够贴切，
+        # 而不分流的代价是「模型填错了」永远被显示成「未知错误」。
         if "model" in said.lower():
-            return (ProbeFailure.MODEL, f"服务端不接受这个模型名，换一个试试。{suffix}")
-        return (ProbeFailure.OTHER, f"服务端拒绝了这次请求。{suffix}")
+            return (ProbeFailure.MODEL, "服务端不接受这个模型名")
+        return (ProbeFailure.OTHER, "服务端拒绝了这次请求")
 
     if code is not None and code >= 500:
-        return (ProbeFailure.OTHER, f"服务端出错了（HTTP {code}），稍后再试。{suffix}")
+        return (ProbeFailure.OTHER, f"服务端出错了（HTTP {code}）")
 
-    return (ProbeFailure.OTHER, f"没能完成这次请求。{suffix}")
+    return (ProbeFailure.OTHER, "没能完成这次请求")
 
 
 def _default_client_factory(api_key: str, base_url: str, timeout: float) -> Any:

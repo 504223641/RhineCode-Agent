@@ -350,7 +350,12 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         self.query_one("#setup-manual-label").display = model
         self.query_one("#setup-manual").display = model
         self.query_one("#setup-fallback").display = model
-        self.query_one("#setup-status").display = verify
+        # 状态行第四屏常驻；第二屏只在有校验错误时出现（`_set_error` 自己管显隐），
+        # 所以这里只负责「进第四屏时打开、离开第二/四屏时关掉」。
+        if verify:
+            self.query_one("#setup-status").display = True
+        elif not creds:
+            self.query_one("#setup-status").display = False
 
         renderer = {
             _STEP_INTRO: self._render_intro,
@@ -443,18 +448,48 @@ class SetupScreen(ModalScreen[SetupOutcome]):
 
     def _credentials_ready(self) -> bool:
         """
-        第二屏能不能往下走。
+        第二屏能不能往下走，不能则把原因写在界面上。
 
         首次配置必须填 key（spec F7）；重跑时留空表示不改，因此允许为空。
         地址两种模式下都必须非空——空地址没有任何合理解释。
+
+        ⚠ **另外拦一道非 ASCII**，这是真机撞出来的。HTTP 头只能是 ASCII，
+        密钥里一旦有中文、全角符号或圆点，请求在**发出去之前**就会抛
+        `UnicodeEncodeError`，用户拿到的是一句
+        「'ascii' codec can't encode character '●' in position 7」
+        ——完全不知道该干什么。真实成因往往是**从网页上复制到了打码后的
+        那串圆点**（`sk-●●●●…`）。
+
+        在这里拦比等请求失败好：用户还站在输入框前，改起来最顺手。
+        `probe` 那侧**也留了同一条判断**（密钥还可能从配置文件里读出来），
+        两处是纵深防御，不是重复。
         """
         key = self.query_one("#setup-key", Input).value.strip()
         url = self.query_one("#setup-url", Input).value.strip()
+
         if not url:
+            self._set_error("接口地址不能为空。")
             return False
         if self._mode is SetupMode.FIRST_RUN and not key:
+            self._set_error("请填写 API Key。")
             return False
+        for label, value in (("密钥", key), ("接口地址", url)):
+            if not value.isascii():
+                self._set_error(
+                    f"{label}里有非 ASCII 字符（中文、全角符号或圆点）。"
+                    "常见原因是从网页上复制到了打码后的密钥，"
+                    "请回控制台复制完整的那一串。"
+                )
+                return False
+        self._set_error("")
         return True
+
+    def _set_error(self, text: str) -> None:
+        """把一条错误显示在状态行上；传空串则清掉。"""
+        status = self.query_one("#setup-status", Static)
+        status.update(escape(text))
+        status.set_classes("setup-error")
+        status.display = bool(text)
 
     # ---- 第三屏：选模型 ----
 
@@ -480,11 +515,11 @@ class SetupScreen(ModalScreen[SetupOutcome]):
             # 「列表会过期」这个问题原样搬回来了，还多骗用户一次。
             # ⚠ 这里**保留橘色**（真机确认）：橘色在本项目里的语义正是
             # 「你没做什么，但情况变了」，而这恰好就是那种情况。
-            reason = self._list_result.error or ""
-            lines = ["● 未能获取服务端列表，以下为内置列表，可能已过期"]
-            if reason:
-                lines.append("  " + reason)
-            fallback.update(escape("\n".join(lines)))
+            # ⚠ **只一行**（真机选定：「文案太复杂了」）。
+            # `ModelListResult.error` 里那个原因**刻意不显示**——已知代价是
+            # 地址填错时用户只知道「没拿到」，不知道为什么。那个字段仍然留着：
+            # 它是数据模型的一部分，也记录着「为什么退了兜底」。
+            fallback.update(escape("● 未能获取模型列表，以下为内置列表"))
         else:
             fallback.update("")
 
@@ -537,13 +572,9 @@ class SetupScreen(ModalScreen[SetupOutcome]):
             return
 
         # 失败：三个出口（spec F4）。
-        # ⚠ 服务端原话**另起一行、灰色**，不再挤在括号里。
-        detail = self._probe_result.detail
-        head, _, tail = detail.partition("（服务端说：")
-        lines = ["● " + head.strip()]
-        if tail:
-            lines.append("  服务端说：" + tail.rstrip("）"))
-        status.update(escape("\n".join(lines)))
+        # ⚠ **只一行**（真机选定：「文案太复杂了」）。`probe` 给的 `detail`
+        # 已经是一句写死的短句、不含任何服务端字符串，这里直接摆出来即可。
+        status.update(escape("● " + self._probe_result.detail))
         status.set_classes("setup-error")
         self._set_buttons("重填 Key", "跳过验证，直接保存", "改接口地址")
         self._focus_primary()

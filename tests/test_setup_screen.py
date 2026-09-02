@@ -264,8 +264,11 @@ class ModelStepTest(_ScreenCase):
             await self.fill_credentials(pilot, screen)
             notice = self.text_of(screen, "#setup-fallback")
             self.assertIn("内置列表", notice)
-            self.assertIn("过期", notice)
-            self.assertIn("连不上服务器", notice, "失败原因也要说")
+            # ⚠ **只一行**（真机选定）：具体原因刻意不显示。
+            # 这条反证钉住「别顺手把 error 那一行加回来」——那正是用户说的
+            # 「文案太复杂了」。
+            self.assertEqual(len(notice.strip().splitlines()), 1, notice)
+            self.assertNotIn("连不上服务器", notice)
 
     async def test_normal_list_says_nothing_about_its_source(self):
         """
@@ -447,6 +450,14 @@ class EscapeMarkupTest(_ScreenCase):
             )
 
     async def test_bracket_in_error_detail_does_not_crash(self):
+        """
+        `error` 里带方括号也不能把 app 掀翻。
+
+        ⚠ 现在这段文本**不再显示**（只一行固定文案），所以本条验的是
+        「拿到这种 error 时界面照常渲染」，而不是「它出现在屏幕上」。
+        留着它是因为 `error` 仍然经手了这条路径，哪天又决定显示出来时
+        这条护栏已经在了。
+        """
         nasty = ModelListResult(
             options=(ModelOption("m", "", True),),
             from_fallback=True,
@@ -456,7 +467,7 @@ class EscapeMarkupTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
-            self.assertIn("getaddrinfo", self.text_of(screen, "#setup-fallback"))
+            self.assertIn("内置列表", self.text_of(screen, "#setup-fallback"))
 
     async def test_bracket_in_probe_detail_does_not_crash(self):
         bad = ProbeResult(
