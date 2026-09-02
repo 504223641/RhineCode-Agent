@@ -11,16 +11,11 @@
 于是这里起一个**只做一件事的最小 App**：挂载后立刻把向导 Screen 推上去，
 拿到结果就退出。它与随后的 `RhineApp` 是**同一个进程里先后跑的两个 App**。
 
-## ⚠ 「同进程连跑两个 Textual App」是本项目从没做过的事
+## ⚠ 「同进程连跑两个 Textual App」是本项目从没做过的事（T1 已验通）
 
 `App.run()` 内部走 `asyncio.run()`，每次调用创建并关闭一个全新的事件循环，
-因此先后跑两个 App 在原理上是成立的。但「原理上成立」和「这个版本的
-Textual 上真的成立」是两件事，所以本模块的第一个版本**只包含一个立刻
-自我关闭的占位 Screen**，配一条护栏用例把它钉住（`tests/test_setup_host.py`）。
-
-真正的四屏向导在 T11–T13 落地后由 T14 换进来。**先验证最大的未知，
-再往上盖东西**——跑不通的话整个方案要换成「让 build_app 容忍空 key」，
-那是另一套设计，越早知道越好。
+因此先后跑两个 App 在原理上成立。T1 把它实测验过了（连跑 2 次、3 次都成功），
+护栏见 `tests/test_setup_host.py`。
 
 ## ⚠ `run_setup` 只能从同步上下文调用（T1 实测）
 
@@ -30,65 +25,74 @@ Textual 上真的成立」是两件事，所以本模块的第一个版本**只�
 只能往那个已经活着的 App 上 `push_screen`。
 
 plan 里「两个入口共用同一个 Screen、但宿主只给启动期用」的分工不是风格
-选择，是这条约束逼出来的。护栏见 `tests/test_setup_host.py` 的
-`HostThenNormalAppTest` 类注释。
+选择，是这条约束逼出来的。
 
-## 为什么测试要传 headless=True
+## ⚠ 向导自己出故障时不许拖垮启动
 
-`App.run()` 缺省要接管真实终端（切备用屏、进 raw 模式）。测试进程里没有
-终端，`headless=True` 让 Textual 用无头驱动跑完整生命周期——**它跑的仍是
-`run()` 这条真路径**（不是 `run_test()` 那条 async pilot 路径），所以
-「两个 App 能不能先后跑」这个问题才真的被验到了。
+`run_setup` 把 App 跑挂的情形兜住，返回 `ABANDONED` 并在 stderr 留一行。
+用户此刻只是想配置一下程序，让向导的 bug 变成「装完就用不了」是不成比例的。
+走 `ABANDONED` 分支的话，调用方会打印模板路径、告诉他手填也行——
+那条路一直是通的。
 """
 
-from textual.app import App, ComposeResult
-from textual.screen import ModalScreen
-from textual.widgets import Static
+import sys
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from rhinecode.setup.models import SetupAction, SetupDraft, SetupMode, SetupOutcome
 
 
-class _ProbeScreen(ModalScreen[str]):
+def run_setup(
+    config_path: Path,
+    prefill: Optional[SetupDraft] = None,
+    mode: SetupMode = SetupMode.FIRST_RUN,
+    *,
+    headless: bool = False,
+    auto_pilot: Optional[Callable[..., Any]] = None,
+) -> SetupOutcome:
     """
-    T1 的占位 Screen：挂载后立刻自我关闭。
+    起一个最小宿主跑完配置向导，返回结果。
 
-    它**不代表最终形态**，只用来回答一个问题：一个 `ModalScreen` 能不能
-    在最小宿主里被推上去、把返回值交回来。T14 会用真的 `SetupScreen`
-    把它替换掉。
+    :param config_path: 要写到哪个配置文件
+    :param prefill: 预填草稿（`/setup` 用；启动期一般是 None）
+    :param mode: `FIRST_RUN` / `RERUN`
+    :param headless: **仅供测试**：不接管真实终端。测试进程里没有终端，
+        但走的仍是 `run()` 这条真路径（不是 `run_test()` 那条 async pilot 路径）
+    :param auto_pilot: **仅供测试**：自动驱动按键的协程
+    :returns: `SetupOutcome`；向导自身出故障时返回 `ABANDONED`
+
+    副作用：接管终端并跑一个完整的 Textual 生命周期；向导内部可能发起
+    两次网络请求并写配置文件。
+
+    ⚠ 只能从**同步**上下文调用，理由见模块 docstring。
     """
+    # ⚠ 延迟 import：本模块被 `__main__` 顶层 import，而 `setup_screen`
+    # 会把整套 Textual 部件拉起来。只是「判一下该不该弹向导」的启动路径
+    # （绝大多数次启动）不该付这笔钱。
+    from textual.app import App, ComposeResult
 
-    def compose(self) -> ComposeResult:
-        # 内容无关紧要，但必须有一个可挂载的子部件——空的 Screen 在某些
-        # Textual 版本上布局阶段会走到不同分支，那不是我们想验的东西。
-        yield Static("RhineCode 正在准备首次设置…")
+    from rhinecode.tui.setup_screen import SetupScreen
 
-    def on_mount(self) -> None:
-        # 立刻交回结果。放在 on_mount 而不是 compose 里：compose 阶段
-        # Screen 还没挂上，dismiss 的回调链尚未建立。
-        self.dismiss("ok")
+    class _SetupHost(App[SetupOutcome]):
+        """只做一件事的宿主：推向导、拿结果、退出。"""
 
+        def compose(self) -> ComposeResult:
+            # 宿主自己不画任何东西——屏幕整个交给向导。
+            return []
 
-class _ProbeHost(App[str]):
-    """T1 的最小宿主 App：推一个 Screen，拿到结果就退出。"""
+        def on_mount(self) -> None:
+            self.push_screen(
+                SetupScreen(config_path, prefill=prefill, mode=mode), self._on_done
+            )
 
-    def on_mount(self) -> None:
-        self.push_screen(_ProbeScreen(), self._on_done)
+        def _on_done(self, outcome: Optional[SetupOutcome]) -> None:
+            # outcome 为 None 只可能来自「Screen 被强制关掉」，按放弃处理。
+            self.exit(outcome or SetupOutcome(action=SetupAction.ABANDONED))
 
-    def _on_done(self, result: str | None) -> None:
-        """
-        Screen 关闭时的回调。
+    try:
+        result = _SetupHost().run(headless=headless, auto_pilot=auto_pilot)
+    except Exception as exc:  # noqa: BLE001 —— 见模块 docstring：不许拖垮启动
+        print(f"配置向导没能启动（{exc}），改用手工填写。", file=sys.stderr)
+        return SetupOutcome(action=SetupAction.ABANDONED)
 
-        :param result: `dismiss()` 交回的值；Screen 被强制关闭时可能是 None
-        """
-        # exit 的参数就是 `App.run()` 的返回值——这条链路正是本次要验的。
-        self.exit(result)
-
-
-def run_setup_probe(*, headless: bool = False) -> str | None:
-    """
-    跑一次最小宿主，返回占位 Screen 交回的值。
-
-    :param headless: 真则用无头驱动（测试进程里没有终端时必须传真）
-    :returns: 占位 Screen 的返回值，正常情况下是 "ok"
-
-    副作用：接管终端并跑一个完整的 Textual 生命周期（headless 时不接管）。
-    """
-    return _ProbeHost().run(headless=headless)
+    return result or SetupOutcome(action=SetupAction.ABANDONED)
