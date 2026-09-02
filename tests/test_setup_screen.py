@@ -657,3 +657,50 @@ class EnterAdvancesEveryScreenTest(_ScreenCase):
             self.assertTrue(
                 screen.query_one("#setup-key", Input).display, "Enter 没走「重填 Key」"
             )
+
+
+class ButtonRendersItsLabelTest(_ScreenCase):
+    """
+    **按钮必须真的画得出文字。**
+
+    ⚠ 这条对应一个真机报上来的 bug：上一版把按钮压成 `height: 1` + `border: none`，
+    结果**按钮里一个字都没有**。量出来的是外框 2 行、**内容区高度 0**——
+    Textual 的 `Button` 自带边框，把外高压到 1 就等于把内容区压没了。
+
+    **它不报错**，测试也全绿（`label` 属性照样是「开始」），只表现为界面上
+    一个空框。所以判据必须落在**内容区的实际高度与宽度**上，而不是 `label`
+    这个属性——后者在坏掉的那一版里同样是对的。
+    """
+
+    async def test_visible_button_has_a_non_empty_content_box(self):
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            visible = [b for b in screen.query(Button) if b.display]
+            self.assertEqual(len(visible), 1)
+            button = visible[0]
+            self.assertGreaterEqual(
+                button.size.height, 1, "按钮内容区高度为 0——标签无处可画"
+            )
+            self.assertGreaterEqual(
+                button.size.width, 1, "按钮内容区宽度为 0——标签无处可画"
+            )
+            self.assertIn("开始", str(button.label))
+
+    async def test_all_three_buttons_render_on_the_failure_screen(self):
+        """失败屏三个按钮同时可见，且每一个都画得出文字。"""
+        screen = self.make(probe_result=_AUTH_FAIL)
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await self.fill_credentials(pilot, screen)
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            await pilot.pause()
+            visible = [b for b in screen.query(Button) if b.display]
+            self.assertEqual(len(visible), 3)
+            for button in visible:
+                self.assertGreaterEqual(
+                    button.size.height, 1, f"{button.id} 内容区高度为 0"
+                )
+                self.assertTrue(str(button.label).strip(), f"{button.id} 没有文字")

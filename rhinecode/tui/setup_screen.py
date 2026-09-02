@@ -195,24 +195,35 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         align-horizontal: center;
     }
     /*
-     * ⚠ **按钮扁平化，三个长得一模一样**（真机反馈：「按钮不统一」）。
-     * Textual 的 `Button` 缺省带边框、高 3 行，且 `variant="primary"` 会换一套
-     * 主题色——于是「开始」是蓝底、「我自己去改文件」是灰底，看起来像两种东西。
-     * 这里全部去掉 variant 与边框，只留一行青字，主次靠**位置**区分（主动作在最右）。
+     * 动作按钮。
+     *
+     * ⚠ **上一版把它压成 `height: 1` + `border: none`，结果按钮里一个字都没有。**
+     * 实测量到的是：外框 2 行、**内容区高度 0**——标签无处可画。同一段 CSS 单独
+     * 拿出来跑却正常，是它与容器嵌套一起算高度时打架。教训：Textual 的 `Button`
+     * 自带边框，把外高压到 1 就等于把内容区压没了，而**它不报错**，
+     * 只表现为「按钮显示不正常没有文字」。
+     *
+     * 现在老老实实给它 3 行（上下边框各 1、内容 1），外观改成项目的青色圆角框；
+     * 选中态是青底加粗 + 实色边框——与命令面板 `background: #7AEEFF 20%` 同一个值。
+     *
+     * ⚠ **三个按钮都不带 `variant`**：带了 Textual 会给它换一整套主题色，
+     * 于是「开始」蓝底、其余灰底——那正是「按钮不统一」的成因。
+     * 主次靠**位置**区分：主动作永远在最右。
      */
     SetupScreen Button {
-        height: 1;
-        min-width: 0;
+        height: 3;
         width: auto;
-        padding: 0 2;
+        min-width: 0;
+        padding: 0 1;
         margin-left: 2;
-        border: none;
+        border: round #7AEEFF 60%;
         background: transparent;
         color: #7AEEFF;
         text-style: none;
     }
     SetupScreen Button:focus,
     SetupScreen Button:hover {
+        border: round #7AEEFF;
         background: #7AEEFF 20%;
         color: #7AEEFF;
         text-style: bold;
