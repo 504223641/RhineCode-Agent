@@ -148,6 +148,7 @@ def build_app(
     web_resolver: Optional[Callable[[str], list]] = None,
     hook_client_factory: Optional[Callable[[], Any]] = None,
     search_client_factory: Optional[Callable[[], Any]] = None,
+    config_path: Optional[Path] = None,
 ) -> BuildResult:
     """
     按固定顺序装配一个完整的 RhineCode 应用。
@@ -175,6 +176,9 @@ def build_app(
     :param web_resolver: 主机名解析函数，同上（缺省用 `socket.getaddrinfo`）。
     :param hook_client_factory: 造 HTTP 客户端的工厂，透传给 Hook 的 `http` 动作。
                      缺省 None（用真 `httpx.Client`）。形态同 `web_client_factory`。
+    :param config_path: 本次实际加载的配置文件路径（first-run-setup 扩展）。
+                        原样交给 `RhineApp`，供 `/setup` 写回**这一份**。
+                        缺省 None 时界面退回用户级路径（等于现状，既有调用方不用改）。
     :param search_client_factory: 造 HTTP 客户端的工厂，透传给 `web_search` 工具。
                      缺省 None（用真 `httpx.Client`）。形态同 `web_client_factory`
                      ——**可注入同样是 spec N5 的硬要求**，而且这里的安全含义更重：
@@ -680,7 +684,11 @@ def build_app(
         )
 
     # ⑥ 界面层。
-    app = RhineApp(manager, cfg, command_registry, recorder=recorder)
+    # first-run-setup 扩展：把**本次实际加载的配置文件路径**交给界面，
+    # `/setup` 要写回这一份。缺省 None 时 RhineApp 退回用户级路径（等于现状）。
+    app = RhineApp(
+        manager, cfg, command_registry, recorder=recorder, config_path=config_path
+    )
 
     # ⑦ 装配期事件：必须在 connect_all + bind_tools **之后**产出，否则工具清单与
     # MCP 状态都还是半空的快照，读 trace 的人会以为「启动时就没连上」。
