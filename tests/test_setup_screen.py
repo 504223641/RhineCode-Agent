@@ -8,6 +8,7 @@
 """
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -101,16 +102,82 @@ class _ScreenCase(unittest.IsolatedAsyncioTestCase):
         """
         return str(screen.query_one(widget_id, Static).render())
 
+    async def wait_for(self, pilot, predicate, what: str, timeout: float = 10.0):
+        """
+        轮询到条件成立为止。
+
+        ⚠ **别用固定次数的 `pilot.pause()` 去等后台线程。** 向导的两次网络请求
+        跑在 worker 线程里，结果经 `post_message` 回主线程——「两拍够不够」
+        是一处**藏起来的时间假设**：本机跑得过，慢一点的机器就不一定。
+
+        实测代价很具体：CI 六格里**只有 windows / Python 3.12 那一格红**，
+        挂在 `test_enter_on_failure_retries_rather_than_a_side_action`
+        （「Enter 没走重填 Key」）——按下 Enter 时第四屏还没渲染出来，
+        焦点自然不在主按钮上。**产品行为是对的，是测试等得不够久。**
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # ⚠ 带一点真实延时，不是空转。等的东西里有**真实计时器**
+            # （见 `settled` 那段说的按下特效），零延时的 `pause()` 推不动它。
+            await pilot.pause(0.02)
+            if predicate():
+                return
+        raise AssertionError(f"等待超时：{what}")
+
+    @staticmethod
+    def settled(screen, widget_id: str = "#btn-primary") -> bool:
+        """
+        按钮的**按下特效已经散掉**。
+
+        ⚠⚠ **这是本文件最容易再踩一次的坑。** `Button.press()` 会给按钮挂一个
+        `-active` 类做按下动画，而**在那期间按钮会吃掉键盘事件**。于是
+        「程序化 `press()` 推进一屏，紧接着 `pilot.press("enter")`」这个序列
+        里，那次 Enter 什么都不会发生——测试超时，看起来像产品的
+        「Enter 等于点主按钮」没实现，实际上产品是对的。
+
+        `-active` 靠**真实计时器**清除（约 0.2 秒），所以必须让时间真的走，
+        单纯多调几次 `pause()` 不管用。
+
+        真人不会撞到它：没有人会在按钮动画的 0.2 秒里再按一次 Enter，
+        而且真人那次点击本身就是键盘/鼠标事件、不是程序化 `press()`。
+        """
+        return "-active" not in screen.query_one(widget_id, Button).classes
+
     async def fill_credentials(self, pilot, screen, key="sk-test", url=None):
-        """走完第一、二屏。"""
+        """走完第一、二屏，**等到第三屏的模型列表真的回来**为止。"""
         screen.query_one("#btn-primary", Button).press()
         await pilot.pause()
         screen.query_one("#setup-key", Input).value = key
         if url is not None:
             screen.query_one("#setup-url", Input).value = url
         screen.query_one("#btn-primary", Button).press()
-        await pilot.pause()
-        await pilot.pause()
+        await self.wait_for(
+            pilot,
+            lambda: screen._list_result is not None and self.settled(screen),
+            "第三屏的模型列表",
+        )
+
+    async def run_verify(self, pilot, screen):
+        """
+        从第三屏按下一步，等到**终验结果回来、且主按钮拿到焦点**为止。
+
+        ⚠ **两个条件都要等，只等结果不够**——实测踩过。`on_verify_finished`
+        里 `_probe_result` 一赋值就立刻重绘、调 `_focus_primary()`，但
+        **Textual 的焦点是异步落位的**：结果已经在了，焦点还没到。
+        此刻按 Enter 会打到上一屏留下的焦点上，于是
+        「Enter 等于点主按钮」那两条用例莫名其妙地失败。
+
+        本方法是那两条用例的**前置条件**，把它写进等待里，
+        比在每条用例里各补一次 `pause()` 可靠。
+        """
+        screen.query_one("#btn-primary", Button).press()
+        await self.wait_for(
+            pilot,
+            lambda: screen._probe_result is not None
+            and screen.query_one("#btn-primary", Button).has_focus
+            and self.settled(screen),
+            "第四屏的终验结果、主按钮焦点与按下特效散去",
+        )
 
 
 class IntroTest(_ScreenCase):
@@ -304,9 +371,7 @@ class ModelStepTest(_ScreenCase):
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
             screen.query_one("#setup-manual", Input).value = "my-own-model"
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             self.assertEqual(load(str(self.path)).model, "my-own-model")
 
     async def test_context_window_follows_selected_model(self):
@@ -321,9 +386,7 @@ class ModelStepTest(_ScreenCase):
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
             screen.query_one("#setup-manual", Input).value = DEFAULT_MODEL
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             self.assertEqual(load(str(self.path)).context_window, 1_000_000)
 
 
@@ -332,9 +395,7 @@ class VerifyStepTest(_ScreenCase):
 
     async def _run_to_end(self, pilot, screen):
         await self.fill_credentials(pilot, screen)
-        screen.query_one("#btn-primary", Button).press()
-        await pilot.pause()
-        await pilot.pause()
+        await self.run_verify(pilot, screen)
 
     async def test_success_writes_and_lists_files(self):
         """AC15/AC17：成功时写盘，并把实际写了哪些文件列出来。"""
@@ -484,9 +545,7 @@ class EscapeMarkupTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             self.assertIn("WinError", self.text_of(screen, "#setup-status"))
 
 
@@ -555,9 +614,7 @@ class EscapeAfterSaveTest(_ScreenCase):
 
     async def _run_to_success(self, pilot, screen):
         await self.fill_credentials(pilot, screen)
-        screen.query_one("#btn-primary", Button).press()
-        await pilot.pause()
-        await pilot.pause()
+        await self.run_verify(pilot, screen)
 
     async def test_escape_after_save_finishes_instead_of_abandoning(self):
         screen = self.make()
@@ -627,9 +684,9 @@ class EnterAdvancesEveryScreenTest(_ScreenCase):
             await pilot.pause()
             screen.query_one("#setup-key", Input).value = "sk-test"
             await pilot.press("enter")
-            await pilot.pause()
-            await pilot.pause()
-            self.assertTrue(screen.query_one("#setup-models").display)
+            await self.wait_for(
+                pilot, lambda: screen.query_one("#setup-models").display, "第三屏"
+            )
 
     async def test_enter_on_model_list_goes_to_verify(self):
         screen = self.make()
@@ -637,20 +694,20 @@ class EnterAdvancesEveryScreenTest(_ScreenCase):
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
             await pilot.press("enter")
-            await pilot.pause()
-            await pilot.pause()
-            self.assertTrue(screen.query_one("#setup-status").display)
+            await self.wait_for(
+                pilot, lambda: screen.query_one("#setup-status").display, "第四屏"
+            )
 
     async def test_enter_on_success_finishes(self):
         screen = self.make()
         app = _Host(screen)
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             await pilot.press("enter")
-            await pilot.pause()
+            # ⚠ 断言前同样要等状态：dismiss → 宿主回调 → `app.outcome` 落位
+            # 这一串也不是同步完成的。
+            await self.wait_for(pilot, lambda: app.outcome is not None, "向导的结果")
         self.assertEqual(app.outcome.action, SetupAction.SAVED)
 
     async def test_enter_on_failure_retries_rather_than_a_side_action(self):
@@ -664,13 +721,12 @@ class EnterAdvancesEveryScreenTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             await pilot.press("enter")
-            await pilot.pause()
-            self.assertTrue(
-                screen.query_one("#setup-key", Input).display, "Enter 没走「重填 Key」"
+            await self.wait_for(
+                pilot,
+                lambda: screen.query_one("#setup-key", Input).display,
+                "Enter 之后退回第二屏（说明主按钮是「重填 Key」）",
             )
 
 
@@ -737,9 +793,7 @@ class ButtonRendersItsLabelTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test(size=(80, 24)) as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             visible = [b for b in screen.query(Button) if b.display]
             self.assertEqual(len(visible), 3)
             heights = {b.id: b.region.height for b in visible}
@@ -761,9 +815,7 @@ class ButtonRendersItsLabelTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test(size=(80, 24)) as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             focused = [b for b in screen.query(Button) if b.display and b.has_focus]
             others = [b for b in screen.query(Button) if b.display and not b.has_focus]
             self.assertTrue(focused and others)
@@ -785,9 +837,7 @@ class ButtonRendersItsLabelTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test(size=(80, 24)) as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             visible = [b for b in screen.query(Button) if b.display]
             self.assertEqual(len(visible), 3)
             for button in visible:
@@ -849,9 +899,7 @@ class SuccessButtonLabelTest(_ScreenCase):
         app = _Host(screen)
         async with app.run_test(size=(80, 24)) as pilot:
             await self.fill_credentials(pilot, screen)
-            screen.query_one("#btn-primary", Button).press()
-            await pilot.pause()
-            await pilot.pause()
+            await self.run_verify(pilot, screen)
             return str(screen.query_one("#btn-primary", Button).label)
 
     async def test_first_run_says_done(self):
