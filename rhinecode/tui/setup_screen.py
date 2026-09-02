@@ -112,6 +112,19 @@ class SetupScreen(ModalScreen[SetupOutcome]):
     ]
 
     DEFAULT_CSS = """
+    /*
+     * ⚠ **颜色一律取项目自己的调色板，不用 Textual 的 `$accent` / `$warning`。**
+     * 那两个在默认深色主题下是**橘色**，而橘色在本项目里有专门的语义
+     * （「你没做什么，但情况变了」——警告、确认面板、运行中）。真机反馈：
+     * 「橘色的边框和字体换成 Rhine 主题的颜色」。
+     *
+     * 取值全部与 `tui/widgets.py` 同源：
+     *   #7AEEFF  主题青（= `widgets.THEME_COLOR`，历史区框线用的就是它）
+     *   #5FD75F  成功绿（= `_COLOR_OK`）
+     *   #FF5F5F  失败红（= `_COLOR_FAIL`）
+     *   #FFA500  警告橘（**兜底提示刻意保留它**——那正是「情况变了」）
+     *   #808080  次级灰（= `widgets.SECONDARY_COLOR`）
+     */
     SetupScreen {
         align: center middle;
     }
@@ -119,41 +132,90 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         width: 74;
         height: auto;
         max-height: 90%;
-        border: round $accent;
+        /* 与 HistoryView / #panel-dock 同一条边框，视觉上是一家的 */
+        border: solid #7AEEFF 60%;
         background: $surface;
         padding: 1 2;
     }
-    SetupScreen .setup-title {
-        text-style: bold;
-        color: $accent;
+    SetupScreen #setup-header {
+        height: 1;
         margin-bottom: 1;
     }
-    SetupScreen .setup-hint {
-        color: $text-muted;
+    SetupScreen #setup-title {
+        width: 1fr;
+        color: #7AEEFF;
+        text-style: bold;
+    }
+    SetupScreen #setup-step {
+        width: auto;
+        color: #808080;
+        text-align: right;
     }
     SetupScreen .setup-warn {
-        color: $warning;
+        color: #FFA500;
     }
     SetupScreen .setup-error {
-        color: $error;
+        color: #FF5F5F;
     }
     SetupScreen .setup-ok {
-        color: $success;
+        color: #5FD75F;
+    }
+    SetupScreen .setup-dim {
+        color: #808080;
     }
     SetupScreen .setup-field-label {
         margin-top: 1;
+        color: #808080;
     }
     SetupScreen #setup-models {
         height: auto;
         max-height: 10;
         margin-top: 1;
+        border: none;
+        background: transparent;
     }
-    SetupScreen .setup-actions {
+    SetupScreen #setup-models > .option-list--option-highlighted {
+        background: #7AEEFF 20%;
+        color: #7AEEFF;
+        text-style: bold;
+    }
+    /*
+     * 动作按钮区。
+     *
+     * ⚠ **只有一个按钮时居中，多个时右对齐**（真机反馈）。靠 `.single`
+     * 这个类切换，由 `_set_buttons` 按「本屏可见几个」加减——写死一种的话，
+     * 四屏里三屏都是单按钮，那一屏三个按钮会挤在中间很别扭。
+     */
+    SetupScreen #setup-actions {
         height: auto;
         margin-top: 1;
+        align-horizontal: right;
     }
+    SetupScreen #setup-actions.single {
+        align-horizontal: center;
+    }
+    /*
+     * ⚠ **按钮扁平化，三个长得一模一样**（真机反馈：「按钮不统一」）。
+     * Textual 的 `Button` 缺省带边框、高 3 行，且 `variant="primary"` 会换一套
+     * 主题色——于是「开始」是蓝底、「我自己去改文件」是灰底，看起来像两种东西。
+     * 这里全部去掉 variant 与边框，只留一行青字，主次靠**位置**区分（主动作在最右）。
+     */
     SetupScreen Button {
-        margin-right: 1;
+        height: 1;
+        min-width: 0;
+        width: auto;
+        padding: 0 2;
+        margin-left: 2;
+        border: none;
+        background: transparent;
+        color: #7AEEFF;
+        text-style: none;
+    }
+    SetupScreen Button:focus,
+    SetupScreen Button:hover {
+        background: #7AEEFF 20%;
+        color: #7AEEFF;
+        text-style: bold;
     }
     """
 
@@ -193,28 +255,40 @@ class SetupScreen(ModalScreen[SetupOutcome]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-root"):
-            yield Static("", id="setup-title", classes="setup-title")
+            # 标题行：左边标题、右上角一个灰色角标（`Esc 退出  1/4`）。
+            # ⚠ 角标是**四个字的角标**，不是那句独占一行的说明——真机反馈说
+            # 后者「有点多余，不太像一个产品」，已删；但完全没有退出提示的话，
+            # 不知道 Esc 的人就只能杀进程了。
+            with Horizontal(id="setup-header"):
+                yield Static("", id="setup-title")
+                yield Static("", id="setup-step")
             yield Static("", id="setup-body")
 
-            # 第二屏的两个输入框
+            # 第二屏：标签 + 输入框。**说明全部放进占位符**（真机选定的极简版式）。
+            # ⚠ 已知代价：占位符一打字就消失，而地址那个框预填了值、占位符
+            # 根本不会显示。这是选版式时明知并接受的——地址本身自解释。
             yield Static("API Key", id="setup-key-label", classes="setup-field-label")
             yield Input(id="setup-key", password=False)
             yield Static("接口地址", id="setup-url-label", classes="setup-field-label")
             yield Input(id="setup-url")
 
-            # 第三屏
-            yield Static("", id="setup-fallback", classes="setup-warn")
+            # 第三屏：列表 + 兜底提示 + 手输框。
+            # ⚠ **正常时不说「列表来自服务端」**（真机选定）——那句话对用户没有
+            # 决策价值。兜底提示排在**列表之后**，于是它出现时列表位置不动。
             yield OptionList(id="setup-models")
+            yield Static("", id="setup-fallback", classes="setup-warn")
             yield Static("", id="setup-manual-label", classes="setup-field-label")
             yield Input(id="setup-manual", placeholder="直接输入模型名")
 
             # 第四屏
             yield Static("", id="setup-status")
 
-            with Horizontal(id="setup-actions", classes="setup-actions"):
-                yield Button("开始", id="btn-primary", variant="primary")
-                yield Button("我自己去改文件", id="btn-secondary")
-                yield Button("改接口地址", id="btn-tertiary")
+            # ⚠ 三个按钮**都不带 variant**——带了就会各自换一套主题色，
+            # 那正是「按钮不统一」的成因。主次靠位置：主动作永远在最右。
+            with Horizontal(id="setup-actions"):
+                yield Button("", id="btn-tertiary")
+                yield Button("", id="btn-secondary")
+                yield Button("", id="btn-primary")
 
     def on_mount(self) -> None:
         # ⚠ 输入框的初值在挂载后设，不在 compose 里——compose 阶段部件尚未
@@ -240,9 +314,13 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         实测教训是**方法名也要查**：本次字段名全部查过了，恰恰漏了方法名。
         """
         step = self._step
-        self.query_one("#setup-title", Static).update(
-            escape(f"RhineCode 配置向导　{step}/4")
-        )
+        self.query_one("#setup-title", Static).update(escape("RhineCode 配置向导"))
+        # 右上角标：`Esc 退出  N/4`。
+        # ⚠ **成功写盘之后不再提示 Esc**——那时 Esc 的语义已经变成「完成」
+        # （见 `action_abandon`），再挂一个「退出」会让人以为按下去东西没存。
+        saved = bool(self._written)
+        corner = f"{step}/4" if saved else f"Esc 退出  {step}/4"
+        self.query_one("#setup-step", Static).update(escape(corner))
 
         # 各屏专属部件的显隐
         creds = step == _STEP_CREDENTIALS
@@ -286,44 +364,64 @@ class SetupScreen(ModalScreen[SetupOutcome]):
             if label is not None:
                 button.label = label
 
+        # ⚠ **一个按钮时居中，多个时右对齐**（真机反馈）。四屏里三屏是单按钮，
+        # 写死右对齐会让它们孤零零地贴在右下角。
+        visible = sum(1 for x in (primary, secondary, tertiary) if x is not None)
+        self.query_one("#setup-actions").set_class(visible == 1, "single")
+
+    def _focus_primary(self) -> None:
+        """
+        把焦点放到主按钮上。
+
+        ⚠ **每一屏都必须有一个明确的焦点落点**，因为「按 Enter 等于点主按钮」
+        这条约定是靠焦点实现的：`Input` 与 `OptionList` 自己会把 Enter 变成
+        提交/选中事件，而没有输入部件的那两屏（第一屏、第四屏）只能靠
+        **焦点停在主按钮上**。不显式聚焦的话，Textual 会挑 DOM 里第一个
+        可聚焦部件——第四屏失败态那是「改接口地址」，于是 Enter 按下去
+        跑到了一个完全不相干的动作上。
+        """
+        button = self.query_one("#btn-primary", Button)
+        if button.display:
+            button.focus()
+
     # ---- 第一屏：说明 ----
 
     def _render_intro(self) -> None:
+        """
+        第一屏：一句话说清这是什么、要几步、大概多久。
+
+        ⚠ **刻意不显示配置文件路径，也不解释 Esc 能退出。** 真机反馈原话：
+        「这些内容感觉有点多余，不太像一个产品」。退出提示压缩成右上角四个字
+        （见 `_repaint`），路径则彻底不出现——需要手改的人有 `/setup`，
+        README 里也写着位置。**这是对 spec F6/AC10 的一次修订**，
+        `spec.md` 与 `checklist.md` 里都挂了勘误块。
+        """
         if self._mode is SetupMode.RERUN:
-            intro = (
-                "改配置。填完保存，**下次启动生效**。\n\n"
-                f"会写到：{self._config_path}\n"
-                "这台机器上所有项目共用这一份。"
-            )
+            body = "修改模型接入配置。保存后于下次启动生效。"
+            primary = "开始"
         else:
-            intro = (
-                "欢迎。花一分钟填两项，之后就不用再管了。\n\n"
-                f"会写到：{self._config_path}\n"
-                "这台机器上所有项目共用这一份。\n\n"
-                "任何时候按 Esc 都可以退出，程序会告诉你文件在哪、自己填也行。"
-            )
-        self.query_one("#setup-body", Static).update(escape(intro))
-        self._set_buttons("开始", "我自己去改文件")
+            body = "首次使用需要配置模型接入信息。共 4 步，约 1 分钟。"
+            primary = "开始"
+        self.query_one("#setup-body", Static).update(escape(body))
+        self._set_buttons(primary)
+        self._focus_primary()
 
     # ---- 第二屏：凭据与地址 ----
 
     def _render_credentials(self) -> None:
-        if self._mode is SetupMode.RERUN:
-            body = (
-                "密钥留空表示不改。要换服务商或换密钥时才需要填。\n"
-                "接口地址走代理或私有部署时才需要改。"
-            )
-            placeholder = "留空表示不改"
-        else:
-            body = (
-                "DeepSeek 的密钥，在 platform.deepseek.com 拿。\n"
-                "直接粘贴即可。它只写进上面那个文件，不会出现在界面、日志或行为记录里。"
-            )
-            placeholder = "sk-..."
-        self.query_one("#setup-body", Static).update(escape(body))
-        self.query_one("#setup-key", Input).placeholder = placeholder
+        """第二屏：两个字段，说明放在各自的占位符里。"""
+        self.query_one("#setup-body", Static).update(
+            escape("填写 DeepSeek 的访问凭据。")
+        )
+        key_input = self.query_one("#setup-key", Input)
+        key_input.placeholder = (
+            "留空则不修改"
+            if self._mode is SetupMode.RERUN
+            else "在 platform.deepseek.com 获取"
+        )
+        self.query_one("#setup-url", Input).placeholder = "使用代理或私有部署时才需要修改"
         self._set_buttons("下一步")
-        self.query_one("#setup-key", Input).focus()
+        key_input.focus()
 
     def _credentials_ready(self) -> bool:
         """
@@ -343,28 +441,34 @@ class SetupScreen(ModalScreen[SetupOutcome]):
     # ---- 第三屏：选模型 ----
 
     def _render_model(self) -> None:
-        self.query_one("#setup-manual-label", Static).update(
-            escape("认不出想要的？直接输入模型名：")
-        )
+        """
+        第三屏：模型列表。
+
+        ⚠ **正常时不显示「列表来自服务端」**（真机选定的版式）——那句话对用户
+        没有决策价值。兜底提示排在**列表之后**，因此它出现与否不改变列表的位置。
+        """
+        self.query_one("#setup-manual-label", Static).update(escape("或直接输入模型名"))
+        fallback = self.query_one("#setup-fallback", Static)
+
         if self._list_result is None:
-            self.query_one("#setup-body", Static).update(
-                escape("正在向服务端要一份当前可用的模型清单…")
-            )
-            self.query_one("#setup-fallback", Static).update("")
+            self.query_one("#setup-body", Static).update(escape("正在获取可用模型列表…"))
+            fallback.update("")
             self._set_buttons(None)
             return
 
-        self.query_one("#setup-body", Static).update(escape("选一个模型："))
+        self.query_one("#setup-body", Static).update(escape("选择模型。"))
         if self._list_result.from_fallback:
-            # ⚠ 兜底必须**说出来**（spec F9）。静默退回内置清单等于把
-            # 「清单会过期」这个问题原样搬回来了，还多骗用户一次。
-            reason = escape(self._list_result.error or "")
-            self.query_one("#setup-fallback", Static).update(
-                escape("⚠ 没能拿到服务端的清单，下面这份是内置兜底，可能已经过期。")
-                + ("\n　　" + reason if reason else "")
-            )
+            # ⚠ 兜底必须**说出来**（spec F9）。静默退回内置列表等于把
+            # 「列表会过期」这个问题原样搬回来了，还多骗用户一次。
+            # ⚠ 这里**保留橘色**（真机确认）：橘色在本项目里的语义正是
+            # 「你没做什么，但情况变了」，而这恰好就是那种情况。
+            reason = self._list_result.error or ""
+            lines = ["● 未能获取服务端列表，以下为内置列表，可能已过期"]
+            if reason:
+                lines.append("  " + reason)
+            fallback.update(escape("\n".join(lines)))
         else:
-            self.query_one("#setup-fallback", Static).update("")
+            fallback.update("")
 
         option_list = self.query_one("#setup-models", OptionList)
         option_list.clear_options()
@@ -372,48 +476,59 @@ class SetupScreen(ModalScreen[SetupOutcome]):
             # ⚠ `model_id` 与 `blurb` 都可能来自服务端，一律过 escape
             label = escape(item.model_id)
             if item.blurb:
-                label += "　" + escape(item.blurb)
+                label += "  " + escape(item.blurb)
             if item.recommended:
-                label += "　（推荐）"
+                label += "  · 推荐"
             option_list.add_option(Option(label, id=item.model_id))
         self._set_buttons("下一步")
+        # ⚠ **进来就聚焦列表**（真机要求「上下键可以选择」）。不聚焦的话
+        # 焦点会落在手输框上，上下键什么都不做，而列表看起来是可选的。
+        option_list.focus()
 
     # ---- 第四屏：终验与写盘 ----
 
     def _render_verify(self) -> None:
+        """
+        第四屏：终验结果。
+
+        ⚠ **成功页刻意只有一行结果**。原先还列了写入的文件路径与
+        「同时生成的三份模板」两段，真机反馈说多余；而且那两段**自相矛盾**
+        ——清单里只列 1 个文件，紧接着又说还有 3 个。**这是对 spec F10/AC15
+        的一次修订**，`spec.md` 与 `checklist.md` 都挂了勘误块。
+        """
         status = self.query_one("#setup-status", Static)
         if self._probe_result is None:
             self.query_one("#setup-body", Static).update(
-                escape(f"用 {self._draft.model} 发一次最小请求，确认真的能连上…")
+                escape(f"正在连接 {self._draft.model}…")
             )
             status.update("")
             self._set_buttons(None)
             return
 
+        self.query_one("#setup-body", Static).update("")
+
         if self._probe_result.ok:
-            lines = [
-                f"✓ 连上了（{self._draft.model}，{self._probe_result.elapsed_ms} 毫秒）",
-                "",
-                "已写入：",
-            ]
-            lines += [f"　　{path}" for path in self._written]
-            if self._mode is SetupMode.RERUN:
-                lines += ["", "新配置**下次启动生效**。"]
-            else:
-                lines += [
-                    "",
-                    "同时生成的 permissions / mcp / hooks 三份模板全是注释，",
-                    "暂时不改变任何行为，想用时取消注释即可。",
-                ]
-            status.update(escape("\n".join(lines)))
+            # 毫秒换成秒：`1264 毫秒` 要在脑子里换算一次，`1.3 秒` 不用。
+            seconds = self._probe_result.elapsed_ms / 1000
+            status.update(
+                escape(f"● 连接成功 · {self._draft.model} · {seconds:.1f} 秒")
+            )
             status.set_classes("setup-ok")
             self._set_buttons("开始用" if self._mode is SetupMode.FIRST_RUN else "完成")
+            self._focus_primary()
             return
 
-        # 失败：三个出口（spec F4）
-        status.update(escape("✗ " + self._probe_result.detail))
+        # 失败：三个出口（spec F4）。
+        # ⚠ 服务端原话**另起一行、灰色**，不再挤在括号里。
+        detail = self._probe_result.detail
+        head, _, tail = detail.partition("（服务端说：")
+        lines = ["● " + head.strip()]
+        if tail:
+            lines.append("  服务端说：" + tail.rstrip("）"))
+        status.update(escape("\n".join(lines)))
         status.set_classes("setup-error")
-        self._set_buttons("重填 key", "仍然保存并继续", "改接口地址")
+        self._set_buttons("重填 Key", "跳过验证，直接保存", "改接口地址")
+        self._focus_primary()
 
     # ---- 后台工作 ----
 
@@ -489,12 +604,22 @@ class SetupScreen(ModalScreen[SetupOutcome]):
 
     def action_abandon(self) -> None:
         """
-        放弃（spec F3/F18）：**不动任何文件**，交回 ABANDONED。
+        `Esc`：放弃（spec F3/F18）——**不动任何文件**，交回 ABANDONED。
 
         ⚠ 这一条在**任何一屏**都成立，包括两个等待态——网络卡住时
         `Esc` 必须能出来（spec N4）。worker 是 `exclusive` 的，
         Screen 关闭后它投递的消息会被上面两个 handler 的 `_step` 检查丢掉。
+
+        ⚠ **但配置已经写盘之后，`Esc` 的语义翻转成「完成」。** 这是真机复核
+        时发现的一个真 bug：第四屏成功页里配置**已经存好了**，此时按 Esc
+        却走放弃分支——启动路径据此打印「请在 config.yaml 填入真实 api_key
+        后重新运行」然后退出，而那句话此刻是**假的**（key 就在文件里）。
+        用户看到的是「明明配好了，它还让我去填」。判据取 `self._written`
+        非空，即「本次真的落过盘」。
         """
+        if self._written:
+            self._finish_saved()
+            return
         self.dismiss(SetupOutcome(action=SetupAction.ABANDONED, written=()))
 
     def _finish_saved(self) -> None:
@@ -507,44 +632,44 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         button_id = event.button.id
         step = self._step
 
-        if step == _STEP_INTRO:
-            if button_id == "btn-primary":
-                self._goto_credentials()
-            elif button_id == "btn-secondary":
-                self.action_abandon()
-            return
-
-        if step == _STEP_CREDENTIALS:
-            if button_id == "btn-primary":
-                self._submit_credentials()
-            return
-
-        if step == _STEP_MODEL:
-            if button_id == "btn-primary":
-                self._submit_model()
-            return
-
-        # 第四屏
-        if self._probe_result is not None and self._probe_result.ok:
-            self._finish_saved()
-            return
+        # 主按钮一律走 `_advance`——它与 Enter 共用同一条路径，
+        # 两处各写一遍的话「按钮做了 A、回车做了 B」这种分叉不会报错。
         if button_id == "btn-primary":
-            self._back_to_credentials(focus_url=False)
-        elif button_id == "btn-secondary":
-            # 「仍然保存并继续」（spec F4）：校验没过也让人进去。
-            # 断网、代理抽风、服务端 5xx 都不该把人锁死在向导里。
-            self._save()
-            self._finish_saved()
-        elif button_id == "btn-tertiary":
-            self._back_to_credentials(focus_url=True)
+            self._advance()
+            return
+
+        if step == _STEP_VERIFY and self._probe_result is not None:
+            if button_id == "btn-secondary":
+                # 「跳过验证，直接保存」（spec F4）：校验没过也让人进去。
+                # 断网、代理抽风、服务端 5xx 都不该把人锁死在向导里。
+                self._save()
+                self._finish_saved()
+            elif button_id == "btn-tertiary":
+                self._back_to_credentials(focus_url=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """在输入框里按回车 = 点了主按钮。"""
+        """
+        在输入框里按回车 = 点主按钮（真机要求：**每一屏 Enter 都等于下一步**）。
+
+        另外两屏（第一屏、第四屏）没有输入部件，靠 `_focus_primary` 把焦点
+        停在主按钮上，Textual 自己就会把 Enter 变成一次 `Button.Pressed`。
+        两条路合起来才是完整的「Enter 一律等于主按钮」。
+        """
         event.stop()
-        if self._step == _STEP_CREDENTIALS:
+        self._advance()
+
+    def _advance(self) -> None:
+        """按当前屏执行「下一步」。Enter 与主按钮共用它，避免两处分叉。"""
+        if self._step == _STEP_INTRO:
+            self._goto_credentials()
+        elif self._step == _STEP_CREDENTIALS:
             self._submit_credentials()
         elif self._step == _STEP_MODEL:
             self._submit_model()
+        elif self._probe_result is not None and self._probe_result.ok:
+            self._finish_saved()
+        elif self._probe_result is not None:
+            self._back_to_credentials(focus_url=False)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """在清单里按回车选中一个模型 = 选好了，直接往下走。"""

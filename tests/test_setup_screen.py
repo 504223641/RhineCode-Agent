@@ -116,12 +116,31 @@ class _ScreenCase(unittest.IsolatedAsyncioTestCase):
 class IntroTest(_ScreenCase):
     """第一屏（AC10）。"""
 
-    async def test_shows_config_path(self):
+    async def test_states_what_this_step_is_and_how_long(self):
+        """
+        第一屏说清「这是什么、几步、多久」。
+
+        ⚠ **它刻意不显示配置文件路径**——真机反馈「这些内容感觉有点多余，
+        不太像一个产品」。这是对 spec F6/AC10 的一次修订，两份文档都挂了勘误块。
+        本条同时是那次修订的反证：路径**不该**出现。
+        """
         screen = self.make()
         app = _Host(screen)
         async with app.run_test() as pilot:
             await pilot.pause()
-            self.assertIn(str(self.path), self.text_of(screen, "#setup-body"))
+            body = self.text_of(screen, "#setup-body")
+            self.assertIn("4 步", body)
+            self.assertNotIn(str(self.path), body, "第一屏又把路径摆出来了")
+
+    async def test_corner_shows_escape_hint_and_step(self):
+        """右上角标：`Esc 退出  1/4`。退出提示压缩成四个字，不再独占一行。"""
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            corner = self.text_of(screen, "#setup-step")
+            self.assertIn("Esc", corner)
+            self.assertIn("1/4", corner)
 
     async def test_escape_abandons_without_writing(self):
         """AC7：按 Esc 交回 ABANDONED，且**没写任何文件**。"""
@@ -135,14 +154,22 @@ class IntroTest(_ScreenCase):
         self.assertEqual(app.outcome.written, ())
         self.assertFalse(self.path.exists(), "放弃时不该写任何文件")
 
-    async def test_manual_button_also_abandons(self):
+    async def test_single_button_is_centered(self):
+        """
+        第一屏只有一个按钮，且**居中**（真机反馈：一个按钮时居中）。
+
+        ⚠ 「我自己去改文件」那个按钮已删——真机反馈说它多余。放弃这条路
+        仍然走 `Esc`（spec F3 不变），右上角标也还写着。
+        """
         screen = self.make()
         app = _Host(screen)
         async with app.run_test() as pilot:
             await pilot.pause()
-            screen.query_one("#btn-secondary", Button).press()
-            await pilot.pause()
-        self.assertEqual(app.outcome.action, SetupAction.ABANDONED)
+            visible = [
+                b for b in screen.query(Button) if b.display
+            ]
+            self.assertEqual(len(visible), 1)
+            self.assertTrue(screen.query_one("#setup-actions").has_class("single"))
 
 
 class CredentialsTest(_ScreenCase):
@@ -207,7 +234,7 @@ class CredentialsTest(_ScreenCase):
             await pilot.pause()
             screen.query_one("#btn-primary", Button).press()
             await pilot.pause()
-            self.assertIn("不改", screen.query_one("#setup-key", Input).placeholder)
+            self.assertIn("不修改", screen.query_one("#setup-key", Input).placeholder)
 
 
 class ModelStepTest(_ScreenCase):
@@ -236,9 +263,30 @@ class ModelStepTest(_ScreenCase):
         async with app.run_test() as pilot:
             await self.fill_credentials(pilot, screen)
             notice = self.text_of(screen, "#setup-fallback")
-            self.assertIn("兜底", notice)
+            self.assertIn("内置列表", notice)
             self.assertIn("过期", notice)
             self.assertIn("连不上服务器", notice, "失败原因也要说")
+
+    async def test_normal_list_says_nothing_about_its_source(self):
+        """
+        **正常拿到清单时那一行是空的**（真机选定的版式）。
+
+        「列表来自服务端」对用户没有决策价值。这条同时钉住「兜底提示排在
+        列表之后」这个位置选择——它出现与否不该把列表顶走。
+        """
+        screen = self.make(models=_OK_LIST)
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self.fill_credentials(pilot, screen)
+            self.assertEqual(self.text_of(screen, "#setup-fallback").strip(), "")
+
+    async def test_option_list_gets_focus(self):
+        """进第三屏就聚焦列表——真机要求「上下键可以选择」。"""
+        screen = self.make(models=_OK_LIST)
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self.fill_credentials(pilot, screen)
+            self.assertTrue(screen.query_one("#setup-models", OptionList).has_focus)
 
     async def test_manual_input_wins_over_selection(self):
         """
@@ -288,8 +336,12 @@ class VerifyStepTest(_ScreenCase):
         async with app.run_test() as pilot:
             await self._run_to_end(pilot, screen)
             status = self.text_of(screen, "#setup-status")
-            self.assertIn("连上了", status)
-            self.assertIn(str(self.path), status)
+            self.assertIn("连接成功", status)
+            self.assertIn("srv-flash", status)
+            # ⚠ **成功页刻意不再列出写入的文件与三份模板**（真机反馈：多余，
+            # 而且那两段自相矛盾——清单只列 1 个文件却说还有 3 个）。
+            # 这是对 spec F10/AC15 的一次修订，两份文档都挂了勘误块。
+            self.assertNotIn(str(self.path), status, "成功页又把路径摆出来了")
             screen.query_one("#btn-primary", Button).press()
             await pilot.pause()
 
@@ -474,3 +526,134 @@ class PreservesUserSectionsTest(_ScreenCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EscapeAfterSaveTest(_ScreenCase):
+    """
+    **写盘之后按 Esc 等于「完成」，不是「放弃」。**
+
+    ⚠ 这是真机复核时抓到的一个真 bug。第四屏成功页里配置**已经存好了**，
+    此时按 Esc 却走放弃分支——启动路径据此打印「请在 config.yaml 填入真实
+    api_key 后重新运行」然后退出，而那句话此刻是**假的**（key 就在文件里）。
+    用户看到的是「明明配好了，它还让我去填」。
+    """
+
+    async def _run_to_success(self, pilot, screen):
+        await self.fill_credentials(pilot, screen)
+        screen.query_one("#btn-primary", Button).press()
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_escape_after_save_finishes_instead_of_abandoning(self):
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self._run_to_success(pilot, screen)
+            await pilot.press("escape")
+            await pilot.pause()
+        self.assertEqual(app.outcome.action, SetupAction.SAVED)
+        self.assertIn(self.path, app.outcome.written)
+
+    async def test_escape_before_save_still_abandons(self):
+        """
+        反证：**没写盘时 Esc 仍然是放弃**。
+
+        判据取「本次真的落过盘」，不是「走到第几屏了」——把它写成按屏判断
+        会让「校验还没回来就按 Esc」变成一次假的成功。
+        """
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self.fill_credentials(pilot, screen)
+            await pilot.press("escape")
+            await pilot.pause()
+        self.assertEqual(app.outcome.action, SetupAction.ABANDONED)
+        self.assertFalse(self.path.exists())
+
+    async def test_corner_drops_escape_hint_after_save(self):
+        """
+        写盘之后右上角标不再写「Esc 退出」。
+
+        那时 Esc 的语义已经变成「完成」，再挂一个「退出」会让人以为
+        按下去东西没存。
+        """
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self._run_to_success(pilot, screen)
+            self.assertNotIn("Esc", self.text_of(screen, "#setup-step"))
+
+
+class EnterAdvancesEveryScreenTest(_ScreenCase):
+    """
+    **每一屏按 Enter 都等于点主按钮**（真机要求）。
+
+    实现分两条路：有输入部件的屏靠 `Input.Submitted` / `OptionList.OptionSelected`，
+    没有输入部件的两屏（第一、第四）靠 `_focus_primary` 把焦点停在主按钮上，
+    由 Textual 自己把 Enter 变成一次 `Button.Pressed`。**两条路都要有护栏**
+    ——只测其中一条的话，另一条断了完全看不出来。
+    """
+
+    async def test_enter_on_intro_goes_to_credentials(self):
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(screen.query_one("#setup-key", Input).display)
+
+    async def test_enter_in_key_input_goes_to_model_step(self):
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            screen.query_one("#setup-key", Input).value = "sk-test"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertTrue(screen.query_one("#setup-models").display)
+
+    async def test_enter_on_model_list_goes_to_verify(self):
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self.fill_credentials(pilot, screen)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertTrue(screen.query_one("#setup-status").display)
+
+    async def test_enter_on_success_finishes(self):
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self.fill_credentials(pilot, screen)
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+        self.assertEqual(app.outcome.action, SetupAction.SAVED)
+
+    async def test_enter_on_failure_retries_rather_than_a_side_action(self):
+        """
+        失败态有三个按钮，Enter 必须落在**主按钮**（重填 Key）上。
+
+        ⚠ 不显式聚焦的话，Textual 会挑 DOM 里第一个可聚焦部件——那是
+        「改接口地址」，于是 Enter 跑到一个完全不相干的动作上。
+        """
+        screen = self.make(probe_result=_AUTH_FAIL)
+        app = _Host(screen)
+        async with app.run_test() as pilot:
+            await self.fill_credentials(pilot, screen)
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(
+                screen.query_one("#setup-key", Input).display, "Enter 没走「重填 Key」"
+            )

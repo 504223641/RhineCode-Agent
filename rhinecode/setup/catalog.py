@@ -55,9 +55,9 @@ _WINDOWS: dict[str, int] = {
 # 「选哪个」，因此写的必须是**差别**（快/便宜 vs 更能想/更贵），
 # 而不是模型的自我介绍。
 _BLURBS: dict[str, tuple[str, bool]] = {
-    "deepseek-v4-flash": ("日常写代码，快、便宜", True),
-    "deepseek-v4-pro": ("更能想，慢一些也贵一些", False),
-    "deepseek-v4-flash-vision-exp": ("实验性，能看图；本项目只发文本，用不上", False),
+    "deepseek-v4-flash": ("日常编码，速度快、成本低", True),
+    "deepseek-v4-pro": ("推理能力更强，速度与成本更高", False),
+    "deepseek-v4-flash-vision-exp": ("实验性多模态；本项目只发送文本", False),
 }
 
 # 拉不到清单时的兜底候选。
