@@ -468,18 +468,16 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         url = self.query_one("#setup-url", Input).value.strip()
 
         if not url:
-            self._set_error("接口地址不能为空。")
+            self._set_error("接口地址不能为空")
             return False
         if self._mode is SetupMode.FIRST_RUN and not key:
-            self._set_error("请填写 API Key。")
+            self._set_error("请填写 API Key")
             return False
         for label, value in (("密钥", key), ("接口地址", url)):
             if not value.isascii():
-                self._set_error(
-                    f"{label}里有非 ASCII 字符（中文、全角符号或圆点）。"
-                    "常见原因是从网页上复制到了打码后的密钥，"
-                    "请回控制台复制完整的那一串。"
-                )
+                # ⚠ **一句话说完**（真机反馈：「这种报错文案也太复杂了」），
+                # 与 `probe` 那边的固定短句同一个口径。
+                self._set_error(f"{label}里有非 ASCII 字符，请重新复制")
                 return False
         self._set_error("")
         return True
@@ -519,7 +517,11 @@ class SetupScreen(ModalScreen[SetupOutcome]):
             # `ModelListResult.error` 里那个原因**刻意不显示**——已知代价是
             # 地址填错时用户只知道「没拿到」，不知道为什么。那个字段仍然留着：
             # 它是数据模型的一部分，也记录着「为什么退了兜底」。
-            fallback.update(escape("● 未能获取模型列表，以下为内置列表"))
+            #
+            # ⚠ 措辞是「**以上**为内置列表」不是「以下」——本提示挂在
+            # `OptionList` **之后**（那个位置是刻意的：提示出现与否不会把
+            # 列表顶走）。第一版写的「以下」指错了方向，真机一眼看出来。
+            fallback.update(escape("● 未能获取模型列表，以上为内置列表"))
         else:
             fallback.update("")
 

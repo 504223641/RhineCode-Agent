@@ -264,6 +264,10 @@ class ModelStepTest(_ScreenCase):
             await self.fill_credentials(pilot, screen)
             notice = self.text_of(screen, "#setup-fallback")
             self.assertIn("内置列表", notice)
+            # ⚠ 「**以上**为内置列表」——提示挂在列表**之后**。
+            # 第一版写的「以下」指错了方向，真机一眼看出来。
+            self.assertIn("以上", notice)
+            self.assertNotIn("以下", notice)
             # ⚠ **只一行**（真机选定）：具体原因刻意不显示。
             # 这条反证钉住「别顺手把 error 那一行加回来」——那正是用户说的
             # 「文案太复杂了」。
@@ -791,3 +795,42 @@ class ButtonRendersItsLabelTest(_ScreenCase):
                     button.size.height, 1, f"{button.id} 内容区高度为 0"
                 )
                 self.assertTrue(str(button.label).strip(), f"{button.id} 没有文字")
+
+
+class ValidationMessagesAreShortTest(_ScreenCase):
+    """
+    第二屏的校验提示也得是**一句短话**。
+
+    真机反馈原话：「这种报错文案也太复杂了简单点」。`probe` 那侧的固定短句
+    已有 `DetailIsAlwaysOurOwnWordsTest` 钉着长度，界面这侧此前是漏的——
+    而它恰恰是用户最容易撞到的一条（填错东西的当场）。
+    """
+
+    async def _error_after(self, key: str, url: str) -> str:
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            screen.query_one("#setup-key", Input).value = key
+            screen.query_one("#setup-url", Input).value = url
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            return self.text_of(screen, "#setup-status")
+
+    async def test_non_ascii_key_message_is_one_short_line(self):
+        text = await self._error_after("sk-●●●●", "https://api.deepseek.com")
+        self.assertIn("非 ASCII", text)
+        self.assertEqual(text.splitlines(), [text], "校验提示里有换行")
+        self.assertLessEqual(len(text), 30, f"这句太长了：{text}")
+
+    async def test_empty_key_message_is_one_short_line(self):
+        text = await self._error_after("", "https://api.deepseek.com")
+        self.assertTrue(text.strip())
+        self.assertLessEqual(len(text), 30, f"这句太长了：{text}")
+
+    async def test_non_ascii_url_is_caught_too(self):
+        text = await self._error_after("sk-ok", "https://例子.com")
+        self.assertIn("非 ASCII", text)
+        self.assertLessEqual(len(text), 30)
