@@ -321,3 +321,48 @@ class NeverRaisesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealClientNoLeakTest(unittest.TestCase):
+    """
+    **AC19 的动态一半**：走真实的 SDK 客户端，全程开 DEBUG 日志，密钥不许出现在日志里。
+
+    上面 `SecretRedactionTest` 验的是「我们自己组织的措辞」不含密钥；这一条补的是
+    另一半——**SDK 与它底下的 httpx 自己会不会把密钥写进日志**。
+    `--log-file` 把根 logger 挂上 handler 之后，第三方库的日志就一并落盘了，
+    而那条路径不经过我们任何一行代码。
+
+    ⚠ **零外部流量**：地址指向 `127.0.0.1:1`（必然没人监听），连接立刻被拒绝。
+    不联网既是纪律也是速度——这条用例跑完不到一秒。
+    """
+
+    def test_api_key_never_reaches_the_log(self):
+        import logging
+        import tempfile
+        from pathlib import Path
+
+        secret = "sk-do-not-log-me-0123456789abcdef"
+
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "run.log"
+            handler = logging.FileHandler(log_path, encoding="utf-8")
+            root = logging.getLogger()
+            previous_level = root.level
+            root.addHandler(handler)
+            root.setLevel(logging.DEBUG)
+            try:
+                result = probe.verify(
+                    secret, "http://127.0.0.1:1", "deepseek-v4-flash", timeout=2.0
+                )
+            finally:
+                root.removeHandler(handler)
+                handler.close()
+                root.setLevel(previous_level)
+
+            # 前提：这次调用确实发生了、并且确实失败在网络上
+            self.assertFalse(result.ok)
+            self.assertEqual(result.kind, ProbeFailure.NETWORK)
+            self.assertNotIn(secret, result.detail)
+
+            written = log_path.read_text(encoding="utf-8", errors="replace")
+            self.assertNotIn(secret, written, "密钥被写进日志了")
