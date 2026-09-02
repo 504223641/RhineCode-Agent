@@ -195,35 +195,38 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         align-horizontal: center;
     }
     /*
-     * 动作按钮。
+     * 动作按钮：**一行文字，没有框，选中时青底**——这是能做到的最简样式。
      *
-     * ⚠ **上一版把它压成 `height: 1` + `border: none`，结果按钮里一个字都没有。**
-     * 实测量到的是：外框 2 行、**内容区高度 0**——标签无处可画。同一段 CSS 单独
-     * 拿出来跑却正常，是它与容器嵌套一起算高度时打架。教训：Textual 的 `Button`
-     * 自带边框，把外高压到 1 就等于把内容区压没了，而**它不报错**，
-     * 只表现为「按钮显示不正常没有文字」。
-     *
-     * 现在老老实实给它 3 行（上下边框各 1、内容 1），外观改成项目的青色圆角框；
-     * 选中态是青底加粗 + 实色边框——与命令面板 `background: #7AEEFF 20%` 同一个值。
+     * ⚠ **高度必须用 `auto`，绝不能写 `height: 1`。** 上一版写死 1 之后，
+     * Textual 的 `Button` 自带边框把内容区挤成了 **0 行**，界面上就是一个
+     * 空框、一个字都没有。而它**完全静默**：不报错，`label` 属性照样是对的。
+     * `border: none` + `height: auto` 才是「一行高」的正确写法。
+     * 护栏见 `tests/test_setup_screen.py::ButtonRendersItsLabelTest`——
+     * 判据落在**内容区的实际尺寸**上，不是 `label` 属性。
      *
      * ⚠ **三个按钮都不带 `variant`**：带了 Textual 会给它换一整套主题色，
      * 于是「开始」蓝底、其余灰底——那正是「按钮不统一」的成因。
      * 主次靠**位置**区分：主动作永远在最右。
      */
     SetupScreen Button {
-        height: 3;
+        height: auto;
         width: auto;
         min-width: 0;
-        padding: 0 1;
-        margin-left: 2;
-        border: round #7AEEFF 60%;
+        padding: 0 2;
+        margin-left: 1;
+        border: none;
         background: transparent;
         color: #7AEEFF;
         text-style: none;
     }
     SetupScreen Button:focus,
     SetupScreen Button:hover {
-        border: round #7AEEFF;
+        /* ⚠ **`border: none` 在这里必须再写一遍。** Textual 的 Button 自带
+           一条 `:focus` 规则会把边框加回来，而**伪类的优先级压过纯类型选择器**
+           （`Button:focus` > `SetupScreen Button`）。只在上面那条写 `border: none`
+           的话，按钮平时是一行、**一拿到焦点就变回三行**——而第一屏进来
+           焦点就在它身上，于是看起来像根本没生效。 */
+        border: none;
         background: #7AEEFF 20%;
         color: #7AEEFF;
         text-style: bold;

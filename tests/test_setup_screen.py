@@ -688,6 +688,28 @@ class ButtonRendersItsLabelTest(_ScreenCase):
             )
             self.assertIn("开始", str(button.label))
 
+    async def test_focused_button_stays_one_line(self):
+        """
+        **有焦点时按钮不许变高。**
+
+        ⚠ Textual 的 `Button` 自带一条 `:focus` 规则会把边框加回来，而
+        **伪类的优先级压过纯类型选择器**（`Button:focus` > `SetupScreen Button`）
+        ——只在非焦点那条里写 `border: none` 的话，按钮平时一行、**一拿到焦点
+        就变回三行**。而第一屏进来焦点就在它身上，于是看起来像根本没生效。
+
+        判据取**外框高度**（`region.height`），不是内容高度：内容在两种情况下
+        都是 1，坏掉的只有外框。
+        """
+        screen = self.make()
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            button = screen.query_one("#btn-primary", Button)
+            self.assertTrue(button.has_focus, "第一屏进来焦点就该在主按钮上")
+            self.assertEqual(
+                button.region.height, 1, "按钮拿到焦点后变高了——:focus 把边框加回来了"
+            )
+
     async def test_all_three_buttons_render_on_the_failure_screen(self):
         """失败屏三个按钮同时可见，且每一个都画得出文字。"""
         screen = self.make(probe_result=_AUTH_FAIL)
