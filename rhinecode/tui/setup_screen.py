@@ -569,7 +569,10 @@ class SetupScreen(ModalScreen[SetupOutcome]):
                 escape(f"● 连接成功 · {self._draft.model} · {seconds:.1f} 秒")
             )
             status.set_classes("setup-ok")
-            self._set_buttons("开始用" if self._mode is SetupMode.FIRST_RUN else "完成")
+            # ⚠ 两种模式**用同一个词**（真机反馈：把「开始用」改成「完成」）。
+            # 此前首次配置写「开始用」、重跑写「完成」，那是一处没必要的分叉：
+            # 按钮说的是「这一步做完了」，与后面接什么无关。
+            self._set_buttons("完成")
             self._focus_primary()
             return
 

@@ -303,7 +303,7 @@ python -m unittest tests.test_config_timeout                                    
 **步骤：**
 1. 进入时异步调 `probe.verify`，显示等待态。
 2. 成功 → 调 `writer.apply`，展示实际写入的文件清单 + 一句「三份可选模板
-   全是注释、暂不改变行为」；出口「开始用」→ `dismiss(SAVED, written)`。
+   全是注释、暂不改变行为」；出口「完成」→ `dismiss(SAVED, written)`。
 3. 失败 → 按 `ProbeFailure` 四类给不同措辞（**过 `escape`**），三个出口：
    「重填 key」（回第 2 屏）/「改接口地址」（回第 2 屏并聚焦地址）/
    「仍然保存并继续」（照样 `writer.apply` 后 `dismiss(SAVED, ...)`）。

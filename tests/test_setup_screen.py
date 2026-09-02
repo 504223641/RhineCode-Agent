@@ -834,3 +834,33 @@ class ValidationMessagesAreShortTest(_ScreenCase):
         text = await self._error_after("sk-ok", "https://例子.com")
         self.assertIn("非 ASCII", text)
         self.assertLessEqual(len(text), 30)
+
+
+class SuccessButtonLabelTest(_ScreenCase):
+    """
+    成功页那个按钮两种模式**用同一个词**：「完成」。
+
+    此前首次配置写「开始用」、重跑写「完成」——那是一处没必要的分叉，
+    而按钮说的是「这一步做完了」，与后面接什么无关。真机反馈定的。
+    """
+
+    async def _label_after_success(self, mode) -> str:
+        screen = self.make(mode=mode)
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await self.fill_credentials(pilot, screen)
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            await pilot.pause()
+            return str(screen.query_one("#btn-primary", Button).label)
+
+    async def test_first_run_says_done(self):
+        self.assertEqual(await self._label_after_success(SetupMode.FIRST_RUN), "完成")
+
+    async def test_rerun_says_the_same_thing(self):
+        self.path.write_text(
+            "protocol: deepseek\nmodel: m\nbase_url: https://api.deepseek.com\n"
+            "api_key: sk-existing\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(await self._label_after_success(SetupMode.RERUN), "完成")
