@@ -195,20 +195,29 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         align-horizontal: center;
     }
     /*
-     * 动作按钮：**一行文字，没有框，选中时青底**——这是能做到的最简样式。
+     * 动作按钮：**一行文字，没有框，有没有焦点长得一模一样**。
      *
-     * ⚠ **高度必须用 `auto`，绝不能写 `height: 1`。** 上一版写死 1 之后，
-     * Textual 的 `Button` 自带边框把内容区挤成了 **0 行**，界面上就是一个
-     * 空框、一个字都没有。而它**完全静默**：不报错，`label` 属性照样是对的。
-     * `border: none` + `height: auto` 才是「一行高」的正确写法。
-     * 护栏见 `tests/test_setup_screen.py::ButtonRendersItsLabelTest`——
-     * 判据落在**内容区的实际尺寸**上，不是 `label` 属性。
+     * ⚠⚠ **选择器必须带上自己的类 `.setup-action`，这是实测逼出来的。**
+     * Textual 给每个 `Button` 挂了一个内部类 `-style-default`，它那条规则是
+     * `Button.-style-default { border: tall ... }`——**「类型+类」的优先级压过
+     * 「类型+类型」**，于是 `SetupScreen Button { border: none }` 一直在输。
      *
-     * ⚠ **三个按钮都不带 `variant`**：带了 Textual 会给它换一整套主题色，
-     * 于是「开始」蓝底、其余灰底——那正是「按钮不统一」的成因。
-     * 主次靠**位置**区分：主动作永远在最右。
+     * 实测出来的症状正是用户报的那个：**有焦点的按钮 1 行、没焦点的 3 行**
+     * ——因为只有带 `:focus` 伪类的那条规则（也算一个「类」）赢了，
+     * 平时那条从来没生效过。加上自己的类之后是「2 类型 + 1 类」，稳赢。
+     *
+     * ⚠ **`border: none` 在焦点态那条也要再写一遍**：Textual 自带的
+     * `Button:focus` 会把边框加回来，同样是伪类压类型的形态。
+     *
+     * ⚠ **焦点态刻意不做任何视觉区分**（用户要求「不需要添加焦点」）。
+     * 代价是失败屏那三个按钮长得一样、看不出回车会落在哪个上——
+     * 主次靠**位置**表达：主动作永远在最右。
+     *
+     * ⚠ 高度写法：`height: auto` + `border: none` 才是「一行高」。写死
+     * `height: 1` 会把内容区挤成 0 行、按钮里一个字都没有，而且完全静默
+     * （`label` 属性照样是对的）——那是上一个 bug 的成因。
      */
-    SetupScreen Button {
+    SetupScreen Button.setup-action {
         height: auto;
         width: auto;
         min-width: 0;
@@ -219,17 +228,12 @@ class SetupScreen(ModalScreen[SetupOutcome]):
         color: #7AEEFF;
         text-style: none;
     }
-    SetupScreen Button:focus,
-    SetupScreen Button:hover {
-        /* ⚠ **`border: none` 在这里必须再写一遍。** Textual 的 Button 自带
-           一条 `:focus` 规则会把边框加回来，而**伪类的优先级压过纯类型选择器**
-           （`Button:focus` > `SetupScreen Button`）。只在上面那条写 `border: none`
-           的话，按钮平时是一行、**一拿到焦点就变回三行**——而第一屏进来
-           焦点就在它身上，于是看起来像根本没生效。 */
+    SetupScreen Button.setup-action:focus,
+    SetupScreen Button.setup-action:hover {
         border: none;
-        background: #7AEEFF 20%;
+        background: transparent;
         color: #7AEEFF;
-        text-style: bold;
+        text-style: none;
     }
     """
 
@@ -300,9 +304,9 @@ class SetupScreen(ModalScreen[SetupOutcome]):
             # ⚠ 三个按钮**都不带 variant**——带了就会各自换一套主题色，
             # 那正是「按钮不统一」的成因。主次靠位置：主动作永远在最右。
             with Horizontal(id="setup-actions"):
-                yield Button("", id="btn-tertiary")
-                yield Button("", id="btn-secondary")
-                yield Button("", id="btn-primary")
+                yield Button("", id="btn-tertiary", classes="setup-action")
+                yield Button("", id="btn-secondary", classes="setup-action")
+                yield Button("", id="btn-primary", classes="setup-action")
 
     def on_mount(self) -> None:
         # ⚠ 输入框的初值在挂载后设，不在 compose 里——compose 阶段部件尚未

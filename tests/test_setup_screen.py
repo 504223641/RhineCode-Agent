@@ -688,17 +688,13 @@ class ButtonRendersItsLabelTest(_ScreenCase):
             )
             self.assertIn("开始", str(button.label))
 
-    async def test_focused_button_stays_one_line(self):
+    async def test_focused_button_is_one_line(self):
         """
-        **有焦点时按钮不许变高。**
+        按钮只占一行——包括**有焦点**的时候。
 
-        ⚠ Textual 的 `Button` 自带一条 `:focus` 规则会把边框加回来，而
-        **伪类的优先级压过纯类型选择器**（`Button:focus` > `SetupScreen Button`）
-        ——只在非焦点那条里写 `border: none` 的话，按钮平时一行、**一拿到焦点
-        就变回三行**。而第一屏进来焦点就在它身上，于是看起来像根本没生效。
-
-        判据取**外框高度**（`region.height`），不是内容高度：内容在两种情况下
-        都是 1，坏掉的只有外框。
+        ⚠ Textual 自带的 `Button:focus` 会把边框加回来（伪类压类型）。
+        判据取**外框高度**（`region.height`）而不是内容高度：内容在坏掉的那版
+        里也是 1，变高的只有外框。
         """
         screen = self.make()
         app = _Host(screen)
@@ -706,9 +702,67 @@ class ButtonRendersItsLabelTest(_ScreenCase):
             await pilot.pause()
             button = screen.query_one("#btn-primary", Button)
             self.assertTrue(button.has_focus, "第一屏进来焦点就该在主按钮上")
+            self.assertEqual(button.region.height, 1)
+
+    async def test_all_visible_buttons_have_the_same_height(self):
+        """
+        **有焦点和没焦点的按钮必须一样大。** 这条直接钉住用户报的那个症状。
+
+        ⚠ 成因值得记住：Textual 给每个 `Button` 挂了内部类 `-style-default`，
+        它那条规则是 `Button.-style-default { border: tall ... }`——
+        **「类型+类」的优先级压过「类型+类型」**，于是
+        `SetupScreen Button { border: none }` 一直在输，只有带 `:focus` 伪类
+        （也算一个「类」）的那条赢了。结果就是**有焦点的 1 行、没焦点的 3 行**。
+        修法是给按钮加一个自己的类，凑成「2 类型 + 1 类」。
+
+        判据刻意是「三个**互相**一样高」而不是「都等于 1」：写成后者的话，
+        某天整体改成两行高就要跟着改这条，而它想钉的从来不是那个数字。
+        """
+        screen = self.make(probe_result=_AUTH_FAIL)
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await self.fill_credentials(pilot, screen)
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            await pilot.pause()
+            visible = [b for b in screen.query(Button) if b.display]
+            self.assertEqual(len(visible), 3)
+            heights = {b.id: b.region.height for b in visible}
             self.assertEqual(
-                button.region.height, 1, "按钮拿到焦点后变高了——:focus 把边框加回来了"
+                len(set(heights.values())), 1, f"按钮高度不一致：{heights}"
             )
+            # 焦点确实在其中一个身上——不然这条用例等于什么都没验
+            self.assertTrue(any(b.has_focus for b in visible))
+
+    async def test_focus_does_not_change_appearance(self):
+        """
+        **焦点不做任何视觉区分**（用户要求「不需要添加焦点」）。
+
+        代价已知：失败屏那三个按钮长得一样，看不出回车会落在哪个上——
+        主次靠**位置**表达（主动作永远在最右）。这条钉的是「别顺手把
+        高亮加回来」。
+        """
+        screen = self.make(probe_result=_AUTH_FAIL)
+        app = _Host(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await self.fill_credentials(pilot, screen)
+            screen.query_one("#btn-primary", Button).press()
+            await pilot.pause()
+            await pilot.pause()
+            focused = [b for b in screen.query(Button) if b.display and b.has_focus]
+            others = [b for b in screen.query(Button) if b.display and not b.has_focus]
+            self.assertTrue(focused and others)
+            for other in others:
+                self.assertEqual(
+                    focused[0].styles.background,
+                    other.styles.background,
+                    "焦点态又有底色了",
+                )
+                self.assertEqual(
+                    focused[0].styles.text_style,
+                    other.styles.text_style,
+                    "焦点态又加粗了",
+                )
 
     async def test_all_three_buttons_render_on_the_failure_screen(self):
         """失败屏三个按钮同时可见，且每一个都画得出文字。"""
