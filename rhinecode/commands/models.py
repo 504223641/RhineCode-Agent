@@ -265,6 +265,17 @@ class CommandController(Protocol):
         """刷新底部状态栏（影响模式或状态的命令执行后显式调用）。"""
         ...
 
+    def open_setup(self) -> None:
+        """
+        打开配置向导（first-run-setup 扩展 F15）。
+
+        ⚠ **这是一处成对维护点，共三处**：本协议方法 ↔
+        `commands/builtins.py` 的 `/setup` 注册项 ↔ `tui/app.py` 的实现。
+        漏掉任何一处的表现都是**「命令能补全、按了没反应」**，不报错。
+        护栏见 `tests/test_setup_command.py`。
+        """
+        ...
+
     def clear_conversation(self) -> None:
         """清空对话历史与聊天区（/clear 的领域与界面副作用）。"""
         ...

@@ -238,6 +238,19 @@ def _handle_resume(invocation: CommandInvocation, controller: CommandController)
     controller.resume_session(invocation.arguments or None)
 
 
+def _handle_setup(invocation: CommandInvocation, controller: CommandController) -> None:
+    """
+    /setup：重新走一遍配置向导（first-run-setup 扩展 F15）。
+
+    向导自己负责一切（预填、拉模型清单、终验、写盘），本处只负责把它打开。
+    多余参数忽略——它没有子命令，而报一个「参数错误」只会挡住用户。
+
+    ⚠ **成对维护点**：本处理函数与注册项 ↔ `CommandController.open_setup`
+    ↔ `tui/app.py` 的实现，三处缺一不可，漏了不报错。
+    """
+    controller.open_setup()
+
+
 def _handle_clear(invocation: CommandInvocation, controller: CommandController) -> None:
     """
     /clear：清空对话（历史 + 聊天区 + 新会话档），显示兼容确认文本并刷新状态栏
@@ -405,6 +418,14 @@ def build_builtin_registry() -> CommandRegistry:
                 command_type=CommandType.LOCAL,
                 handler=_handle_skills,
                 argument_hint="[子命令]",
+            ),
+            CommandSpec(
+                name="/setup",
+                aliases=(),
+                description="重新配置 API Key、接口地址与模型（下次启动生效）",
+                usage="/setup",
+                command_type=CommandType.UI,
+                handler=_handle_setup,
             ),
             CommandSpec(
                 name="/clear",

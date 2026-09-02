@@ -9,10 +9,18 @@
 # 权限系统 / Skill / 子 Agent 全都只在 deepseek 下可用）。
 # 老配置里若还写着那两个值，启动时会明确报错并给出改法。
 protocol: deepseek
-model: deepseek-chat
+
+# 模型。当前官方在售两个：
+#   deepseek-v4-flash  日常写代码，快、便宜（缺省）
+#   deepseek-v4-pro    更能想，慢一些也贵一些
+# 老别名 deepseek-chat / deepseek-reasoner **已于 2026-07-24 停用**，
+# 写它们会直接报「模型不存在」。运行中敲 /setup 可以拉一次实时清单。
+model: deepseek-v4-flash
 base_url: https://api.deepseek.com
 api_key: YOUR_API_KEY
 
 # 可选：上下文窗口上限（token），c8 两层压缩据此判断历史是否逼近溢出。
-# 缺省 65536；不同模型/账号窗口不同，可按需调整。非法或 <=0 会回退默认值。
-# context_window: 65536
+# 缺省 1000000（DeepSeek V4 全系都是 1M）。它不改变模型的真实上限，
+# 只决定什么时候开始压缩历史；换用窗口更小的模型时要跟着调小。
+# 非法或 <=0 会回退默认值。
+# context_window: 1000000

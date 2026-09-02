@@ -20,22 +20,35 @@ git clone https://github.com/504223641/RhineCode-Agent.git
 cd RhineCode-Agent
 pip install -e .
 
-rhine          # 第一次运行会在 ~/.rhinecode/ 生成配置模板并告诉你去哪填 key
+cd 你自己的项目目录    # 当前目录就是它能操作的范围
+rhine
 ```
 
-在 `~/.rhinecode/config.yaml` 里填上 `api_key`，然后 **`cd` 到你自己的项目目录**、
-再敲一次 `rhine` 就开始了——当前目录就是它能操作的范围。
+**第一次运行会弹出一个四屏的配置向导**：粘贴 API Key → 选模型（清单是当场向
+DeepSeek 要的，不是写死的）→ 它发一次最小请求确认能连上 → 直接进入主界面。
+**全程不用离开终端，也不用再敲一次命令。**
+
+配置写在 `~/.rhinecode/config.yaml`，这台机器上所有项目共用。想改随时敲
+`/setup` 重来一遍（改完下次启动生效）。
+
+想手填也可以——向导任何一屏按 `Esc` 就会退出并告诉你文件在哪：
 
 ```yaml
 protocol: deepseek
-model: deepseek-chat
+model: deepseek-v4-flash     # 另一个是 deepseek-v4-pro，更能想但慢一些贵一些
 base_url: https://api.deepseek.com
 api_key: sk-你的密钥
 ```
 
+> ⚠ 老别名 `deepseek-chat` / `deepseek-reasoner` **已于 2026-07-24 停用**，
+> 填它们会直接报「模型不存在」。
+>
 > 同时生成的还有 `permissions.yaml` / `mcp.yaml` / `hooks.yaml` 三份可选配置，
 > 模板内容**全是注释、默认不生效**，想用时取消注释即可。
 > 完整字段与三层配置的优先级见 [安装、配置与启动](docs/guide/getting-started.md)。
+>
+> 在 CI、管道或重定向里跑（**没有终端**）时不会弹向导，行为与以前一样：
+> 生成模板、提示一句、退出。
 
 **本项目只支持 DeepSeek 一个 Provider。** `protocol` 字段刻意保留（环境信息、状态栏、
 行为记录都在读它），但填成已删除的 `anthropic` / `openai` 会在启动时报错并给出迁移说明。

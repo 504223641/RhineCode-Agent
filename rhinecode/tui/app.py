@@ -33,7 +33,8 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Static, Input
 
 from rhinecode import logsetup
-from rhinecode.config import Config
+from pathlib import Path
+from rhinecode.config import Config, user_config_path
 from rhinecode.subagents.tasks import STATUS_LABELS, TaskManager
 from rhinecode.commands import (
     CommandDispatcher,
@@ -561,6 +562,7 @@ class RhineApp(App):
         config: Config,
         command_registry: CommandRegistry,
         recorder: "Optional[TraceRecorderProtocol]" = None,
+        config_path: "Optional[Path]" = None,
     ):
         """
         :param manager: 已初始化的对话管理器，持有 Provider / Agent 和对话历史
@@ -570,10 +572,18 @@ class RhineApp(App):
                                  保证执行、补全与帮助共享同一份事实来源
         :param recorder: 行为记录器（trace 设施）。缺省用 `NullRecorder()`，
                          **不传等于零回归**，界面层的全部埋点变成空调用
+        :param config_path: 本次实际加载的配置文件路径（first-run-setup 扩展）。
+                         `/setup` 要写回**这一份**，不是想当然的用户级那份——
+                         用 `--config x.yaml` 启动时，写用户级等于**改了一个
+                         跟当前运行无关的文件**，而界面上完全看不出来。
+                         缺省 None 时退回 `config.user_config_path()`（等于现状，
+                         既有调用方一个字都不用改）
         """
         super().__init__()
         self._manager = manager
         self._config = config
+        # first-run-setup 扩展：`/setup` 要写回本次真正在用的那份配置。
+        self._config_path = config_path or user_config_path()
         # 行为记录器：Null Object 兜底，界面各埋点无需判空（trace spec N1）
         self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         # 命令层接线（c10）：单个分发器实例，提交入口的唯一分流点。
@@ -1396,6 +1406,56 @@ class RhineApp(App):
     def refresh_status(self) -> None:
         """刷新状态栏（命令处理函数显式调用，取代旧的命令字符串白名单）。"""
         self._refresh_status()
+
+    def open_setup(self) -> None:
+        """
+        `/setup`：在运行中重新走一遍配置向导（first-run-setup 扩展 F15–F18）。
+
+        执行流程：
+        1. 从**本次实际在用的**配置文件里读出可预填的几项
+           （`read_current` 契约上不回真实密钥，界面上那一栏是空的）。
+        2. 把与首次启动**同一个** `SetupScreen` 推上来，只是模式为 RERUN。
+        3. 保存则提示「下次启动生效」，放弃则什么都不做。
+
+        ⚠ **不做热切换**（F17）。热切换要在 Agent 循环运行期换掉共享的
+        Provider 实例，属独立评审的改动；这与 `/hooks` `/agents`
+        「改了配置要重启」的既有约定一致。
+
+        ⚠ **Agent 正在跑的时候也允许打开**：它不碰任何运行期状态，
+        后台 Worker 照常跑，面板关掉就看得到结果。
+
+        ⚠ **成对维护点（三处）**：本方法 ↔ `CommandController.open_setup`
+        ↔ `commands/builtins.py` 的 `/setup` 注册项。漏掉任何一处的表现都是
+        「命令能补全、按了没反应」，不报错。
+
+        副作用：推一个 Screen；用户确认后会写配置文件。
+        """
+        from rhinecode.setup import writer
+        from rhinecode.setup.models import SetupMode
+        from rhinecode.tui.setup_screen import SetupScreen
+
+        path = self._config_path
+        self.push_screen(
+            SetupScreen(path, prefill=writer.read_current(path), mode=SetupMode.RERUN),
+            self._on_setup_done,
+        )
+
+    def _on_setup_done(self, outcome) -> None:
+        """
+        向导关闭后的回调。
+
+        :param outcome: `SetupOutcome`；Screen 被强制关掉时可能是 None
+
+        放弃时**什么都不做**（F18）——不写文件，也不往聊天区留痕迹。
+        一次「我看看，算了」不该在对话历史里留下任何东西。
+        """
+        from rhinecode.setup.models import SetupAction
+
+        if outcome is None or outcome.action is not SetupAction.SAVED:
+            return
+        self.show_event(
+            f"配置已保存到 {self._config_path}，新配置下次启动生效。"
+        )
 
     def clear_conversation(self) -> None:
         """

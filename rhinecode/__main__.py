@@ -30,6 +30,9 @@ from pathlib import Path
 from rhinecode.bootstrap import BootstrapError, build_app
 from rhinecode.config import load, user_config_path, scaffold_user_config, PLACEHOLDER_API_KEY
 from rhinecode import logsetup
+from rhinecode.setup import trigger
+from rhinecode.setup.models import SetupAction
+from rhinecode.tui.setup_host import run_setup
 from rhinecode.permission import config as perm_config
 from rhinecode.hooks import config as hook_config
 from rhinecode.mcp import config as mcp_config
@@ -43,6 +46,26 @@ from rhinecode.trace.recorder import create_recorder
 # 两个选项共用同一个哨兵：它们的三态语义逐字相同，各写一份只会让
 # 「改了一个忘了另一个」成为可能。
 _PATH_DEFAULT = "<default>"
+
+
+def _stdin_is_interactive() -> bool:
+    """
+    判断这次运行有没有一个真人坐在终端前（first-run-setup 扩展 spec F2）。
+
+    :returns: 标准输入是终端则真
+
+    这条判据一次覆盖三种「不该弹向导」的场景：CI、管道（`echo x | rhine`）、
+    重定向（`rhine < /dev/null`）。它们共同的特征就是标准输入不是终端。
+
+    ⚠ **`sys.stdin` 可能是 None**（Windows 上用 pythonw 之类的无控制台方式
+    启动时），此时 `sys.stdin.isatty()` 会抛 AttributeError；`isatty()` 自身
+    也可能在已关闭的流上抛 ValueError。两种都按「非交互」处理——
+    判不准的时候，选那条**逐字保持老行为**的路。
+    """
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
 
 # 入口层的 logger。日志缺省关闭，因此这些调用在不开 --log-file 时**零开销地
 # 什么都不做**（根 logger 上没有 handler）。
@@ -151,7 +174,32 @@ def main() -> None:
         except OSError as e:
             print(f"无法生成配置模板：{e}", file=sys.stderr)
             sys.exit(1)
-        if config_created:
+
+        # first-run-setup 扩展：配置不可用时，**在终端里**把人引到向导上。
+        #
+        # 判据是「这份配置当前可不可用」而不是「跑过没跑过」（spec F1）——
+        # 不落任何「已完成首次配置」的标记位，否则用户手工删掉 key 之后
+        # 就再也引导不出来，手上只剩一个起不来的程序和一句「请填入 api_key」。
+        reason = trigger.classify(config_path)
+
+        if reason is not None and _stdin_is_interactive():
+            outcome = run_setup(config_path)
+            if outcome.action is SetupAction.ABANDONED:
+                # 放弃 = 回到老路：告诉他文件在哪，自己填也行（spec F3）。
+                # 退出码 0——用户主动放弃不是错误。
+                print(
+                    f"已在 {config_path.parent} 生成配置模板"
+                    "（config.yaml / permissions.yaml / mcp.yaml / hooks.yaml），"
+                    "请在 config.yaml 填入真实 api_key 后重新运行 rhine。"
+                )
+                sys.exit(0)
+            # SAVED → 配置已落盘，继续往下走。
+            # ⚠ **仍然照常走下面的 `load()`**，不跳过校验：向导不做
+            # 「我写的一定对」的假设，让 load() 把它再验一遍。
+        elif config_created:
+            # ⚠ **非交互路径逐字保持本扩展之前的行为**（spec F2）：
+            # 提示一句、退出码 0。破了这条，CI、管道、`&&` 链、任何包装
+            # 脚本都会断——它们没有终端可弹向导，只会永远挂在那儿。
             print(
                 f"已在 {config_path.parent} 生成配置模板"
                 "（config.yaml / permissions.yaml / mcp.yaml / hooks.yaml），"
@@ -193,6 +241,9 @@ def main() -> None:
             cfg,
             resume_latest=args.continue_session,
             recorder=recorder,
+            # first-run-setup 扩展：`/setup` 要写回**这次真正加载的**那份配置，
+            # 而不是想当然的用户级那份——`--config x.yaml` 启动时两者不是一个文件。
+            config_path=config_path,
         )
     except BootstrapError as e:
         print(e, file=sys.stderr)

@@ -41,6 +41,10 @@ EXPECTED_TABLE = {
     # **纯只读、无子命令**——任务的增删改由模型通过工具做，不由用户敲命令做，
     # 否则会出现两条并行的写路径，而命令层那条绕开了「谁改的」这个记录。
     "/tasks": ({"/board"}, CommandType.LOCAL),
+    # first-run-setup 扩展新增：重跑配置向导。无别名、界面类型。
+    # **UI 而不是 LOCAL**：它推一个 ModalScreen 上来，属于「改变界面状态」；
+    # 走 PROMPT 的话敲一次会变成一句发给模型的话，既花钱又什么都不会发生。
+    "/setup": (set(), CommandType.UI),
     "/clear": ({"/reset", "/new"}, CommandType.UI),
     "/exit": ({"/quit"}, CommandType.UI),
 }
@@ -52,19 +56,22 @@ class BuiltinMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = build_builtin_registry()
 
-    def test_exactly_fifteen_canonical_commands(self) -> None:
+    def test_exactly_sixteen_canonical_commands(self) -> None:
         """
-        内置命令恰好十五条（C10 的十二条 + c11 的 /skills + c12 的 /hooks
+        内置命令恰好十六条（C10 的十二条 + c11 的 /skills + c12 的 /hooks
         + c13 的 /agents + c15 的 /tasks，减去 auto-plan 扩展合并掉的一条
-        ——`/plan` 与 `/perm` 合并为 `/mode`，`/plan` 降为别名）。
+        ——`/plan` 与 `/perm` 合并为 `/mode`，`/plan` 降为别名；
+        再加 first-run-setup 扩展的 `/setup`）。
 
         这条 len 断言是「批准表」的护栏——它保证任何人新增命令时必须
         显式更新 EXPECTED_TABLE 并同步这个数字，而不能悄悄加进去。
         **绝不能因为它变红就删掉它**，那等于让护栏永久失效。
+        ⚠ 它变红时正确的做法是**先确认这条命令是不是真的被批准了**，
+        再改这里的数字——本次 `/setup` 出自 first-run-setup 扩展的 spec F15。
         """
         names = [s.name for s in self.registry.visible_commands()]
         self.assertEqual(set(names), set(EXPECTED_TABLE))
-        self.assertEqual(len(names), 15)
+        self.assertEqual(len(names), 16)
 
     def test_alias_mapping(self) -> None:
         """全部首批别名映射正确（spec F10/AC5）。"""

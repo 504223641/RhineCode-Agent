@@ -29,6 +29,37 @@ _KNOWN_PROVIDERS = ("bocha", "brave")
 # 因此需要单独识别，用来区分「用户已填真实 key」和「刚生成模板还没填」。
 PLACEHOLDER_API_KEY = "YOUR_API_KEY"
 
+# 缺省模型（first-run-setup 扩展 F19）。
+#
+# ⚠ **这里曾经写着 `deepseek-chat`，而那个名字已经死了。** DeepSeek 于
+# 2026-04-24 公告 `deepseek-chat` / `deepseek-reasoner` 两个老别名在
+# **2026-07-24 停用**，官方定价页此后不再列出它们。也就是说在那之后，
+# 一个新用户装好、填上真 key、照模板跑，**第一句话就报模型不存在**。
+#
+# 更值得记住的是它**没被发现一个多月**：项目自己从年中起所有真机验收
+# （`docs/e2e-sweep/`、各扩展的 acceptance）用的都是 `deepseek-v4-flash`,
+# 而模板里一直是老名字——**实际在用的和写下来的早就分家了**。这正是
+# first-run-setup 扩展让向导**向服务端拉模型清单**、只把这里当兜底的直接依据。
+#
+# ⚠ **成对维护点**：本常量 ↔ `setup/catalog.py` 的兜底清单 ↔
+# `config.example.yaml`。三处都在声明「我们认为当前该用哪个模型」，
+# 已经分家过一次了。护栏见 `tests/test_setup_catalog.py`。
+DEFAULT_MODEL = "deepseek-v4-flash"
+
+# 缺省上下文窗口上限（token，first-run-setup 扩展 F20）。
+#
+# ⚠ **这里曾经写着 65536，而 DeepSeek V4 全系是 1M**（最大输出 384K）。
+# 差 15 倍的后果不是报错，而是 c8 的两层压缩在**真实窗口的 6.5% 处**就开始
+# 压历史——白白丢掉上下文，还白花一次摘要的钱。项目自己的端到端实测
+# （`docs/e2e-sweep/README.md`）配的正是 1000000。
+#
+# ⚠ 它只影响 RhineCode 判断「何时该压缩」，**不改变模型的真实上限**。
+# 换用窗口更小的模型时必须跟着调小，否则会一直压不动、直到服务端报超长。
+#
+# ⚠ **成对维护点**：本常量 ↔ `_CONFIG_TEMPLATE` 的注释 ↔
+# `docs/internals/config.md`。护栏见 `tests/test_config_timeout.py::TemplateAndDocsTest`。
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+
 # 首次运行自动生成的配置模板。内容与 config.example.yaml 对齐（默认 deepseek），
 # api_key 用占位符，引导用户填入真实值后再运行。
 _CONFIG_TEMPLATE = """\
@@ -39,11 +70,26 @@ _CONFIG_TEMPLATE = """\
 # 已于 2026-08-20 删除（它们一直停留在纯对话能力，工具调用 / Plan Mode /
 # 权限系统 / Skill / 子 Agent 全都只在 deepseek 下可用）。
 protocol: deepseek
-model: deepseek-chat
+
+# 模型。当前官方在售两个：
+#   deepseek-v4-flash  日常写代码，快、便宜（缺省）
+#   deepseek-v4-pro    更能想，慢一些也贵一些
+# ⚠ 老别名 deepseek-chat / deepseek-reasoner **已于 2026-07-24 停用**，
+#   写它们会直接报「模型不存在」。
+# 不确定当前有哪些可用时，运行中敲 /setup 会向服务端拉一次实时清单。
+model: deepseek-v4-flash
 base_url: https://api.deepseek.com
 api_key: YOUR_API_KEY
 
 # ---- 可选项（不写即用缺省值）----
+
+# 上下文窗口上限（token），缺省 1000000。RhineCode 据此判断「历史是不是快装不下了、
+# 该不该压缩」。DeepSeek V4 全系都是 1M，所以缺省值就照它写。
+#
+# ⚠ 它**不改变模型的真实上限**，只影响什么时候开始压缩历史。
+#   换用窗口更小的模型时**必须跟着调小**，否则会一直压不动、直到服务端报超长；
+#   调得比真实窗口小很多则相反——白丢上下文，还白花一次摘要的钱。
+# context_window: 1000000
 
 # 等待模型响应时，**两个数据块之间**的最长间隔（秒），缺省 90。
 #
@@ -179,14 +225,15 @@ class Config:
     - protocol：后端协议类型，决定使用哪个 Provider 实现。目前只支持 deepseek
                 （anthropic / openai 已于 2026-08-20 删除，写这两个值会在装配期
                  报错并给出迁移说明，见 provider/factory.py）
-    - model：模型名称，直接传给 API（例如 deepseek-chat）
+    - model：模型名称，直接传给 API（例如 deepseek-v4-flash）
     - base_url：API 请求基础地址，支持自定义代理或私有部署
     - api_key：身份认证密钥，仅在运行时内存中使用，不打印到界面或日志
     - debug_log：是否把每次请求的缓存命中/未命中 token 追加到 <项目根>/.rhinecode_debug.log，
                  用于验证缓存策略是否生效（c5 F10）。可选字段，缺省为 True；每次请求仅写一行，
                  IO 异常会静默降级，不影响对话。不想生成该文件时在配置里设为 false。
     - context_window：上下文窗口上限（token），作为「历史是否逼近溢出」的判断基准（c8 F1）。
-                 可选字段，缺省 65536；不同模型/账号窗口不同，可按需调大调小。非法或 <=0 时
+                 可选字段，缺省 DEFAULT_CONTEXT_WINDOW（1000000，照 DeepSeek V4 全系的实际窗口）；
+                 不同模型/账号窗口不同，可按需调大调小。非法或 <=0 时
                  由 load() 回退默认值，不阻断启动（fail-safe）。
     - stream_idle_timeout / stream_connect_timeout：主对话等模型响应时的**块间空闲**
       超时与连接超时（秒，C8）。可选字段，缺省 90 / 10。⚠ 前者**不是总时长上限**，
@@ -213,7 +260,10 @@ class Config:
     # 调试日志开关：默认开启便于随时验证缓存；非必填字段，老配置不写也能正常加载。
     debug_log: bool = True
     # 上下文窗口上限（token）：c8 两层压缩据此判断是否逼近溢出；非必填，老配置不写也能加载。
-    context_window: int = 65536
+    # ⚠ 缺省值收在 DEFAULT_CONTEXT_WINDOW 里，别在这里写字面量——它此前有三份
+    # 拷贝（本行 + load() 里的两处），而「改了一处漏两处」的表现是「默认值改了
+    # 但实际没生效」，完全静默。
+    context_window: int = DEFAULT_CONTEXT_WINDOW
     # 网络访问工具总开关：缺省启用；非必填，老配置不写也能加载（web_fetch 扩展 F4）。
     web_fetch_enabled: bool = True
     # c14：隔离工作区的清理阈值（天）与环境初始化清单。
@@ -431,8 +481,13 @@ def load(path: str) -> Config:
     # debug_log 为可选项：缺省为 True，字符串写法需显式表达 true/false，避免 "false" 被当成 True。
     debug_log = _parse_bool(data.get("debug_log", True), "debug_log")
 
-    # context_window 为可选项：缺省 65536，非法/非正值回退默认（c8 F1，见 _parse_int）。
-    context_window = _parse_int(data.get("context_window", 65536), "context_window", 65536)
+    # context_window 为可选项：非法/非正值回退默认（c8 F1，见 _parse_int）。
+    # 缺省值一律取 DEFAULT_CONTEXT_WINDOW，本行**不写字面量**（见该常量的注释）。
+    context_window = _parse_int(
+        data.get("context_window", DEFAULT_CONTEXT_WINDOW),
+        "context_window",
+        DEFAULT_CONTEXT_WINDOW,
+    )
 
     # C8：两个超时都走 `_parse_float` 的「回退默认」口径（与 context_window 同，
     # 与 web_fetch_enabled 的「非法值抛错」不同）。理由是它们纯属调优项——

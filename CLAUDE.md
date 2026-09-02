@@ -101,6 +101,8 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 - **澄清提问面板随时可用** ——模型卡在「有好几种都说得通的做法」上时，**任何阶段**都能弹面板让用户点一下，而不是在正文里写一串问句然后干等他手打一大段。此前 `ask_user` 与 `ClarifyPanel` 只在 Plan Mode 规划阶段可见（C4 的历史遗留），本扩展把**可见性判据从「在哪个阶段」换成「有没有人可问」**——即本次运行拿没拿到澄清回调。这条判据顺带**结构性**兑现两条不变量：子 Agent 与 C15 无人值守轮都拿不到回调，因此看不到这个工具，不必另立禁用清单。面板补齐到 Claude Code 的形态：一次 1–4 个问题（串行弹）、每题 2–4 个候选项带说明、可多选（**回车逐项勾选并自动前进、末尾「提交」行回车交卷**，转义 ASCII 勾选框）、末尾由**界面**无条件追加一项「其它…」进自由输入态（面板保留为提示态、打字在主输入框）。**多选题里「其它…」本身就是一个勾选项**：打完字回到勾选界面（那一行变成 `[x] 其它：<内容>` 并计入条数），接着挑，最后仍在「提交」行交卷；已勾时回车即取消——按一下切换，与其余勾选项同语义。⚠ **`Esc` 的语义按阶段分岔**：规划阶段仍是「不想规划了、整轮停止」，其余任何时候是「我不选，你自己定」并**继续跑**，且一次运行里跳过 2 次即熔断、不再打扰。⚠ **触发口径两侧都写、下限可数、外加四正四负八个带判据的示例**——依据是 todo-list 那轮真机复测（三个静态规则杠杆加满仍是 0 次调用）。行为细节见 [`docs/extensions/ask-user/`](docs/extensions/ask-user/spec.md)。
 
+- **首次启动配置向导** ——把「生成模板 → 打印一句话 → 退出，你自己去改 YAML」换成**四屏 Textual 向导，跑完直接进主界面**：说明 → 填 Key 与接口地址 → 选模型 → 发一次最小请求终验并写盘。外加 **`/setup`** 随时重跑（**两个入口共用同一个 `ModalScreen`**，本项目第一个 ModalScreen）。⚠ **触发判据是「这份配置当前可不可用」（缺文件 / 占位符 / 解析失败），而不是「跑过没跑过」**——刻意**不落任何「已完成首次配置」的标记位**，否则用户手工删掉 key 之后就再也引导不出来，手上只剩一个起不来的程序和一句「请填入 api_key」（判据抄 Gemini CLI）。⚠ **非交互（非 TTY：CI / 管道 / 重定向，或显式 `--config`）行为逐字不变**，破了这条任何脚本包装都会断。⚠ **模型清单向服务端现拉、内置清单只作兜底**，且兜底时**必须在界面上说出来**（静默退回等于把「清单会过期」原样搬回来还多骗一次人）。⚠ 写盘是**在现有文件文本上定点替换、保住全部注释**（`yaml.dump` 会把模板里六十多行说明抹掉，而多数用户只读那份模板），`api_key` **留空表示不改**（写空值会静默清空密钥、下次启动才发现），**读不出来的文件先改名备份再写**（Windows 下 GBK 配置正是这个形态）。⚠ **顺带修掉两个已经在生效的错误**：模板里的 `deepseek-chat` 已于 2026-07-24 停用（照模板填完真 key 也跑不起来，而项目自己的真机验收从年中起用的都是 `deepseek-v4-flash`——**分家一个多月没人发现**，这正是改用「服务端优先」的直接依据）；`context_window` 缺省 65536 而 V4 全系是 1M，c8 压缩在真实窗口 6.5% 处就开始触发。行为细节见 [`docs/extensions/first-run-setup/`](docs/extensions/first-run-setup/spec.md)。
+
 另有一套**跨阶段的测试设施**（不占章节号、缺省关闭、不进产品包）：**Trace 行为记录器**（`--trace`）把运行过程写成三十一类结构化事件的 JSONL 配只读阅读器；**端到端驱动设施**（`tests/e2e/`）起常驻宿主让 Claude 经本机回环通道自己驱动界面跑完整交互闭环。两者都用于验收既有能力与排查那类「界面上看不出、但行为确实不对」的问题。
 
 **本项目只支持 DeepSeek 一个 Provider。** Anthropic / OpenAI 两个实现已于 2026-08-20 删除——它们一直停留在纯对话能力，而工具调用、Plan Mode、权限系统、Skill、子 Agent 全都只在 `protocol: deepseek` 下可用，三份实现里有两份没人用却要跟着每次协议改动一起维护。`protocol` 字段本身**刻意保留**（它是「当前用什么协议」的标识，环境信息 / 状态栏 / trace 快照都在读它），配成已删除的两个值时会在装配期报错并给出迁移说明。⚠ **`openai` SDK 依赖不能跟着删**：DeepSeek 走的就是 OpenAI 兼容协议。
@@ -146,6 +148,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 | Classifier | `classifier/` | 分类器审查的提示词/解析/熔断/缓存/宽泛规则识别/文案/门面/会话（c16，只依赖 `provider.base` 与 `trace`） | 四条：**只依赖 `provider.base` 与 `trace`，绝不 import `permission` / `agent` / `tools`**（`import permission.models` 会连带执行 `permission/__init__.py`、把引擎与 `rhinecode.tools` 一起拉起来，叶子性质当场失效——`broad.py` 的入参收成两个字符串正是为此）；**加锁临界区只做纯内存读写**，埋点与界面通知一律在锁外（本项目第五次面对同一类死锁）；**熔断计数器不按 `scope` 分桶**——分桶会让「分类器整体不可用」被拆成三份、各自不到阈值，于是**永远不熔断**；**`review` 绝不外抛异常**，它跑在决策预扫里，抛出去会让整轮工具执行炸掉 |
 | Team | `team/` | 花名册/共享清单/信箱/注入闸门/渲染/门面（c15，只依赖 `provider.base` 与 `trace`） | 三条：**加锁临界区只做纯内存读写**，`Event.set()` 一律在锁外（它唤醒待命队员的线程，属跨线程调度）——本项目第四次面对同一类死锁；**`TeamGate.has_awaited` 恒为假**，返回真会让队员为「可能有人给我发消息」赖着不收工、永远停不下来（等消息发生在**待命状态**，不在 Agent Loop 里）；**注入消息的正文必须无害化**，队员能在正文里伪造一个 `</teammate-message>` 再开一个 `from="main"`，而**能伪造的来源标注等于没有来源标注** |
 | Todo | `todo/` | 主对话待办清单的数据/校验/显示决策（todo-list 扩展，只依赖标准库与 `trace`） | 三条：**只依赖标准库与 `trace`，绝不 import `team`**——两者语义相反（「谁来做」vs「做到哪了」），复用它那份状态枚举会让两个本该互不知情的包互相知道对方；**`MAX_ITEMS` 是拒绝线不是截断线**，截断会让模型以为整份写进去了而清单少了几条，它下一轮据此做的判断全是错的；**校验必须在写入之前全部跑完**，边解析边写会让一份「前三条合法、第四条非法」的输入留下半张表，而调用方拿到的是「失败」 |
+| Setup | `setup/` | 首次启动配置向导的纯逻辑：触发判定/模型目录/两次网络请求/定点替换写盘（first-run-setup 扩展，只依赖标准库、`config` 与 `openai` SDK） | 三条：**绝不 import `bootstrap` / `conversation` / `tui` / `provider`**——它跑在装配**之前**（`build_app` 要拿 `cfg.api_key` 造 Provider，而本包存在的理由恰恰是「那个 key 还没有」），反向依赖会成环；**`api_key` 为空串表示「不改」，写盘时必须整个跳过该键**，写成 `api_key: ''` 会**静默清空用户的密钥**、要到下次启动才发现；**绝不覆盖一份读不出来的配置**——先改名备份再写（Windows 下 GBK 配置正是这个形态，`UnicodeDecodeError` 是 `ValueError` 子类、已落进 `INVALID` 分支，两处成对） |
 | Skills | `skills/` | Skill 解析/发现/渲染/预授权翻译/激活编排（只依赖 `permission` 的两个模块与 `trace`） | **加锁不变量**：临界区只做纯内存读写，一切回调与跨线程调度在锁外——违反会与 Textual 阻塞式 `call_from_thread` 组成**确定性死锁，整个 TUI 冻结** |
 | Context | `context/` | 两层压缩：估算、工具结果存盘、LLM 摘要 | `allow_summary` 必须在 `and` 链最前面短路——锚点对应主历史，拿它估子对话毫无意义 |
 | Trace | `trace/` | 行为记录器（**跨阶段测试设施**，只依赖标准库与 `provider.base`） | 序列化+写入+flush+序号推进必须在**同一临界区**，且**序号只在 flush 成功后推进** |
@@ -169,7 +172,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 全部条目在 **`paired-maintenance` Skill**（约 3.5 万字符，按需加载）。
 
 ⚠ **动下面任何一处代码之前，先加载它**——`agent/`、`permission/`、
-`classifier/`、`subagents/`、`team/`、`todo/`、`worktree/`、`hooks/`、`skills/`、
+`classifier/`、`subagents/`、`team/`、`todo/`、`setup/`、`worktree/`、`hooks/`、`skills/`、
 `tui/`、`trace/`、`web/`、`tests/e2e/`、`bootstrap.py`、`conversation.py`、
 `presets.py`、`tools/`、`commands/`、`context/`、`memory/`、`mcp/`、
 `provider/`、`config.py`。
@@ -204,7 +207,7 @@ RhineCode 是一个用 Python + Textual 实现的终端 AI 编程助手，交互
 
 ```bash
 pip install -e .                          # 安装（开发模式），生成全局命令 rhine
-rhine                                      # 任意目录启动；首次运行自动生成 ~/.rhinecode/config.yaml 模板并引导填 api_key
+rhine                                      # 任意目录启动；首次运行在终端里弹四屏配置向导，填完直接进主界面（非交互环境仍是「生成模板+提示+退出」）
 rhine --config config.yaml                # 显式指定配置文件覆盖全局配置
 rhine --continue                          # 启动时恢复最近一次会话，接着上次继续（c9）
 python -m rhinecode --config config.yaml  # 未安装/开发调试时的等价入口（需在源码目录）
@@ -308,7 +311,7 @@ Python 默认处理器一次就把程序掀翻，表现为「平时按两下、�
 要点：
 
 - 不带 `--config` 时读**用户级** `~/.rhinecode/config.yaml`，使 `rhine` 在任意目录都读同一份配置
-  （工作目录仍是 AI 操作的项目根）。首次运行自动生成三份模板。
+  （工作目录仍是 AI 操作的项目根）。首次运行自动生成四份模板，并在终端里弹配置向导（first-run-setup 扩展）。
 - 四份 YAML 各自的层级：`config.yaml` 用户级；`permissions.yaml` / `mcp.yaml` 用户级 + 项目级
   （权限另有本地级 `*.local.yaml`）；Skill 定义是目录不是 YAML，项目 > 用户 > 内置。
 - **权限规则跨层合并后 deny 永远优先**，不按层级覆盖。
