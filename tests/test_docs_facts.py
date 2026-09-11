@@ -88,7 +88,12 @@ FACTS: dict[str, Fact] = {
         pattern=r"([零一二三四五六七八九十]+)类(?:\*\*)?(?:结构化)?事件",
         sites=[
             "CLAUDE.md",
-            "README.md",
+            # ⚠ `README.md` 曾登记在此，2026-09-11 随 README 精简一并移除：那一版把
+            # 「行为记录（trace）」整条从面向用户的特性清单里删掉了（它是测试设施，
+            # 不是用户上手要读的东西），于是 README 里再没有「N 类事件」这句话。
+            # **登记一个不存在的 site 会让 test_every_registered_site_still_matches
+            # 永久红**，而那条护栏的职责恰恰是「登记了就必须还在」——删掉说法时
+            # 必须同时从这里摘掉，这是本文件开头那条成对维护点的另一半。
             "docs/guide/features.md",
             "docs/guide/project-structure.md",
             "docs/internals/architecture.md",
