@@ -32,7 +32,7 @@ from pathlib import Path
 
 from rhinecode.hooks.actions import DETAIL_LIMIT, run_command_action
 from rhinecode.hooks.models import CommandAction, HookEventType, HookPayload
-from rhinecode.tools.run_command import RUN_HEAD, RUN_TAIL, RunCommandTool
+from rhinecode.tools.run_command import RUN_OUTPUT_MAX_CHARS, RunCommandTool
 
 
 class RunCommandFullOutputTest(unittest.TestCase):
@@ -44,6 +44,15 @@ class RunCommandFullOutputTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.tool = RunCommandTool()
 
+    # 每行形如 `L00042`，连换行符 7 个字符。裁剪判据是**字符预算**而不是行数，
+    # 所以要触发裁剪得算一下需要多少行——写死一个数会在预算调整后静默失效
+    # （行数够不着预算时这组用例会全部退化成「没裁剪」而依然通过）。
+    LINE_CHARS = 7
+
+    def _lines_to_exceed_budget(self) -> int:
+        """算出「足够超过 stdout 预算」的行数，留 500 行余量。"""
+        return RUN_OUTPUT_MAX_CHARS // self.LINE_CHARS + 500
+
     def _run_many_lines(self, count: int):
         """跑一条产出 `count` 行、每行内容可辨识的命令。"""
         # 用 python 而不是 shell 循环：Windows 与 POSIX 上写法一致，
@@ -53,7 +62,10 @@ class RunCommandFullOutputTest(unittest.TestCase):
         # 经 `shell=True` 传下去时 `\n` 是字面两个字符而不是换行，
         # python 直接报语法错、命令产出 0 行——而断言「输出被裁剪了」
         # 于是失败在一个和真实原因毫不相干的地方。
-        script = f"[print('L%04d' % i) for i in range({count})]"
+        #
+        # ⚠ `%05d` 而不是 `%04d`：现在要产出几千行才够超预算，四位数会在
+        # 第 10000 行变成五位，探针字符串就对不上了。
+        script = f"[print('L%05d' % i) for i in range({count})]"
         return self.tool.execute(
             {"command": f'python -c "{script}"'}, cwd=self.cwd
         )
@@ -71,19 +83,20 @@ class RunCommandFullOutputTest(unittest.TestCase):
 
     def test_long_output_is_clipped_for_model_but_kept_in_full(self) -> None:
         """裁剪版丢了中间行，完整版一行不少。"""
-        total = RUN_HEAD + RUN_TAIL + 50
+        total = self._lines_to_exceed_budget()
+        middle = f"L{total // 2:05d}"
         res = self._run_many_lines(total)
         self.assertTrue(res.ok, res.output)
 
         # ① 给模型的那份**确实**被裁了（省 token 的行为一个字没变）
         self.assertIn("省略中间", res.output)
-        self.assertNotIn("L0035", res.output)
+        self.assertNotIn(middle, res.output)
 
         # ② 完整版存在，且被省掉的那些行真的在里面
         self.assertIsNotNone(res.full_output)
         assert res.full_output is not None  # 给类型检查看的
         self.assertNotIn("省略中间", res.full_output)
-        for probe in ("L0000", "L0035", f"L{total - 1:04d}"):
+        for probe in ("L00000", middle, f"L{total - 1:05d}"):
             self.assertIn(probe, res.full_output, f"完整输出里应当有 {probe}")
 
         # ③ 行数对得上：完整版含全部 total 行

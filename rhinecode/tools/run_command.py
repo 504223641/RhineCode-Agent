@@ -26,10 +26,29 @@ DEFAULT_TIMEOUT = 30
 KILL_TIMEOUT = 5
 DRAIN_TIMEOUT = 5
 
-# 输出截断保护：单路输出（stdout/stderr）行数超过 RUN_HEAD+RUN_TAIL 时，
-# 只保留前 RUN_HEAD 行与后 RUN_TAIL 行，中间以省略提示替代，避免长输出爆 token。
-RUN_HEAD = 30
-RUN_TAIL = 10
+# 输出截断保护：两路输出（stdout + stderr）**合计**的字符预算。超出时对每一路
+# 做「头+尾」保留、中间以省略提示替代，避免长输出爆 token。
+#
+# ## 为什么是字符预算而不是行数（2026-09-17 改）
+#
+# 原先是「前 30 行 + 后 10 行」，两个问题：
+#
+# ① **行数反映不了体量。** 30 行 `git log` 绰绰有余，30 行源码什么都说明不了。
+#    实测一次真实会话里模型打印 128 行源码，拿到 40 行、丢掉中间 88 行，
+#    于是它把切片越切越小、连续烧掉十几轮迭代（那份 trace 里 6322 字符的
+#    输出进历史时只剩 1773 字符）。
+# ② **上游两家都按体量算。** Claude Code 的 Bash 默认给模型约 30 000 字符
+#    （`BASH_MAX_OUTPUT_LENGTH` 可调到 150 000）；Codex 的 `truncation_policy`
+#    缺省 10 000 字节、按模型下发。本项目取前者的值。
+#
+# ⚠ **这个预算必须与「历史里放得下多大一条结果」相容。** 2026-09-17 删掉
+# c8 第一层存盘之后，工具输出进了历史就不会再被动，因此「产出时限量」是唯一
+# 的闸门——调大它等于直接调大单条消息能占的上下文。
+#
+# ⚠ stderr 单独留一份保底：命令失败时关键信息全在那里，而失败的命令往往同时
+# 刷一屏 stdout。不保底的话真正要看的那几行会被挤掉。
+RUN_OUTPUT_MAX_CHARS = 30_000
+RUN_STDERR_MIN_CHARS = 4_000
 
 
 def decode_subprocess_output(raw: bytes) -> str:
@@ -295,22 +314,86 @@ def run_shell_captured(
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr), dropped_env
 
 
-def _clip(text: str) -> str:
+def _split_budget(out_len: int, err_len: int) -> tuple[int, int]:
     """
-    对多行文本做「头+尾」截断保护。
+    把 `RUN_OUTPUT_MAX_CHARS` 这一份预算分给 stdout 与 stderr。
 
-    行数不超过 RUN_HEAD+RUN_TAIL 时原样返回；否则取前 RUN_HEAD 行 +
-    省略中间行数的提示 + 后 RUN_TAIL 行。
+    :param out_len: stdout 的实际字符数
+    :param err_len: stderr 的实际字符数
+    :returns: (stdout 预算, stderr 预算)，两者之和不超过 RUN_OUTPUT_MAX_CHARS
+
+    分法：**先给 stderr 保底，剩下的全归 stdout**。
+
+    为什么偏向 stderr：命令失败时关键信息全在那里，而失败的命令往往同时刷一屏
+    stdout（编译错误前面常有几百行进度输出）。按体量平分的话，真正要看的那几行
+    会被挤掉。保底额度只在 stderr **确实有那么多内容**时才占用——它为空时
+    stdout 独享全部预算。
+
+    副作用：无（纯函数）。
+    """
+    err_budget = min(err_len, max(RUN_STDERR_MIN_CHARS, RUN_OUTPUT_MAX_CHARS // 3))
+    return RUN_OUTPUT_MAX_CHARS - err_budget, err_budget
+
+
+def _clip(text: str, budget: int) -> str:
+    """
+    对多行文本做「头+尾」截断保护，按**字符预算**决定切不切、切多少。
 
     :param text: 原始文本（如命令的 stdout）
+    :param budget: 本路输出的字符预算（见 `_split_budget`）
     :returns: 截断后的文本（必要时含「…（省略中间 k 行）…」提示）
+
+    不超预算时原样返回；否则头尾各拿一半预算、中间用一行提示替代。
+    切点落在**行边界**上——按字符硬切会把一行劈成两半，而模型多半正要读那一行。
+
+    ⚠ **头尾对半分是刻意的**（对齐 Codex 的 `HeadTailBuffer`，它的
+    `HEAD_BUDGET = MAX_BYTES / 2`）：命令输出的信息通常集中在两端——开头是它在
+    做什么，结尾是结果与报错，中间是过程。
+
+    副作用：无（纯函数）。
     """
-    lines = text.splitlines()
-    if len(lines) <= RUN_HEAD + RUN_TAIL:
+    if len(text) <= budget:
         return text
-    omitted = len(lines) - RUN_HEAD - RUN_TAIL
-    head = lines[:RUN_HEAD]
-    tail = lines[-RUN_TAIL:]
+
+    lines = text.splitlines()
+    half = budget // 2
+
+    # 从头累加到半个预算为止
+    head: list[str] = []
+    used = 0
+    for line in lines:
+        # +1 是重新 join 时补回的换行符，不计的话拼出来会超预算
+        if used + len(line) + 1 > half:
+            break
+        head.append(line)
+        used += len(line) + 1
+
+    # 从尾倒着累加到另外半个预算为止，且不与 head 重叠
+    tail: list[str] = []
+    used = 0
+    for line in reversed(lines[len(head):]):
+        if used + len(line) + 1 > half:
+            break
+        tail.append(line)
+        used += len(line) + 1
+    tail.reverse()
+
+    if not head and not tail:
+        # ⚠ **超长单行**：两个循环都会在第一行就 break，head 与 tail 双双为空，
+        # 按行拼出来的结果会是「只有一句省略提示、一个字内容都没有」——
+        # 比裁剪本身糟得多（模型看不出这行里有什么，只能再跑一次命令）。
+        # 这种情况退回按字符硬切，首尾各半。压缩过的 JS、单行 JSON 就是这个形态。
+        return (
+            text[:half]
+            + f"\n…（省略中间 {len(text) - 2 * half} 字）…\n"
+            + text[-half:]
+        )
+
+    omitted = len(lines) - len(head) - len(tail)
+    if omitted <= 0:
+        # 两段加起来已经覆盖全部行——不该发生（覆盖全部行意味着没超预算，
+        # 函数开头就返回了），但真发生时给原文比给一句假的省略提示好。
+        return text
     return "\n".join(head + [f"…（省略中间 {omitted} 行）…"] + tail)
 
 
@@ -465,14 +548,16 @@ class RunCommandTool(Tool):
                 else ""
             )
 
-            # 回显命令 + 退出码 + 截断保护后的两路输出，便于模型阅读且不爆 token
+            # 回显命令 + 退出码 + 截断保护后的两路输出，便于模型阅读且不爆 token。
+            # 两路共用一份字符预算，分法见 `_split_budget`。
+            out_budget, err_budget = _split_budget(len(stdout), len(stderr))
             parts = [f"$ {command}", f"退出码: {proc.returncode}"]
             if env_note:
                 parts.append(env_note)
             if stdout:
-                parts.append(f"stdout（{out_lines} 行）:\n{_clip(stdout)}")
+                parts.append(f"stdout（{out_lines} 行）:\n{_clip(stdout, out_budget)}")
             if stderr:
-                parts.append(f"stderr（{err_lines} 行）:\n{_clip(stderr)}")
+                parts.append(f"stderr（{err_lines} 行）:\n{_clip(stderr, err_budget)}")
             output = "\n".join(parts)
 
             # 同一份内容的**未裁剪**版本，只供行为记录（见 ToolResult.full_output）。
