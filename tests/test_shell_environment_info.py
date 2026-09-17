@@ -121,21 +121,34 @@ class ToolDescriptionTest(unittest.TestCase):
         self.assertIn(shell, env_text)
         self.assertIn(shell, desc, "工具描述没提解释器，或与环境信息说的不是同一个")
 
-    @unittest.skipUnless(os.name == "nt", "cmd 陷阱只在 Windows 上存在")
-    def test_windows_description_names_both_traps(self) -> None:
+    def test_description_matches_this_platform(self) -> None:
         """
-        ⚠ **只说「是 cmd.exe」不够，两个陷阱必须逐条点名。**
+        描述随平台切换，**两个平台各断言各的**。
 
-        实测：模型第三次写的 `set X=0 && python` 是**教科书式正确的 cmd 语法**，
-        败在 cmd 把 `&` 前的空格算进变量值；它还把这误诊成引号问题，又白烧一轮。
+        ⚠ **刻意写成分支而不是 `skipUnless`**：跳过的话另一个平台上这段描述
+        一个字都没人验，而它是随 `os.name` 生成的、两条分支都可能被改坏。
+        顺带避免在非 Windows 上凭空多出一条 skip——`CLAUDE.md` 那句
+        「默认跳过 N 项」会因此在不同平台上对不上。
+
+        Windows 那一支里 ⚠ **只说「是 cmd.exe」不够，两个陷阱必须逐条点名**：
+        实测模型写的 `set X=0 && python` 是**教科书式正确的 cmd 语法**，
+        败在 cmd 把 `&` 前的空格算进变量值；它还把这误诊成引号问题、又白烧一轮。
         一条只说 shell 名字的提示救不了这种。
         """
         desc = RunCommandTool.description
-        self.assertIn("PowerShell", desc, "没排除掉 PowerShell 这个猜测")
-        self.assertIn("tail", desc, "没说 cmd 里没有 tail 这类命令")
-        self.assertIn("set X=1&&", desc, "没给出设环境变量的正确写法")
-        self.assertIn("空格", desc, "没点名尾随空格这个陷阱")
-        self.assertIn("VAR=", desc, "没说前缀式环境变量在 cmd 里不成立")
+        if os.name == "nt":
+            self.assertIn("cmd.exe", desc)
+            self.assertIn("PowerShell", desc, "没排除掉 PowerShell 这个猜测")
+            self.assertIn("tail", desc, "没说 cmd 里没有 tail 这类命令")
+            self.assertIn("set X=1&&", desc, "没给出设环境变量的正确写法")
+            self.assertIn("空格", desc, "没点名尾随空格这个陷阱")
+            self.assertIn("VAR=", desc, "没说前缀式环境变量在 cmd 里不成立")
+        else:
+            self.assertIn("/bin/sh", desc)
+            self.assertIn("POSIX", desc)
+            # POSIX 上不该冒出 cmd 的那套说法（描述是按平台生成的，别串了）。
+            self.assertNotIn("cmd.exe", desc)
+            self.assertNotIn("set X=1&&", desc)
 
     def test_trailing_space_trap_is_real(self) -> None:
         """
