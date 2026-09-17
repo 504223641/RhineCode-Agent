@@ -16,6 +16,26 @@ from rhinecode.tools.path_guard import (
 MAX_READ_BYTES = 1024 * 1024
 MAX_RANGE_LINES = 2000
 
+# 一次读取**给模型**的字符上限。
+#
+# ## 为什么需要它（2026-09-17 新增）
+#
+# 在此之前 `read_file` 的输出**实际上没有体量上限**：整文件读只在超过
+# `MAX_READ_BYTES`（1 MiB）时才拒绝，于是一个 900 KB 的文件会被整个塞进历史
+# （约 30 万 token）；范围读只限行数、不限行长。
+#
+# 这个洞此前由 c8 第一层存盘兜着——塞进去，下一轮立刻被换成占位。那一层
+# 已于 2026-09-17 删除（上游 Claude Code 与 Codex 都没有「事后删历史」这种
+# 机制，它们一律在**产出的那一刻**限量），因此闸门必须收到这里来。
+#
+# ⚠ **第二层 LLM 摘要救不了这种**：它压的是「较早的历史」，而刚读回来的这条
+# 是最新的，正好落在「保留近期原文」的保护区里。
+#
+# 取值比 `run_command` 的 30 000 宽，理由有两条：读文件是核心操作；而且模型
+# 有现成的续读手段（`start_line` / `max_lines`），超出部分不是丢了而是分页。
+# 形态对齐 Claude Code 的 Read——它同样是给第一页 + 一句「还有多少、怎么接着读」。
+READ_OUTPUT_MAX_CHARS = 100_000
+
 # 读到 c8 存盘目录时回灌给模型的说法。
 #
 # ⚠ **措辞要说清「为什么白读」并给出出路**，不能只写一句「不允许」——
@@ -28,6 +48,75 @@ OFFLOAD_STORE_REFUSAL = (
     "而且它比原结果更大，读回来会立刻被再次存盘，反复下去只会白烧迭代。"
     "请改为重新调用产生那条结果的工具本身，并缩小范围分段取回"
     "（例如给 read_file 传 start_line / max_lines，或给 grep_content 收窄 pattern）。"
+)
+
+
+def _fit_to_budget(rendered: list[str], budget: int) -> tuple[list[str], bool, bool]:
+    """
+    从头保留尽可能多的完整行，直到用满字符预算。
+
+    :param rendered: 已经带好行号的各行（不含换行符）
+    :param budget: 字符预算
+    :returns: (保留下来的行, 是否发生了截断, 是否是**在一行内部**切的)
+
+    第三个返回值决定调用方该给哪一句续读提示，**两种情况的出路完全不同**：
+    按行切时 `start_line=N+1` 能精确续上；在一行内部切时那个建议是**错的**
+    （被切掉的是第 N 行的后半截，而 `start_line=N+1` 会从第 N+1 行开始，
+    正好跳过它）。给一条走不通的建议比不给更糟——模型会照做，然后拿着
+    一份缺了一块的内容继续推理，而它看不出有什么不对。
+
+    **从头保留而不是头尾各留一半**，这一点与 `run_command._clip` 刻意不同：
+    命令输出的信息集中在两端（开头是在做什么、结尾是结果），而文件是顺序读的，
+    模型拿到前 N 行之后可以用 `start_line=N+1` 精确地接着读——给它一个中间有
+    窟窿的文件反而没法续。
+
+    ⚠ 单行长度超过整份预算时（压缩过的 JS、单行 JSON），保留列表会是空的。
+    调用方必须自己处理那种情况，否则模型拿到的是「一行内容都没有」。
+
+    副作用：无（纯函数）。
+    """
+    kept: list[str] = []
+    used = 0
+    for line in rendered:
+        # +1 是重新 join 时补回的换行符，不计的话拼出来会超预算
+        if used + len(line) + 1 > budget:
+            if not kept:
+                # 第一行就装不下：硬切它并**就地说明**。不说明的话模型会拿着
+                # 半行代码当成完整的一行去推理，而它看不出有什么不对。
+                return [line[:budget] + "…（本行过长，已截断）"], True, True
+            return kept, True, False
+        kept.append(line)
+        used += len(line) + 1
+    return kept, False, False
+
+
+def _continue_hint(next_start: int, total: int) -> str:
+    """
+    生成「还剩多少、怎么接着读」那一句。
+
+    :param next_start: 续读应当从第几行开始（1 起）
+    :param total: 文件总行数
+    :returns: 以换行开头的一句提示
+
+    ⚠ **必须把续读参数直接写出来**，不能只说「内容已截断」。只说截断会让模型
+    要么当没看见继续推理（拿半个文件当全文），要么去猜一个范围重试——而猜错
+    一次就是白烧一轮。这与 `context/offload.py` 那条占位符的教训同源：
+    拒绝或截断的文案要说清「怎么办」，不能只说「不行」。
+
+    副作用：无（纯函数）。
+    """
+    return (
+        f"\n…（本次只显示到第 {next_start - 1} 行，共 {total} 行。"
+        f"用 start_line={next_start} 继续读后面的部分）"
+    )
+
+
+# 在一行内部切时的提示。**刻意不给 `start_line`**，理由见 `_fit_to_budget`
+# 的第三个返回值：那条建议在这种情况下是错的。
+LONG_LINE_HINT = (
+    "\n…（这一行本身就超过了单次读取的字符上限，后半截未显示。"
+    "它多半是压缩过的代码或单行 JSON——`start_line` 帮不上忙，"
+    "要看具体某一段请用 `grep_content` 搜关键词定位）"
 )
 
 
@@ -153,10 +242,29 @@ class ReadFileTool(Tool):
             total = len(lines)
             width = len(str(total))
             header = f"文件: {path} · {total} 行 · {human_size(byte_len)}"
-            numbered = "\n".join(f"{i:>{width}}│ {line}" for i, line in enumerate(lines, start=1))
-            output = f"{header}\n{numbered}"
+            rendered = [
+                f"{i:>{width}}│ {line}" for i, line in enumerate(lines, start=1)
+            ]
+            full = f"{header}\n" + "\n".join(rendered)
 
-            return ToolResult(ok=True, output=output, summary=f"读取 {total} 行 · {human_size(byte_len)}")
+            kept, clipped, line_cut = _fit_to_budget(rendered, READ_OUTPUT_MAX_CHARS)
+            if not clipped:
+                return ToolResult(
+                    ok=True,
+                    output=full,
+                    summary=f"读取 {total} 行 · {human_size(byte_len)}",
+                )
+
+            hint = LONG_LINE_HINT if line_cut else _continue_hint(len(kept) + 1, total)
+            output = f"{header}\n" + "\n".join(kept) + hint
+            # 完整原文只进行为记录，模型仍然只拿上面那份
+            # （见 `ToolResult.full_output`，与 `run_command` 同一条约定）。
+            return ToolResult(
+                ok=True,
+                output=output,
+                summary=f"读取 {len(kept)}/{total} 行 · {human_size(byte_len)}",
+                full_output=full,
+            )
 
         except UnicodeDecodeError:
             # 二进制文件或非 UTF-8 编码，无法作为文本读取
@@ -204,16 +312,48 @@ class ReadFileTool(Tool):
 
         last_line = selected[-1][0]
         width = len(str(last_line))
-        header = (
+        rendered = [f"{lineno:>{width}}│ {line}" for lineno, line in selected]
+        full_header = (
             f"文件: {display_path} · {human_size(byte_len)} · "
             f"第 {start_line}-{last_line} 行"
         )
-        numbered = "\n".join(f"{lineno:>{width}}│ {line}" for lineno, line in selected)
-        output = f"{header}\n{numbered}"
-        if truncated:
-            output += f"\n…（已达本次读取上限 {max_lines} 行，后续内容未显示）"
+        full = f"{full_header}\n" + "\n".join(rendered)
+
+        # 两个上限**都**可能收住这次读取：行数（max_lines）与字符预算。
+        # 哪个先到就按哪个截，但给模型的续读提示只有一句——它不需要知道
+        # 是被哪一条拦下的，它只需要知道从第几行接着读。
+        kept, clipped, line_cut = _fit_to_budget(rendered, READ_OUTPUT_MAX_CHARS)
+        shown_last = selected[len(kept) - 1][0] if kept else start_line
+        header = (
+            full_header
+            if not clipped
+            else (
+                f"文件: {display_path} · {human_size(byte_len)} · "
+                f"第 {start_line}-{shown_last} 行"
+            )
+        )
+        output = f"{header}\n" + "\n".join(kept)
+
+        if clipped and line_cut:
+            output += LONG_LINE_HINT
+        elif clipped:
+            # 字符预算先到：还剩多少行不知道（没读完整个文件），
+            # 所以这一句只说「从哪儿接着读」，不报总行数。
+            output += (
+                f"\n…（本次输出已达字符上限，只显示到第 {shown_last} 行。"
+                f"用 start_line={shown_last + 1} 继续读后面的部分）"
+            )
+        elif truncated:
+            output += (
+                f"\n…（已达本次读取上限 {max_lines} 行，只显示到第 {last_line} 行。"
+                f"用 start_line={last_line + 1} 继续读后面的部分）"
+            )
+
         return ToolResult(
             ok=True,
             output=output,
-            summary=f"范围读取 {len(selected)} 行 · {human_size(byte_len)}",
+            summary=f"范围读取 {len(kept)} 行 · {human_size(byte_len)}",
+            # 完整原文只进行为记录（同 run_command 那条约定）；没截断时不另存，
+            # 两份一模一样只会让记录文件白白翻倍。
+            full_output=full if clipped else None,
         )
