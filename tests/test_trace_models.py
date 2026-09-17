@@ -27,9 +27,9 @@ class EventTypeTest(unittest.TestCase):
         # `reader.SUMMARIZERS`、CLAUDE.md 与 docs/internals（漏了不报错）。
         # 十五类（c2–c11）+ c12 Hook 两类 + c13 子 Agent 两类 + c14 隔离工作区四类
         # + c15 协作四类 + tui-activity-fold 界面两类（批次归并 / 档位切换）
-        # + c16 分类器一类 + todo-list 待办一类。
+        # + c16 分类器一类 + todo-list 待办一类 + 续跑判定一类。
         members = list(TraceEventType)
-        self.assertEqual(len(members), 31)
+        self.assertEqual(len(members), 32)
         for m in members:
             # 取值必须是成员名的小写形式：落盘的 type 字段与阅读器的 --type 参数直接比对
             self.assertEqual(m.value, m.name.lower())

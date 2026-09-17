@@ -514,6 +514,21 @@ def _s_classifier_verdict(r: dict) -> str:
     )
 
 
+def _s_continuation_review(r: dict) -> str:
+    """
+    检查点上的一次「还要不要接着跑」判定。
+
+    ⚠ **理由必须进摘要行**：读记录的人问的第一个问题就是「它凭什么说停」，
+    而那句理由是判定器给出的唯一解释。判定器给用户的那份也是它
+    （**刻意不回灌给干活的模型**——告诉它「你看起来没进展」，它下一轮就会
+    去表演进展，同 c16 那条「具体理由是绕过指南」）。
+    """
+    return (
+        f"第 {r.get('iteration')} 轮 · {r.get('decision')}"
+        f" · {r.get('duration_ms')}ms · {_text_of(r.get('reason'), 60)}"
+    )
+
+
 def _s_todo_update(r: dict) -> str:
     """
     主对话待办清单的一次整表覆写（todo-list 扩展）。
@@ -563,6 +578,7 @@ SUMMARIZERS: dict[str, Callable[[dict], str]] = {
     TraceEventType.UI_DETAIL_LEVEL.value: _s_ui_detail_level,
     TraceEventType.CLASSIFIER_VERDICT.value: _s_classifier_verdict,
     TraceEventType.TODO_UPDATE.value: _s_todo_update,
+    TraceEventType.CONTINUATION_REVIEW.value: _s_continuation_review,
 }
 
 # 未登记类型的显式标记。**不要改成空串**——它是「新增事件类型时忘了登记摘要函数」

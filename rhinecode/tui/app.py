@@ -2844,7 +2844,7 @@ class RhineApp(App):
 
         ## 为什么级别在这里定，而不是让调用方猜（tui-display 扩展 F20）
 
-        七种结束原因分成两档，判据是「用户看到之后要不要做点什么」：
+        八种结束原因分成两档，判据是「用户看到之后要不要做点什么」：
 
         - **事件级**——「已取消」「计划未执行」是**用户自己刚做的决定**的回执，
           他知道发生了什么，不需要被醒目提示；
@@ -2870,6 +2870,8 @@ class RhineApp(App):
         if stop_reason == StopReason.SPINNING:
             # 警告级：与迭代上限同类——任务没做完就停了，用户多半要重试或改写。
             return LEVEL_WARNING, message or "检测到原地打转，已停止"
+        if stop_reason == StopReason.NO_PROGRESS:
+            return LEVEL_WARNING, message or "看不出还在往前走，已停止"
         return LEVEL_NOTICE, ""
 
     @staticmethod

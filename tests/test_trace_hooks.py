@@ -941,6 +941,10 @@ class AllTypesTest(TraceHookBase):
                 "in_progress": 1, "version": 3,
                 "titles": ["读现有实现", "改 login 接口", "改三处调用方", "跑测试"],
             },
+            T.CONTINUATION_REVIEW: {
+                "iteration": 25, "decision": "continue",
+                "reason": "在按一条明确思路推进", "duration_ms": 420,
+            },
         }
         self.assertEqual(len(payloads), len(list(T)), "每个类型都要有一条代表性负载")
         for t, payload in payloads.items():

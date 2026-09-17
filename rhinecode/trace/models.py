@@ -24,12 +24,12 @@ from typing import Any
 
 class TraceEventType(str, Enum):
     """
-    行为记录的事件种类，共**三十一类**。
+    行为记录的事件种类，共**三十二类**。
 
     构成（每一批都对应一个章节，新增时请一并更新这个计数与 CLAUDE.md 的能力表）：
     spec F11–F16 十五类 + c12 Hook 两类 + c13 子 Agent 两类 + c14 worktree 四类
     + c15 协作四类 + tui-activity-fold 界面两类 + c16 分类器一类
-    + todo-list 待办一类。
+    + todo-list 待办一类 + 续跑判定一类。
 
     ⚠️ 这个数字长期是错的（曾停在「十九类」，CLAUDE.md 停在「二十三类」），
     因为它是**纯注释、漏改不报错**。`tests/test_trace_models.py` 现在有一条
@@ -73,6 +73,7 @@ class TraceEventType(str, Enum):
     UI_DETAIL_LEVEL = "ui_detail_level"          # tui-activity-fold：展开档位的切换
     CLASSIFIER_VERDICT = "classifier_verdict"    # c16：一次分类器审查的输入、结论与熔断状态
     TODO_UPDATE = "todo_update"                  # todo-list：主对话待办清单的一次整表覆写
+    CONTINUATION_REVIEW = "continuation_review"  # 检查点上的一次「还要不要接着跑」判定
 
 
 # ---------------------------------------------------------------------------
