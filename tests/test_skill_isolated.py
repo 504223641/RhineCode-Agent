@@ -479,10 +479,15 @@ class ContextLayerTest(IsolatedTestBase):
 
     def test_first_layer_offload_applies_second_layer_does_not(self) -> None:
         """
-        大工具结果在子历史中被替换为「预览 + 路径」占位，且**未**调用摘要 LLM。
+        大工具结果在子历史中被替换为「预览 + 来源」占位，且**未**调用摘要 LLM。
 
         这是「子对话共享 ContextManager 但只开第一层」这个决策的唯一收益点，
         不验就不知道有没有真的接上。
+
+        ⚠ 这条断言原先是 `assertIn(".rhinecode", ...)`——占位里当时确实写着存盘
+        文件的路径，而那正是 2026-09-17 修掉的死循环的诱因（见
+        `context/offload.py` 模块 docstring）。现在改成断言「**有**来源、
+        **没有**路径」，两句缺一不可：只断言有来源的话，把路径原样加回去照样绿。
         """
         big = "X" * 40000  # 远超第一层单结果阈值
         provider = ScriptedProvider([_tool_call("echo_tool"), _text()])
@@ -496,8 +501,12 @@ class ContextLayerTest(IsolatedTestBase):
         tool_msgs = [m for m in second_round if m.role == "tool"]
         self.assertTrue(tool_msgs)
         self.assertLess(len(tool_msgs[0].content), 4000, "第一层存盘没生效")
-        self.assertIn(".rhinecode", tool_msgs[0].content)
-        # 存盘文件确实生成了。
+        self.assertIn("已存盘", tool_msgs[0].content, "占位标记不见了")
+        self.assertIn("来源：echo_tool", tool_msgs[0].content, "占位没写清这条结果是谁产生的")
+        self.assertNotIn(
+            ".rhinecode", tool_msgs[0].content, "占位里又出现了存盘路径（死循环的诱因）"
+        )
+        # 存盘文件确实生成了（人工排查仍取得到，只是不再告诉模型路径）。
         offload_dir = Path(".rhinecode") / "context"
         self.assertTrue(list(offload_dir.glob("*.txt")))
 
