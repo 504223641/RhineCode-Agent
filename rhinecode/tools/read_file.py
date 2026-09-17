@@ -6,10 +6,29 @@
 """
 
 from rhinecode.tools.base import Tool, ToolResult, human_size
-from rhinecode.tools.path_guard import PathGuardError, require_cwd as _require_cwd, resolve_readable
+from rhinecode.tools.path_guard import (
+    PathGuardError,
+    is_offload_store_path,
+    require_cwd as _require_cwd,
+    resolve_readable,
+)
 
 MAX_READ_BYTES = 1024 * 1024
 MAX_RANGE_LINES = 2000
+
+# 读到 c8 存盘目录时回灌给模型的说法。
+#
+# ⚠ **措辞要说清「为什么白读」并给出出路**，不能只写一句「不允许」——
+# 只说不允许会让模型去找绕过的办法（同 `todo_write.plan_blocked_hint` 那条教训）。
+# 这里的事实是：那份文件是上一条工具结果的**逐字副本**，读它拿不到任何新东西，
+# 而它比原文更大、必然再次被存盘，于是形成一个不收敛的循环
+# （见 `context/offload.py` 模块 docstring 的实测记录）。
+OFFLOAD_STORE_REFUSAL = (
+    "这是上下文管理存下的工具结果副本，不是原始文件，读它拿不到任何新内容——"
+    "而且它比原结果更大，读回来会立刻被再次存盘，反复下去只会白烧迭代。"
+    "请改为重新调用产生那条结果的工具本身，并缩小范围分段取回"
+    "（例如给 read_file 传 start_line / max_lines，或给 grep_content 收窄 pattern）。"
+)
 
 
 class ReadFileTool(Tool):
@@ -69,7 +88,19 @@ class ReadFileTool(Tool):
 
             # 只读工具不经过确认，因此必须先把路径钉死在项目工作目录内；
             # c9 起额外放行「只读白名单」目录（当前仅用户级记忆目录），写类工具不受影响。
-            abs_path = resolve_readable(path, _require_cwd(cwd))
+            root = _require_cwd(cwd)
+            abs_path = resolve_readable(path, root)
+
+            # c8 存盘目录：路径合法、文件也确实在，但读它没有意义且会形成死循环。
+            # 判定放在存在性检查**之前**是刻意的——存盘文件随时可能已被清理，
+            # 放在后面的话模型会先拿到一句「文件不存在」，那句话既没解释原因、
+            # 也没给出路，它多半会换一个存盘路径接着试。
+            if is_offload_store_path(abs_path, root):
+                return ToolResult(
+                    ok=False,
+                    output=OFFLOAD_STORE_REFUSAL,
+                    summary="存盘副本，不可直接读取",
+                )
 
             if not abs_path.exists():
                 return ToolResult(ok=False, output=f"文件不存在: {path}", summary="文件不存在")

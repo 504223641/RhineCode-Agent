@@ -2,8 +2,20 @@
 第一层·轻量预防：工具结果存盘（c8 F4/F5/F6/F7）。
 
 思路：token 大头是工具结果（read_file / grep / run_command 的输出）。第一层不调模型、
-成本低——把「过大的工具结果」完整写入磁盘文件，历史里只留「预览片段 + 文件路径」占位，
-从源头抑制单条消息膨胀。模型若需要完整内容，可按占位里的路径用 read_file 重新读取。
+成本低——把「过大的工具结果」完整写入磁盘文件，历史里只留「预览片段 + 来源说明」占位，
+从源头抑制单条消息膨胀。模型若需要完整内容，**重新调用产生它的那个工具并缩小范围**。
+
+⚠ **占位里绝不能出现存盘文件的路径**（2026-09-17 修复的死循环，真实 trace 实录）。
+原文案写的是「完整内容见文件：<路径>（需要完整内容时，请用 read_file 读取该文件路径）」，
+模型照做之后发生的事是：`read_file` 给每行加行号前缀、再套一层文件头，于是**读回来的
+结果比存盘原文更大**（实测 22.2K → 25.2K）→ 必然再次超阈值 → 再次存盘 → 生成新路径 →
+占位又叫它去读。内容每轮单调增大，**结构上不可能收敛**。那份 trace 里 14 次读存盘文件
+全部触发二次存盘（14/14），一条 25 轮的任务有 9 轮（36% 的迭代、35% 的输入 token）
+烧在三条这样的链上，而模型**一次都没拿到它要的内容**。
+
+⚠ 同一个「自放大」形态在**搜索**那一侧已经修过一次，见 `tools/path_guard.py` 的
+`runtime_artifact_dirs_of`——那次让 glob/grep 跳过本目录。读取这一侧当时没覆盖到，
+而它更糟：搜索是**偶然**命中存盘文件，读取是占位符**主动**把模型指过去的。
 
 两条规则（每次请求前由 ContextManager 调 run 执行）：
 - 单结果：任一工具结果估算超过 SINGLE_RESULT_TOKENS，直接存盘。
@@ -22,6 +34,7 @@ from typing import Optional
 
 from rhinecode.provider.base import Message
 from rhinecode.tools.base import human_size
+from rhinecode.tools.display import summarize_args_plain
 from rhinecode.context.estimate import estimate_message_tokens
 from rhinecode.context.models import CompactionNotice
 
@@ -31,6 +44,10 @@ SINGLE_RESULT_TOKENS: int = 4000
 COMBINED_RESULT_TOKENS: int = 16000
 # 占位里保留的预览字符数（结果头部），供模型判断相关性、决定是否重读。
 PREVIEW_CHARS: int = 500
+# 占位里「来源」那一行的参数摘要长度上限。
+# 取 200 与确认面板同值：那一行要让模型看清「重调哪次调用」，按工具行的 60 截
+# 会把 path 之后的 start_line / max_lines 切掉，而那恰恰是它该调整的参数。
+SOURCE_ARGS_MAX_CHARS: int = 200
 
 
 class Offloader:
@@ -78,27 +95,72 @@ class Offloader:
         self._seq += 1
         return f"_seq{self._seq}"
 
-    def _placeholder(self, original: str, path: Path) -> str:
+    def _placeholder(self, original: str, source: Optional[str]) -> str:
         """
-        构造替换原始工具结果的占位文本：体量说明 + 头部预览 + 文件路径 + 重读提示。
+        构造替换原始工具结果的占位文本：体量说明 + 来源 + 头部预览 + 重取提示。
 
-        预览让模型能判断这段结果是否与当前任务相关；路径与提示引导它在需要完整内容时
-        重新 read_file，而不是凭空假设内容（呼应第二层的边界消息理念）。
+        :param original: 被替换掉的工具结果原文
+        :param source: 产生这条结果的那次工具调用的摘要（形如 `read_file(path=a.md)`）；
+                       历史里找不到对应调用时为 None，此时退回一句不点名的通用提示
+        :returns: 占位文本
+
+        预览让模型判断这段结果与当前任务是否相关；**来源**让它知道该重调哪一次调用。
+
+        ⚠ **这里绝不能出现存盘文件的路径**，理由见模块 docstring 那段死循环记录。
+        给出路径等于邀请模型去读一份「比原文更大」的副本，而那条路不收敛。
+        存盘文件只服务于人工排查（路径记在 trace 的 `context_compaction` 事件里），
+        它不是给模型走的通路。
         """
         preview = original[:PREVIEW_CHARS]
         ellipsis = "…" if len(original) > PREVIEW_CHARS else ""
+        # 来源查不到时不硬编一个工具名——说错了比不说更糟（模型会去调一次它没调过的工具）。
+        origin_line = f"来源：{source}\n" if source else ""
+        retry_hint = (
+            "（需要完整内容时，请重新调用上面那次工具并缩小范围，例如给 read_file 传"
+            " start_line / max_lines 分段取回、给 grep_content 收窄 pattern）"
+            if source
+            else "（需要完整内容时，请重新执行产生这条结果的那次工具调用，并缩小范围分段取回）"
+        )
         return (
             f"[大型工具结果已存盘 · 原 {human_size(len(original.encode('utf-8')))}]\n"
+            f"{origin_line}"
             f"预览（前 {PREVIEW_CHARS} 字）：\n{preview}{ellipsis}\n"
-            f"完整内容见文件：{path}\n"
-            f"（需要完整内容时，请用 read_file 读取该文件路径）"
+            f"{retry_hint}"
         )
 
-    def _offload_one(self, msg: Message) -> Optional[Path]:
+    @staticmethod
+    def _source_map(history: list[Message]) -> dict[str, str]:
+        """
+        扫一遍历史，建「tool_call_id → 该次调用的摘要」表。
+
+        :param history: 当前对话历史
+        :returns: 形如 {"call_00_x": "read_file(path=docs/a.md)"} 的映射；
+                  历史里没有对应 assistant 消息的调用不会出现在表里
+
+        为什么从历史里反查而不是让调用方传进来：`run()` 本来就拿着整个 history，
+        而让 `ContextManager` 多传一份「调用清单」会给 C8 的既有契约加一个参数，
+        且那份清单本身也只能从同一个 history 里算——绕一圈没有任何收益。
+
+        副作用：无（纯读）。
+        """
+        mapping: dict[str, str] = {}
+        for m in history:
+            if m.role != "assistant" or not m.tool_calls:
+                continue
+            for call in m.tool_calls:
+                if not call.id:
+                    continue
+                args = summarize_args_plain(call.arguments, SOURCE_ARGS_MAX_CHARS)
+                mapping[call.id] = f"{call.name}({args})"
+        return mapping
+
+    def _offload_one(self, msg: Message, source: Optional[str] = None) -> Optional[Path]:
         """
         把单条工具结果存盘并原地替换为占位。
 
         :param msg: 待存盘的 role="tool" 消息（原地修改其 content）
+        :param source: 产生这条结果的那次工具调用的摘要，写进占位的「来源」一行；
+                       None 表示历史里查不到，占位退回通用提示
         :returns: 存盘成功返回落盘路径；写盘失败返回 None（此时保留原文，不改 content）
 
         副作用：可能创建目录、写文件；成功时修改 msg.content、登记幂等键、
@@ -115,7 +177,7 @@ class Offloader:
         except OSError:
             # 写盘失败：保留原文、不登记幂等键，本次不压缩这条（fail-safe，N2）。
             return None
-        msg.content = self._placeholder(msg.content, file_path)
+        msg.content = self._placeholder(msg.content, source)
         self._offloaded.add(key)
         self.last_run_details.append((key, str(file_path)))
         return file_path
@@ -139,13 +201,15 @@ class Offloader:
         offloaded_count = 0
         # 每次 run 开头清空明细：它描述的是「本次」存盘了什么，不是累计
         self.last_run_details = []
+        # 「这条结果是谁产生的」的反查表，两趟共用；建一次即可（纯读，无副作用）。
+        sources = self._source_map(history)
 
         # 第一趟：单结果超阈值直接存盘。
         for m in history:
             if not is_candidate(m):
                 continue
             if estimate_message_tokens(m) > SINGLE_RESULT_TOKENS:
-                if self._offload_one(m) is not None:
+                if self._offload_one(m, sources.get(m.tool_call_id or "")) is not None:
                     offloaded_count += 1
 
         # 第二趟：聚合。对仍未存盘的工具结果算合计，若超阈值则按体积降序依次存盘。
@@ -158,7 +222,7 @@ class Offloader:
                 if total <= COMBINED_RESULT_TOKENS:
                     break
                 tokens = estimate_message_tokens(m)
-                if self._offload_one(m) is not None:
+                if self._offload_one(m, sources.get(m.tool_call_id or "")) is not None:
                     offloaded_count += 1
                     total -= tokens
 
@@ -167,6 +231,6 @@ class Offloader:
         return [
             CompactionNotice(
                 kind="offload",
-                message=f"已把 {offloaded_count} 个大型工具结果存盘，历史仅保留预览与路径。",
+                message=f"已把 {offloaded_count} 个大型工具结果存盘，历史仅保留预览与来源。",
             )
         ]
