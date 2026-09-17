@@ -78,6 +78,7 @@ class GoldenBaselineTest(unittest.TestCase):
         return EnvironmentInfo(
             working_dir="/fixed/workdir",
             platform="testos",
+            shell="testsh",
             date="2026-01-01",
             git_branch="main",
             model="test-model",

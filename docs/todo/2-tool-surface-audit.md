@@ -40,6 +40,43 @@
   `SINGLE_RESULT_TOKENS = 4000`（约 12K 字符）落在那段真空里。
   结果是模型第一次读一个中等大小的文档，**拿到的永远是占位而不是内容**。
   Claude Code 的 Read 默认只读前 2000 行并**明确告诉你被截断了**，值得对标。
+- ⚠ **`run_command` 在 Windows 上要不要改用 Git Bash——这条单独拿出来评估，
+  它是本轮唯一一个「改行为」而不是「改文案」的候选。**
+
+  **背景**：`run_shell_captured` 用 `subprocess.Popen(shell=True)`，于是
+  Windows 上是 `cmd.exe`、POSIX 上是 `/bin/sh`。2026-09-17 两份真实 trace 实录，
+  模型把三种 shell 都猜了一遍（POSIX / PowerShell / cmd），**4 轮迭代、197K
+  输入 token** 白烧在语法试错上。已经做了便宜的那一半（环境信息报解释器名 +
+  工具描述给 cmd 语法与两个陷阱，见 `tests/test_shell_environment_info.py`），
+  **这一条是贵的那一半**。
+
+  **支持改**：模型的默认直觉就是 POSIX——这不是偏好问题，是训练分布问题。
+  上游印证：**Claude Code 在 Windows 上让 Bash 工具跑 Git Bash**，并在工具描述里
+  逐字写明「runs Git Bash (POSIX sh), not cmd.exe or PowerShell. Use Unix shell
+  syntax: `/dev/null` not `NUL`, forward slashes, `$VAR` not `%VAR%`」。
+  改了之后 `tail` / 管道 / `VAR=x cmd` / `2>/dev/null` 全都直接可用，
+  那份 trace 里 4 次失败有 3 次当场消失。
+
+  **反对/成本**：① 多一个外部依赖，**必须处理「机器上没装 Git Bash」的回退**，
+  而回退意味着同一份项目在两台机器上 shell 不同——那正是本项目最忌讳的
+  「静默降级」形态（环境信息必须如实报出退回了 cmd，不能假装）；
+  ② `filtered_environ` 与那段控制台模式的处理（`ENABLE_PROCESSED_INPUT`，
+  见 `run_command.py` 的模块 docstring）都是按 cmd 写的，要重新核；
+  ③ 路径形态会变（MSYS 的 `/g/xxx` vs `G:\xxx`），而工具返回的路径会进模型上下文；
+  ④ ⚠ **MSYS 的路径转换本身就是个坑**——`CLAUDE.md` 里那条
+  「从 Git Bash 驱动 e2e 必须 `MSYS_NO_PATHCONV=1`」记的就是它，
+  换过去之后**所有以 `/` 开头的参数都会被改写**，这是新引入的一类失败。
+
+  **判据建议**：不要凭感觉定。用调度器在 live 模式跑一组对照——同一批任务，
+  一组 cmd、一组 Git Bash，量「因 shell 语法失败的工具调用次数」。
+  ⚠ **两边都要跑**，只跑 Git Bash 会看不见它新引入的那类失败（③④）。
+
+  ⚠ 若真要改，`agent/prompt/environment.py` 的 `_detect_shell` **必须同步**
+  ——它现在逐条照抄 CPython 对 `shell=True` 的实现规则，改了执行方式而不改它，
+  就是**在对模型撒谎**，而那比什么都不说更糟：模型会自信地写一种不生效的语法，
+  且不会去怀疑这条环境信息。`tests/test_shell_environment_info.py` 有一条
+  **真起子进程让它自报家门**的护栏钉着这个（变异实测过，谎报当场红）。
+
 - 各工具 `description` 的触发口径是否一致、`primary_arg` 登记是否齐全。
 - ⚠ 有几处**成对维护点**专管「两处措辞必须同口径」（Skill 清单 ↔ `load_skill`、
   角色清单 ↔ `run_agent`、交付信息 ↔ 委派工具、消息标记块 ↔ `send_message`、
@@ -103,8 +140,13 @@
 （`tests/e2e/`）跑真机 A/B。A/B 场景设计有坑——场景必须让「违反提示词」成为
 省事的那条路，否则测不出东西。
 
-文档里「已经攒下的具体线索」那一节有 5 条实测过的起点（read_file 的行号膨胀
+文档里「已经攒下的具体线索」那一节有 6 条实测过的起点（read_file 的行号膨胀
 15%、超过 12K 字符必被存盘、is_inside 的 1ms 热点等），直接从那里开始。
+
+⚠ 其中「run_command 在 Windows 上要不要改用 Git Bash」是**唯一一个改行为而不是
+改文案**的候选，风险与其余几条不在一个量级（新外部依赖 + 必须处理没装的回退 +
+MSYS 路径转换这一类新失败）。**它要单独拿给用户拍板**，别混在批量 PR 里，
+而且判据必须是两边对照的真机数据，不能凭感觉。
 
 做完把这份文档删掉，并按 `docs/todo/README.md` 的命名规则重排剩下的序号。
 ```
