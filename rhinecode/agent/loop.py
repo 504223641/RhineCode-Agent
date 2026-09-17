@@ -306,9 +306,33 @@ class RunOptions:
 
 
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
+    """
+    模型生成的参数解析不出来时，回灌给它的结构化错误。
+
+    :param tc: 那次解析失败的调用（`arguments` 为 None）
+    :returns: ok=False 的工具结果，循环据此继续而不是崩溃
+
+    ⚠ **必须说清「错在哪」，只说「格式不对、重试」是不够的。**
+    原文案没有任何具体信息，模型只能凭猜重写一遍同样长的参数——真实 trace 里
+    一次 1200 token 的 `edit_file` 参数就这么白烧了一整轮迭代。现在把
+    `arguments_error` 里的位置信息带上（JSON 解析器给的「第几列少了个逗号」
+    这类），它才有得改。这与已知项 #21 的教训同源：**拒绝或截断的文案要说清
+    为什么并给出路，否则模型会去找绕过的办法**（当时是去读存盘文件，这里是
+    原样重试）。
+
+    ⚠ 刻意**不把模型写的原文回灌给它**——那是它自己刚写的，再贴一遍只会白白
+    占掉一遍上下文。原文留在 trace 里给人看，见 `ToolCall.raw_arguments`。
+
+    副作用：无（纯函数）。
+    """
+    why = getattr(tc, "arguments_error", None)
+    detail = f"（{why}）" if why else ""
     return ToolResult(
         ok=False,
-        output=f"工具 {tc.name} 的参数必须是 JSON 对象，请检查格式后重试。",
+        output=(
+            f"工具 {tc.name} 的参数必须是一个合法的 JSON 对象{detail}。"
+            f"请重新生成这次调用的参数。"
+        ),
         summary="参数格式错误",
     )
 
@@ -448,6 +472,22 @@ class Agent:
                 "tool": tc.name,
                 "tool_call_id": tc.id,
                 "arguments": full_text(tc.arguments) if tc.arguments is not None else None,
+                # 参数解析失败时把模型写的原文与失败原因一并记下来（2026-09-18）。
+                # 不记的话这条事件只剩 `"arguments": null` 与一句「参数格式错误」，
+                # **模型到底写了什么就此消失**，而那是排查这类失败的唯一线索。
+                # 口径与 `trace/tracing_provider._tool_call_payload` 完全一致：
+                # 只在失败时出现、不截断——同一次失败会留下两条事件，两边说法
+                # 不一致会让读的人以为是两回事。
+                **(
+                    {"raw_arguments": full_text(tc.raw_arguments)}
+                    if getattr(tc, "raw_arguments", None) is not None
+                    else {}
+                ),
+                **(
+                    {"arguments_error": tc.arguments_error}
+                    if getattr(tc, "arguments_error", None)
+                    else {}
+                ),
                 "ok": res.ok,
                 "summary": res.summary,
                 "output": full_text(

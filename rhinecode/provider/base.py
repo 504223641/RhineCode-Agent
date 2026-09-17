@@ -25,10 +25,26 @@ class ToolCall:
     :param name: 被调用的工具名（对应 Tool.name）
     :param arguments: 解析后的参数字典；若模型生成的 JSON 非法导致解析失败，则为 None，
                       由协调层转成结构化错误回灌模型，而非崩溃
+    :param raw_arguments: **只在 `arguments` 为 None 时才有值**——模型生成的那串原始
+                      文本，一个字符都没改。解析成功时刻意留空：`arguments` 已经
+                      无损地承载了同样的内容，再存一份会让每条记录里的写文件正文
+                      凭空翻倍。
+    :param arguments_error: 同样只在解析失败时有值，说明是怎么失败的（JSON 语法错
+                      误的位置，或「解析出来不是一个对象」）。
+
+    ## 为什么失败时必须把原文留下来
+
+    解析失败时只记一个 `arguments: None`，等于**把唯一的证据扔了**：
+    事后谁也说不清模型到底写坏在哪、是它生成了非法 JSON 还是我们这边拼接碎片
+    时丢了东西。真实 trace 里出现过一次（2026-09-18，一次约 1200 token 的
+    `edit_file` 参数），当场无从排查。这与「工具裁剪了 output 必须同时填
+    `full_output`」是同一条纪律的两个落点：**观测设施丢内容就不再是证据。**
     """
     id: str
     name: str
     arguments: Optional[dict]
+    raw_arguments: Optional[str] = None
+    arguments_error: Optional[str] = None
 
 
 @dataclass

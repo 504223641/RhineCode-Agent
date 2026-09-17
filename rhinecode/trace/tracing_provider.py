@@ -23,7 +23,7 @@ import contextlib
 import time
 from typing import Any, Iterator, Optional
 
-from rhinecode.provider.base import BaseProvider, Message, StreamChunk
+from rhinecode.provider.base import BaseProvider, Message, StreamChunk, ToolCall
 from rhinecode.trace.models import (
     TraceEventType,
     full_text,
@@ -141,15 +141,7 @@ class TracingProvider(BaseProvider):
                             first_chunk_at = time.monotonic()
                         thinking_parts.append(chunk.content)
                     elif chunk.type == "tool_call" and chunk.tool_call is not None:
-                        tool_calls.append(
-                            {
-                                "id": chunk.tool_call.id,
-                                "name": chunk.tool_call.name,
-                                "arguments": full_text(chunk.tool_call.arguments)
-                                if chunk.tool_call.arguments is not None
-                                else None,
-                            }
-                        )
+                        tool_calls.append(_tool_call_payload(chunk.tool_call))
                     elif chunk.type == "usage":
                         usage = chunk.usage
                     elif chunk.type == "error":
@@ -197,6 +189,43 @@ def _tool_names(tools: Optional[list[dict]]) -> list[str]:
             if isinstance(fn, dict) and fn.get("name"):
                 names.append(fn["name"])
     return names
+
+
+def _tool_call_payload(tc: ToolCall) -> dict:
+    """
+    把一次工具调用转成可落盘的形态。
+
+    :param tc: Provider 拼接完成的工具调用
+    :returns: 至少含 id / name / arguments 三个键的字典
+
+    ## 解析失败时多写两个键，成功时一个都不多写
+
+    `arguments` 解析成功时它就是内容的无损形态，不必再存一份原文。
+    解析**失败**时 `arguments` 是 None，这时候若不把 `raw_arguments`
+    一并写下来，那段内容在记录里就彻底消失了——事后只看得到
+    `"arguments": null`，说不清模型写坏在哪。`arguments_error` 记的是失败原因
+    （JSON 语法错误的位置，或「解析出来不是对象」），它是排查时的第一条线索。
+
+    ⚠ 这两个键与 `tool_execute` 那边的同名键**必须保持同一口径**（都只在失败时
+    出现、都不截断）——一次失败的调用会在记录里留下两条事件（本函数产出的
+    `api_response` 与循环产出的 `tool_execute`），两边说法不一致会让读的人
+    以为是两回事。
+
+    副作用：无（纯函数）。
+    """
+    payload: dict = {
+        "id": tc.id,
+        "name": tc.name,
+        "arguments": full_text(tc.arguments) if tc.arguments is not None else None,
+    }
+    raw = getattr(tc, "raw_arguments", None)
+    if raw is not None:
+        # 刻意走 full_text：它是「这里是一段可能很长、且绝不截断的正文」的语义标记
+        payload["raw_arguments"] = full_text(raw)
+    err = getattr(tc, "arguments_error", None)
+    if err:
+        payload["arguments_error"] = err
+    return payload
 
 
 def _render_messages(messages: list[Message]) -> list[dict]:

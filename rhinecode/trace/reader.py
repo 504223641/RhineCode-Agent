@@ -96,6 +96,13 @@ def _s_api_request(r: dict) -> str:
 def _s_api_response(r: dict) -> str:
     calls = r.get("tool_calls") or []
     err = f" · 流错误 {r['stream_error']}" if r.get("stream_error") else ""
+    # 参数解析失败必须在时间线上一眼看得见：这一轮模型是发了工具调用的，
+    # 但那次调用**没能执行**，而「工具调用 1 个」这句话本身分辨不出这件事。
+    # 完整原文在负载里（`--seq` 展开可见），摘要行只给个数与原因。
+    broken = [c for c in calls if isinstance(c, dict) and c.get("arguments_error")]
+    if broken:
+        reason = broken[0].get("arguments_error")
+        err += f" · ⚠ 参数解析失败 {len(broken)} 个（{reason}）"
     # 首字延迟单独显示：它是流式体验最关键的指标（用户等了多久才看到第一个字），
     # 而总耗时里混着「出字很慢」与「首字就慢」两种完全不同的问题。
     first = r.get("first_chunk_ms")

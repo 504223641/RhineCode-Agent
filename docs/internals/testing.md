@@ -83,6 +83,21 @@ Trace 记录器测试（`tests/test_trace_*.py` + `tests/test_bootstrap.py`，�
   `DETAIL_LIMIT`）。两处都改成「给模型的那份继续裁，完整原文另存只进 trace」。
   三层判据：数据结构填对了 / 裁剪行为本身没变 / **它真的落进了 `tool_execute`**
   （中间隔着 `_trace_tool` 一层，那里漏用同样不报错）。含「没裁剪时不写第二份」的反证。
+- **`test_trace_raw_arguments.py`（14 条，2026-09-18 新增）** —— 同一条纪律的
+  **第三个落点**：模型生成的工具参数 JSON 解析失败时，那串原文原先就此消失
+  （记录里只剩 `"arguments": null`），事后既说不清模型写坏在哪，也分不清是它
+  生成了非法 JSON 还是我们拼碎片时丢了东西。真实 trace 里撞到过一次，一次约
+  1200 token 的 `edit_file` 参数白烧掉一整轮迭代而无从排查。
+  现在失败时带上 `ToolCall.raw_arguments`（**逐字不截断**）与 `arguments_error`。
+  判据分五层：Provider 解析后的形态 / `api_response` 事件 / `tool_execute` 事件 /
+  阅读器摘要行 / 回灌给模型的那句话。
+  ⚠ **后两个事件必须各写一条**——它们各有各的组装代码，只钉一条时把另一条改回
+  原样照样全绿（同 `read_file` 两条读取路径那次变异实测的教训）。
+  ⚠ 三条反证缺一不可：**解析成功时不许存第二份**（「反正都记上」看起来永远更
+  安全，而写文件的参数动辄几十 KB）、**原文不许回灌给模型**（它自己刚写的，
+  再贴一遍只是白占上下文）、**正常响应的摘要行不许凭空多出那段**。
+  八次变异实测全部抓到，其中两条「只改一个事件」的变异各只红一条，正好证明
+  两个落点是各自独立钉住的。
 - **`test_trace_system_serial.py`（4 条）** —— 七个 `system_serial` 工具此前
   一条 `permission_decision` 都不产。其中
   `test_every_tool_execution_is_preceded_by_a_decision` 是**改造前根本写不出来**
