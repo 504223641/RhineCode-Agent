@@ -16,6 +16,7 @@
 import unittest
 
 from textual.app import App, ComposeResult
+from textual.color import Color
 from textual.containers import Vertical
 
 from rhinecode.provider.base import ToolCall
@@ -77,6 +78,33 @@ def visible_children_of(view: HistoryView):
 def summary_of(batch: ToolBatchWidget) -> str:
     """取聚合行的纯文本（未转义、不含档位提示）。"""
     return batch.summary_text()
+
+
+def has_color(styles: "list[str]", hex_color: str) -> bool:
+    """
+    样式清单里有没有这个颜色。
+
+    ⚠ **必须认两种写法。** Textual 的两条渲染通路给出的样式串形态不同：
+    markup 那条（`set_markup`，批次聚合行走它）保留原样 `#5FD75F`，
+    Rich 那条（`set_rich`，工具行走它）已归一成 `rgb(95,215,95)`。
+    只认其中一种的话，断言会失败在与判据无关的地方——实现期真踩过一次。
+    """
+    r, g, b = Color.parse(hex_color).rgb
+    forms = (hex_color.lower(), f"rgb({r},{g},{b})")
+    return any(form in str(style).lower() for style in styles for form in forms)
+
+
+def head_styles_of(batch: ToolBatchWidget) -> "list[str]":
+    """
+    聚合行**真正画出来**的样式（颜色）清单。
+
+    ⚠ **刻意从渲染结果读，不从组件字段读。** 断言一个「返回颜色的属性」
+    等于把实现抄一遍当判据——`_repaint` 里改成直接写死失败色时，那种判据
+    照样全绿。这里走 `render()` 拿到 `Content`，读它的 span 样式，
+    那就是终端上落下的颜色。
+    """
+    content = batch.render()
+    return [str(span.style) for span in getattr(content, "spans", [])]
 
 
 async def prepared(app: App) -> HistoryView:
@@ -415,8 +443,20 @@ class SummaryTextTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(summary_of(batch), "搜索内容 1 次")
 
-    async def test_failure_count_appended(self) -> None:
-        """AC9：并行检索里有一个失败而模型继续跑时，聚合语末尾写出失败个数。"""
+    async def test_failure_is_neither_written_nor_painted(self) -> None:
+        """
+        **AC9 已反转（2026-09-17）**：批次里有失败时，聚合行**既不写失败个数、
+        也不变色**——封闭即成功色。
+
+        原 AC9 是「状态点变失败色 + 末尾写出个数」。反转的理由见
+        `ToolBatchWidget._repaint` 的那段勘误：检索类调用的失败绝大多数是
+        正常探路，整行染红等于反复报一个不需要用户处理的警报。
+
+        ⚠ **两条断言缺一不可，它们防的是两种不同的退化**：
+        只断言文本里没有「失败」，把颜色改回失败色照样全绿（用户看到的仍是
+        满屏红）；只断言颜色是绿的，把 `· 1 个失败` 加回聚合语照样全绿。
+        用户这次报的正是**颜色**那一半。
+        """
         app = _Harness()
         async with app.run_test(size=(120, 40)) as pilot:
             view = await prepared(app)
@@ -431,9 +471,36 @@ class SummaryTextTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             text = summary_of(batch)
-            self.assertTrue(text.endswith("1 个失败"), text)
+            self.assertNotIn("失败", text)
             # 失败的那次仍计入本组总数——聚合语说的是「做了几次」不是「成了几次」
-            self.assertIn("搜索内容 2 次", text)
+            self.assertEqual(text, "搜索内容 2 次")
+
+            styles = head_styles_of(batch)
+            self.assertTrue(has_color(styles, ToolCallWidget._COLOR_OK), styles)
+            self.assertFalse(has_color(styles, ToolCallWidget._COLOR_FAIL), styles)
+
+    async def test_failure_count_still_reaches_the_recorder(self) -> None:
+        """
+        **不显示 ≠ 不记录。** 聚合行不说失败了，`failure_count` 仍要数得对
+        ——它是行为记录 `ui_tool_batch.failures` 的唯一来源，也是折叠态
+        沉默之后「那一轮到底有没有报错」唯一的直接答案。
+
+        少了这条，把 `failure_count` 一起删掉会全绿，而那是一次观测能力的损失
+        （显示上省掉一个高频无用的红色是产品决定，记录上省掉一个事实不是）。
+        """
+        app = _Harness()
+        async with app.run_test(size=(120, 40)) as pilot:
+            view = await prepared(app)
+            w1 = view.add_tool_widget(call("c1", "read_file", path="a.py"))
+            w2 = view.add_tool_widget(call("c2", "read_file", path="b.py"))
+            await pilot.pause()
+            w1.finish(True, "12 行")
+            w2.finish(False, "文件不存在")
+            batch = view.query_one(ToolBatchWidget)
+            view.append_system("x")
+            await pilot.pause()
+
+            self.assertEqual(batch.failure_count, 1)
 
     async def test_no_failure_segment_when_all_succeed(self) -> None:
         app = _Harness()

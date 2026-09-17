@@ -21,6 +21,7 @@ from rhinecode.tools.display import (
     FOLD_GROUPS,
     RUNNING_VERBS,
     compose_batch_summary,
+    count_batch_failures,
     fold_group_map,
     is_foldable,
     resolve_full_title,
@@ -132,7 +133,13 @@ class RunningVerbTest(unittest.TestCase):
 
 
 class BatchSummaryTest(unittest.TestCase):
-    """F3/F6：聚合语的分组、顺序与失败段。"""
+    """
+    F3：聚合语的分组与顺序。
+
+    ⚠ **「失败段」那一部分已于 2026-09-17 反转**（原 F6）：聚合语不再写失败
+    个数，对应的用例现在是一条**反证**（`test_failures_are_never_mentioned`）。
+    个数仍算得出来，落点见 `BatchFailureCountTest`。
+    """
 
     def test_counts_by_group(self) -> None:
         text = compose_batch_summary(
@@ -158,13 +165,24 @@ class BatchSummaryTest(unittest.TestCase):
         """
         self.assertEqual(compose_batch_summary([("grep_content", True)]), "搜索内容 1 次")
 
-    def test_failures_appended_at_the_end(self) -> None:
+    def test_failures_are_never_mentioned(self) -> None:
+        """
+        **反证：聚合语里一个失败字样都不许出现**（原 F6，2026-09-17 反转）。
+
+        原实现在末尾追加 `· N 个失败`。去掉它的理由见
+        `compose_batch_summary` 的勘误段：检索类调用的失败绝大多数是正常探路，
+        把它抬到聚合语里等于反复报一个不需要用户处理的警报。
+
+        ⚠ **这条是反证，不是冗余**：「折叠不该藏信息」字面上永远像句好话，
+        最可能的退化就是有人把那一段加回来——加回来时这条当场红。
+        失败的可见性由**那一条工具行本身**承担（失败色 + 「失败」二字，F7 未改）。
+        """
         text = compose_batch_summary(
             [("grep_content", True), ("grep_content", False), ("read_file", True)]
         )
-        self.assertTrue(text.endswith("1 个失败"))
+        self.assertNotIn("失败", text)
         # 失败的那次仍计入本组总数——聚合语说的是「做了几次」，不是「成了几次」
-        self.assertIn("搜索内容 2 次", text)
+        self.assertEqual(text, "搜索内容 2 次 · 读取 1 个文件")
 
     def test_no_failure_segment_when_all_succeed(self) -> None:
         text = compose_batch_summary([("read_file", True), ("read_file", True)])
@@ -185,6 +203,44 @@ class BatchSummaryTest(unittest.TestCase):
 
     def test_empty_input(self) -> None:
         self.assertEqual(compose_batch_summary([]), "")
+
+
+class BatchFailureCountTest(unittest.TestCase):
+    """
+    `count_batch_failures`：**不显示 ≠ 不记录**。
+
+    聚合语不再写失败个数（见 `BatchSummaryTest.test_failures_are_never_mentioned`），
+    但那个数字仍要算得出来——它是行为记录里 `ui_tool_batch.failures` 的来源，
+    也是折叠态不再说出失败之后「那一轮到底有没有报错」唯一的直接答案。
+    """
+
+    def test_counts_only_settled_failures(self) -> None:
+        self.assertEqual(
+            count_batch_failures(
+                [("read_file", True), ("read_file", False), ("grep_content", False)]
+            ),
+            2,
+        )
+
+    def test_pending_is_not_a_failure(self) -> None:
+        """
+        与聚合语同一条口径：尚未产生结果（None）**不是失败**。
+        写成 `not ok` 的话，运行中的每一次调用都会被算成失败，
+        而记录里那一格会在批次还没跑完时就开始报数。
+        """
+        self.assertEqual(count_batch_failures([("read_file", None)]), 0)
+
+    def test_all_success_and_empty(self) -> None:
+        self.assertEqual(count_batch_failures([("read_file", True)]), 0)
+        self.assertEqual(count_batch_failures([]), 0)
+
+    def test_unregistered_tool_still_counts(self) -> None:
+        """
+        ⚠ **与聚合语刻意不同口径**：聚合语会跳过不可归并的工具（它没有量词模板，
+        算进去会把整句话搞成半截），而失败计数**照数**——记录要回答的是
+        「这一批里有没有报错」，一个工具有没有登记量词与那件事无关。
+        """
+        self.assertEqual(count_batch_failures([("write_file", False)]), 1)
 
 
 class FullTitleTest(unittest.TestCase):

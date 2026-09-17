@@ -1083,21 +1083,32 @@ class RhineApp(App):
             lambda: {"source": source, "text": full_text(text)},
         )
 
-    def _trace_tool_batch(self, summary: str, calls: int) -> None:
+    def _trace_tool_batch(self, summary: str, calls: int, failures: int = 0) -> None:
         """
         记一条 `ui_tool_batch`：一批工具调用归并成了一行（tui-activity-fold N7）。
 
-        由 `HistoryView` 在批次封闭时回调。**记的是聚合语原文与调用数**——
-        前者是用户真正看到的那句话（与界面同源，见 `ToolBatchWidget.summary_text`），
-        后者是「归并有没有生效」的直接依据：排查「怎么还是一行一行地铺」时，
+        由 `HistoryView` 在批次封闭时回调。**记三样：聚合语原文、调用数、失败数**——
+        第一个是用户真正看到的那句话（与界面同源，见 `ToolBatchWidget.summary_text`），
+        第二个是「归并有没有生效」的直接依据：排查「怎么还是一行一行地铺」时，
         看到 `1 次调用` 就知道批次根本没攒起来。
+
+        ⚠ **`failures` 是 2026-09-17 补上的，理由恰恰是界面不再显示它**：
+        原先聚合语末尾写着 `· N 个失败`，`summary` 里自带这个信息；那一段随
+        原 F6 的反转去掉之后，若不单独记一格，「那一轮到底有没有报错」就只能靠
+        逐条翻 `tool_execute` 去数——**显示上省掉一个高频无用的红色是产品决定，
+        记录上省掉一个事实是观测能力的损失**，两件事不能一起做。
 
         :param summary: 聚合语纯文本（未转义）
         :param calls: 本批次纳入的调用次数
+        :param failures: 其中已落定的失败次数（缺省 0，兼容不传的老调用方）
         """
         self._recorder.emit_lazy(
             TraceEventType.UI_TOOL_BATCH,
-            lambda: {"summary": full_text(summary), "calls": calls},
+            lambda: {
+                "summary": full_text(summary),
+                "calls": calls,
+                "failures": failures,
+            },
         )
 
     def show_user_input(self, text: str) -> None:

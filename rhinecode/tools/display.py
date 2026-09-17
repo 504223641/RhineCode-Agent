@@ -344,17 +344,37 @@ def running_verb(tool_name: str) -> str:
 
 def compose_batch_summary(entries: "list[tuple[str, Optional[bool]]]") -> str:
     """
-    把一个批次里的若干次调用压成一句聚合语（F3/F6）。
+    把一个批次里的若干次调用压成一句聚合语（F3）。
 
-    产出形如：`查找文件 1 次 · 搜索内容 3 次 · 读取 8 个文件 · 1 个失败`
+    产出形如：`查找文件 1 次 · 搜索内容 3 次 · 读取 8 个文件`
 
     ## 两条口径
 
     1. **分组顺序取该组第一次出现的时序**，不是字母序也不是表里的定义序——
        聚合语要读起来与实际发生顺序一致（先搜后读时，搜索段就该在前）。
-    2. **失败段恒在末尾**，且只在有失败时出现。它是兜底路径：真正要紧的失败
-       会让模型停下来说明，而那会封闭批次、让那条调用单独可见；
-       这里覆盖的只有「并行调用中某个失败、模型没停」这一种。
+    2. **聚合语说的是「做了几次」，不是「成了几次」**：失败的那次照常计入
+       本组总数，且**聚合语里不出现任何失败字样**（见下方那段勘误）。
+
+    ## ⚠ 勘误：失败段已移除（原 F6，2026-09-17 反转）
+
+    原实现在末尾追加 `· N 个失败` 并把整行染成失败色，依据是 spec F6
+    「折叠不藏失败」。**现在不这么做了**，理由是那条规则把「这一轮干成了没有」
+    与「过程里有没有某一次调用返回了错」混成了同一个信号：
+
+    - 检索类调用的失败**绝大多数是正常探路**（`read_file` 撞上一个不存在的
+      路径、`grep_content` 一处没匹配上），模型看一眼就换个地方继续，
+      整轮任务照样完成。把整行染红等于反复报一个不需要用户处理的警报，
+      而警报报多了就等于没有警报。
+    - **真正要紧的失败会让模型停下来说明**，那会封闭批次、让那条调用单独可见
+       ——那条路径一个字都没动（F1 的正文断开边界）。
+
+    失败**并没有被藏起来**，只是换了落点：那一条工具行本身仍是失败色、
+    仍写着「失败」二字（F7 未改），按 `Ctrl+O` 展开就在那里；
+    行为记录里另有 `failures` 字段直接给出个数（`count_batch_failures`）。
+
+    ⚠ **别顺手把失败段加回来**：它字面上永远像句好话（「折叠不该藏信息」），
+    而这次反转恰恰是用户实测提出来的——把整行的颜色从「这一轮成了没有」
+    降格成「过程里有没有一次报错」，是**拿一个高频无用的红色换掉一个有用的绿色**。
 
     ## 为什么量词都带宾语
 
@@ -370,7 +390,6 @@ def compose_batch_summary(entries: "list[tuple[str, Optional[bool]]]") -> str:
     """
     order: "list[str]" = []          # 组标识，按首次出现排
     counts: "dict[str, int]" = {}
-    failures = 0
     for name, ok in entries or []:
         entry = FOLD_GROUPS.get(str(name or ""))
         if entry is None:
@@ -382,17 +401,33 @@ def compose_batch_summary(entries: "list[tuple[str, Optional[bool]]]") -> str:
             order.append(group)
             counts[group] = 0
         counts[group] += 1
-        if ok is False:
-            failures += 1
 
     segments = []
     for group in order:
         # 取该组的量词模板。模板与组标识同在 FOLD_GROUPS 里，故必然取得到。
         template = next(t for g, t in FOLD_GROUPS.values() if g == group)
         segments.append(template.format(n=counts[group]))
-    if failures:
-        segments.append(f"{failures} 个失败")
     return SEGMENT_SEP.join(segments)
+
+
+def count_batch_failures(entries: "list[tuple[str, Optional[bool]]]") -> int:
+    """
+    数一个批次里**已落定的失败**次数。
+
+    聚合语不再显示失败个数（见 `compose_batch_summary` 的勘误段），但这个数字
+    仍要有人算——两个用处：界面侧判断要不要做别的处理，以及**行为记录**里
+    `ui_tool_batch.failures` 那一格。
+
+    ⚠ **它与聚合语刻意放在同一个模块里并互相指认**：「不显示」是一个显示决定，
+    「不记录」会是一次观测能力的损失，两件事完全不同。折叠态不再说出失败之后，
+    记录就是回答「那一轮到底有没有报错」的唯一去处——这一条不能跟着一起省掉。
+
+    :param entries: 与 `compose_batch_summary` 同一份 `(工具名, 是否成功)` 列表
+    :returns: `ok is False` 的条目数；尚未产生结果（None）的不算失败
+
+    副作用：无（纯函数）。
+    """
+    return sum(1 for _name, ok in entries or [] if ok is False)
 
 
 def fold_group_map(registry) -> dict:
@@ -462,5 +497,6 @@ __all__ = [
     "is_foldable",
     "running_verb",
     "compose_batch_summary",
+    "count_batch_failures",
     "fold_group_map",
 ]
