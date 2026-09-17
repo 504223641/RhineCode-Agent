@@ -49,6 +49,7 @@ from rhinecode.tools.display import (
     TOOL_LABELS,
     clip_value,
     compose_batch_summary,
+    count_batch_failures,
     resolve_call_parts,
     resolve_full_title,
     running_verb,
@@ -1537,9 +1538,17 @@ class ToolBatchWidget(SelectableStatic):
         head = self._running_text or DEFAULT_BATCH_VERB
         return f"{summary}{SEGMENT_SEP}{head}" if summary else head
 
-    def _has_failure(self) -> bool:
-        """本批次里是否有已落定的失败调用（F6）。"""
-        return any(ok is False for _name, ok in self._entries)
+    @property
+    def failure_count(self) -> int:
+        """
+        本批次里**已落定的失败**次数。
+
+        ⚠ **它不参与聚合行的显示**（见 `_repaint` 里那段勘误）：聚合语不写失败
+        个数、聚合行也不因此变色。这个数字只有一个出口——批次封闭时交给
+        行为记录（`ui_tool_batch.failures`）。折叠态不再说出失败之后，
+        记录就是回答「那一轮到底有没有报错」的唯一去处。
+        """
+        return count_batch_failures(self._entries)
 
     def _repaint(self) -> None:
         """
@@ -1550,8 +1559,6 @@ class ToolBatchWidget(SelectableStatic):
         本组件**自己就是那行聚合语**（继承 `Static`），因此这里直接 `update`
         自身，不存在「子组件挂没挂上」的问题——那正是不做容器换来的简化。
         """
-        color = ToolCallWidget._COLOR_FAIL if self._has_failure() else ToolCallWidget._COLOR_OK
-
         if not self._batch_closed:
             # 未封闭：**已完成的聚合语 + 进行时**，下面一行是当前这次调用的参数。
             # **不显示耗时**——那由状态行统一承担（F5），两处各显示一份会让用户
@@ -1570,7 +1577,22 @@ class ToolBatchWidget(SelectableStatic):
         # ⚠ **不再附档位提示**（tui-activity-fold 验收期修订）：那句话说的是一个
         # 全局快捷键，而一屏上可能有好几个批次——重复到第二次就没有信息量了。
         # 发现性改由输入框占位符承担，见 `NEXT_LEVEL_HINT` 的注释。
-        lines = [f"[{color}]● {escape(self._compose_head())}[/]"]
+        #
+        # ⚠ **颜色恒为成功色，哪怕批次里有失败调用**（原 F6，2026-09-17 反转）。
+        #
+        # 原实现是「有失败就整行红 + 聚合语末尾写个数」。反转的理由是那个信号
+        # 混了两件事：检索类调用的失败绝大多数是**正常探路**（读一个不存在的
+        # 路径、搜一处没匹配上），模型换个地方继续、整轮任务照样完成——
+        # 把整行染红等于反复报一个不需要用户处理的警报，而警报报多了等于没有
+        # 警报。这一行的颜色现在只回答一件事：**这一批检索跑完了**。
+        #
+        # 失败没有被藏起来，只是换了落点：那一条工具行本身仍是失败色、仍写着
+        # 「失败」二字（`ToolCallWidget._render_finished`，F7 未改），`Ctrl+O`
+        # 展开就在那里；个数则进行为记录的 `ui_tool_batch.failures`。
+        #
+        # ⚠ **别顺手把 `failure_count` 接回这里**——「折叠不该藏信息」字面上
+        # 永远像句好话，而这次反转正是用户看着满屏红色提出来的。
+        lines = [f"[{ToolCallWidget._COLOR_OK}]● {escape(self._compose_head())}[/]"]
         # F4：只有一次调用时，聚合行下方保留一条从属行放主参数值——
         # 单次时那个信息放得下，不给是纯损失；多次时十个文件名塞不进一行。
         if len(self._entries) == 1 and self._single_arg:
@@ -1692,7 +1714,7 @@ class HistoryView(ScrollableContainer):
         """
         self._fold_groups = dict(mapping or {})
 
-    # 批次封闭时的回调（`(聚合语, 调用数) -> None`），由 `app.on_mount` 注入。
+    # 批次封闭时的回调（`(聚合语, 调用数, 失败数) -> None`），由 `app.on_mount` 注入。
     # 缺省是个空实现——历史区不认识行为记录器，装配不到时它照常工作。
     _on_batch_closed = None
 
@@ -1719,7 +1741,12 @@ class HistoryView(ScrollableContainer):
         if self._on_batch_closed is not None:
             # 埋点整段兜异常：观测设施绝不能反过来打断被观测的界面
             try:
-                self._on_batch_closed(batch.summary_text(), batch.call_count)
+                # ⚠ **失败数必须单独传**：聚合语自 2026-09-17 起不再写失败个数
+                # （原 F6 反转），于是记录这一格成了「那一轮到底有没有报错」
+                # 唯一的直接答案。少传它不报错，只是那个信息从产物里消失。
+                self._on_batch_closed(
+                    batch.summary_text(), batch.call_count, batch.failure_count
+                )
             except Exception:  # noqa: BLE001
                 pass
 

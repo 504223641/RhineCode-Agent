@@ -25,6 +25,9 @@ import unittest
 from rhinecode.agent.events import AgentEvent, AgentEventType, StopReason
 from rhinecode.provider.base import ToolCall
 from rhinecode.tools.base import ToolResult
+# 颜色断言的归一化助手在组件级那份测试里（两种渲染通路给出的样式串形态不同），
+# 两处共用一份，别各写一个。
+from tests.test_tui_batch import has_color
 from rhinecode.tui.widgets import (
     DETAIL_FOLDED,
     DETAIL_ITEMS,
@@ -228,7 +231,12 @@ class FailureRunTest(_RunBase):
     这里覆盖的是兜底路径——聚合行必须变色并写出失败个数（AC9）。
     """
 
-    async def test_failure_count_shows_in_the_folded_summary(self) -> None:
+    async def test_folded_summary_stays_quiet_about_the_failure(self) -> None:
+        """
+        **整轮反证（原 AC9 已于 2026-09-17 反转）**：聚合行不写失败个数。
+
+        失败的那次仍计入总数——聚合语说的是「做了几次」不是「成了几次」。
+        """
         events = [
             said("我查几个地方。"),
             *ran(call("c1", "grep_content", pattern="def "), "共 5 处匹配"),
@@ -240,18 +248,21 @@ class FailureRunTest(_RunBase):
         async def check(app, view, pilot):
             batch = view.query_one(ToolBatchWidget)
             summary = batch.summary_text()
-            self.assertTrue(summary.endswith("1 个失败"), summary)
-            # 失败的那次仍计入总数——聚合语说的是「做了几次」不是「成了几次」
+            self.assertNotIn("失败", summary)
             self.assertIn("读取 2 个文件", summary)
 
         await self._drive(events, check)
 
-    async def test_folded_summary_alone_tells_something_broke(self) -> None:
+    async def test_failure_is_visible_only_after_expanding(self) -> None:
         """
-        **折叠状态下就能看出「有东西失败了」**，不必展开。
+        **失败换了落点，不是被删了**（原 AC9 反转后这条接替它的位置）。
 
-        这条是折叠不藏重要信息的最后一道：即便用户从不按展开键，
-        屏幕上那一行也得说出实情。
+        折叠态那一行**一个失败字样都没有、颜色是成功色**；按 `Ctrl+O` 展开
+        之后，那条工具行本身仍是失败色、仍写着「失败」二字（F7 未改）。
+
+        ⚠ **两半必须在同一条用例里**：只验前半等于只证明「它安静了」，
+        而那与「它把失败吃掉了」在断言上无法区分——后半才是「安静是安全的」
+        这句话的唯一依据。
         """
         events = [
             said("查一下。"),
@@ -260,7 +271,20 @@ class FailureRunTest(_RunBase):
             DONE,
         ]
         async def check(app, view, pilot):
-            self.assertIn("失败", view.query_one(ToolBatchWidget).summary_text())
+            batch = view.query_one(ToolBatchWidget)
+            self.assertNotIn("失败", batch.summary_text())
+            styles = [str(s.style) for s in batch.render().spans]
+            self.assertTrue(has_color(styles, ToolCallWidget._COLOR_OK), styles)
+            self.assertFalse(has_color(styles, ToolCallWidget._COLOR_FAIL), styles)
+
+            # 展开：那一条工具行必须自己把实情说出来
+            view.set_detail_level(DETAIL_ITEMS)
+            await pilot.pause()
+            row = view.query_one(ToolCallWidget)
+            self.assertTrue(row.display, "展开档下工具行必须可见")
+            self.assertIn("失败", row.plain_text())
+            row_styles = [str(s.style) for s in row.render().spans]
+            self.assertTrue(has_color(row_styles, ToolCallWidget._COLOR_FAIL), row_styles)
 
         await self._drive(events, check)
 

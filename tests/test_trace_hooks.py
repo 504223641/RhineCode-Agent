@@ -913,7 +913,12 @@ class AllTypesTest(TraceHookBase):
             T.TEAM_MEMBER: {"name": "worker-a", "event": "idle", "detail": ""},
             T.AUTO_WAKE: {"count": 1, "limit": 5, "trigger": "main"},
             # tui-activity-fold 界面两类
-            T.UI_TOOL_BATCH: {"summary": "搜索内容 3 次 · 读取 2 个文件", "calls": 5},
+            # ⚠ `failures` 是 2026-09-17 补的一格：聚合语自那天起不再写失败个数
+            # （tui-activity-fold 原 F6 反转），记录这一格成了「那一轮到底有没有
+            # 报错」唯一的直接答案，所以代表性负载里必须带上它。
+            T.UI_TOOL_BATCH: {
+                "summary": "搜索内容 3 次 · 读取 2 个文件", "calls": 5, "failures": 1,
+            },
             T.UI_DETAIL_LEVEL: {"level": 1},
             # c16 分类器一类
             T.CLASSIFIER_VERDICT: {

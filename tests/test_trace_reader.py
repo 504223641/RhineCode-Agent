@@ -518,5 +518,43 @@ class ClarifyInteractionSummaryTest(unittest.TestCase):
         self.assertEqual(line, "confirm → allow · write_file")
 
 
+class ToolBatchSummaryTest(unittest.TestCase):
+    """
+    批次归并那一行的摘要（tui-activity-fold N7）。
+
+    ⚠ **`failures` 必须出现在摘要行里**（2026-09-17）：界面上的聚合语自那天起
+    不再写失败个数（原 F6 反转），于是这里成了「那一轮到底有没有报错」
+    唯一一眼看得到的地方。新增负载字段不进摘要行就等于白记。
+    """
+
+    def _line(self, **payload) -> str:
+        from rhinecode.trace.reader import _s_ui_tool_batch
+
+        base = {"summary": "搜索内容 3 次 · 读取 2 个文件", "calls": 5}
+        base.update(payload)
+        return _s_ui_tool_batch(base)
+
+    def test_failures_are_written_out(self) -> None:
+        self.assertIn("2 个失败", self._line(failures=2))
+
+    def test_zero_failures_stays_quiet(self) -> None:
+        """
+        **反证：零失败时一个字都不加。**
+
+        每条都挂一个「0 个失败」只会挤掉摘要行里真正有信息量的部分
+        ——而摘要行的宽度是稀缺资源（同 `multi_select` 刻意不进摘要那条）。
+        """
+        self.assertNotIn("失败", self._line(failures=0))
+        self.assertNotIn("失败", self._line())
+
+    def test_garbage_does_not_break_the_line(self) -> None:
+        """
+        观测设施绝不能因为一格脏数据就读不出整条记录——旧产物里压根没有这一格，
+        手改过的产物里什么都可能有。
+        """
+        self.assertNotIn("失败", self._line(failures="不是数字"))
+        self.assertNotIn("失败", self._line(failures=None))
+
+
 if __name__ == "__main__":
     unittest.main()

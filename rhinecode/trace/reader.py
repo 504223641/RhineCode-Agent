@@ -422,8 +422,18 @@ def _s_ui_tool_batch(r: dict) -> str:
     摘要行给**聚合语原文 + 调用数**：前者是用户真正看到的那句话，
     后者是「归并有没有生效」的直接依据——排查「怎么还是一行一行地铺」时，
     看到 `1 次调用` 就知道批次根本没攒起来。
+
+    ⚠ **有失败时追加 `N 个失败`，这一段必须进摘要行**（2026-09-17）：
+    界面上的聚合语自那天起不再写失败个数（tui-activity-fold 原 F6 反转），
+    于是这里是「那一轮到底有没有报错」唯一一眼看得到的地方。零失败时不写
+    ——每条都挂一个 `0 个失败` 只会挤掉真正有信息量的部分。
     """
-    return f"{r.get('summary', '')} · {r.get('calls', 0)} 次调用"
+    head = f"{r.get('summary', '')} · {r.get('calls', 0)} 次调用"
+    try:
+        failures = int(r.get("failures") or 0)
+    except (TypeError, ValueError):
+        failures = 0
+    return f"{head} · {failures} 个失败" if failures else head
 
 
 def _s_ui_detail_level(r: dict) -> str:

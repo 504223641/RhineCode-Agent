@@ -82,6 +82,10 @@ def compose_batch_summary(
     """产出聚合语，如「查找文件 1 次 · 搜索内容 3 次 · 读取 8 个文件 · 1 个失败」。
 
     分组顺序 = 各组**第一次出现**的时序（F3）；失败段恒在末尾（F6）。
+
+    ⚠ 勘误（2026-09-17）：**失败段已移除**，见 spec 里 F6 的勘误块。
+    现在的签名多一个兄弟函数 `count_batch_failures(entries) -> int`——
+    个数仍算得出来，但只进行为记录（`ui_tool_batch.failures`），不进聚合语。
     """
 
 def running_verb(tool_name: str) -> str:
