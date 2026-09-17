@@ -39,6 +39,11 @@ self.assertFalse(bar.disabled, "自由输入态下输入框必须解禁")
 
 **取样**：整模块单跑 8 项全绿；单条单跑 3/3 绿；`run_parallel` 下红过。
 
+⚠ **2026-09-18 补：同一个类里的 `test_other_is_a_checkbox_and_typing_returns_to_the_list`
+也是同一个形态**（`run_parallel` 下红一次，随后整模块单跑 3/3 全绿）。
+也就是说这条不是某一个断言的问题，而是 **`AskUserE2ETest` 整个类在并行负载下
+会偶发**——修的时候别只盯那一条断言，先找这个类共用的等待/时序假设。
+
 ### ③ `tests/test_subagent_e2e.py::ForegroundE2ETest::test_conclusion_returned_as_tool_result`
 
 ```python
