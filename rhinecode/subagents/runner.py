@@ -193,7 +193,7 @@ class SubAgentRuntime:
     :param recorder: 行为记录器（共享；写入端已加锁，作用域是 threading.local）
     :param new_context_manager: **每次调用返回一个新的** ContextManager。
         它持有 `_anchor_tokens` / `_circuit_broken` 等可变状态且无锁，
-        并发共享会互相污染估算锚点。新建实例很轻，只共享存盘目录。
+        并发共享会互相污染估算锚点。新建实例很轻（只是几个字段）。
         为 `None` 时子 Agent 不跑任何上下文压缩（测试与非工具模式）。
     :param environment_text: 取环境信息段的回调，**入参是本次子 Agent 的工作目录**
         （c14 修正）。**刻意不给默认值**——与 `PermissionRequest.cwd` 同一条理由：
@@ -803,7 +803,7 @@ def run_subagent(
                 options=RunOptions(
                     max_iterations=max_turns or RunOptions().max_iterations,
                     record_usage=False, # 别拿子 Agent 的 usage 污染主历史锚点
-                    allow_summary=False,# 只跑 C8 第一层（工具结果存盘）
+                    allow_summary=False,# 子 Agent 不跑 C8 的 LLM 摘要
                     # 注册中心里除最终工具集之外的一律排除：既不发给模型，
                     # 调用了也拒绝（spec F13 的第二半）。
                     excluded_tools=frozenset(all_tool_names) - toolset.allowed,

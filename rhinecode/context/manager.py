@@ -2,10 +2,25 @@
 上下文管理编排器（c8 F3/F8/F14/F15/F16）。
 
 ContextManager 是 Context 层唯一持有 provider 引用、唯一有副作用编排的模块，
-把两层压缩、会话级状态（估算锚点、熔断计数、已存盘集合）、LLM 摘要调用串起来。
+把 LLM 摘要、会话级状态（估算锚点、熔断计数）串起来。
+
+## ⚠ 2026-09-17：只剩一层了
+
+c8 原设计是两层——第一层把过大的工具结果存盘、历史里只留占位（**不调模型**），
+第二层在逼近窗口时调 LLM 摘要。**第一层已整层删除**，理由是它按绝对阈值触发
+（合计 16 000 token），而那两个数字定于「DeepSeek 约 64K 窗口」的年代；窗口换成
+1 000 000 之后它变成在**窗口的 1.6%** 处就开始删历史，真实 trace 实录里模型
+连续十几轮拿不到自己刚读的文件、最终撞迭代上限、一个文件都没写出来。
+
+对齐上游：Claude Code 与 Codex **都没有「事后删历史」这种机制**（在 Codex 整棵
+树里搜 offload / spill 零命中），它们一律在工具**产出的那一刻**限量，进了历史
+就不再动，唯一会改写已有历史的只有摘要，触发点在窗口的 90%～97%。
+
+限量那一半现在由工具自己承担（`run_command.RUN_OUTPUT_MAX_CHARS` /
+`read_file.READ_OUTPUT_MAX_CHARS`）——**那是唯一的体量闸门，别再往回加一层**。
 
 对外方法（供 loop / conversation 调用）：
-- before_request(history)：自动路径。每次请求前先第一层 offload，再判断是否第二层摘要。
+- before_request(history)：自动路径。每次请求前判断是否要摘要。
 - record_usage(usage, sent_len)：用 API 返回的精确 prompt_tokens 更新估算锚点。
 - manual_compact(history)：/compact 手动路径（更窄的 3K 余量）。
 - usage_report(history)：/context 的只读文本报告。
@@ -15,13 +30,11 @@ ContextManager 是 Context 层唯一持有 provider 引用、唯一有副作用�
 在 /compact 生成器里），provider 调用是阻塞的，与现有同步执行模型一致。
 """
 
-from pathlib import Path
 from typing import Optional
 
 from rhinecode.hooks import HookEventType, NullHookManager
 from rhinecode.provider.base import BaseProvider, Message
 from rhinecode.context.estimate import estimate_tokens
-from rhinecode.context.offload import Offloader
 from rhinecode.context.summarize import (
     SUMMARY_SYSTEM_PROMPT,
     compute_retain_index,
@@ -98,7 +111,6 @@ class ContextManager:
         provider: BaseProvider,
         model: str,
         window: int,
-        store_dir: Path,
         auto_margin: Optional[int] = None,
         recorder: "Optional[TraceRecorderProtocol]" = None,
         hook_manager=None,
@@ -107,14 +119,11 @@ class ContextManager:
         :param provider: Provider，用于第二层摘要的 LLM 调用（复用 stream_chat）
         :param model: 模型名（当前仅备用/日志语义，摘要请求直接走 provider 默认模型）
         :param window: 上下文窗口上限（token），来自 config.context_window
-        :param store_dir: 第一层存盘目录（<项目根>/.rhinecode/context/）
         :param auto_margin: 自动触发的安全余量（防估算误差）。**缺省 None = 按窗口比例推导**，
                             见 `_derive_margin`；显式传值则原样采用（测试用）。
                             手动 /compact 不设余量阈值（用户主动触发即尽力压缩），故无对应参数。
         :param recorder: 行为记录器（trace 设施）。缺省 `NullRecorder()`，不传等于零回归。
         :param hook_manager: Hook 编排者（c12）。缺省 `NullHookManager()`，同样不传等于零回归。
-                             **只有第二层（LLM 摘要）产出事件**，第一层存盘不产——
-                             那一层每轮都可能发生若干次，挂 Hook 上去只会产生噪音。
         """
         self._recorder: TraceRecorderProtocol = recorder or NullRecorder()
         self._hooks = hook_manager if hook_manager is not None else NullHookManager()
@@ -124,7 +133,6 @@ class ContextManager:
         self.auto_margin = (
             auto_margin if auto_margin is not None else _derive_margin(window)
         )
-        self._offloader = Offloader(store_dir)
         # 估算锚点：上次 API 的精确 prompt_tokens 及其覆盖的历史条数；None 表示暂无锚点。
         self._anchor_tokens: Optional[int] = None
         self._anchor_len: int = 0
@@ -146,31 +154,35 @@ class ContextManager:
         self, history: list[Message], allow_summary: bool = True
     ) -> list[CompactionNotice]:
         """
-        每次 API 请求前执行：先第一层 offload，再按自动余量判断是否第二层摘要（F3）。
+        每次 API 请求前执行：按自动余量判断是否需要第二层摘要（F3）。
 
-        第一层先行的意义：offload 可能把刚产生的大工具结果存盘、直接降低估算值，
-        从而减轻第二层的触发压力（AC3）。
+        ## ⚠ 这里曾经还有「第一层」，2026-09-17 删了
 
-        :param history: 当前对话历史（可能被原地修改：offload 改写内容 / 摘要重构列表）
+        原先是「先跑第一层存盘、再判断第二层」。第一层按**绝对阈值**触发
+        （单条 4 000 token / 合计 16 000 token），而那两个数字定于「DeepSeek 约
+        64K 窗口」的年代——窗口换成 1 000 000 之后，它变成在**窗口的 1.6%** 处
+        就开始删历史里的工具结果。
+
+        真实 trace 实录（修完存盘占位死循环之后跑的那一份）：一条「创建一个新的
+        Agent」的任务跑满 25 轮迭代，17 次存盘里有 8 次删掉的是**模型还没看过**
+        的内容——它读一个文件，下一轮开头那条结果就被换成 700 字的占位，于是
+        照着占位的提示「缩小范围重调」，新结果又被删，如此往复；最后一个文件
+        都没写出来。
+
+        **别再往回加一层。** 限量已经收到工具产出的那一刻（见
+        `run_command.RUN_OUTPUT_MAX_CHARS` / `read_file.READ_OUTPUT_MAX_CHARS`），
+        那是上游两家的做法，也是唯一不会误删的位置——进了历史的东西在到达
+        摘要触发线之前一个字都不动。
+
+        :param history: 当前对话历史（摘要会原地重构这个列表）
         :param allow_summary: 是否允许第二层 LLM 摘要（c11 F21）。
-            Skill 独立模式的子对话传 False——它只跑零成本的第一层。
+            Skill 独立模式的子对话传 False——它跑的是另一条短历史，
+            拿主历史的锚点估它毫无意义。**传 False 即整个方法不做任何事。**
         :returns: 本次发生的压缩动作通知列表（可能为空）
 
-        副作用：可能写盘、原地修改 history、发起摘要 LLM 调用。
+        副作用：可能原地重构 history、发起摘要 LLM 调用。
         """
-        notices = self._offloader.run(history)
-        # 第一层存盘埋点（trace F16）：记「哪些工具调用被存了盘、存到哪」。
-        # 明细由 Offloader.last_run_details 提供——tool_call_id 与落盘路径原本都是
-        # 它内部的局部值，本层拿不到（见 offload.py 里那段注释）。
-        details = self._offloader.last_run_details
-        if details:
-            self._recorder.emit(
-                TraceEventType.CONTEXT_COMPACTION,
-                layer="offload",
-                tool_call_ids=[k for k, _ in details],
-                paths=[p for _, p in details],
-                count=len(details),
-            )
+        notices: list[CompactionNotice] = []
         # allow_summary 必须放在 and 链的**最前面**短路（c11 T34）：
         # _estimate 依赖的锚点对应的是**主历史**（record_usage 记的是主对话的
         # prompt_tokens 与主历史条数），而子对话传进来的是另一条短历史；
@@ -184,13 +196,12 @@ class ContextManager:
             notices.append(self._do_summary(history))
         return notices
 
-    # 关于子对话共享同一个 ContextManager 实例的两项已评估结论（c11）：
+    # 关于子对话共享同一个 ContextManager 实例的已评估结论（c11）：
+    # `_consecutive_failures` 熔断计数**不会被污染**。子对话恒不摘要
+    # （allow_summary=False），根本走不到 `_do_summary`，也就不可能给
+    # 主对话的熔断计数加一。
     #
-    # 1. `_offloader` 的幂等集合共享**无害**。它的幂等键是 `tool_call_id`，
-    #    那是 API 生成的全局唯一 id，主对话与子对话的工具调用不会撞键。
-    # 2. `_consecutive_failures` 熔断计数**不会被污染**。子对话恒不摘要
-    #    （allow_summary=False），根本走不到 `_do_summary`，也就不可能给
-    #    主对话的熔断计数加一。
+    # （此处原先还有一条关于第一层存盘幂等集合的结论，随那一层于 2026-09-17 删除。）
 
     def record_usage(self, usage, sent_len: int) -> None:
         """
@@ -219,7 +230,7 @@ class ContextManager:
         返回 0，_do_summary 据此返回 noop「无可摘要的早段」；这是「确实没得压」而非拒绝。
         即便已熔断，用户显式请求仍尝试一次（不受自动熔断压制），但仍受单次失败计数影响。
 
-        注意：手动路径只做第二层摘要，不做第一层 offload（第一层由自动路径 before_request 承担）。
+
 
         :param history: 当前对话历史（可能被原地重构）
         :returns: 压缩结果通知（summary / noop / circuit_break）
@@ -419,7 +430,6 @@ class ContextManager:
             estimated_tokens=est,
             window=self.window,
             headroom=self.window - est,
-            offloaded_count=self._offloader.count,
             circuit_broken=self._circuit_broken,
         )
 
@@ -458,7 +468,6 @@ class ContextManager:
             f"  估算 token：{s.estimated_tokens}",
             f"  窗口上限：{s.window}",
             f"  距上限余量：{s.headroom}",
-            f"  已存盘工具结果：{s.offloaded_count} 个",
         ]
         if s.circuit_broken:
             lines.append("  警告：自动摘要已熔断（连续失败），/clear 后恢复")
@@ -466,12 +475,11 @@ class ContextManager:
 
     def reset(self) -> None:
         """
-        /clear 时重置所有会话级状态：锚点、熔断、已存盘集合归零（F15 熔断复位）。
+        /clear 时重置所有会话级状态：锚点与熔断归零（F15 熔断复位）。
 
-        副作用：清空 _offloader 幂等集合、锚点与熔断状态；不删除磁盘上的存盘文件。
+        副作用：清空锚点与熔断状态。
         """
         self._anchor_tokens = None
         self._anchor_len = 0
         self._summary_failures = 0
         self._circuit_broken = False
-        self._offloader.reset()

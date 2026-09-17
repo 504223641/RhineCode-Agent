@@ -35,9 +35,15 @@ MAX_ANSWER_CHARS: int = 8_000
 
 # 降级时回灌主上下文的原文节选上限。
 #
-# 取值依据：按 `context/estimate.py` 的 CHARS_PER_TOKEN = 3.0 折算约 2 670 token，
-# **低于 `context/offload.py` 的 SINGLE_RESULT_TOKENS = 4000**，
-# 使降级结果不会每次都触发 C8 的第一层存盘（spec F17 的相容要求）。
+# 取值依据：按 `context/estimate.py` 的 CHARS_PER_TOKEN = 3.0 折算约 2 670 token。
+#
+# ⚠ **原依据是「低于 c8 第一层存盘的 SINGLE_RESULT_TOKENS = 4000」，
+# 而那一层已于 2026-09-17 整层删除。** 约束换成了新的一条、方向相同：
+# 它必须低于**工具产出时的体量闸门**——现在那是每个工具自己的字符预算
+# （`read_file.READ_OUTPUT_MAX_CHARS` / `run_command.RUN_OUTPUT_MAX_CHARS`）。
+# 降级节选走的是 `web_fetch` 这条路，与那两个不是同一个工具，但同属「一条工具
+# 结果能有多大」这个量级问题，保持在最小的那个闸门之下才不会成为历史里最胖的
+# 那一条。护栏见 `tests/test_web_extract.py`。
 MAX_FALLBACK_CHARS: int = 8_000
 
 # 不可信内容标记。与 render 用的是同一对标签——抽取模型看到的素材和

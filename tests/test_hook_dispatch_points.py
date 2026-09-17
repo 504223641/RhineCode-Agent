@@ -241,12 +241,10 @@ class SessionEventsTest(WorkspaceFixture):
 
 
 class CompactEventsTest(unittest.TestCase):
-    """压缩两事件只挂第二层（AC2）。"""
+    """压缩两事件只挂 LLM 摘要（AC2）。"""
 
     def _manager(self, hooks, tmp: Path) -> ContextManager:
-        return ContextManager(
-            QuietProvider(), "m", 65536, tmp / "ctx", hook_manager=hooks
-        )
+        return ContextManager(QuietProvider(), "m", 65536, hook_manager=hooks)
 
     def test_manual_compact_sends_both(self):
         hooks = RecordingHooks()
@@ -271,8 +269,16 @@ class CompactEventsTest(unittest.TestCase):
         self.assertEqual(hooks.events(), ["pre_compact", "post_compact"])
         self.assertIs(hooks.payload(E.POST_COMPACT)["ok"], False)
 
-    def test_offload_layer_does_not_fire(self):
-        """第一层存盘每轮都可能发生若干次，挂上去只会产生噪音。"""
+    def test_a_request_that_needs_no_compaction_fires_nothing(self):
+        """
+        没发生压缩就不该有任何 Hook 事件。
+
+        ⚠ 这条原名 `test_offload_layer_does_not_fire`，验的是「c8 第一层存盘
+        不挂 Hook」（那一层每轮可能发生若干次，挂上去只会产生噪音）。第一层已于
+        2026-09-17 整层删除，判据因此收窄成更朴素的一条——但**仍然要留着**：
+        `before_request` 现在是「够不着触发线就什么都不做」，而「什么都不做」
+        必须真的一个事件都不发，否则用户的 `pre_compact` Hook 会在每一轮空转。
+        """
         hooks = RecordingHooks()
         with tempfile.TemporaryDirectory() as tmp:
             cm = self._manager(hooks, Path(tmp))

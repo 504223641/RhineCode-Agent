@@ -98,7 +98,10 @@ PROTECTED_RELATIVE: tuple[tuple[str, ...], ...] = (
 #     ——那正是「给自己写持久指令」，与 `skills/` 同性质。
 EXCLUDED_RELATIVE: tuple[tuple[str, ...], ...] = (
     (".rhinecode", "sessions"),   # c9 会话存档
-    (".rhinecode", "context"),    # c8 存盘的工具结果原文
+    # ⚠ **c8 第一层存盘已于 2026-09-17 删除，本条仍然留着，别当成漏删。**
+    # 理由与 `path_guard._RUNTIME_ARTIFACT_RELATIVE` 里那条同源：旧文件还在磁盘
+    # 上，而它们是机器副本、不是「决定以后会发生什么」的配置，写它们不必过人眼。
+    (".rhinecode", "context"),    # 旧版 c8 第一层存下的工具结果原文
     (".rhinecode", "traces"),     # 行为记录
 )
 

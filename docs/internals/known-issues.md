@@ -255,12 +255,55 @@
     ③ **fail-open**——它是防呆不是安全边界（读存盘目录本来就不越权），
     判定异常时按「不是存盘文件」处理；真正的防线是占位符不再给路径。
 
-    护栏见 `tests/test_context_offload.py::PlaceholderPointsAtSourceTest`
-    （8 条，含一条用真 `ReadFileTool` 重演整条链的端到端反证、一条
-    「有来源 + 没路径」两句缺一不可的反证——只断言有来源的话把路径加回去照样
-    全绿、以及一条钉住「两张表不合一」的反证）。
+    护栏曾是 `tests/test_context_offload.py::PlaceholderPointsAtSourceTest`（8 条）。
+    ⚠ **那个文件已随第一层整层删除**（见下面的第二段），护栏一并删除——
+    它守的那个机制不存在了，留着只会指向不存在的代码。
 
-    ⚠ **本条只修了「轮数被白白烧掉」，没有改迭代上限本身**。固定 25 轮这个
-    策略的问题另立——上游（Claude Code 的 `max_turns` 默认 **No limit**、
-    Codex 的 `--max-turns` 提案 **closed as not planned**）都不把固定轮数当
-    主要护栏，而是靠「模型自然收工 + 预算上限 + 用户可打断 + 自动压缩」。
+    ---
+
+    ## ⚠ 第二段（2026-09-17 同日）：修完之后又量了一次，病根不在这个 bug
+
+    修完上面那条之后**同一句用户消息照样跑满 25 轮、照样零产出**
+    （新 trace：`G:\Splendor-Agent\.rhinecode\traces\20260917-193626-846.jsonl`）。
+    逐条比对「工具产出了多少 / 模型实际收到多少」之后，病根是**第一层存盘本身**：
+
+    - 它按**绝对阈值**触发（单条 4 000 / 合计 16 000 token），而那两个数定于
+      「DeepSeek 约 64K 窗口」的年代。`context_window` 现在缺省 1 000 000，
+      于是它相当于**用量到 1.6% 就开始删历史**（那次会话峰值 36K，占窗口 3.6%，
+      而存盘器已经删了 17 次）。
+    - 17 次里有 **8 次删的是模型还没看过的内容**：工具在第 N 轮末尾返回结果，
+      存盘器在第 N+1 轮**开头**动手，而请求是在那之后才组装的——那段内容在历史里
+      只存在了一个瞬间，从来没被发出去过。模型收到的是 700 字占位。
+    - 第二趟「聚合」删的是已经看过的，于是模型反复重读同一段（trace 里第 9 轮
+      原样重复了第 3 轮的调用）。
+    - 从第 10 轮起模型**放弃 `read_file`**，改用 `python -c "print(open(f).read()[a:b])"`
+      自己造读文件工具绕开存盘器——然后撞上 `run_command` 当时的「30 行 + 10 行」。
+
+    **修法是把整层删掉**，对齐上游：Claude Code 与 Codex **都没有「事后删历史」
+    这种机制**（在 Codex 整棵树 9192 个文件里搜 `offload` / `spill` / `externaliz`
+    零命中），它们一律在工具**产出的那一刻**限量、进了历史就不再动，唯一会改写
+    已有历史的只有 LLM 摘要，触发点在窗口的 90%（Codex `auto_compact_token_limit`
+    = 窗口 × 90%）～97%（Claude Code 1M 模型约 967K）。
+
+    限量那一半随之收到工具自己：`run_command.RUN_OUTPUT_MAX_CHARS`（30 000，
+    对齐 Claude Code 的 Bash 默认值）与 `read_file.READ_OUTPUT_MAX_CHARS`
+    （100 000，配分页提示）。
+
+    **三处刻意留着的，别当成漏删**：
+    ① `path_guard._RUNTIME_ARTIFACT_RELATIVE` 里的 `.rhinecode/context`
+    ② `permission/protected.py` 的 `EXCLUDED_RELATIVE` 里同一条
+    ③ `.gitignore` 里那一行
+    ——理由都一样：**旧文件还躺在每个跑过 rhine 的项目里**，摘掉之后 grep 会
+    重新开始命中它们。另有第四处：`trace/reader.py` 的 `layer == "offload"`
+    摘要分支也留着，阅读器要能读懂用户手上的旧记录。
+
+    **可复用的教训**：修掉一个具体的 bug 之后，要再问一遍「**它所在的那个机制
+    本身是不是也该没有**」。#21 上半段那条「同一个自放大环还有没有别的入口」是
+    横向的，这一条是纵向的——而这次是后者才真正解决问题。
+
+    ⚠ **本条仍然没有改迭代上限本身**。固定 25 轮那个策略的问题另立
+    （`docs/todo/1-iteration-budget.md`）——上游（Claude Code 的 `max_turns`
+    默认 **No limit**、Codex 的 `--max-turns` 提案 **closed as not planned**）
+    都不把固定轮数当主要护栏，而是靠「模型自然收工 + 预算上限 + 用户可打断 +
+    自动压缩」。**改完上面这些之后要重新量一次 25 轮够不够**，拿旧观测去论证
+    「上限要加大」是错的。

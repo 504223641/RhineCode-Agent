@@ -249,8 +249,9 @@ class RunOptions:
     :param record_usage: 是否用本次 API 返回的 usage 更新 C8 的估算锚点。
         子对话传 False：它跑的是另一条短历史，用它的 usage 去更新**主历史**的
         锚点会让主历史的估算彻底失准。
-    :param allow_summary: 是否允许 C8 的第二层（LLM 摘要）。子对话传 False，
-        只跑零成本的第一层存盘（spec F21）。
+    :param allow_summary: 是否允许 C8 的 LLM 摘要。子对话传 False（spec F21）——
+        它跑的是另一条短历史，拿主历史的锚点估它毫无意义。
+        （原文写的是「只跑零成本的第一层存盘」，第一层已于 2026-09-17 删除。）
     :param excluded_tools: 本轮**不提供给模型、且调用了也要拒绝**的工具名。
 
         C11 曾用一个三元组（allowed / exempt / excluded）表达 Skill 的工具收窄，
@@ -1208,30 +1209,19 @@ class Agent:
                 history.append(extra)
                 _record(extra)
 
-            # 上下文压缩（c8 F3）：每次 API 请求前先跑两层压缩（先第一层存盘、再按需第二层摘要），
-            # 把可能过长的历史压回 token 预算内。压缩可能原地修改 history（改写工具结果 / 重构列表）。
-            # 每条压缩动作都以 NOTICE 事件反馈给 TUI（F17）。context_manager 为 None 时整段跳过，
-            # 保持 c8 之前的行为不变（N1 低侵入）。
+            # 上下文压缩（c8 F3）：每次 API 请求前判断历史是否逼近窗口，需要时调 LLM
+            # 摘要把早段压掉。摘要会原地重构 history。每条压缩动作都以 NOTICE 事件
+            # 反馈给 TUI（F17）——摘要**真的改写了对话内容**，用户此后往上翻会发现
+            # 早段变成了一条摘要，那必须告知，不是内部机制。
+            # context_manager 为 None 时整段跳过，保持 c8 之前的行为不变（N1 低侵入）。
+            #
+            # ⚠ 这里曾经有一个 `if notice.kind == "offload": continue` 的分支，
+            # 用来吞掉第一层存盘的通知（它是纯内部机制、不改变对话内容）。
+            # 第一层已于 2026-09-17 整层删除，那个分支随之消失。
             if context_manager is not None:
                 for notice in context_manager.before_request(
                     history, allow_summary=options.allow_summary
                 ):
-                    # ⚠ **第一层存盘不再通知界面**（tui-activity-fold 验收期修订）。
-                    #
-                    # 「已把 N 个大型工具结果存盘」是纯内部机制：它不改变对话内容、
-                    # 不需要用户做任何事，而它出现的时机恰好是历史最长、屏幕最挤的
-                    # 时候——正是本轮改造要腾出的那块地方。留着它等于一边归并工具行
-                    # 一边往历史里塞新的过程噪音。
-                    #
-                    # **证据不丢**：`context/manager.py` 已在存盘处埋了
-                    # `context_compaction` 事件，排查时用 `--trace` 照样查得到，
-                    # 那才是这条信息该待的地方。
-                    #
-                    # ⚠ 第二层 LLM 摘要**仍然通知**：它会真的改写历史（早段被压成
-                    # 一条摘要），用户此后再往上翻会发现内容变了——那不是内部机制，
-                    # 是对话本身发生了变化，必须告知。
-                    if notice.kind == "offload":
-                        continue
                     # 提示级：上下文压缩是后台常规动作（tui-display 扩展 F19）
                     yield AgentEvent(type=AgentEventType.NOTICE, message=notice.message)
 

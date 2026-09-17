@@ -117,7 +117,11 @@ def worktrees_dir_of(root: Union[str, Path]) -> Path:
 # （比如某种缓存下来的角色定义），把它加进本表会**静默地把它从保护范围里摘掉**。
 _RUNTIME_ARTIFACT_RELATIVE: tuple[tuple[str, ...], ...] = (
     (".rhinecode", "sessions"),   # c9 会话存档：完整对话原文
-    (".rhinecode", "context"),    # c8 存盘的工具结果原文
+    # ⚠ **c8 第一层存盘已于 2026-09-17 删除，本条仍然留着，别当成漏删。**
+    # 那一层不再产生新文件，但用户机器上**已经产生**的那些 `.txt` 还躺在磁盘
+    # 上（每个跑过 rhine 的项目里都有一堆）。摘掉这一条，grep 会重新开始命中
+    # 它们——正是下面第 1、3 条危害。
+    (".rhinecode", "context"),    # 旧版 c8 第一层存下的工具结果原文
     (".rhinecode", "traces"),     # 行为记录：模型请求响应 + 工具输出原文
 )
 
@@ -150,68 +154,17 @@ def runtime_artifact_dirs_of(root: Union[str, Path]) -> tuple[Path, ...]:
     return tuple(base.joinpath(*parts) for parts in _RUNTIME_ARTIFACT_RELATIVE)
 
 
-# c8 第一层的工具结果存盘目录（相对工作目录）。**读取**类工具一律拒绝它。
+# ⚠ **这里曾经有 `_OFFLOAD_STORE_RELATIVE` / `offload_store_dir_of` /
+# `is_offload_store_path` 三件**，用来让 `read_file` 拒绝读 c8 第一层的存盘目录。
+# c8 第一层已于 2026-09-17 整层删除（理由见 `context/manager.py` 模块 docstring），
+# 那三件随之消失。
 #
-# ⚠ **与 `_RUNTIME_ARTIFACT_RELATIVE` 刻意不合一，尽管本表是它的子集。**
-# 那张表的语义是「**搜索**时跳过」，除本目录外还含 `sessions/` 与 `traces/`；
-# 而「让模型帮我看一份 trace / 翻一下上次的会话存档」是完全合理的请求，
-# 拿那张表来拦读取会把它一并堵死——**那是功能损失，不是修 bug**。
-# 反过来，把本目录从那张表里摘出来复用到这里也不行：两张表的增删理由不同，
-# 合一之后任一侧的变动都会静默改掉另一侧（与 `permission/protected.py` 的
-# `EXCLUDED_RELATIVE` 那对「取值相同但不合一」是同一条理由）。
-#
-# 为什么只有它需要拦读取：存盘文件是**上一条工具结果的逐字副本**，
-# 对模型没有任何原文之外的信息，而读它会触发一个不收敛的循环
-# （见 `context/offload.py` 模块 docstring 里那段实测记录）。
-# `sessions/` 与 `traces/` 没有这个性质——它们不是「某条结果的副本」。
-_OFFLOAD_STORE_RELATIVE: tuple[str, ...] = (".rhinecode", "context")
+# ⚠ **但上面 `_RUNTIME_ARTIFACT_RELATIVE` 里的 `(".rhinecode", "context")` 一条
+# 必须留着**，别当成漏删顺手清掉：用户机器上已经产生的那些 `.txt` 还躺在磁盘上，
+# 摘掉它之后 grep 会重新开始命中它们——而那正是那张表当初被造出来要防的事
+# （见 `runtime_artifact_dirs_of` 的第 2 条危害）。同理 `permission/protected.py`
+# 的 `EXCLUDED_RELATIVE` 里那条也留着。
 
-
-def offload_store_dir_of(root: Union[str, Path]) -> Path:
-    """
-    给定工作目录下的 c8 存盘目录，读取类工具一律拒绝落在其内的路径。
-
-    :param root: 工作目录根（**按调用者的工作目录算**，与权限管线第②层同口径，
-                 因此 c14 的隔离子 Agent 判的是它自己那份工作区）
-    :returns: 绝对路径（**可能不存在**，惰性创建）
-
-    副作用：无（纯路径拼接）。
-    """
-    return Path(root).joinpath(*_OFFLOAD_STORE_RELATIVE)
-
-
-def is_offload_store_path(path: Union[str, Path], root: Union[str, Path]) -> bool:
-    """
-    判断某路径是否落在 c8 存盘目录内。
-
-    :param path: 待判定路径。**必须已是解析过的绝对路径**（调用方那边来自
-                 `resolve_readable`，它内部已 resolve 过）
-    :param root: 本次调用的工作目录。**同样必须已解析**（来自 `require_cwd`）
-    :returns: 落在存盘目录内返回 True；判定异常返回 False（fail-open）
-
-    ⚠ **刻意不复用 `is_inside`，而它才是本模块的通用写法。** 那个函数对两个入参
-    各做一次 `Path.resolve()`，而 `resolve()` 是真的文件系统调用——实测在 Windows
-    上单次 `is_inside` 要 **1.0 ms**，占 `read_file` 整体耗时的 **38%**，而
-    `read_file` 是全项目调用最频繁的工具。这里两个入参**进来时就已经解析过了**
-    （见上面两条 `:param`），再解析一遍是纯浪费。故改成纯内存比较，零 I/O。
-    ⚠ 代价写清楚：若 `.rhinecode` 目录**自身**是个指向别处的符号链接，
-    `path` 解析后不再含这两段，本判定会漏掉——这是**有意接受**的，见下一段。
-
-    ⚠ **fail-open 同样是刻意的**：本判定不是安全边界（存盘目录本来就在工作区内、
-    读它不越权），它只是一道「别走进死循环」的防呆。判定不成立时按「不是存盘文件」
-    处理，最坏结果是循环少拦一次；反过来 fail-close 会让一次路径判定抖动变成
-    「正常文件读不了」，那是拿功能去换一个本来就有主防线的防呆。
-    **真正的防线是占位符不再给出这个路径**（见 `context/offload.py` 模块 docstring）。
-
-    副作用：无（纯路径比较，不碰文件系统）。
-    """
-    try:
-        target = Path(path)
-        store = offload_store_dir_of(root)
-        # Windows 上 PurePath 的比较天然大小写不敏感，无需另行归一。
-        return target == store or store in target.parents
-    except (OSError, ValueError):
-        return False
 
 
 def is_inside(path: Union[str, Path], container: Union[str, Path]) -> bool:
@@ -447,8 +400,6 @@ __all__ = [
     "require_cwd",
     "worktrees_dir_of",
     "runtime_artifact_dirs_of",
-    "offload_store_dir_of",
-    "is_offload_store_path",
     "is_inside",
     "resolve_in_workspace",
     "resolve_readable",
