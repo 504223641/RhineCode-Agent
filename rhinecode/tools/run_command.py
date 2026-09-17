@@ -314,6 +314,52 @@ def _clip(text: str) -> str:
     return "\n".join(head + [f"…（省略中间 {omitted} 行）…"] + tail)
 
 
+def _shell_syntax_note() -> str:
+    """
+    生成「这台机器上该用什么语法写命令」那一段，随平台切换。
+
+    :returns: 一段以换行结尾的说明；非 Windows 上是 POSIX 版
+
+    ## 为什么要有这一段（2026-09-17，两份真实 trace 实录）
+
+    模型不知道 `run_command` 用的是哪个 shell，于是把三种都猜了一遍：
+    POSIX（`| tail -40`、`VAR=x cmd`、`cmd &`）、PowerShell（`| Select-Object`）、
+    cmd（`set X=0 && cmd`）。一次任务里 **4 轮迭代、197K 输入 token** 白烧在
+    语法试错上，占那条用户消息的 23%。
+
+    ⚠ **只说「是 cmd.exe」不够，所以那两个陷阱必须逐条点名。** 实测：模型第三次
+    写的 `set PYTHONHASHSEED=0 && python ...` 是**教科书式正确的 cmd 语法**，
+    败在 cmd.exe 把 `&` 前的空格算进变量值——值变成 `'0 '`，Python 报
+    「must be an integer」。而模型把它**误诊**成引号问题，又白烧一轮。
+    一条只说 shell 名字的提示救不了这种。
+
+    ⚠ **这段与环境信息里那行「命令解释器：xxx」是一对成对维护点**，
+    两处必须指同一个 shell；而**详细语法只写在这里**，因为工具描述进可缓存的
+    稳定前缀、只付一次费，环境信息走消息通道、按轮次重复计费。
+
+    副作用：无（纯字符串，按 `os.name` 分支）。
+    """
+    if os.name != "nt":
+        return (
+            "**命令交给 `/bin/sh` 执行**，用 POSIX 语法。\n"
+        )
+    return (
+        "⚠ **命令交给 Windows 的 `cmd.exe` 执行**（不是 PowerShell，也不是 bash/Git Bash），"
+        "请按 cmd 语法写：\n"
+        "- **没有** `tail` / `head` / `grep` / `sed` / `awk` / `which` 这些命令，"
+        "也没有 `2>/dev/null`（用 `2>nul`）。要截断输出不必自己动手——本工具已经会"
+        "只保留首尾若干行。\n"
+        "- **设环境变量**用 `set X=1&& 命令`，⚠ **`&` 前不要留空格**："
+        "`set X=1 && 命令` 会把值设成 `\"1 \"`（带尾随空格），"
+        "很多程序会因此报「值非法」，而错误信息完全不会提到空格。\n"
+        "- 前缀式的 `VAR=值 命令` 在 cmd 里不成立（它会被当成一个可执行文件名）。\n"
+        "- 路径分隔符与 `%VAR%` 取值都按 cmd 的写法。\n"
+    )
+
+
+_SHELL_SYNTAX_NOTE = _shell_syntax_note()
+
+
 class RunCommandTool(Tool):
     """在项目工作目录下执行 shell 命令并返回输出。"""
 
@@ -333,6 +379,7 @@ class RunCommandTool(Tool):
     description = (
         "在项目工作目录下执行一条 shell 命令，返回标准输出、标准错误与退出码。"
         "用于运行测试、构建、启动脚本、查看环境等。\n"
+        f"{_SHELL_SYNTAX_NOTE}"
         "**不要用它替代专用工具**：读文件用 `read_file`，按文件名找文件用 `glob_files`，"
         "按内容搜索用 `grep_content`。除非用户明确要求，否则不要用它跑 "
         "`cat` / `head` / `tail` / `find` / `grep` / `ls` / `echo` 这类命令——"

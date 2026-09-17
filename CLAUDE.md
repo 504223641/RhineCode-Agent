@@ -345,7 +345,7 @@ C10（斜杠命令系统）、C9（记忆系统）、C8（上下文管理）、C
 
 ```bash
 python -m compileall rhinecode tests
-python -m unittest discover -s tests      # 全量；**条数以 discover 的输出为准**，skipped 4，约 3.5 分钟
+python -m unittest discover -s tests      # 全量；**条数与跳过数都以 discover 的输出为准**，约 3.5 分钟
                                           # ⚠ 这里刻意不写具体条数（R7）：它每次加用例都会变，
                                           #   而写死一个数等于每个加测试的 PR 都要顺手改一次文档，
                                           #   护栏化之后就成了噪声门禁、迟早被放宽。要看条数跑一次就有，
@@ -435,8 +435,14 @@ Textual 的「slow callback」告警会在满量跑时刷几百行，直接 prin
 [`docs/internals/testing.md`](docs/internals/testing.md) 的对应小节与
 `tests/test_subprocess_timeout.py` 的模块 docstring 末节。
 
-默认跳过 4 项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）与「连续起停」
-慢速专项（需 `RHINE_E2E_SLOW=1`）。**本机需装 git**——有预置依赖真实提交历史，
+默认跳过的是两类**环境门控**项：真实模型端到端（需 `RHINE_E2E_LIVE=1` 与有效凭据）
+与「连续起停」慢速专项（需 `RHINE_E2E_SLOW=1`）。
+⚠ **另有少量平台门控项，所以跳过数在不同平台上不一样**——例如
+`tests/test_shell_environment_info.py` 里那条「cmd.exe 的尾随空格陷阱确实存在」的
+反证只能在 Windows 上跑（它真起一个 `cmd.exe` 子进程验那个陷阱）。
+**这里刻意不写死一个数字**，理由与上面「条数以 `discover` 的输出为准」同源：
+写死的那份从定义上就会过期，而这一个还会随平台变。
+**本机需装 git**——有预置依赖真实提交历史，
 缺 git 时明确报错而非静默跳过（静默跳过会让那些场景假绿）。
 
 **另有两份「不测产品行为、只测文档」的护栏**（R7）：`tests/test_docs_facts.py`

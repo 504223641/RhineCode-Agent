@@ -36,6 +36,7 @@ def _env() -> EnvironmentInfo:
     return EnvironmentInfo(
         working_dir="/tmp/x",
         platform="win32",
+        shell="cmd.exe",
         date="2026-07-29",
         git_branch="main",
         model="deepseek-chat",

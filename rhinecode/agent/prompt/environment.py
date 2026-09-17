@@ -10,9 +10,11 @@
 """
 
 import datetime
+import os
 import platform as _platform
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from rhinecode.config import Config
 from rhinecode.agent.prompt.texts import ENVIRONMENT_TEMPLATE
@@ -28,7 +30,11 @@ class EnvironmentInfo:
     一次运行的环境快照。
 
     :param working_dir: 项目根（启动 RhineCode 时的工作目录）绝对路径；模型据此理解文件路径基准
-    :param platform: 操作系统/平台描述（如 Windows-11-...）；影响模型生成命令时的语法假设
+    :param platform: 操作系统/平台描述（如 Windows-11-...）
+    :param shell: `run_command` 实际使用的命令解释器（见 _detect_shell）。
+                  ⚠ **它才是模型生成命令时该依据的东西，`platform` 不够**——
+                  Windows 上 cmd / PowerShell / Git Bash 都说得通，而开发机上
+                  通常三种都装着。真实 trace 里模型把三种全猜了一遍，白烧 4 轮
     :param date: 当前日期（ISO 格式 yyyy-mm-dd）；给模型对「最近 / 今年」等相对时间一个参照
     :param git_branch: 当前 git 分支名；非 git 仓库或获取失败时为「无」（见 _detect_git_branch）
     :param model: 当前使用的模型名
@@ -37,6 +43,7 @@ class EnvironmentInfo:
 
     working_dir: str
     platform: str
+    shell: str
     date: str
     git_branch: str
     model: str
@@ -54,11 +61,40 @@ class EnvironmentInfo:
         return ENVIRONMENT_TEMPLATE.format(
             working_dir=self.working_dir,
             platform=self.platform,
+            shell=self.shell,
             date=self.date,
             git_branch=self.git_branch,
             model=self.model,
             protocol=self.protocol,
         )
+
+
+def _detect_shell() -> str:
+    """
+    探测 `run_command` 实际使用的命令解释器名。
+
+    :returns: Windows 上是 `COMSPEC` 指向的解释器名（缺省 `cmd.exe`），
+              POSIX 上是 `/bin/sh`
+
+    ## 判据必须与真正起子进程的地方一致
+
+    `tools/run_command.py` 的 `run_shell_captured` 用 `subprocess.Popen(shell=True)`，
+    而 CPython 对它的实现是：**Windows 走 `COMSPEC`（缺省 `cmd.exe`）**，
+    **POSIX 固定走 `/bin/sh`**。这里逐条照抄那个规则——**这是一处成对维护点**：
+    哪天 `run_shell_captured` 改成显式指定 `executable=`（比如改用 Git Bash），
+    这里必须同步，否则我们会**对模型撒谎**，而那比什么都不说更糟：
+    它会自信地写一种根本不生效的语法，且不会去怀疑这条环境信息。
+
+    ⚠ 只取解释器的**名字**（`cmd.exe` 而不是 `C:\\WINDOWS\\system32\\cmd.exe`）：
+    环境信息按轮次重复计费，完整路径对模型没有额外信息量。
+
+    副作用：无（只读环境变量）。
+    """
+    if os.name == "nt":
+        # COMSPEC 正常总是存在；取不到时按 CPython 的缺省值报 cmd.exe。
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        return Path(comspec).name or "cmd.exe"
+    return "/bin/sh"
 
 
 def _detect_git_branch(project_root: str) -> str:
@@ -103,9 +139,10 @@ def collect_environment(config: Config, project_root: str) -> EnvironmentInfo:
     执行步骤：
     1. 工作目录取传入的 project_root（由上层确定为启动时的项目根，与工具路径边界一致）。
     2. 平台用标准库 platform.platform()。
-    3. 日期用 datetime.date.today() 的 ISO 字符串（每次运行实时取，跨午夜会变）。
-    4. git 分支用 _detect_git_branch 探测（非 git 仓库/获取失败时为「无」）。
-    5. 模型名与 protocol 取自配置。
+    3. 命令解释器用 _detect_shell 探测（必须与 run_shell_captured 实际起的那个一致）。
+    4. 日期用 datetime.date.today() 的 ISO 字符串（每次运行实时取，跨午夜会变）。
+    5. git 分支用 _detect_git_branch 探测（非 git 仓库/获取失败时为「无」）。
+    6. 模型名与 protocol 取自配置。
 
     :param config: 运行配置，提供 model 与 protocol
     :param project_root: 项目根绝对路径
@@ -117,6 +154,7 @@ def collect_environment(config: Config, project_root: str) -> EnvironmentInfo:
     return EnvironmentInfo(
         working_dir=project_root,
         platform=_platform.platform(),
+        shell=_detect_shell(),
         date=datetime.date.today().isoformat(),
         git_branch=_detect_git_branch(project_root),
         model=config.model,
