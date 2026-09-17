@@ -153,6 +153,7 @@ _ISOLATED_FAILURE_TEXT = {
     StopReason.STREAM_ERROR: "模型请求出错（含上下文超限），本次 Skill 未产出结果。",
     StopReason.UNKNOWN_TOOL: "连续调用未知工具已停止，本次 Skill 未产出结果。",
     StopReason.PLAN_REJECTED: "计划未获批准，本次 Skill 未执行。",
+    StopReason.SPINNING: "子任务在原地打转已停止，本次 Skill 未产出结果。",
 }
 
 

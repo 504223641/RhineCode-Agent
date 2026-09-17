@@ -59,10 +59,24 @@ class EchoTool(Tool):
     parameters = {"type": "object", "properties": {}}
     read_only = True
 
-    def __init__(self, output: str = "工具输出") -> None:
+    def __init__(self, output: str = "工具输出", *, varying: bool = False) -> None:
+        """
+        :param output: 固定输出
+        :param varying: 每次调用给出**不同**的输出
+
+        ⚠ `varying=True` 是给「要真的跑满迭代上限」的用例用的。
+        固定输出 + 固定参数 = 一次标准的原地打转（`agent/spinning.py`），
+        循环会在第 3 轮把自己停掉，**永远到不了迭代上限**。
+        这不是打转检测在误伤，是那种剧本本来就长得跟死循环一模一样。
+        """
         self._output = output
+        self._varying = varying
+        self._calls = 0
 
     def execute(self, args: dict) -> ToolResult:
+        self._calls += 1
+        if self._varying:
+            return ToolResult(ok=True, output=f"{self._output} 第 {self._calls} 次")
         return ToolResult(ok=True, output=self._output)
 
 
@@ -230,9 +244,12 @@ class ConclusionFlowTest(IsolatedTestBase):
         不渲染任何东西；不补这条，用户会觉得界面完全没反应。
         （这里用「一直调工具直到打满迭代上限」触发该分支；
         取消路径由 test_cancel_event_is_rebuilt 从另一侧覆盖。）
+
+        ⚠ 工具必须 `varying=True`，理由见 `EchoTool` 的说明：固定参数 + 固定
+        输出会先被打转检测拦下，那样这条验的就是另一个分支了。
         """
         provider = ScriptedProvider([_tool_call("echo_tool")])
-        mgr = self._manager(provider, tools=[EchoTool()])
+        mgr = self._manager(provider, tools=[EchoTool(varying=True)])
         self._write_skill()
 
         events = list(mgr.run_skill("rev", "", "/rev"))
@@ -244,12 +261,33 @@ class ConclusionFlowTest(IsolatedTestBase):
         self.assertTrue(notices)
 
     def test_max_iterations_reason(self) -> None:
-        """子对话打满迭代上限 → 对应原因文案（AC33）。"""
+        """
+        子对话打满迭代上限 → 对应原因文案（AC33）。
+
+        ⚠ `varying=True` 不可省：固定参数 + 固定输出是一次标准的原地打转，
+        循环会在第 3 轮停掉、**根本走不到迭代上限**，这条于是变成在验
+        `SPINNING` 的文案——名字说的还是迭代上限，验的已经是别的东西了。
+        """
+        provider = ScriptedProvider([_tool_call("echo_tool")])
+        mgr = self._manager(provider, tools=[EchoTool(varying=True)])
+        self._write_skill()
+        list(mgr.run_skill("rev", "", "/rev"))
+        self.assertIn("迭代上限", mgr.history[1].content)
+
+    def test_spinning_reason(self) -> None:
+        """
+        子对话原地打转 → 另一条文案（2026-09-18）。
+
+        与上一条**刻意成对**：两者的剧本只差「工具输出变不变」，而用户看到的
+        说明必须不同——「任务太大没做完」与「它卡住了在重复」要他做的事完全
+        不一样（前者拆小重试，后者换个说法或直接告诉它下一步）。
+        """
         provider = ScriptedProvider([_tool_call("echo_tool")])
         mgr = self._manager(provider, tools=[EchoTool()])
         self._write_skill()
         list(mgr.run_skill("rev", "", "/rev"))
-        self.assertIn("迭代上限", mgr.history[1].content)
+        self.assertIn("原地打转", mgr.history[1].content)
+        self.assertNotIn("迭代上限", mgr.history[1].content)
 
     def test_stream_error_reason(self) -> None:
         """

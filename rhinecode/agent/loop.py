@@ -61,6 +61,7 @@ from rhinecode.hooks import (
     NullHookManager,
 )
 from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
+from rhinecode.agent.spinning import SpinDetector, render_spin_message
 from rhinecode.classifier import (
     SCOPE_LAUNCH,
     SCOPE_MESSAGE,
@@ -210,6 +211,19 @@ DENIED_UNATTENDED_FEEDBACK = (
 )
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
+#
+# ⚠ **2026-09-18 起它不再是「到了就停」，而是「到了就问一次还要不要继续」。**
+# 原先这一个数字同时扮演两个方向相反的角色：模型卡住时嫌它太多（白等白花钱），
+# 任务本身复杂时嫌它太少（活干到一半被腰斩——真实 trace 实录：第 25 轮它刚
+# 定位到性能瓶颈，正要动手就被掐了）。一个数字答不了两个问题，于是拆开：
+#
+#   「卡住了」  → `agent/spinning.py`，纯代码、零成本、每轮都在看
+#   「还要不要跑」→ 到了这条线问一次（续跑判定器，判不了就问用户）
+#
+# 对齐上游：**Claude Code 与 Codex 的主循环都不设轮次上限**。前者的 `maxTurns`
+# 是可选参数、没有默认值（`if (D && turnCount > D)`——没设就整段跳过），
+# 后者的二进制里 `max_turns` / `turn limit` / `max iterations` 一个都搜不到，
+# 它改用 token 预算 + 提示词里的 no-progress check。
 MAX_ITERATIONS = 25
 # 连续「整轮都是未知工具」达到该次数即停止，避免模型在不存在的工具上空转（spec F2）。
 MAX_CONSECUTIVE_UNKNOWN = 3
@@ -1181,6 +1195,10 @@ class Agent:
         # 正常作答，也不代表用户又想被问了；而「连续」口径会让模型学会
         # 「穿插着问就能一直问」。
         clarify_skips = 0
+        # 原地打转检测（2026-09-18）。作用域是**一次运行**——跨会话累计会让
+        # 用户第二次问同一件事时凭空少了几次额度，而那两次之间他可能已经改了
+        # 代码，「同样的命令给出同样的结果」在那时是新信息、不是打转。
+        spin = SpinDetector()
         # c13：子 Agent 闸门。缺省 NullGate → 两处调用退化为零成本空操作，
         # **不传等于零回归**。
         gate = options.subagent_gate if options.subagent_gate is not None else NullGate()
@@ -1422,12 +1440,18 @@ class Agent:
             clarify_skips += ctx.clarify_skipped
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
+            round_actions: list[tuple[str, object, str]] = []
             for tc in tool_calls:
                 res = results.get(tc.id)
                 output = res.output if res is not None else "工具未产生结果"
                 tool_msg = Message(role="tool", tool_call_id=tc.id, content=output)
                 history.append(tool_msg)
                 _record(tool_msg)
+                # 打转检测取的是**模型实际收到的那一份**（`res.output`），
+                # 不是 `full_output`：判据是「它看到的东西有没有变」，而它看到
+                # 的就是这一份。拿完整原文去比会让一次被裁剪的长输出里，
+                # 尾部的无关抖动掩盖掉「模型眼里完全一样」这个事实。
+                round_actions.append((tc.name, tc.arguments, output))
 
             # 计划获批 → 本轮后续迭代进入执行阶段
             if ctx.approved:
@@ -1458,6 +1482,22 @@ class Agent:
                     type=AgentEventType.FINISHED,
                     stop_reason=StopReason.UNKNOWN_TOOL,
                     message=f"连续 {consecutive_unknown} 轮调用未知工具，已停止。",
+                )
+                return
+
+            # 原地打转检测（2026-09-18）：同一个 (工具名, 参数, 结果) 反复出现。
+            #
+            # ⚠ **位置必须在结果回灌之后**：判据是「模型看到的东西有没有变」，
+            # 而那要等结果拿到手才知道。放在执行之前只能比参数，而只比参数会
+            # 误伤真实的排查节奏（真实 trace 里模型连跑三次性能基准——参数各不
+            # 相同、结果从 0.91 到 0.89 再到 0.040，那是正常的「量→改→复测」）。
+            spun = spin.record_round(round_actions)
+            if spun is not None:
+                spun_tool, spun_count = spun
+                yield AgentEvent(
+                    type=AgentEventType.FINISHED,
+                    stop_reason=StopReason.SPINNING,
+                    message=render_spin_message(spun_tool, spun_count),
                 )
                 return
 

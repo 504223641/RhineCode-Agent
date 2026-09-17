@@ -2844,12 +2844,12 @@ class RhineApp(App):
 
         ## 为什么级别在这里定，而不是让调用方猜（tui-display 扩展 F20）
 
-        六种结束原因分成两档，判据是「用户看到之后要不要做点什么」：
+        七种结束原因分成两档，判据是「用户看到之后要不要做点什么」：
 
         - **事件级**——「已取消」「计划未执行」是**用户自己刚做的决定**的回执，
           他知道发生了什么，不需要被醒目提示；
-        - **警告级**——迭代上限、未知工具、流错误都是**任务没做完就停了**，
-          用户多半要重试或改写请求。漏看这三条会让人以为任务成功了。
+        - **警告级**——迭代上限、未知工具、流错误、原地打转都是**任务没做完
+          就停了**，用户多半要重试或改写请求。漏看会让人以为任务成功了。
 
         改造前六种全走同一条 `[dim]` 通道，最要紧的三条与最平常的三条长得
         一模一样。emoji（`⏹` `⚠`）一并去掉：警告级由 widget 统一加「警告：」
@@ -2867,6 +2867,9 @@ class RhineApp(App):
             return LEVEL_WARNING, message or "连续调用未知工具，已停止"
         if stop_reason == StopReason.STREAM_ERROR:
             return LEVEL_WARNING, "因流错误已停止"
+        if stop_reason == StopReason.SPINNING:
+            # 警告级：与迭代上限同类——任务没做完就停了，用户多半要重试或改写。
+            return LEVEL_WARNING, message or "检测到原地打转，已停止"
         return LEVEL_NOTICE, ""
 
     @staticmethod
