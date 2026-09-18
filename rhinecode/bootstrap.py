@@ -72,6 +72,7 @@ from rhinecode.trace.tracing_provider import TracingProvider
 # 由本层从 `Rule` 上取字段——那是刻意的，见 `classifier/broad.py` 的模块 docstring
 # （让分类器包 import `permission` 会连带把引擎与 `rhinecode.tools` 拉起来，
 #  它就不再是叶子包了）。
+from rhinecode.classifier.continuation import ContinuationReviewer
 from rhinecode.classifier import (
     ClassifierConfig,
     ClassifierService,
@@ -495,6 +496,18 @@ def build_app(
                 recorder=recorder,
             )
             manager.classifier = classifier_service
+            # 续跑判定器**共用同一个 Provider**（便宜的模型 + 超时），
+            # 但此外一行状态都不共享——尤其**不共用熔断计数器**，理由见
+            # `classifier/continuation.py` 的模块 docstring。
+            #
+            # ⚠ **已知取舍：它跟着分类器一起开关。** 关掉安全审查会连带失去
+            # 「跑过 25 轮」的能力，那有点出人意料，但两者需要的东西是同一样
+            # （一个便宜的第二模型，由 `classifier.model` / `classifier.timeout`
+            # 配置）。要把它拆成独立开关，就得把上面那段 Provider 构造也搬出
+            # `cfg.classifier_enabled` 的分支——那是一次独立的改动。
+            manager.continuation = ContinuationReviewer(
+                classifier_provider, recorder=recorder
+            )
 
             # F20/F21：丢弃过宽的命令放行规则并逐条告知。
             #

@@ -294,18 +294,37 @@ class DeepSeekProvider(BaseProvider):
             for idx in sorted(tool_buffers.keys()):
                 buf = tool_buffers[idx]
                 raw_args = buf["arguments"] or "{}"
+                failure: Optional[str] = None
                 try:
                     parsed_raw = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as exc:
                     # 模型可能生成非法 JSON：标记 arguments=None，由协调层转结构化错误
                     parsed = None
+                    failure = f"JSON 解析失败：{exc}"
                 else:
                     # Function-calling arguments must be a JSON object. Other JSON values
                     # are treated like a parse failure so permission code never sees them.
-                    parsed = parsed_raw if isinstance(parsed_raw, dict) else None
+                    if isinstance(parsed_raw, dict):
+                        parsed = parsed_raw
+                    else:
+                        parsed = None
+                        failure = (
+                            f"参数解析出来是 {type(parsed_raw).__name__}，不是 JSON 对象"
+                        )
                 yield StreamChunk(
                     type="tool_call",
-                    tool_call=ToolCall(id=buf["id"], name=buf["name"], arguments=parsed),
+                    # ⚠ 失败时**必须**把原始碎片拼接结果原样带上（`raw_arguments`）：
+                    # 只回一个 `arguments=None` 的话，这段内容在整条链路上就此消失，
+                    # trace 里只剩 `"arguments": null`，事后无法判断是模型写坏了 JSON
+                    # 还是我们拼碎片时丢了东西。见 `ToolCall` 的 docstring。
+                    # 成功时刻意不带：`arguments` 已经是同一份内容的无损形态。
+                    tool_call=ToolCall(
+                        id=buf["id"],
+                        name=buf["name"],
+                        arguments=parsed,
+                        raw_arguments=raw_args if parsed is None else None,
+                        arguments_error=failure,
+                    ),
                 )
 
             _logger.info("请求完成 耗时=%.1fs", time.monotonic() - started)

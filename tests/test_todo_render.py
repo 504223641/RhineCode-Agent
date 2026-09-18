@@ -371,6 +371,84 @@ class TodoReminderTest(unittest.TestCase):
         ):
             self.assertIn("不要在回复里向用户提起它", text)
 
+    # ------------------------------------------------------------------ #
+    # 2026-09-18：提醒不许向模型提问（真实 trace 实录的重复正文）
+    # ------------------------------------------------------------------ #
+
+    def test_the_reminder_does_not_ask_the_model_a_question(self) -> None:
+        """
+        ⚠ **提醒里不许出现要模型作答的问句。**
+
+        原文写的是「**它做完了吗？**……先回答这个问题」，模型于是**真的每轮
+        当众回答一遍**。真实 trace 实录：连续八轮里六轮的正文开头都是
+        「第 3 条还没做完——……」，六句几乎一模一样——用户看到的是
+        「它卡住了在原地重复」，而它其实每轮都在正常干活。
+
+        判据钉的是**问号与「回答」这个动作**，不是某一句具体措辞：
+        换个说法再问一遍（「这条完成了没有？」）同样会复现那个症状。
+        """
+        text = render_todo_reminder(4, False, (3, "跑对局验证"))
+        self.assertNotIn("？", text, "提醒不许向模型提问——它会当众作答")
+        self.assertNotIn("?", text)
+        self.assertNotIn("回答", text)
+
+    def test_the_reminder_says_not_to_narrate_progress(self) -> None:
+        """
+        光去掉问号不够，还要**明说**别在正文里复述进度。
+
+        项目的语气提示词要求模型「工作中给用户短更新」，所以它每轮都会说点
+        什么；不点名的话，它很容易继续把那句短更新写成进度复述。
+        """
+        text = render_todo_reminder(4, False, (3, "跑对局验证"))
+        self.assertIn("不要在正文里复述进度", text)
+
+    def test_naming_the_item_survives(self) -> None:
+        """
+        ⚠ **反证：不许靠「退回泛泛的催促」来消除重复。**
+
+        念出序号与标题是 2026-08-18 真机复测的结果（见 `render_todo_reminder`
+        的措辞要求 ④）。「它每轮都在复述那条标题，那就别念标题了」是消除重复
+        最省事的改法，而它等于把那次修复整个撤销——**症状没了，发动机也没了**。
+
+        指名与提问是两回事：前者让模型想起那件具体的事，后者逼它当众作答。
+        """
+        text = render_todo_reminder(4, False, (3, "跑对局验证"))
+        self.assertIn("第 3 条", text)
+        self.assertIn("跑对局验证", text)
+
+    def test_the_time_anchor_survives(self) -> None:
+        """同上，时点锚点（那三个工具名）也不许在这轮改写里被顺手删掉。"""
+        text = render_todo_reminder(4, False, (3, "跑对局验证"))
+        for tool_name in ("edit_file", "write_file", "run_command"):
+            self.assertIn(tool_name, text)
+        self.assertIn("之前", text)
+
+    def test_the_reminder_is_still_injected_every_round(self) -> None:
+        """
+        ⚠ **反证：不许改成「隔 N 轮才提醒一次」。**
+
+        Claude Code 正是那么做的（距上次更新 ≥10 轮 **且** 距上次提醒 ≥10 轮），
+        照抄看起来是个更干净的解法。但它那么做得起是因为它的模型静态提示词就
+        吃得住，而本项目两轮真机验收摆着：静态提示词那条路三个杠杆加满仍是
+        **0 次 `todo_write`**，每轮注入是唯一被证明有效的杠杆。
+
+        **问题从来不在频率，在措辞。** 本函数是纯函数、不持有任何轮次状态，
+        这条用例钉的就是这一点——真要做频率闸门，必然得先给它加参数或状态，
+        那时候人会读到这段说明。
+        """
+        import inspect
+
+        params = inspect.signature(render_todo_reminder).parameters
+        self.assertEqual(
+            list(params),
+            ["item_count", "all_done", "in_progress"],
+            "提醒不该知道『第几轮』——加轮次参数前先读这条用例的说明",
+        )
+        # 同样的入参必须永远给出同样的输出（没有隐藏的跨轮状态）
+        first = render_todo_reminder(4, False, (3, "跑对局验证"))
+        for _ in range(5):
+            self.assertEqual(render_todo_reminder(4, False, (3, "跑对局验证")), first)
+
 
 if __name__ == "__main__":
     unittest.main()

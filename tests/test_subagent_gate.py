@@ -234,10 +234,14 @@ class DeliveryWithinOneRunTest(unittest.TestCase):
         gate = _gate(tasks)
         record = tasks.create(KIND_ROLE, "explorer", "t")
 
+        # ⚠ 三轮的参数**刻意各不相同**。写成三次一模一样的调用，本场景就同时
+        # 是一次「原地打转」（`agent/spinning.py`），循环会在第 3 轮把自己停掉、
+        # 第 4 轮根本不存在——而本用例要验的恰恰是第 3 轮之后那次请求体。
+        # 真实的主 Agent 在等子 Agent 期间做的也是三件不同的事，不是同一件三遍。
         provider = _ScriptedProvider([
-            ToolCall(id="a", name="read_file", arguments={}),
-            ToolCall(id="b", name="read_file", arguments={}),
-            ToolCall(id="c", name="read_file", arguments={}),
+            ToolCall(id="a", name="read_file", arguments={"path": "a.py"}),
+            ToolCall(id="b", name="read_file", arguments={"path": "b.py"}),
+            ToolCall(id="c", name="read_file", arguments={"path": "c.py"}),
             "我做完了。",
         ])
         # 第 2 轮请求发出后让它完成

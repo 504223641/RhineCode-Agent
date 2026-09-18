@@ -60,6 +60,8 @@ class StopReason(str, Enum):
     PLAN_REJECTED = "plan_rejected"    # 用户拒绝执行计划
     UNKNOWN_TOOL = "unknown_tool"      # 连续调用未知工具达到阈值
     STREAM_ERROR = "stream_error"      # 底层流出错
+    SPINNING = "spinning"              # 原地打转：同样的调用拿到同样的结果反复出现
+    NO_PROGRESS = "no_progress"        # 检查点上的续跑判定认为已经不在往前走了
 
 
 class ConfirmDecision(str, Enum):

@@ -31,6 +31,23 @@ self.assertTrue(screen.query_one("#setup-models", OptionList).has_focus)
 
 断言紧跟在填完凭据、切到第三屏之后，等的是 Textual 把焦点推到列表上。
 
+⚠ **2026-09-18 复测：它在 `context-budget-realign` 分支上几乎是确定性的——
+连跑 4 次红 4 次，而同一天同一台机器上 `main` 跑 1 次绿。**
+两条分支的产品代码差异与本用例毫无关系（改的是 c8 与三个工具的输出预算），
+唯一变的是**测试模块总数**（3756 → 3764），而 `run_parallel` 按模块分片，
+于是 `test_setup_screen` 的**同片邻居换了一批**。
+
+这条观察对修它很有用，有两层：
+
+① **「难以复现」这个前提已经不成立了**——在那条分支上它是个稳定的红，
+可以直接调试，不必再靠 `run_parallel` 连跑碰运气。
+② 它同时是「坑一」（单模块跑在空闲机器上验不出来）的一个**更强的样本**：
+决定它红不红的不是机器忙不忙，而是**恰好和谁跑在同一片里**。
+因此修法判据除了「连跑多次全绿」，还应当包括「在那条分支上也绿」。
+
+⚠ 别把这当成那条分支引入的回归——它在 `main` 上早就红过（见上面 2026-09-17
+那次取样），分支只是把它的复现率推高了。
+
 ### ② `tests/test_e2e_ask_user.py::AskUserE2ETest::test_the_input_box_is_only_unlocked_in_the_free_text_state`
 
 ```python

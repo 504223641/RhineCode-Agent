@@ -44,7 +44,7 @@ rhinecode/
 │   ├── render.py        # 注入消息标记块 / 看板文本 / 组队说明
 │   └── service.py       # 门面（协作能力的唯一入口）
 ├── trace/               # 行为记录（跨阶段测试设施，叶子包、只依赖标准库）
-│   ├── models.py        # 三十一类事件枚举、六种作用域、脱敏/白名单纯函数（**无截断**）
+│   ├── models.py        # 三十二类事件枚举、六种作用域、脱敏/白名单纯函数（**无截断**）
 │   ├── recorder.py      # TraceRecorder（锁内序列化+落盘+序号）/ NullRecorder / create_recorder
 │   ├── tracing_provider.py  # Provider 装饰器：记录每次请求与响应（唯一分层例外）
 │   └── reader.py        # 只读 CLI 阅读器（python -m rhinecode.trace.reader）

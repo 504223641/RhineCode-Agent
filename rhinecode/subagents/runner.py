@@ -78,6 +78,14 @@ _FAILURE_TEXT = {
         "若任务很大，可能是它自己的上下文超了窗口——建议拆小后重试。"
     ),
     StopReason.PLAN_REJECTED: "子 Agent 的计划被拒绝，未产出结论。",
+    StopReason.SPINNING: (
+        "子 Agent 在原地打转而停止：同一个调用带着同样的参数、拿到同样的结果"
+        "反复出现。多半是它卡在某个判断上了，建议把任务说得更具体再委派。"
+    ),
+    StopReason.NO_PROGRESS: (
+        "子 Agent 跑了很多轮之后看不出还在往前走，已停止。"
+        "任务可能过大或说得不够具体，建议拆小之后再委派。"
+    ),
 }
 
 _UNEXPECTED_TEXT = "子 Agent 运行时出错，未产出结论：{error}"

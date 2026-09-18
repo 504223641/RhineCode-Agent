@@ -61,6 +61,15 @@ from rhinecode.hooks import (
     NullHookManager,
 )
 from rhinecode.agent.gate import MAX_WAIT_ROUNDS, NullGate
+from rhinecode.agent.spinning import SpinDetector, render_spin_message
+from rhinecode.classifier.continuation import (
+    MAX_CONSECUTIVE_CONTINUES,
+    RECENT_ROUNDS,
+    RESULT_DIGEST_CHARS,
+    ContinuationDecision,
+    ContinuationProtocol,
+    RoundDigest,
+)
 from rhinecode.classifier import (
     SCOPE_LAUNCH,
     SCOPE_MESSAGE,
@@ -210,6 +219,19 @@ DENIED_UNATTENDED_FEEDBACK = (
 )
 
 # 迭代上限：兜底安全网，任何情况下循环都不会超过这么多轮（spec N3）。
+#
+# ⚠ **2026-09-18 起它不再是「到了就停」，而是「到了就问一次还要不要继续」。**
+# 原先这一个数字同时扮演两个方向相反的角色：模型卡住时嫌它太多（白等白花钱），
+# 任务本身复杂时嫌它太少（活干到一半被腰斩——真实 trace 实录：第 25 轮它刚
+# 定位到性能瓶颈，正要动手就被掐了）。一个数字答不了两个问题，于是拆开：
+#
+#   「卡住了」  → `agent/spinning.py`，纯代码、零成本、每轮都在看
+#   「还要不要跑」→ 到了这条线问一次（续跑判定器，判不了就问用户）
+#
+# 对齐上游：**Claude Code 与 Codex 的主循环都不设轮次上限**。前者的 `maxTurns`
+# 是可选参数、没有默认值（`if (D && turnCount > D)`——没设就整段跳过），
+# 后者的二进制里 `max_turns` / `turn limit` / `max iterations` 一个都搜不到，
+# 它改用 token 预算 + 提示词里的 no-progress check。
 MAX_ITERATIONS = 25
 # 连续「整轮都是未知工具」达到该次数即停止，避免模型在不存在的工具上空转（spec F2）。
 MAX_CONSECUTIVE_UNKNOWN = 3
@@ -294,6 +316,14 @@ class RunOptions:
     # 给自己签授权书——用户说「别提交」，模型在委派时写一句「请提交代码」，
     # 边界就没了。
     classifier_principal_history: "Optional[list]" = None
+    # 续跑判定器（2026-09-18）。**缺省 None 即本改动之前的行为，不传等于零回归**
+    # ——第一个检查点直接停，停止原因与文案逐字不变。
+    #
+    # ⚠ 它**不是** c16 的那个安全分类器，三条理由写在
+    # `classifier/continuation.py` 的模块 docstring 里，每一条单独都足以否决
+    # 合并；最要紧的是熔断计数器不能共用（那会让一个不稳的续跑判定把命令与
+    # 网络的安全审查一起熔断掉）。两者只共用一个 Provider。
+    continuation: "Optional[ContinuationProtocol]" = None
     # c15 F18/F19：本次运行是不是「无人值守轮」——由队友的消息自动唤起、
     # 用户没有在场。**只影响判 ASK 时回灌哪条文案**，不改变任何权限判定：
     # `interactive=False` 已经决定了「一律拒绝」，本标志只决定「怎么把这件事
@@ -305,10 +335,68 @@ class RunOptions:
     subagent_gate: object = None
 
 
+def _digest_args(arguments) -> str:
+    """
+    把一次调用的参数压成一行，供续跑判定的轮次摘要用。
+
+    只取键名与很短的值：判「有没有在往前走」要看的是「它在动哪个文件/跑哪条
+    命令」，不是文件的完整内容（一次 `write_file` 的参数就是整份文件）。
+
+    副作用：无（纯函数）。
+    """
+    if not isinstance(arguments, dict):
+        return ""
+    parts = []
+    for key, value in list(arguments.items())[:4]:
+        text = str(value).replace("\n", " ")
+        parts.append(f"{key}={text[:60]}")
+    return ", ".join(parts)
+
+
+def _digest_result(res: "Optional[ToolResult]") -> str:
+    """
+    把一次调用的结果压成一行。
+
+    ⚠ 取的是**模型实际收到的那一份**（`output`）而不是 `full_output`：
+    判据是「它看到的东西有没有变」。首行 + 长度就够——两次调用拿到同样长度
+    的同样开头，多半就是同一个东西。
+
+    副作用：无（纯函数）。
+    """
+    if res is None:
+        return "没有结果"
+    text = (res.summary or res.output or "").strip().replace("\n", " ")
+    return f"{text[:RESULT_DIGEST_CHARS]}（共 {len(res.output or '')} 字）"
+
+
 def _invalid_args_result(tc: ToolCall) -> ToolResult:
+    """
+    模型生成的参数解析不出来时，回灌给它的结构化错误。
+
+    :param tc: 那次解析失败的调用（`arguments` 为 None）
+    :returns: ok=False 的工具结果，循环据此继续而不是崩溃
+
+    ⚠ **必须说清「错在哪」，只说「格式不对、重试」是不够的。**
+    原文案没有任何具体信息，模型只能凭猜重写一遍同样长的参数——真实 trace 里
+    一次 1200 token 的 `edit_file` 参数就这么白烧了一整轮迭代。现在把
+    `arguments_error` 里的位置信息带上（JSON 解析器给的「第几列少了个逗号」
+    这类），它才有得改。这与已知项 #21 的教训同源：**拒绝或截断的文案要说清
+    为什么并给出路，否则模型会去找绕过的办法**（当时是去读存盘文件，这里是
+    原样重试）。
+
+    ⚠ 刻意**不把模型写的原文回灌给它**——那是它自己刚写的，再贴一遍只会白白
+    占掉一遍上下文。原文留在 trace 里给人看，见 `ToolCall.raw_arguments`。
+
+    副作用：无（纯函数）。
+    """
+    why = getattr(tc, "arguments_error", None)
+    detail = f"（{why}）" if why else ""
     return ToolResult(
         ok=False,
-        output=f"工具 {tc.name} 的参数必须是 JSON 对象，请检查格式后重试。",
+        output=(
+            f"工具 {tc.name} 的参数必须是一个合法的 JSON 对象{detail}。"
+            f"请重新生成这次调用的参数。"
+        ),
         summary="参数格式错误",
     )
 
@@ -448,6 +536,22 @@ class Agent:
                 "tool": tc.name,
                 "tool_call_id": tc.id,
                 "arguments": full_text(tc.arguments) if tc.arguments is not None else None,
+                # 参数解析失败时把模型写的原文与失败原因一并记下来（2026-09-18）。
+                # 不记的话这条事件只剩 `"arguments": null` 与一句「参数格式错误」，
+                # **模型到底写了什么就此消失**，而那是排查这类失败的唯一线索。
+                # 口径与 `trace/tracing_provider._tool_call_payload` 完全一致：
+                # 只在失败时出现、不截断——同一次失败会留下两条事件，两边说法
+                # 不一致会让读的人以为是两回事。
+                **(
+                    {"raw_arguments": full_text(tc.raw_arguments)}
+                    if getattr(tc, "raw_arguments", None) is not None
+                    else {}
+                ),
+                **(
+                    {"arguments_error": tc.arguments_error}
+                    if getattr(tc, "arguments_error", None)
+                    else {}
+                ),
                 "ok": res.ok,
                 "summary": res.summary,
                 "output": full_text(
@@ -1141,6 +1245,10 @@ class Agent:
         # 正常作答，也不代表用户又想被问了；而「连续」口径会让模型学会
         # 「穿插着问就能一直问」。
         clarify_skips = 0
+        # 原地打转检测（2026-09-18）。作用域是**一次运行**——跨会话累计会让
+        # 用户第二次问同一件事时凭空少了几次额度，而那两次之间他可能已经改了
+        # 代码，「同样的命令给出同样的结果」在那时是新信息、不是打转。
+        spin = SpinDetector()
         # c13：子 Agent 闸门。缺省 NullGate → 两处调用退化为零成本空操作，
         # **不传等于零回归**。
         gate = options.subagent_gate if options.subagent_gate is not None else NullGate()
@@ -1179,7 +1287,29 @@ class Agent:
             except Exception:
                 pass
 
-        for iteration in range(1, options.max_iterations + 1):
+        # ⚠ **这个循环刻意没有上界**（2026-09-18）。停在哪由下面四件事决定：
+        # 模型自然收工 / 用户取消 / 原地打转检测 / 检查点上的续跑判定。
+        # `options.max_iterations` 现在是**检查点间隔**而不是硬顶——到了那条线
+        # 问一次「还要不要接着跑」，判定器说继续就再给同样多的轮次。
+        #
+        # ⚠ **没有判定器时行为与改动前逐字一致**：第一个检查点直接停，
+        # 停止原因仍是 `MAX_ITERATIONS`、文案仍是那一句。不传等于零回归。
+        #
+        # ⚠ 无论判定器说多少次「继续」，`MAX_CONSECUTIVE_CONTINUES` 都会在
+        # 若干段之后强制停下来——那是本设计唯一的结构性兜底，见
+        # `classifier/continuation.py` 的模块 docstring（判定器看得到工具输出，
+        # 因此它是可以被投毒的；投毒的后果是烧钱，而这条上限封住了它）。
+        iteration = 0
+        checkpoint = max(1, options.max_iterations)
+        consecutive_continues = 0
+        digests: list[RoundDigest] = []
+        # 用户最初的要求：判定器判「有没有在往这个方向走」的唯一参照。
+        goal = next(
+            (m.content for m in reversed(history) if m.role == "user" and m.content),
+            "",
+        )
+        while True:
+            iteration += 1
             # 安全点 1：进入新一轮前检查取消
             if cancel_event.is_set():
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.USER_CANCELLED)
@@ -1382,12 +1512,18 @@ class Agent:
             clarify_skips += ctx.clarify_skipped
 
             # 按原始顺序把每个工具结果作为 role="tool" 消息回灌历史
+            round_actions: list[tuple[str, object, str]] = []
             for tc in tool_calls:
                 res = results.get(tc.id)
                 output = res.output if res is not None else "工具未产生结果"
                 tool_msg = Message(role="tool", tool_call_id=tc.id, content=output)
                 history.append(tool_msg)
                 _record(tool_msg)
+                # 打转检测取的是**模型实际收到的那一份**（`res.output`），
+                # 不是 `full_output`：判据是「它看到的东西有没有变」，而它看到
+                # 的就是这一份。拿完整原文去比会让一次被裁剪的长输出里，
+                # 尾部的无关抖动掩盖掉「模型眼里完全一样」这个事实。
+                round_actions.append((tc.name, tc.arguments, output))
 
             # 计划获批 → 本轮后续迭代进入执行阶段
             if ctx.approved:
@@ -1421,17 +1557,116 @@ class Agent:
                 )
                 return
 
+            # 原地打转检测（2026-09-18）：同一个 (工具名, 参数, 结果) 反复出现。
+            #
+            # ⚠ **位置必须在结果回灌之后**：判据是「模型看到的东西有没有变」，
+            # 而那要等结果拿到手才知道。放在执行之前只能比参数，而只比参数会
+            # 误伤真实的排查节奏（真实 trace 里模型连跑三次性能基准——参数各不
+            # 相同、结果从 0.91 到 0.89 再到 0.040，那是正常的「量→改→复测」）。
+            spun = spin.record_round(round_actions)
+            if spun is not None:
+                spun_tool, spun_count = spun
+                yield AgentEvent(
+                    type=AgentEventType.FINISHED,
+                    stop_reason=StopReason.SPINNING,
+                    message=render_spin_message(spun_tool, spun_count),
+                )
+                return
+
+            # 本轮摘要：留给检查点上的续跑判定用。
+            #
+            # ⚠ **只留摘要不留原文**。判「有没有在往前走」要的是「这次调用成没成、
+            # 拿到的东西和上次一样吗」，那在开头几行就看得出来；而一次 `read_file`
+            # 的原文是十万字符，全塞进判定请求既贵又没用。完整原文一直在 trace 里，
+            # 这里不是截断证据，是**不把证据当提示词用**。
+            digests.append(
+                RoundDigest(
+                    iteration=iteration,
+                    text=collector.text,
+                    tools=tuple(
+                        (
+                            tc.name,
+                            _digest_args(tc.arguments),
+                            bool(results[tc.id].ok) if tc.id in results else False,
+                            _digest_result(results.get(tc.id)),
+                        )
+                        for tc in tool_calls
+                    ),
+                )
+            )
+            if len(digests) > RECENT_ROUNDS:
+                del digests[0]
+
             # 安全点 2：本轮结束后检查取消
             if cancel_event.is_set():
                 yield AgentEvent(type=AgentEventType.FINISHED, stop_reason=StopReason.USER_CANCELLED)
                 return
 
-        # 走完上限仍未结束 → 兜底停止（N3）
-        yield AgentEvent(
-            type=AgentEventType.FINISHED,
-            stop_reason=StopReason.MAX_ITERATIONS,
-            message=f"已达到迭代上限（{options.max_iterations} 轮），自动停止。",
-        )
+            # ── 检查点：还要不要接着跑 ──────────────────────────────────
+            #
+            # ⚠ 位置在**全部停止条件之后**是刻意的：模型自然收工、被取消、
+            # 原地打转都已经在上面返回了，走到这里说明「它还在干活、且还没干完」
+            # ——那才是这个判定唯一有意义的时刻。
+            if iteration % checkpoint != 0:
+                continue
+
+            if options.continuation is None:
+                # 没配判定器 → 与本改动之前逐字一致：停，原因与文案都不变。
+                yield AgentEvent(
+                    type=AgentEventType.FINISHED,
+                    stop_reason=StopReason.MAX_ITERATIONS,
+                    message=f"已达到迭代上限（{options.max_iterations} 轮），自动停止。",
+                )
+                return
+
+            if consecutive_continues >= MAX_CONSECUTIVE_CONTINUES:
+                # ⚠ 结构性兜底：判定器说再多次「继续」也到此为止。
+                yield AgentEvent(
+                    type=AgentEventType.FINISHED,
+                    stop_reason=StopReason.MAX_ITERATIONS,
+                    message=(
+                        f"已经连续跑了 {iteration} 轮（续跑判定放行 "
+                        f"{consecutive_continues} 次），先停下来。"
+                        f"如果还没做完，回一句「继续」就接着跑。"
+                    ),
+                )
+                return
+
+            verdict = options.continuation.should_continue(goal, digests, iteration)
+            if verdict.decision is ContinuationDecision.CONTINUE:
+                consecutive_continues += 1
+                # 提示级（`AgentEvent.level` 的缺省值）：这是一条「情况变了但
+                # 你不用做什么」的陈述。⚠ 刻意不 import `tui` 的 LEVEL_* 常量
+                # ——`agent` 不依赖 `tui`，那个方向是反的。
+                yield AgentEvent(
+                    type=AgentEventType.NOTICE,
+                    message=f"已跑 {iteration} 轮，判定仍在推进，继续。",
+                )
+                continue
+
+            if verdict.decision is ContinuationDecision.STOP:
+                yield AgentEvent(
+                    type=AgentEventType.FINISHED,
+                    stop_reason=StopReason.NO_PROGRESS,
+                    message=(
+                        f"跑了 {iteration} 轮之后看不出还在往前走"
+                        f"（{verdict.reason or '判定器未说明'}），先停下来。"
+                        f"如果判断有误，回一句「继续」就接着跑。"
+                    ),
+                )
+                return
+
+            # UNKNOWN：问不出来。**不当成「继续」**——一个坏掉的判定器会变成
+            # 「永远继续」，那正是这条线要防的状态。退回改动前的行为并说明原因。
+            yield AgentEvent(
+                type=AgentEventType.FINISHED,
+                stop_reason=StopReason.MAX_ITERATIONS,
+                message=(
+                    f"已跑 {iteration} 轮，而续跑判定没能给出结论"
+                    f"（{verdict.reason or '原因不明'}），按上限停止。"
+                ),
+            )
+            return
 
     # ------------------------------------------------------------------ #
     # 工具执行：特殊工具路由 + 只读并发 + 副作用串行

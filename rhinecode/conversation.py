@@ -153,6 +153,8 @@ _ISOLATED_FAILURE_TEXT = {
     StopReason.STREAM_ERROR: "模型请求出错（含上下文超限），本次 Skill 未产出结果。",
     StopReason.UNKNOWN_TOOL: "连续调用未知工具已停止，本次 Skill 未产出结果。",
     StopReason.PLAN_REJECTED: "计划未获批准，本次 Skill 未执行。",
+    StopReason.SPINNING: "子任务在原地打转已停止，本次 Skill 未产出结果。",
+    StopReason.NO_PROGRESS: "子任务看不出进展已停止，本次 Skill 未产出结果。",
 }
 
 
@@ -395,6 +397,13 @@ class ConversationManager:
         # 同形态）。为 `None` 时本章整体不启用，三类动作的行为与本章之前**逐字一致**
         # ——`RunOptions.classifier` 缺省 None，循环里那两处判断整个跳过。
         self.classifier = None
+        # 续跑判定器（2026-09-18）。同样由装配层属性注入。为 `None` 时
+        # Agent Loop 在第一个检查点直接停，行为与本改动之前**逐字一致**。
+        #
+        # ⚠ 它**不是**上面那个分类器，两者只共用一个 Provider——理由见
+        # `classifier/continuation.py` 的模块 docstring（最要紧的是熔断计数器
+        # 不能共用，否则一个不稳的续跑判定会把安全审查一起熔断掉）。
+        self.continuation = None
         # web_search 扩展 F13：`WebSearchManager`，由装配层属性注入。
         # 协调层只用它做一件事——`/clear` 时复位会话级搜索配额。
         # None = 搜索能力未启用（或此实例不是走 `build_app` 造的）。
@@ -2092,6 +2101,10 @@ class ConversationManager:
                 # c16：主对话的分类器审查。取用户消息的来源就是本次运行自己的
                 # 历史，因此 `classifier_principal_history` 不必传（缺省即此）。
                 classifier=self.classifier,
+                # 续跑判定：只给**主对话**。子 Agent 与 fork 子对话刻意不传
+                # ——它们的轮次预算是委派方明确给定的（角色的 `max_turns`），
+                # 让一个判定器去放宽它等于把那个声明架空了。
+                continuation=self.continuation,
             ),
         )
         return self._wrap_events(events, extra_skill=grant_skill)
