@@ -48,6 +48,34 @@ self.assertTrue(screen.query_one("#setup-models", OptionList).has_focus)
 ⚠ 别把这当成那条分支引入的回归——它在 `main` 上早就红过（见上面 2026-09-17
 那次取样），分支只是把它的复现率推高了。
 
+⚠⚠ **2026-09-18 再复测，上面那段的结论要改一条：真正的复现句柄不是分支，
+是「单跑整个测试类」。**（`context-budget-realign` 已随 PR #78 合入 main 并删除，
+照上面那段去找那条分支是找不到的，所以这里必须写清楚替代办法。）
+
+```bash
+python -m unittest tests.test_setup_screen.ModelStepTest   # 6 条，约 5.5 秒
+```
+
+| 当时的分支 | 单跑 `ModelStepTest` 三次 |
+| --- | --- |
+| `main`（干净） | **红 3 次** |
+| `context-budget-realign` | 红 2 次 |
+| `trace-raw-arguments` | 红 2 次 |
+
+**干净 `main` 上红得最狠。** 这把这条 flake 的成本从「`run_parallel` 八分片连跑
+碰运气」降到「5.5 秒一次、几乎每次都红」。
+
+⚠ **它同时推翻了上面那句「整模块单跑绿」的一半**：同一天量的
+`python -m unittest tests.test_setup_screen`（整模块）在 `main` 上是**绿**的，
+而只跑其中一个类是**红**的。也就是说**同模块里排在前面的那些用例反而让它变绿**
+——它们多占了一点时间，或者改变了 Textual 的调度顺序，正好把焦点推到位了。
+**「跑得越少越容易红」这个方向与直觉相反，修的时候别用整模块跑来判断修好没有。**
+
+⚠ 由此，上面「两层」里的第 ② 层要收窄：**「和谁跑在同一片里」不是唯一变量**，
+在一台空闲机器上单跑一个类照样红。分片邻居影响的是**并行满量下**的复现率，
+而这条用例本身就带着一个时间假设，负载只是把它放大。修法判据相应改成三条全绿：
+单跑该类连跑多次、整模块单跑、`run_parallel` 满量。
+
 ### ② `tests/test_e2e_ask_user.py::AskUserE2ETest::test_the_input_box_is_only_unlocked_in_the_free_text_state`
 
 ```python
