@@ -47,7 +47,7 @@ class HookEventType(str, Enum):
     - POST_TOOL_USE / POST_TOOL_USE_FAILURE：工具**真的执行了**之后，按 ok 分流
 
     **系统级**
-    - PRE_COMPACT / POST_COMPACT：C8 第二层 LLM 摘要压缩前后（**不含第一层存盘**）
+    - PRE_COMPACT / POST_COMPACT：C8 的 LLM 摘要压缩前后
     - NOTIFICATION：系统需要用户注意时
 
     ⚠ **成对维护点**：新增事件须同步三处——本枚举、下方的 `EVENT_FIELDS`、

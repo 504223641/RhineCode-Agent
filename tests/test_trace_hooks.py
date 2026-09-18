@@ -376,29 +376,34 @@ class ToolOutcomeTest(TraceHookBase):
 
 
 class ContextCompactionHookTest(TraceHookBase):
-    def test_offload_layer_records_ids_and_paths(self) -> None:
-        from rhinecode.context.estimate import CHARS_PER_TOKEN
-        from rhinecode.context.offload import SINGLE_RESULT_TOKENS
+    # ⚠ 这里曾经有一条 `test_offload_layer_records_ids_and_paths`，验 c8 第一层
+    # 存盘的埋点（记「哪些工具调用被存了盘、存到哪」）。第一层已于 2026-09-17
+    # 整层删除，那条随之删除；`CONTEXT_COMPACTION` 事件现在只有摘要这一种来源。
+    #
+    # ⚠ **`trace/reader.py` 里那个 `layer == "offload"` 的摘要分支刻意留着**
+    # ——阅读器读的是已经写在磁盘上的旧记录，删掉它会让旧 trace 打印一串 None。
 
-        big = "A" * (int(SINGLE_RESULT_TOKENS * CHARS_PER_TOKEN) + 200)
+    def test_a_request_below_the_line_records_nothing(self) -> None:
+        """
+        够不着摘要触发线时不产出任何压缩事件。
+
+        ⚠ 这条是新加的**反证**：第一层删除之后 `before_request` 在绝大多数轮次
+        里什么都不做，而「什么都不做却照样埋一条点」会让时间线被噪音淹没——
+        排查上下文问题时第一件事就是数这类事件有几条。
+        """
         history = [
             Message(role="user", content="go"),
-            Message(role="tool", content=big, tool_call_id="call-1"),
+            Message(role="tool", content="A" * 60_000, tool_call_id="call-1"),
         ]
         cm = ContextManager(
             ScriptedProvider([_text_round()]),
             "model",
-            65536,
-            self.root / "store",
+            1_000_000,
             recorder=self.rec,
         )
         cm.before_request(history)
 
-        ev = self.records(T.CONTEXT_COMPACTION)
-        self.assertEqual(len(ev), 1)
-        self.assertEqual(ev[0]["layer"], "offload")
-        self.assertEqual(ev[0]["tool_call_ids"], ["call-1"])
-        self.assertTrue(Path(ev[0]["paths"][0]).exists())
+        self.assertEqual(self.records(T.CONTEXT_COMPACTION), [])
 
     def test_summary_layer_records_boundary_and_counts(self) -> None:
         summary_script = [
@@ -407,7 +412,7 @@ class ContextCompactionHookTest(TraceHookBase):
         ]
         provider = ScriptedProvider([summary_script])
         cm = ContextManager(
-            provider, "model", 65536, self.root / "store", recorder=self.rec
+            provider, "model", 65536, recorder=self.rec
         )
         # 每条约 2000 token（6000 字），20 条共约 40K，早段必然落在 10K 保留区之外
         history = [Message(role="user", content=f"m{i}" * 3000) for i in range(20)]
@@ -423,7 +428,7 @@ class ContextCompactionHookTest(TraceHookBase):
     def test_summary_noop_recorded_as_not_ok(self) -> None:
         provider = ScriptedProvider([_text_round()])
         cm = ContextManager(
-            provider, "model", 65536, self.root / "store", recorder=self.rec
+            provider, "model", 65536, recorder=self.rec
         )
         cm.manual_compact([Message(role="user", content="短")])
         ev = [r for r in self.records(T.CONTEXT_COMPACTION) if r["layer"] == "summary"]
@@ -443,7 +448,7 @@ class ScopeTest(TraceHookBase):
         ]
         provider = ScriptedProvider([summary_script])
         traced = TracingProvider(provider, self.rec, "model")
-        cm = ContextManager(traced, "model", 65536, self.root / "store", recorder=self.rec)
+        cm = ContextManager(traced, "model", 65536, recorder=self.rec)
         history = [Message(role="user", content=f"m{i}" * 3000) for i in range(20)]
         cm.manual_compact(history)
 
@@ -876,7 +881,7 @@ class AllTypesTest(TraceHookBase):
             T.UI_MESSAGE: {"source": "system", "text": "提示"},
             T.STATUS_BAR: {"text": "\\[deepseek] m"},
             T.AGENT_EVENT: {"event_type": "progress", "iteration": 2},
-            T.CONTEXT_COMPACTION: {"layer": "offload", "count": 1},
+            T.CONTEXT_COMPACTION: {"layer": "summary", "ok": True, "retain_index": 4},
             T.SKILL_STATE: {"action": "activate", "skill": "demo"},
             T.HISTORY_RESTORED: {"origin": "startup", "message_count": 4},
             # c12 Hook 两类

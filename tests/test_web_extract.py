@@ -122,21 +122,32 @@ class FallbackOutcomeTests(unittest.TestCase):
         self.assertTrue(out.chars_truncated)
         self.assertEqual(len(out.text), MAX_FALLBACK_CHARS)
 
-    def test_fallback_limit_stays_under_offload_threshold(self) -> None:
+    def test_fallback_limit_stays_under_the_tool_output_budgets(self) -> None:
         """
-        降级节选的上限必须与 C8 第一层存盘阈值相容（spec F17）。
+        降级节选的上限必须与**工具产出时的体量闸门**相容（spec F17 的接班人）。
 
-        按 estimate.py 的 CHARS_PER_TOKEN 折算后要低于 offload.py 的
-        SINGLE_RESULT_TOKENS，否则每次降级都会触发存盘、留下一个没用的占位符。
+        ## ⚠ 这条换过一次比较对象（2026-09-17）
+
+        原先比的是 c8 第一层存盘的 `SINGLE_RESULT_TOKENS`（4000 token）——
+        超过它的话每次降级都会立刻触发存盘、在历史里留下一个没用的占位符。
+        第一层已整层删除，那个比较对象没了。
+
+        **但它保护的东西还在，只是换了名字。** 现在「一条工具结果能有多大」由
+        每个工具自己在产出时决定，因此这里改成与**最小的那个闸门**比——
+        降级节选不该成为历史里最胖的那一条。
+
+        ⚠ **别把这条用例删掉。** 一旦删了，就没有任何东西记得「工具之间的额度
+        需要互相看一眼」；下一个人调大 `MAX_FALLBACK_CHARS` 时不会想到还有别的
+        工具在同一个量级上。
         """
-        from rhinecode.context.estimate import CHARS_PER_TOKEN
-        from rhinecode.context.offload import SINGLE_RESULT_TOKENS
+        from rhinecode.tools.read_file import READ_OUTPUT_MAX_CHARS
+        from rhinecode.tools.run_command import RUN_OUTPUT_MAX_CHARS
 
-        approx_tokens = MAX_FALLBACK_CHARS / CHARS_PER_TOKEN
+        smallest = min(READ_OUTPUT_MAX_CHARS, RUN_OUTPUT_MAX_CHARS)
         self.assertLess(
-            approx_tokens,
-            SINGLE_RESULT_TOKENS,
-            "降级节选折算后超过了 C8 的单结果存盘线，会导致每次降级都触发存盘",
+            MAX_FALLBACK_CHARS,
+            smallest,
+            "降级节选比工具自己的输出预算还大，它会成为历史里最胖的一条",
         )
 
     def test_empty_text(self) -> None:

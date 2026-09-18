@@ -22,8 +22,40 @@ from rhinecode.tools.path_guard import (
 
 # 返回的最大命中行数，避免超长结果。
 MAX_MATCHES = 200
+# 单条命中行保留的最大字符数，超出部分截断并就地标注。
+#
+# ## 为什么需要它（2026-09-17）
+#
+# `MAX_MATCHES` 限的是**条数**，而单行长度不限。搜一个压缩过的 JS 或单行 JSON，
+# 200 条命中每条几万字符，一次搜索就能产出上百万字符。
+#
+# 这在 c8 第一层存盘还在的时候由那一层兜着（塞进去、下一轮换成占位）。第一层
+# 已整层删除——上游两家都是在工具**产出的那一刻**限量、进了历史就不再动——
+# 所以每个可能产出大结果的工具都要自己把住这一关。`read_file` 与 `run_command`
+# 各有自己的字符预算，这里是同一件事在搜索工具上的落点。
+#
+# 取 500：一行源码通常在 120 字符以内，500 足够把命中行连同上下文看清楚；
+# 200 条 × 500 字符 ≈ 100 000 字符，与 `read_file` 的预算同量级。
+#
+# ⚠ **截断要就地标注**，不能默默切掉——模型看不出这行还有后半截，会拿着半行
+# 代码去推理（同 `read_file` 那条超长单行的教训）。真要看全文请它去读那个文件。
+MAX_LINE_CHARS = 500
 # 跳过的目录名（版本控制、虚拟环境、缓存等），减少噪声与无意义遍历。
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
+
+def _clip_line(line: str) -> str:
+    """
+    把单条命中行截到 `MAX_LINE_CHARS`，超出时就地标注。
+
+    :param line: 原始命中行
+    :returns: 不超过上限的行（必要时带「…（本行过长…）」标注）
+
+    副作用：无（纯函数）。
+    """
+    if len(line) <= MAX_LINE_CHARS:
+        return line
+    return line[:MAX_LINE_CHARS] + f"…（本行过长，已截断，原长 {len(line)} 字）"
+
 
 PathFilter = Callable[[str, "Path"], bool]
 """
@@ -196,7 +228,7 @@ class GrepTool(Tool):
                 if rel != current:
                     lines_out.append(rel)
                     current = rel
-                lines_out.append(f"  {lineno}│ {line}")
+                lines_out.append(f"  {lineno}│ {_clip_line(line)}")
             if capped:
                 lines_out.append(f"…（已达上限 {MAX_MATCHES} 条，可能还有更多）")
             if skipped:

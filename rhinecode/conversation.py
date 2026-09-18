@@ -341,14 +341,12 @@ class ConversationManager:
 
         # 上下文压缩器（c8）：仅在工具可用模式构造——压缩的主要对象是工具结果，
         # 且循环/工具只在该模式存在。长期持有，跨消息累积估算锚点与熔断状态。
-        # 存盘目录锁定在项目根 .rhinecode/context/（与其它 .rhinecode 配置同处，可 gitignore）。
         self._context_manager: Optional[ContextManager] = None
         if self._tools_enabled:
             self._context_manager = ContextManager(
                 provider,
                 config.model,
                 config.context_window,
-                main_project_root() / ".rhinecode" / "context",
                 recorder=self._recorder,
                 hook_manager=self._hooks,
             )
@@ -619,7 +617,7 @@ class ConversationManager:
         清空对话历史，返回兼容确认文本（c10 起由命令层展示，文案保持不变）。
 
         副作用：self.history 被重置为空列表，下次请求将不携带任何上下文；
-        同时重置上下文压缩器的会话级状态（估算锚点、熔断计数、已存盘幂等集合，c8 F15）——
+        同时重置上下文压缩器的会话级状态（估算锚点、熔断计数，c8 F15）——
         历史清空后旧锚点与熔断态都不再适用，必须一并归零。
         c9：会话存档随之「开新档」——旧存档保留不动、后续消息写入新文件（F8），
         记忆高水位一并归零。
@@ -1267,7 +1265,7 @@ class ConversationManager:
         共享的话，两个子 Agent 会互相污染对方的估算锚点，主历史的锚点
         也会被它们改掉——表现是主对话的用量估算突然失准，而没有任何报错。
 
-        新建实例很轻（只是几个字段加一个 Offloader），存盘目录仍共享。
+        新建实例很轻（只是几个字段）。
 
         副作用：无（构造不做 IO）。
         """
@@ -1277,7 +1275,6 @@ class ConversationManager:
             self._provider,
             self._config.model,
             self._config.context_window,
-            main_project_root() / ".rhinecode" / "context",
             recorder=self._recorder,
             hook_manager=self._hooks,
         )
@@ -1531,7 +1528,7 @@ class ConversationManager:
         一段结论，主历史干净、上下文预算也省下来了。
 
         **子对话触达上下文上限时的兜底链路**（兑现 F21 的说明义务）：
-        子对话只跑 C8 第一层（工具结果存盘），不跑第二层摘要——它是短任务，
+        子对话不跑 C8 的 LLM 摘要——它是短任务，
         为它调一次摘要 LLM 不划算，且摘要用的锚点属于主历史、对它无意义。
         万一仍然超窗：API 报错 → `chunk.type == "error"` → 循环产出 ERROR 事件
         （TUI 渲染红色错误行）→ `FINISHED(STREAM_ERROR)` → 下面判为「未产出」

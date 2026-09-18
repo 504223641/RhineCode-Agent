@@ -475,44 +475,41 @@ class SubAgentDrivingTest(IsolatedTestBase):
 
 
 class ContextLayerTest(IsolatedTestBase):
-    """AC21：子对话跑 C8 第一层、不跑第二层。"""
+    """AC21：子对话不跑 LLM 摘要。"""
 
-    def test_first_layer_offload_applies_second_layer_does_not(self) -> None:
+    def test_the_tool_result_reaches_the_model_and_no_summary_is_called(self) -> None:
         """
-        大工具结果在子历史中被替换为「预览 + 来源」占位，且**未**调用摘要 LLM。
+        子对话里的大工具结果**原样送到模型手里**，且未调用摘要 LLM。
 
-        这是「子对话共享 ContextManager 但只开第一层」这个决策的唯一收益点，
-        不验就不知道有没有真的接上。
+        ## ⚠ 这条用例反过来了（2026-09-17）
 
-        ⚠ 这条断言原先是 `assertIn(".rhinecode", ...)`——占位里当时确实写着存盘
-        文件的路径，而那正是 2026-09-17 修掉的死循环的诱因（见
-        `context/offload.py` 模块 docstring）。现在改成断言「**有**来源、
-        **没有**路径」，两句缺一不可：只断言有来源的话，把路径原样加回去照样绿。
+        原名 `test_first_layer_offload_applies_second_layer_does_not`，断言的是
+        「大工具结果在子历史中被替换为占位」——那是 c8 第一层存盘的行为，
+        当时被当成「子对话共享 ContextManager 但只开第一层」这个决策的收益点。
+
+        第一层已整层删除（它按绝对阈值触发，在 1M 窗口下相当于用量到 1.6% 就开始
+        删历史，真实 trace 里模型因此连续十几轮拿不到自己刚读的文件）。收益点不在
+        了，但**另一半仍然要钉住**：子对话恒不摘要（`allow_summary=False`）。
+
+        顺带把「工具结果真的到得了模型」补成正向断言——那是本次改造的目的本身。
         """
-        big = "X" * 40000  # 远超第一层单结果阈值
+        big = "X" * 40000
         provider = ScriptedProvider([_tool_call("echo_tool"), _text()])
         mgr = self._manager(provider, tools=[EchoTool(big)])
         self._write_skill()
 
         list(mgr.run_skill("rev", "", "/rev"))
 
-        # 第二轮发出的消息里，那条 tool 结果应已被替换成占位。
+        # 第二轮发出的消息里，那条 tool 结果必须是**原文**。
         second_round = provider.calls[1]["messages"]
         tool_msgs = [m for m in second_round if m.role == "tool"]
         self.assertTrue(tool_msgs)
-        self.assertLess(len(tool_msgs[0].content), 4000, "第一层存盘没生效")
-        self.assertIn("已存盘", tool_msgs[0].content, "占位标记不见了")
-        self.assertIn("来源：echo_tool", tool_msgs[0].content, "占位没写清这条结果是谁产生的")
-        self.assertNotIn(
-            ".rhinecode", tool_msgs[0].content, "占位里又出现了存盘路径（死循环的诱因）"
-        )
-        # 存盘文件确实生成了（人工排查仍取得到，只是不再告诉模型路径）。
-        offload_dir = Path(".rhinecode") / "context"
-        self.assertTrue(list(offload_dir.glob("*.txt")))
+        self.assertIn(big, tool_msgs[0].content, "工具结果没能原样送到模型手里")
+        self.assertNotIn("已存盘", tool_msgs[0].content, "第一层存盘又回来了")
 
-        # 第二层未被调用：所有请求都带着 tools（摘要请求会强制 tools=None）。
+        # 摘要未被调用：所有请求都带着 tools（摘要请求会强制 tools=None）。
         for call in provider.calls:
-            self.assertIsNotNone(call["tools"], "出现了摘要请求（第二层被调用了）")
+            self.assertIsNotNone(call["tools"], "出现了摘要请求（子对话不该摘要）")
 
 
 class _RecordingHooks(NullHookManager):

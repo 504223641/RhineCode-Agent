@@ -1,4 +1,4 @@
-"""ContextManager 编排单测（c8 T14 / AC3/AC8/AC12）：摘要重构、锚点失效、熔断、manual、offload 先行。"""
+"""ContextManager 编排单测（c8 T14 / AC8/AC12）：摘要重构、锚点失效、熔断、manual、不到线不动历史。"""
 
 import tempfile
 import unittest
@@ -7,7 +7,6 @@ from pathlib import Path
 from rhinecode.provider.base import Message, StreamChunk, ToolCall
 from rhinecode.agent.events import Usage
 from rhinecode.context.manager import ContextManager, MAX_SUMMARY_FAILURES
-from rhinecode.context.offload import SINGLE_RESULT_TOKENS
 from rhinecode.context.estimate import CHARS_PER_TOKEN
 
 
@@ -52,7 +51,7 @@ class SummaryReconstructTest(unittest.TestCase):
 
     def test_success_reconstructs_and_invalidates_anchor(self) -> None:
         prov = FakeProvider(_OK_CHUNKS)
-        cm = ContextManager(prov, "m", window=1000, store_dir=self.store)
+        cm = ContextManager(prov, "m", window=1000)
         cm.record_usage(Usage(prompt_tokens=999), 3)  # 先埋一个锚点
         history = _big_history()
         before = len(history)
@@ -68,7 +67,7 @@ class SummaryReconstructTest(unittest.TestCase):
 
     def test_noop_when_nothing_to_summarize(self) -> None:
         prov = FakeProvider(_OK_CHUNKS)
-        cm = ContextManager(prov, "m", window=1000, store_dir=self.store)
+        cm = ContextManager(prov, "m", window=1000)
         small = [Message(role="user", content="hi"), Message(role="assistant", content="yo")]
         notice = cm._do_summary(small)
         self.assertEqual(notice.kind, "noop")
@@ -85,14 +84,14 @@ class CircuitBreakerTest(unittest.TestCase):
 
     def test_three_failures_trips_breaker(self) -> None:
         prov = FakeProvider(_ERR_CHUNKS)
-        cm = ContextManager(prov, "m", window=1000, store_dir=self.store)
+        cm = ContextManager(prov, "m", window=1000)
         kinds = [cm._do_summary(_big_history()).kind for _ in range(MAX_SUMMARY_FAILURES)]
         self.assertEqual(kinds[-1], "circuit_break")
         self.assertTrue(cm._circuit_broken)
 
     def test_broken_skips_auto_summary(self) -> None:
         prov = FakeProvider(_ERR_CHUNKS)
-        cm = ContextManager(prov, "m", window=1000, store_dir=self.store, auto_margin=100)
+        cm = ContextManager(prov, "m", window=1000, auto_margin=100)
         for _ in range(MAX_SUMMARY_FAILURES):
             cm._do_summary(_big_history())
         self.assertTrue(cm._circuit_broken)
@@ -103,7 +102,7 @@ class CircuitBreakerTest(unittest.TestCase):
 
     def test_reset_clears_breaker(self) -> None:
         prov = FakeProvider(_ERR_CHUNKS)
-        cm = ContextManager(prov, "m", window=1000, store_dir=self.store)
+        cm = ContextManager(prov, "m", window=1000)
         for _ in range(MAX_SUMMARY_FAILURES):
             cm._do_summary(_big_history())
         cm.reset()
@@ -124,7 +123,7 @@ class ManualCompactTest(unittest.TestCase):
         # 手动已无余量阈值：noop 只在「没有够旧的早段可摘要」时出现（物理约束，非拒绝）。
         # 小历史全部落在保留区 → _do_summary 直接 noop，且不调用模型。
         prov = FakeProvider(_OK_CHUNKS)
-        cm = ContextManager(prov, "m", window=1_000_000, store_dir=self.store)
+        cm = ContextManager(prov, "m", window=1_000_000)
         small = [Message(role="user", content="hi"), Message(role="assistant", content="yo")]
         notice = cm.manual_compact(small)
         self.assertEqual(notice.kind, "noop")
@@ -133,47 +132,78 @@ class ManualCompactTest(unittest.TestCase):
 
     def test_compacts_regardless_of_headroom(self) -> None:
         # 阈值已移除：即便窗口极大、余量宽裕（旧逻辑会 noop），只要有够旧的早段就直接摘要。
-        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=1_000_000, store_dir=self.store)
+        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=1_000_000)
         notice = cm.manual_compact(_big_history())
         self.assertEqual(notice.kind, "summary")
 
 
-class OffloadBeforeSummaryTest(unittest.TestCase):
-    """AC3：before_request 先 offload，降低估算，可能因此免去/减轻第二层摘要。"""
+class NothingIsTouchedBelowTheLineTest(unittest.TestCase):
+    """
+    ⚠ **这一组取代了原来的 `OffloadBeforeSummaryTest`**（c8 第一层存盘，
+    2026-09-17 整层删除）。
 
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.store = Path(self._tmp.name)
+    原用例断言「一条超大工具结果会被就地换成占位、估算随之下降」。那个行为正是
+    这次要去掉的东西：它按绝对阈值触发（合计 16 000 token），在 1 000 000 的窗口
+    下相当于**用量到 1.6% 就开始删历史**，真实 trace 里模型因此连续十几轮拿不到
+    自己刚读的文件。
 
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+    现在钉住的是反过来的不变量：**没到摘要触发线之前，历史一个字都不许动。**
+    """
 
-    def test_offload_runs_and_lowers_estimate(self) -> None:
+    def test_a_huge_tool_result_is_left_alone(self) -> None:
+        """远低于触发线时，超大工具结果原样留在历史里。"""
         prov = FakeProvider(_OK_CHUNKS)
-        cm = ContextManager(prov, "m", window=100_000, store_dir=self.store)
-        big_tool = Message(
-            role="tool",
-            content="B" * int((SINGLE_RESULT_TOKENS + 2000) * CHARS_PER_TOKEN),
-            tool_call_id="c1",
-        )
+        cm = ContextManager(prov, "m", window=1_000_000)
+        big = "B" * 200_000          # 约 67K token，远超旧的单条 4000 token 线
         history = [
             Message(role="user", content="q"),
-            Message(role="assistant", content="", tool_calls=[ToolCall(id="c1", name="read_file", arguments={})]),
-            big_tool,
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="c1", name="read_file", arguments={})],
+            ),
+            Message(role="tool", content=big, tool_call_id="c1"),
         ]
         est_before = cm._estimate(history)
         notices = cm.before_request(history)
         est_after = cm._estimate(history)
 
-        self.assertTrue(any(n.kind == "offload" for n in notices))
-        self.assertLess(est_after, est_before)  # 存盘后估算下降
-        self.assertTrue(history[2].content.startswith("[大型工具结果已存盘"))
+        self.assertEqual(notices, [], "没逼近窗口就不该有任何压缩动作")
+        self.assertEqual(history[2].content, big, "工具结果被动过了")
+        self.assertEqual(est_after, est_before, "估算不该因为压缩而变化")
+
+    def test_history_is_untouched_at_half_the_window(self) -> None:
+        """
+        ⚠ **反证。** 用量到窗口一半时也一个字不许动。
+
+        少了这条，把摘要触发线写成「窗口的 1%」照样能让上面那条通过
+        （那条用的历史只有几万 token，1% 的线在 1M 窗口下是 10K——刚好还够不着）。
+        """
+        prov = FakeProvider(_OK_CHUNKS)
+        cm = ContextManager(prov, "m", window=100_000)
+        history = [Message(role="user", content="q")]
+        for i in range(20):
+            history.append(
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(id=f"c{i}", name="read_file", arguments={})],
+                )
+            )
+            history.append(Message(role="tool", content="B" * 7_500, tool_call_id=f"c{i}"))
+        before = [m.content for m in history]
+
+        self.assertGreater(cm._estimate(history), 40_000, "构造的历史应当到窗口一半左右")
+        notices = cm.before_request(history)
+
+        self.assertEqual(notices, [])
+        self.assertEqual([m.content for m in history], before, "历史被改写了")
 
 
 class UsageReportTest(unittest.TestCase):
     def test_report_contains_fields(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=65536, store_dir=Path(d))
+            cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=65536)
             report = cm.usage_report([Message(role="user", content="hi")])
             self.assertIn("估算", report)
             self.assertIn("65536", report)
@@ -191,7 +221,7 @@ class StatusLineTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_lean_history_no_warn(self) -> None:
-        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=65536, store_dir=self.store)
+        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=65536)
         text, warn = cm.status_line([Message(role="user", content="hi")])
         self.assertTrue(text.startswith("上下文："))
         self.assertIn("%", text)
@@ -200,13 +230,13 @@ class StatusLineTest(unittest.TestCase):
 
     def test_over_threshold_warns(self) -> None:
         # 窗口很小 → 大历史轻易越过 window*0.8 → 高亮
-        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=500, store_dir=self.store)
+        cm = ContextManager(FakeProvider(_OK_CHUNKS), "m", window=500)
         _, warn = cm.status_line(_big_history())
         self.assertTrue(warn)
 
     def test_circuit_broken_marks_and_warns(self) -> None:
         prov = FakeProvider(_ERR_CHUNKS)
-        cm = ContextManager(prov, "m", window=1_000_000, store_dir=self.store)
+        cm = ContextManager(prov, "m", window=1_000_000)
         for _ in range(MAX_SUMMARY_FAILURES):
             cm._do_summary(_big_history())
         self.assertTrue(cm._circuit_broken)

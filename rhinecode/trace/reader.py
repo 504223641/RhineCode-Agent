@@ -253,8 +253,12 @@ def _s_agent_event(r: dict) -> str:
 
 
 def _s_context_compaction(r: dict) -> str:
+    # ⚠ **`layer == "offload"` 这一支留着，尽管产品侧已不再产出它**（c8 第一层于
+    # 2026-09-17 整层删除）。阅读器读的是**已经写在磁盘上的历史记录**，用户手里
+    # 那些旧 trace 里还有这类事件；删掉这一支会让它们退化成走下面的摘要分支、
+    # 打印一串 `None`——一个观测设施对着旧数据胡说八道，比它少认识一种事件糟得多。
     if r.get("layer") == "offload":
-        return f"第一层存盘 {r.get('count')} 个 · {(r.get('tool_call_ids') or [])[:3]}"
+        return f"第一层存盘 {r.get('count')} 个 · {(r.get('tool_call_ids') or [])[:3]}（该机制已移除）"
     ok = "成功" if r.get("ok") else "未压缩"
     tail = f" · {_text_of(r.get('reason') or r.get('skipped'), 40)}" if not r.get("ok") else ""
     return (

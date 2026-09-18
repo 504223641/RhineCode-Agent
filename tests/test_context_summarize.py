@@ -124,17 +124,57 @@ class RetainScalesWithWindowTest(unittest.TestCase):
 
     def test_default_window_behaviour_is_unchanged(self) -> None:
         """
-        默认窗口 65536 及以上必须**逐字维持改造前的取值**。
+        65536 附近的窗口必须**逐字维持改造前的取值**。
 
         这是零回归的形式化表达：比例乘出来超过上限，被夹回原来的固定值。
+
+        ⚠ **1000000 已从这条的清单里摘掉**（2026-09-17）：大窗口侧现在由
+        `LARGE_WINDOW_MARGIN_RATIO` 主导，见下面那两条。两条规则在
+        window ≈ 433 000 处交接，该点以下才谈得上「维持原值」。
         """
         from rhinecode.context.summarize import retain_budget, RETAIN_TOKENS_CAP
         from rhinecode.context.manager import _derive_margin, MARGIN_CAP
 
-        for window in (65536, 131072, 1000000):
+        for window in (65536, 131072, 262144):
             with self.subTest(window=window):
                 self.assertEqual(retain_budget(window), RETAIN_TOKENS_CAP)
                 self.assertEqual(_derive_margin(window), MARGIN_CAP)
+
+    def test_large_window_triggers_near_the_upstream_line(self) -> None:
+        """
+        大窗口下触发点落在窗口的 97% 左右（对齐 Claude Code）。
+
+        依据：Claude Code 在 1M 上下文的模型上约 967K 触发自动压缩（≈96.7%），
+        Codex 的 `auto_compact_token_limit` 是窗口 × 90%。本项目取 97%。
+
+        ⚠ 改造前 1M 窗口的触发点在 **98.7%**（余量停在固定的 13000），
+        只剩 1.3% 的空间吸收估算误差——而本层用的是近似估算，误差的**绝对值**
+        随历史长度增长。c8 第一层删除之后摘要是唯一的兜底，这个余量必须跟着长。
+        """
+        from rhinecode.context.manager import _derive_margin
+
+        for window in (500_000, 1_000_000, 2_000_000):
+            with self.subTest(window=window):
+                trigger = (window - _derive_margin(window)) / window
+                self.assertAlmostEqual(trigger, 0.97, places=2)
+
+    def test_the_margin_has_no_upper_cap(self) -> None:
+        """
+        ⚠ **反证：窗口翻倍，余量必须跟着翻倍。**
+
+        少了这条，给大窗口侧补一个 `min(..., 某个上限)` 照样能让上面那条通过
+        ——只要那个上限大于 1M × 3%。而「余量不跟着窗口走」正是这次要改掉的
+        缺陷本身（它此前把 1M 窗口的触发点顶到 98.7%），换个更大的数字造回来
+        一样是错的。
+
+        同一个形态在本项目已经出现过两次：已知项 #8（`RETAIN_TOKENS` 与
+        `auto_margin` 固定值）与 c8 第一层存盘的绝对阈值。
+        """
+        from rhinecode.context.manager import _derive_margin
+
+        base = _derive_margin(1_000_000)
+        self.assertEqual(_derive_margin(2_000_000), base * 2)
+        self.assertEqual(_derive_margin(4_000_000), base * 4)
 
     def test_small_window_scales_down(self) -> None:
         """小窗口下预算必须真的变小，否则早段永远为空。"""

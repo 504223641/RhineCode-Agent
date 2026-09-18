@@ -372,7 +372,7 @@ def build_builtin_registry() -> CommandRegistry:
             CommandSpec(
                 name="/context",
                 aliases=("/ctx",),
-                description="查看当前上下文用量（估算 token / 余量 / 已存盘数）",
+                description="查看当前上下文用量（估算 token / 距上限余量）",
                 usage="/context",
                 command_type=CommandType.LOCAL,
                 handler=_handle_context,

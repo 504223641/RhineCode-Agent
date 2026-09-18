@@ -91,7 +91,6 @@ _UI_MODULES = (
     "tui/widgets.py",
     "commands/builtins.py",
     "context/manager.py",
-    "context/offload.py",
     "mcp/manager.py",
     "memory/manager.py",
     # ⚠ `team/render.py` **按函数扫**：同一个模块里既有 `/tasks` 报告
